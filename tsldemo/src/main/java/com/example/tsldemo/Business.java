@@ -1,11 +1,17 @@
 package com.example.tsldemo;
 
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+
+@Entity
 public class Business {
+	@Id 
 	private int id;
 	private String name;
 	private String inputData;
 	private String username;
 	private String password;
+	
 	
 	public Business(int id, String name, String username, String password, String inputData) {
 		this.setId(id);

@@ -1,1 +1,23 @@
-services: {}
+version: '3.9'
+
+services: 
+ database:
+  container_name: business-database
+  image: postgres
+  environment:
+   - POSTGRES_HOST=database
+   - POSTGRES_DB=business
+   - POSTGRES_USER=postgres
+   - POSTGRES_PASSWORD=password
+  volumes:
+   - database:/var/lib/postgresql/data
+  ports:
+   - "5332:5432"
+  networks:
+   - database_net
+  restart: unless-stopped
+networks:
+ database_net:
+  driver: bridge
+volumes:
+ database:
