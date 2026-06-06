@@ -1,0 +1,5 @@
+langgraph>=0.6.11
+langchain-core>=0.3.86
+httpx>=0.28.1
+typing-extensions>=4.15.0
+openai>=1.0.0
