@@ -12,6 +12,7 @@ public class Business {
 	private String username;
 	private String password;
 	
+	public Business() {}
 	
 	public Business(int id, String name, String username, String password, String inputData) {
 		this.setId(id);
@@ -58,7 +59,15 @@ public class Business {
 	public String getPassword() {
 		return password;
 	}
+	
+	@Override
+	public String toString() {
+		return String.format(
+			    "Account created: ID=%d, Name=%s, Username=%s",
+			    this.getId(),
+			    this.getName(),
+			    this.getUsername()
+			);
+	}
 
-	
-	
 }
