@@ -1,0 +1,21 @@
+# Dependencies and build output — never send to daemon
+node_modules
+.next
+
+# Git and editor metadata
+.git
+.gitignore
+.gitattributes
+.vscode
+.idea
+
+# Dev / local env files
+.env*.local
+*.env
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+
+# Docs
+*.md

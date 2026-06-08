@@ -1,0 +1,47 @@
+# =============================================================================
+# Stage 1 – base
+# Shared OS + runtime config. Rebuilt only when the Node version changes.
+# =============================================================================
+FROM node:20-alpine AS base
+WORKDIR /app
+
+# =============================================================================
+# Stage 2 – deps
+# Install all dependencies (including devDependencies).
+# Rebuilt only when package.json or package-lock.json change.
+# =============================================================================
+FROM base AS deps
+RUN apk add --no-cache libc6-compat
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# =============================================================================
+# Stage 3 – dev
+# Runs the Next.js development server with Turbopack and hot reload.
+#
+# At runtime, mount the project root over /app so that edits on the host are
+# reflected immediately without rebuilding the image. node_modules must be
+# preserved from the deps stage using an anonymous volume so the container's
+# install is used rather than the (potentially absent) host copy:
+#
+#   docker build -f Dockerfile.dev -t frontend-dev .
+#   docker run -p 3000:3000 \
+#     -v "$(pwd)":/app \
+#     -v /app/node_modules \
+#     frontend-dev
+#
+# Or via docker-compose (see compose.dev.yml).
+# =============================================================================
+FROM base AS dev
+ENV NODE_ENV=development \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
+
+COPY --from=deps /app/node_modules ./node_modules
+# Copied here so the image works standalone (e.g. in CI preview builds).
+# The volume mount at runtime shadows this layer with live host files.
+COPY . .
+
+EXPOSE 3000
+CMD ["npm", "run", "dev"]
