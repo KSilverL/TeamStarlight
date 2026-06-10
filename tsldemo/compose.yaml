@@ -3,7 +3,7 @@ version: '3.9'
 services: 
  database:
   container_name: business-database
-  image: postgres:17
+  image: postgres
   environment:
    - POSTGRES_HOST=database
    - POSTGRES_DB=business
