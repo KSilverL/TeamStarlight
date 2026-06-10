@@ -3,7 +3,7 @@ from __future__ import annotations
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 
-from ..core.azure_clients import get_chat_client
+from ..core.services.factory import get_chat_client
 from ..core.state import AgentState
 
 
@@ -20,6 +20,7 @@ async def conversation_node(state: AgentState, config: RunnableConfig) -> dict:
     platform: str       = state.get("conversation_platform", "")  # type: ignore[assignment]
     current_draft: str  = (state.get("drafts") or {}).get(platform, "")
     history: list[dict] = (state.get("conversation_history") or {}).get(platform, [])
+    originals: dict     = state.get("original_drafts") or {}
 
     user_text = interrupt({
         "platform":      platform,
@@ -52,8 +53,13 @@ async def conversation_node(state: AgentState, config: RunnableConfig) -> dict:
         {"role": "assistant", "content": revised},
     ]
 
-    return {
+    update: dict = {
         "conversation_status":  "active",
         "drafts":               {platform: revised},
         "conversation_history": {platform: new_history},
     }
+    # Snapshot the pre-edit draft on the first edit so the write-back can emit an
+    # edit_pair (before/after) when this platform is later approved (§4.4).
+    if platform not in originals:
+        update["original_drafts"] = {platform: current_draft}
+    return update

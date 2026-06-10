@@ -1,20 +1,22 @@
 """
 Shared fixtures for the integration test suite.
 
-Two autouse fixtures keep every test deterministic and offline:
-  - deterministic_critic: pins critic_node's 10% random safety-block so it never fires
-  - no_azure: clears Azure creds + resets the lazy client singletons → mock-fallback mode
+Autouse fixtures keep every test deterministic, offline, and in mock mode:
+  - _reset_config: clears cached Settings + service-factory singletons each test
+  - mock_environment: clears toggle/Azure env so the default (mock) mode is in force
+  - deterministic_critic: pins MockContentSafety's 10% random block so it never fires
 """
 
 from __future__ import annotations
 
 import pytest
 
-import core.azure_clients as az
-import nodes.phase2_platform as p2
-from core.interfaces import BaseStatusNotifier
-from core.state import AgentState
-from graph.builder import compile_graph
+import LLM_service.core.services.mock as svc_mock
+from LLM_service.core.config import reset_settings
+from LLM_service.core.interfaces import BaseStatusNotifier
+from LLM_service.core.services.factory import reset_services
+from LLM_service.core.state import AgentState
+from LLM_service.graph.builder import compile_graph
 
 
 class RecordingNotifier(BaseStatusNotifier):
@@ -27,32 +29,53 @@ class RecordingNotifier(BaseStatusNotifier):
         self.events.append((task_id, status))
 
 
+@pytest.fixture
+def recording_notifier() -> RecordingNotifier:
+    """A fresh RecordingNotifier for tests that assert on streamed backend events."""
+    return RecordingNotifier()
+
+
 # ── Autouse determinism / offline patches ─────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _reset_config():
+    """
+    Clear cached Settings and service-factory singletons before and after every
+    test so env/toggle changes made by one test never leak into the next.
+    """
+    reset_settings()
+    reset_services()
+    yield
+    reset_settings()
+    reset_services()
+
 
 @pytest.fixture(autouse=True)
 def deterministic_critic(monkeypatch):
     """
-    critic_node hard-fails ~10% of the time via `random.random() < 0.10`. Pin it high so
-    the safety check always passes; tone always aligns because all drafts are >= 30 chars.
+    MockContentSafety hard-fails ~10% of the time via `random.random() < 0.10`. Pin it
+    high so the safety check always passes; tone always aligns (drafts are >= 30 chars).
     """
-    monkeypatch.setattr(p2.random, "random", lambda: 0.99)
+    monkeypatch.setattr(svc_mock.random, "random", lambda: 0.99)
 
 
 @pytest.fixture(autouse=True)
-def no_azure(monkeypatch):
+def mock_environment(monkeypatch):
     """
-    Guarantee no real Azure calls: clear credentials and reset the module-level lazy
-    singletons so AzureImageGenerator / AzureChatClient re-initialise in mock mode.
+    Force the default (mock) feature-toggle state for every test by clearing the
+    toggle and Azure credential env vars, so nothing accidentally hits a real API.
+    Tests that need production mode set the relevant vars themselves and reset.
     """
     for var in (
-        "AZURE_OPENAI_ENDPOINT",
-        "AZURE_OPENAI_API_KEY",
-        "AZURE_OPENAI_DALLE_DEPLOYMENT",
-        "AZURE_OPENAI_CHAT_DEPLOYMENT",
+        "USE_MOCK", "USE_MOCK_LLM", "USE_MOCK_IMAGE", "USE_MOCK_SAFETY", "USE_MOCK_RAG",
+        "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY",
+        "AZURE_OPENAI_DALLE_DEPLOYMENT", "AZURE_OPENAI_CHAT_DEPLOYMENT",
+        "AZURE_CONTENT_SAFETY_ENDPOINT", "AZURE_CONTENT_SAFETY_KEY",
+        "AZURE_SEARCH_ENDPOINT", "AZURE_SEARCH_KEY",
     ):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr(az, "_image_generator", None)
-    monkeypatch.setattr(az, "_chat_client", None)
+    reset_settings()
+    reset_services()
 
 
 # ── Graph / config / state factories ──────────────────────────────────────────
@@ -88,17 +111,23 @@ def make_state():
             notes=None,
             examples=None,
             user_preferences=None,
+            business_id="biz_test_0001",
+            business_type="coffee_shop",
+            campaign_goal="product_launch",
+            user_requirement=None,
             current_status="starting",
             strategy="",
             rag_structure_context="",
             outline={},
             outline_approval="pending",
             content_approvals={},
+            last_review_decision={},
             conversation_platform="",
             conversation_status="done",
             conversation_history={},
             rag_tone_context={},
             drafts={},
+            original_drafts={},
             media_assets={},
             critic_comments={},
             is_passed={},

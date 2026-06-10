@@ -3,3 +3,10 @@ langchain-core>=0.3.86
 httpx>=0.28.1
 typing-extensions>=4.15.0
 openai>=1.0.0
+
+# ── Production backends ────────────────────────────────────────────────────────
+# Required when USE_MOCK_RAG=false — Azure AI Search dual-vector store (RAG).
+# Embeddings reuse the `openai` Azure OpenAI client above.
+azure-search-documents>=11.4.0
+# Required only when USE_MOCK_SAFETY=false — Azure AI Content Safety (still a skeleton):
+# azure-ai-contentsafety>=1.0.0

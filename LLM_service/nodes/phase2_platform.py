@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-import asyncio
-import random
 from typing import Optional
 
 from langchain_core.runnables import RunnableConfig
 
+from ..core import events
 from ..core.interfaces import BaseStatusNotifier
+from ..core.services.factory import (
+    get_content_safety,
+    get_tone_critic,
+    get_tone_retriever,
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -20,81 +24,50 @@ def _get_task_id(config: RunnableConfig) -> str:
 
 
 # ── Phase 2 shared nodes ──────────────────────────────────────────────────────
-# creator_node has been replaced by platform-specific nodes in phase2_creators.py.
-# These three nodes are shared across all platform pipelines.
+# These three nodes are shared across all platform pipelines. Backend choice
+# (mock vs Azure) is resolved by the factory per the USE_MOCK toggle. Per-node
+# progress events are emitted centrally by the wrapper in graph/builder.py; this
+# module only adds the curated per-platform *result* event in feedback_db_node.
 
-async def rag_tone_node(state: dict, config: RunnableConfig) -> dict:
-    """Retrieves platform-specific tone and format guidelines."""
+async def rag_tone_node(state: dict) -> dict:
+    """content_rag retrieval (RAG设计方案 §5.2). Runs the dual-query split once and
+    stores the bundle — tone baseline + positive examples (for the creator) +
+    rejections (for the critic) — keyed by platform."""
     platform: str = state["platform"]
-    notifier = _get_notifier(config)
-    task_id = _get_task_id(config)
-
-    if notifier:
-        await notifier.notify(task_id, {"node": "rag_tone", "platform": platform, "status": "running"})
-
-    await asyncio.sleep(0.08)  # mock retrieval
-
-    tone_guidelines: dict[str, str] = {
-        "X":         "Concise and witty; max 280 chars; use threads for depth; 1-2 hashtags max",
-        "Instagram": "Visual-first; aspirational lifestyle copy; 150-300 chars; 5-10 relevant hashtags",
-        "TikTok":    "Energetic and trend-aware; hook in first 3 words; CTA-heavy; 100-150 chars",
-        "LinkedIn":  "Professional and thought-leadership tone; data-driven; 300-600 chars; no hashtag spam",
-        "Facebook":  "Conversational; community-oriented; 100-250 chars; question-based CTAs work well",
-    }
-    tone_guide = tone_guidelines.get(platform, f"Adapt content naturally for {platform} audiences")
-
-    if notifier:
-        await notifier.notify(task_id, {"node": "rag_tone", "platform": platform, "status": "done"})
-
-    return {"rag_tone_context": {platform: tone_guide}}
+    bundle = await get_tone_retriever().retrieve(
+        platform=platform,
+        business_id=state.get("business_id", ""),
+        outline=state.get("outline", {}),
+        brand_voice=state.get("brand_voice", ""),
+        user_requirement=state.get("user_requirement"),
+    )
+    return {"rag_tone_context": {platform: bundle}}
 
 
-async def critic_node(state: dict, config: RunnableConfig) -> dict:
+async def critic_node(state: dict) -> dict:
     """
     Two-stage content review:
-      1. Mock Azure AI Content Safety — 10% probability hard-fails the content.
-      2. If safety passes, perform tone alignment check.
-    Only proceeds to tone check if the safety check passes.
+      1. Content safety — blocks disallowed content outright.
+      2. If safety passes, a tone-alignment check (contrasted against past rejections).
+    Only proceeds to the tone check if the safety check passes.
     """
     platform: str = state["platform"]
     draft: str = state.get("drafts", {}).get(platform, "")
-    notifier = _get_notifier(config)
-    task_id = _get_task_id(config)
 
-    if notifier:
-        await notifier.notify(task_id, {"node": "critic", "platform": platform, "status": "running"})
-
-    # ── Stage 1: Azure AI Content Safety (mock) ───────────────────────────────
-    await asyncio.sleep(0.05)
-    if random.random() < 0.10:  # 10% probability content safety violation
-        comment = (
-            "CONTENT_SAFETY_BLOCKED: Mock Azure AI Content Safety flagged this content. "
-            "Please revise and resubmit."
-        )
-        if notifier:
-            await notifier.notify(task_id, {"node": "critic", "platform": platform, "status": "safety_blocked"})
+    # ── Stage 1: content safety ───────────────────────────────────────────────
+    safety = await get_content_safety().check(text=draft)
+    if safety.blocked:
         return {
-            "critic_comments": {platform: comment},
+            "critic_comments": {platform: safety.reason},
             "is_passed": {platform: False},
         }
 
-    # ── Stage 2: Tone alignment check (mock) ──────────────────────────────────
-    await asyncio.sleep(0.05)
-
-    tone_aligned = platform.lower() in draft.lower() or len(draft) >= 30
-    if tone_aligned:
-        comment = f"Safety check passed. Tone is well-aligned with {platform} guidelines."
-    else:
-        comment = (
-            f"Safety check passed but tone mismatch detected for {platform}. "
-            "Consider adding platform-native language and increasing content length."
-        )
-
-    if notifier:
-        await notifier.notify(
-            task_id,
-            {"node": "critic", "platform": platform, "status": "done", "passed": tone_aligned},
-        )
+    # ── Stage 2: tone alignment check (contrasted against past rejections) ────
+    bundle = state.get("rag_tone_context", {}).get(platform, {})
+    rejections = [d.get("draft", "") for d in bundle.get("rejections", [])] if isinstance(bundle, dict) else []
+    tone_aligned, comment = await get_tone_critic().review(
+        platform=platform, draft=draft, rejections=rejections or None
+    )
 
     return {
         "critic_comments": {platform: comment},
@@ -104,27 +77,29 @@ async def critic_node(state: dict, config: RunnableConfig) -> dict:
 
 async def feedback_db_node(state: dict, config: RunnableConfig) -> dict:
     """
-    Mock async write of approved content into a vector database for future RAG retrieval.
-    Fires a webhook notification immediately upon completion — this is the signal for the
-    backend to consume the platform's results without waiting for other platforms to finish.
+    Streams a platform's result to the backend the moment its draft clears the
+    critic — the signal for the backend to consume results per platform without
+    waiting for the others. Emits a `result` event (not progress; that is handled
+    by the wrapper). This is NOT the RAG write-back: content_rag is only written
+    after the human verdict at final_review_gate (see feedback_persist_node), so
+    we never persist un-reviewed drafts as "approved" (RAG设计方案 §4.4).
     """
     platform: str = state["platform"]
     notifier = _get_notifier(config)
-    task_id = _get_task_id(config)
 
     if notifier:
-        await notifier.notify(task_id, {"node": "feedback_db", "platform": platform, "status": "writing"})
+        await notifier.notify(
+            _get_task_id(config),
+            events.result_event(
+                "feedback_db_node",
+                "draft_ready",
+                platform=platform,
+                payload={
+                    "draft": state.get("drafts", {}).get(platform),
+                    "media_asset": state.get("media_assets", {}).get(platform),
+                    "critic_comment": state.get("critic_comments", {}).get(platform),
+                },
+            ),
+        )
 
-    await asyncio.sleep(0.06)  # mock async vector DB upsert
-
-    # Notify backend immediately with this platform's final results
-    if notifier:
-        await notifier.notify(task_id, {
-            "node": "feedback_db",
-            "platform": platform,
-            "status": "written",
-            "draft": state.get("drafts", {}).get(platform),
-            "media_asset": state.get("media_assets", {}).get(platform),
-        })
-
-    return {"current_status": f"feedback_stored_{platform}"}
+    return {"current_status": f"draft_ready_{platform}"}

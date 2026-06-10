@@ -18,7 +18,8 @@ if __name__ == "__main__":
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
 
-from LLM_service.core.notifiers import WebhookStatusNotifier
+from LLM_service.core.config import get_settings
+from LLM_service.core.services.factory import get_notifier
 from LLM_service.core.state import AgentState
 from LLM_service.graph.builder import compile_graph
 
@@ -58,7 +59,13 @@ def _print_platform_content(snapshot, platform: str) -> None:
     draft   = (snapshot.values.get("drafts") or {}).get(platform, "(no draft)")
     asset   = (snapshot.values.get("media_assets") or {}).get(platform)
     comment = (snapshot.values.get("critic_comments") or {}).get(platform, "")
+    bundle  = (snapshot.values.get("rag_tone_context") or {}).get(platform, {})
     print(f"\n  ── {platform} ──")
+    if isinstance(bundle, dict):
+        print(
+            f"  RAG: {len(bundle.get('examples', []))} positive example(s), "
+            f"{len(bundle.get('rejections', []))} rejection(s) informed this draft"
+        )
     print(f"  Draft:\n{draft}")
     if asset:
         print(f"  Media: {asset}")
@@ -196,8 +203,9 @@ async def _handle_final_review_gate(graph, config: RunnableConfig) -> None:
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 async def main() -> None:
+    _section(get_settings().mode_banner())
     graph    = compile_graph()
-    notifier = WebhookStatusNotifier()
+    notifier = get_notifier()
     task_id  = "task-starlight-001"
 
     config: RunnableConfig = {
@@ -216,6 +224,11 @@ async def main() -> None:
         "notes":                "Emphasize the farmers and sustainability story",
         "examples":             None,
         "user_preferences":     "Avoid overly salesy language; prefer storytelling",
+        # RAG metadata + intent (hard-filter keys + natural-language ask)
+        "business_id":          "biz_demo_0001",
+        "business_type":        "coffee_shop",
+        "campaign_goal":        "product_launch",
+        "user_requirement":     "Highlight the limited-time launch and the farmers' story",
         # System state
         "current_status":       "starting",
         "strategy":             "",
@@ -223,6 +236,7 @@ async def main() -> None:
         "outline":              {},
         "outline_approval":     "pending",
         "content_approvals":    {},
+        "last_review_decision": {},
         # Conversation state — must start as "done" to prevent stale routing
         "conversation_platform": "",
         "conversation_status":   "done",
@@ -230,6 +244,7 @@ async def main() -> None:
         # Parallel pipeline state
         "rag_tone_context":     {},
         "drafts":               {},
+        "original_drafts":      {},
         "media_assets":         {},
         "critic_comments":      {},
         "is_passed":            {},

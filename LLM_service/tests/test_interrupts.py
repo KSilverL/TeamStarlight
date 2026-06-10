@@ -150,17 +150,14 @@ async def test_thread_isolation_two_users(graph, make_config, make_state):
 
 # ── I. Each platform's result streams to the backend as it completes ──────────
 
-async def test_per_platform_backend_notifications(graph, make_config, make_state):
-    from LLM_service.tests.conftest import RecordingNotifier
-
-    notifier = RecordingNotifier()
-    cfg = make_config("notify-user", notifier=notifier)
+async def test_per_platform_backend_notifications(graph, make_config, make_state, recording_notifier):
+    cfg = make_config("notify-user", notifier=recording_notifier)
     await _to_final_review(graph, cfg, make_state)
     await drain(graph, Command(resume={"X": "approved", "Instagram": "approved"}), cfg)
 
-    written = {
+    streamed = {
         status["platform"]
-        for _task, status in notifier.events
-        if status.get("node") == "feedback_db" and status.get("status") == "written"
+        for _task, status in recording_notifier.events
+        if status.get("type") == "result" and status.get("status") == "draft_ready"
     }
-    assert {"X", "Instagram"}.issubset(written)
+    assert {"X", "Instagram"}.issubset(streamed)
