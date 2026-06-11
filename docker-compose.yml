@@ -1,0 +1,9 @@
+services:
+  frontend:
+    build:
+      context: frontend_service
+      dockerfile: Dockerfile.dev
+  # llm:
+    # Containerised LLM Service Here
+  # backend:
+    # Containerised Backend Service Here
