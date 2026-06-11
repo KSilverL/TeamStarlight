@@ -35,8 +35,8 @@ const PLATFORMS: {
     id: "x",
     label: "X (Twitter)",
     abbr: "X",
-    badgeClass: "bg-zinc-800 text-white",
-    headerClass: "bg-zinc-900 text-white",
+    badgeClass: "bg-[#1B1A17] text-white",
+    headerClass: "bg-[#1B1A17] text-white",
   },
   {
     id: "instagram",
@@ -49,8 +49,8 @@ const PLATFORMS: {
     id: "tiktok",
     label: "TikTok",
     abbr: "TK",
-    badgeClass: "bg-black text-white border border-white/20",
-    headerClass: "bg-black text-white",
+    badgeClass: "bg-[#1B1A17] text-white",
+    headerClass: "bg-[#1B1A17] text-white",
   },
   {
     id: "linkedin",
@@ -225,27 +225,27 @@ export default function ChatPage() {
   }
 
   return (
-    <div className="flex h-screen bg-zinc-950 text-white overflow-hidden">
+    <div className="flex h-screen bg-[#F8F5EE] text-[#1B1A17] overflow-hidden">
       {/* Sidebar */}
       <aside
         className={`${
           sidebarOpen ? "w-72" : "w-0"
-        } transition-all duration-200 overflow-hidden flex-shrink-0 border-r border-white/10 flex flex-col bg-zinc-900`}
+        } transition-all duration-200 overflow-hidden flex-shrink-0 border-r border-[#E8E3DA] flex flex-col bg-white`}
       >
-        <div className="p-5 border-b border-white/10 flex-shrink-0">
+        <div className="p-5 border-b border-[#E8E3DA] flex-shrink-0">
           <Link
             href="/"
-            className="flex items-center gap-2 font-bold text-lg hover:text-indigo-300 transition-colors"
+            className="flex items-center gap-2 font-bold text-lg text-[#1B1A17] hover:text-[#FF4800] transition-colors"
           >
             ✦ Starlight
           </Link>
-          <p className="text-xs text-zinc-500 mt-0.5">AI Content Assistant</p>
+          <p className="text-xs text-[#9E9893] mt-0.5">AI Content Assistant</p>
         </div>
 
         <div className="flex-1 overflow-y-auto p-5 space-y-7">
           {/* Platforms */}
           <div>
-            <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-3">
+            <h3 className="text-xs font-semibold text-[#9E9893] uppercase tracking-wider mb-3">
               Platforms
             </h3>
             <div className="space-y-1.5">
@@ -257,8 +257,8 @@ export default function ChatPage() {
                     onClick={() => togglePlatform(p.id)}
                     className={`flex items-center gap-3 w-full px-3 py-2 rounded-lg text-sm transition-colors ${
                       active
-                        ? "bg-indigo-500/15 text-indigo-300 border border-indigo-500/25"
-                        : "text-zinc-400 hover:text-zinc-200 hover:bg-white/5"
+                        ? "bg-[#FFF0EB] text-[#FF4800] border border-[#FFCBB8]"
+                        : "text-[#6B6561] hover:text-[#1B1A17] hover:bg-[#F2EDE4]"
                     }`}
                   >
                     <span
@@ -268,7 +268,7 @@ export default function ChatPage() {
                     </span>
                     <span>{p.label}</span>
                     {active && (
-                      <span className="ml-auto w-1.5 h-1.5 rounded-full bg-indigo-400 flex-shrink-0" />
+                      <span className="ml-auto w-1.5 h-1.5 rounded-full bg-[#FF4800] flex-shrink-0" />
                     )}
                   </button>
                 );
@@ -278,7 +278,7 @@ export default function ChatPage() {
 
           {/* Content Type */}
           <div>
-            <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-3">
+            <h3 className="text-xs font-semibold text-[#9E9893] uppercase tracking-wider mb-3">
               Content Type
             </h3>
             <div className="grid grid-cols-2 gap-2">
@@ -288,8 +288,8 @@ export default function ChatPage() {
                   onClick={() => setContentType(ct.id)}
                   className={`px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
                     contentType === ct.id
-                      ? "bg-indigo-600 text-white"
-                      : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-white"
+                      ? "bg-[#FF4800] text-white"
+                      : "bg-[#F8F5EE] text-[#6B6561] border border-[#E8E3DA] hover:bg-[#E8E3DA] hover:text-[#1B1A17]"
                   }`}
                 >
                   {ct.label}
@@ -300,10 +300,10 @@ export default function ChatPage() {
 
           {/* Brand Profile */}
           <div>
-            <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-3">
+            <h3 className="text-xs font-semibold text-[#9E9893] uppercase tracking-wider mb-3">
               Brand Profile
             </h3>
-            <div className="bg-zinc-800 rounded-xl p-3.5 space-y-2.5 text-sm">
+            <div className="bg-[#F8F5EE] border border-[#E8E3DA] rounded-xl p-3.5 space-y-2.5 text-sm">
               {[
                 { label: "Business", value: "EcoHome Solutions" },
                 { label: "Tone", value: "Warm, aspirational, educational" },
@@ -312,8 +312,8 @@ export default function ChatPage() {
                 { label: "Notes", value: "Emphasise sustainability & durability" },
               ].map(({ label, value }) => (
                 <div key={label}>
-                  <span className="text-zinc-500 text-xs">{label}</span>
-                  <p className="text-zinc-200 mt-0.5">{value}</p>
+                  <span className="text-[#9E9893] text-xs">{label}</span>
+                  <p className="text-[#1B1A17] mt-0.5">{value}</p>
                 </div>
               ))}
             </div>
@@ -324,11 +324,11 @@ export default function ChatPage() {
       {/* Chat area */}
       <div className="flex-1 flex flex-col min-w-0">
         {/* Header */}
-        <header className="flex items-center justify-between px-5 py-4 border-b border-white/10 bg-zinc-900/60 backdrop-blur flex-shrink-0">
+        <header className="flex items-center justify-between px-5 py-4 border-b border-[#E8E3DA] bg-white flex-shrink-0">
           <div className="flex items-center gap-3">
             <button
               onClick={() => setSidebarOpen(!sidebarOpen)}
-              className="text-zinc-400 hover:text-white transition-colors p-1 rounded"
+              className="text-[#9E9893] hover:text-[#1B1A17] transition-colors p-1 rounded"
               aria-label={sidebarOpen ? "Close sidebar" : "Open sidebar"}
             >
               <svg width="18" height="14" viewBox="0 0 18 14" fill="none" aria-hidden="true">
@@ -338,10 +338,10 @@ export default function ChatPage() {
               </svg>
             </button>
             <div>
-              <h1 className="font-semibold text-sm text-white">
+              <h1 className="font-semibold text-sm text-[#1B1A17]">
                 EcoHome Solutions — Bamboo Kitchen Collection
               </h1>
-              <p className="text-xs text-zinc-500 mt-0.5">
+              <p className="text-xs text-[#9E9893] mt-0.5">
                 {selectedPlatforms.length} platform
                 {selectedPlatforms.length !== 1 ? "s" : ""} · {contentType}{" "}
                 content
@@ -382,9 +382,9 @@ export default function ChatPage() {
               return (
                 <div
                   key={msg.id}
-                  className="flex items-center gap-2 text-sm text-zinc-500 italic"
+                  className="flex items-center gap-2 text-sm text-[#9E9893] italic"
                 >
-                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse flex-shrink-0" />
+                  <span className="w-1.5 h-1.5 rounded-full bg-[#FF4800] animate-pulse flex-shrink-0" />
                   {msg.content}
                 </div>
               );
@@ -400,14 +400,14 @@ export default function ChatPage() {
                 <div
                   className={`max-w-[68%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
                     msg.role === "user"
-                      ? "bg-indigo-600 text-white rounded-br-sm"
-                      : "bg-zinc-800 text-zinc-200 rounded-bl-sm"
+                      ? "bg-[#FF4800] text-white rounded-br-sm shadow-sm"
+                      : "bg-white text-[#1B1A17] border border-[#E8E3DA] rounded-bl-sm shadow-sm"
                   }`}
                 >
                   <p className="whitespace-pre-wrap">{msg.content}</p>
                   <p
                     className={`text-xs mt-2 ${
-                      msg.role === "user" ? "text-indigo-300" : "text-zinc-500"
+                      msg.role === "user" ? "text-[#FFCBB8]" : "text-[#9E9893]"
                     }`}
                   >
                     {formatTime(msg.timestamp)}
@@ -420,7 +420,7 @@ export default function ChatPage() {
         </div>
 
         {/* Input */}
-        <div className="px-6 py-4 border-t border-white/10 bg-zinc-900/60 flex-shrink-0">
+        <div className="px-6 py-4 border-t border-[#E8E3DA] bg-white flex-shrink-0">
           <div className="flex gap-3 items-end">
             <textarea
               ref={textareaRef}
@@ -433,13 +433,13 @@ export default function ChatPage() {
                 }
               }}
               placeholder="Type a message or revision request… (Enter to send, Shift+Enter for new line)"
-              className="flex-1 bg-zinc-800 border border-white/10 rounded-xl px-4 py-3 text-sm text-white placeholder:text-zinc-500 resize-none focus:outline-none focus:border-indigo-500 transition-colors"
+              className="flex-1 bg-[#F8F5EE] border border-[#E8E3DA] rounded-xl px-4 py-3 text-sm text-[#1B1A17] placeholder:text-[#9E9893] resize-none focus:outline-none focus:border-[#FF4800] transition-colors"
               rows={1}
             />
             <button
               onClick={handleSend}
               disabled={!input.trim()}
-              className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white p-3 rounded-xl transition-colors flex-shrink-0"
+              className="bg-[#FF4800] hover:bg-[#E03E00] disabled:opacity-40 disabled:cursor-not-allowed text-white p-3 rounded-xl transition-colors flex-shrink-0"
               aria-label="Send message"
             >
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -467,8 +467,8 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
 
   return (
     <div className="w-full max-w-lg">
-      <p className="text-sm text-zinc-400 mb-2">{message.content}</p>
-      <div className="bg-zinc-800 border border-white/10 rounded-2xl overflow-hidden">
+      <p className="text-sm text-[#6B6561] mb-2">{message.content}</p>
+      <div className="bg-white border border-[#E8E3DA] rounded-2xl overflow-hidden shadow-sm">
         {/* Platform header */}
         <div
           className={`flex items-center justify-between px-4 py-2.5 ${platform.headerClass}`}
@@ -489,12 +489,12 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
         {/* Content */}
         <div className="p-4 space-y-3">
           {draft.imageDesc && (
-            <div className="bg-zinc-700/50 border border-white/5 rounded-lg px-3 py-2 text-xs text-zinc-300">
-              <span className="text-zinc-500">Image prompt: </span>
+            <div className="bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-2 text-xs text-[#6B6561]">
+              <span className="text-[#9E9893]">Image prompt: </span>
               {draft.imageDesc}
             </div>
           )}
-          <p className="text-sm text-zinc-200 whitespace-pre-wrap leading-relaxed">
+          <p className="text-sm text-[#1B1A17] whitespace-pre-wrap leading-relaxed">
             {draft.text}
           </p>
           {draft.hashtags && (
@@ -502,7 +502,7 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
               {draft.hashtags.map((tag) => (
                 <span
                   key={tag}
-                  className="text-xs text-indigo-400 bg-indigo-500/10 px-2 py-0.5 rounded-full"
+                  className="text-xs text-[#FF4800] bg-[#FFF0EB] border border-[#FFCBB8] px-2 py-0.5 rounded-full"
                 >
                   {tag}
                 </span>
@@ -522,14 +522,14 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
             </button>
             <button
               onClick={onReject}
-              className="flex-1 bg-zinc-700 hover:bg-zinc-600 text-zinc-200 text-sm font-medium py-2 rounded-lg transition-colors"
+              className="flex-1 bg-[#F2EDE4] hover:bg-[#E8E3DA] text-[#1B1A17] text-sm font-medium py-2 rounded-lg transition-colors border border-[#E8E3DA]"
             >
               Reject &amp; Regenerate
             </button>
           </div>
         )}
 
-        <p className="text-xs text-zinc-600 px-4 pb-3">
+        <p className="text-xs text-[#9E9893] px-4 pb-3">
           {formatTime(message.timestamp)}
         </p>
       </div>
