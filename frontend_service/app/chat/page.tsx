@@ -4,7 +4,7 @@ import { useState, useRef, useEffect } from "react";
 import Link from "next/link";
 
 type Platform = "x" | "instagram" | "tiktok" | "linkedin";
-type ContentType = "text" | "image" | "video" | "mix";
+type ContentType = "text" | "image" | "video" | "mix" | "brand";
 type ApprovalStatus = "pending" | "approved" | "rejected";
 
 interface DraftContent {
@@ -17,9 +17,11 @@ interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
-  variant?: "status" | "draft";
+  variant?: "status" | "draft" | "html-preview" | "video-pending" | "video-preview";
   platform?: Platform;
   draft?: DraftContent;
+  html?: string;
+  videoJobId?: string;
   approval?: ApprovalStatus;
   timestamp: Date;
 }
@@ -66,6 +68,7 @@ const CONTENT_TYPES: { id: ContentType; label: string }[] = [
   { id: "image", label: "Image" },
   { id: "video", label: "Video" },
   { id: "mix", label: "Mix" },
+  { id: "brand", label: "Brand Animation" },
 ];
 
 const INITIAL_MESSAGES: Message[] = [
@@ -74,58 +77,7 @@ const INITIAL_MESSAGES: Message[] = [
     role: "assistant",
     content:
       "Welcome to Starlight! I'm your AI social media content assistant. Tell me about your business, brand tone, target audience, and what you'd like to promote — I'll generate platform-specific content and walk you through the approval process.",
-    timestamp: new Date(Date.now() - 6 * 60 * 1000),
-  },
-  {
-    id: "2",
-    role: "user",
-    content:
-      "We're EcoHome Solutions — we sell sustainable bamboo home products targeting eco-conscious millennials aged 25–40. Our brand tone is warm, aspirational, and educational. We want to promote our new Bamboo Kitchen Collection across Instagram and LinkedIn.",
-    timestamp: new Date(Date.now() - 5 * 60 * 1000),
-  },
-  {
-    id: "3",
-    role: "assistant",
-    content:
-      "Brand profile captured. Generating a multi-platform content strategy for EcoHome Solutions — Bamboo Kitchen Collection...",
-    variant: "status",
-    timestamp: new Date(Date.now() - 4 * 60 * 1000),
-  },
-  {
-    id: "4",
-    role: "assistant",
-    content: "Here's your Instagram draft. Review and approve or reject:",
-    variant: "draft",
-    platform: "instagram",
-    draft: {
-      text: "🌿 Meet your kitchen's new best friend — the Bamboo Kitchen Collection.\n\nCrafted from 100% organic bamboo, each piece is naturally antimicrobial, carbon-negative in production, and built to last a decade. Because sustainable living shouldn't mean settling for less. 🏡",
-      hashtags: [
-        "#EcoHome",
-        "#BambooKitchen",
-        "#SustainableLiving",
-        "#ZeroWaste",
-        "#GreenHome",
-        "#BambooDesign",
-        "#ConsciousLiving",
-        "#EcoConscious",
-      ],
-      imageDesc:
-        "Flat lay of bamboo cutting boards, utensils, and storage containers on white marble with fresh green herbs",
-    },
-    approval: "pending",
-    timestamp: new Date(Date.now() - 3 * 60 * 1000),
-  },
-  {
-    id: "5",
-    role: "assistant",
-    content: "And here's your LinkedIn draft:",
-    variant: "draft",
-    platform: "linkedin",
-    draft: {
-      text: "The sustainable homewares market is projected to reach $150B by 2030 — and EcoHome Solutions is proud to be part of that shift.\n\nToday we're launching the Bamboo Kitchen Collection: premium products that prove sustainable materials can exceed conventional standards.\n\nBamboo grows 3× faster than hardwood, sequesters carbon during growth, and outlasts plastic by decades. We invite designers, buyers, and conscious consumers to explore what responsible innovation looks like.\n\nThe kitchens we design today reflect the values we leave for tomorrow.",
-    },
-    approval: "pending",
-    timestamp: new Date(Date.now() - 2 * 60 * 1000),
+    timestamp: new Date(),
   },
 ];
 
@@ -134,12 +86,10 @@ const platformMap = Object.fromEntries(PLATFORMS.map((p) => [p.id, p]));
 export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>(INITIAL_MESSAGES);
   const [input, setInput] = useState("");
-  const [selectedPlatforms, setSelectedPlatforms] = useState<Platform[]>([
-    "instagram",
-    "linkedin",
-  ]);
+  const [selectedPlatforms, setSelectedPlatforms] = useState<Platform[]>([]);
   const [contentType, setContentType] = useState<ContentType>("mix");
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -181,9 +131,9 @@ export default function ChatPage() {
     }, 350);
   }
 
-  function handleSend() {
+  async function handleSend() {
     const trimmed = input.trim();
-    if (!trimmed) return;
+    if (!trimmed || isLoading) return;
 
     setMessages((prev) => [
       ...prev,
@@ -199,19 +149,144 @@ export default function ChatPage() {
       textareaRef.current.style.height = "auto";
     }
 
-    setTimeout(() => {
+    if (contentType === "brand") {
+      // Brand animation path — calls the /api/brand proxy → brand agent FastAPI
+      setIsLoading(true);
       setMessages((prev) => [
         ...prev,
         {
           id: (Date.now() + 1).toString(),
-          role: "assistant",
-          content:
-            "Got it — I've noted your feedback and am updating the content strategy. Revised drafts will appear shortly...",
-          variant: "status",
+          role: "assistant" as const,
+          content: "Generating brand animation — this takes 10–20 seconds…",
+          variant: "status" as const,
           timestamp: new Date(),
         },
       ]);
-    }, 700);
+
+      try {
+        const res = await fetch("/api/brand", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ prompt: trimmed }),
+        });
+        const data = await res.json();
+
+        if (!res.ok || data.error) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: (Date.now() + 2).toString(),
+              role: "assistant" as const,
+              content: `Brand agent error: ${data.error ?? "unknown error"}. Make sure the brand agent server is running on port 8000.`,
+              timestamp: new Date(),
+            },
+          ]);
+          return;
+        }
+
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: (Date.now() + 2).toString(),
+            role: "assistant" as const,
+            content: "Here's your brand animation. Review and approve or reject:",
+            variant: "html-preview" as const,
+            html: data.html as string,
+            approval: "pending" as const,
+            timestamp: new Date(),
+          },
+        ]);
+      } catch {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: (Date.now() + 2).toString(),
+            role: "assistant" as const,
+            content:
+              "Could not reach the brand agent. Make sure it is running on port 8000.",
+            timestamp: new Date(),
+          },
+        ]);
+      } finally {
+        setIsLoading(false);
+      }
+    } else if (contentType === "video") {
+      // Video render path — async job on the brand-video-agent (60–180 s)
+      setIsLoading(true);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: (Date.now() + 1).toString(),
+          role: "assistant" as const,
+          content: "Starting video render — this takes 1–2 minutes…",
+          variant: "status" as const,
+          timestamp: new Date(),
+        },
+      ]);
+
+      try {
+        const res = await fetch("/api/video", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ brief: trimmed }),
+        });
+        const data = await res.json();
+
+        if (!res.ok || data.error) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: (Date.now() + 2).toString(),
+              role: "assistant" as const,
+              content: `Video agent error: ${data.error ?? "unknown error"}. Make sure the brand-video-agent is running on port 8001.`,
+              timestamp: new Date(),
+            },
+          ]);
+          return;
+        }
+
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: (Date.now() + 2).toString(),
+            role: "assistant" as const,
+            content: "Rendering your brand video:",
+            variant: "video-pending" as const,
+            videoJobId: data.jobId as string,
+            approval: "pending" as const,
+            timestamp: new Date(),
+          },
+        ]);
+      } catch {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: (Date.now() + 2).toString(),
+            role: "assistant" as const,
+            content:
+              "Could not reach the video agent. Make sure it is running on port 8001.",
+            timestamp: new Date(),
+          },
+        ]);
+      } finally {
+        setIsLoading(false);
+      }
+    } else {
+      // Mock path for text / image / mix content types
+      setTimeout(() => {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: (Date.now() + 1).toString(),
+            role: "assistant",
+            content:
+              "Got it — I've noted your feedback and am updating the content strategy. Revised drafts will appear shortly...",
+            variant: "status",
+            timestamp: new Date(),
+          },
+        ]);
+      }, 700);
+    }
   }
 
   function handleTextareaChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
@@ -287,6 +362,8 @@ export default function ChatPage() {
                   key={ct.id}
                   onClick={() => setContentType(ct.id)}
                   className={`px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                    ct.id === "brand" ? "col-span-2" : ""
+                  } ${
                     contentType === ct.id
                       ? "bg-[#FF4800] text-white"
                       : "bg-[#F8F5EE] text-[#6B6561] border border-[#E8E3DA] hover:bg-[#E8E3DA] hover:text-[#1B1A17]"
@@ -298,26 +375,6 @@ export default function ChatPage() {
             </div>
           </div>
 
-          {/* Brand Profile */}
-          <div>
-            <h3 className="text-xs font-semibold text-[#9E9893] uppercase tracking-wider mb-3">
-              Brand Profile
-            </h3>
-            <div className="bg-[#F8F5EE] border border-[#E8E3DA] rounded-xl p-3.5 space-y-2.5 text-sm">
-              {[
-                { label: "Business", value: "EcoHome Solutions" },
-                { label: "Tone", value: "Warm, aspirational, educational" },
-                { label: "Topic", value: "Bamboo Kitchen Collection" },
-                { label: "Audience", value: "Eco-conscious millennials, 25–40" },
-                { label: "Notes", value: "Emphasise sustainability & durability" },
-              ].map(({ label, value }) => (
-                <div key={label}>
-                  <span className="text-[#9E9893] text-xs">{label}</span>
-                  <p className="text-[#1B1A17] mt-0.5">{value}</p>
-                </div>
-              ))}
-            </div>
-          </div>
         </div>
       </aside>
 
@@ -339,7 +396,7 @@ export default function ChatPage() {
             </button>
             <div>
               <h1 className="font-semibold text-sm text-[#1B1A17]">
-                EcoHome Solutions — Bamboo Kitchen Collection
+                Starlight
               </h1>
               <p className="text-xs text-[#9E9893] mt-0.5">
                 {selectedPlatforms.length} platform
@@ -366,6 +423,33 @@ export default function ChatPage() {
         {/* Messages */}
         <div className="flex-1 overflow-y-auto px-6 py-6 space-y-5">
           {messages.map((msg) => {
+            if (
+              (msg.variant === "video-pending" || msg.variant === "video-preview") &&
+              msg.videoJobId
+            ) {
+              return (
+                <BrandVideoCard
+                  key={msg.id}
+                  message={msg}
+                  onApprove={() => handleApproval(msg.id, "approved")}
+                  onReject={() => handleApproval(msg.id, "rejected")}
+                  formatTime={formatTime}
+                />
+              );
+            }
+
+            if (msg.variant === "html-preview" && msg.html) {
+              return (
+                <BrandAnimationCard
+                  key={msg.id}
+                  message={msg}
+                  onApprove={() => handleApproval(msg.id, "approved")}
+                  onReject={() => handleApproval(msg.id, "rejected")}
+                  formatTime={formatTime}
+                />
+              );
+            }
+
             if (msg.variant === "draft" && msg.draft && msg.platform) {
               return (
                 <DraftCard
@@ -438,7 +522,7 @@ export default function ChatPage() {
             />
             <button
               onClick={handleSend}
-              disabled={!input.trim()}
+              disabled={!input.trim() || isLoading}
               className="bg-[#FF4800] hover:bg-[#E03E00] disabled:opacity-40 disabled:cursor-not-allowed text-white p-3 rounded-xl transition-colors flex-shrink-0"
               aria-label="Send message"
             >
@@ -459,6 +543,258 @@ interface DraftCardProps {
   onReject: () => void;
   formatTime: (d: Date) => string;
 }
+
+// ── Brand Video Card ──────────────────────────────────────────────────────────
+
+interface BrandVideoCardProps {
+  message: Message;
+  onApprove: () => void;
+  onReject: () => void;
+  formatTime: (d: Date) => string;
+}
+
+/**
+ * Renders a brand video card that polls /api/video/[jobId] every 3 seconds
+ * while the Remotion render is in progress, then switches to a <video> player
+ * once the job is done. All polling state is local to this component so each
+ * card manages its own lifecycle independently.
+ */
+function BrandVideoCard({
+  message,
+  onApprove,
+  onReject,
+  formatTime,
+}: BrandVideoCardProps) {
+  const [renderStatus, setRenderStatus] = useState<"pending" | "done" | "error">(
+    message.variant === "video-preview" ? "done" : "pending"
+  );
+  const [elapsed, setElapsed] = useState(0);
+  const [renderError, setRenderError] = useState<string | null>(null);
+  const approval = message.approval;
+
+  useEffect(() => {
+    if (renderStatus !== "pending" || !message.videoJobId) return;
+
+    // Poll job status every 3 s
+    const poll = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/video/${message.videoJobId}`);
+        const data = await res.json();
+        if (data.status === "done") {
+          setRenderStatus("done");
+        } else if (data.status === "error") {
+          setRenderStatus("error");
+          setRenderError(data.error ?? "Render failed.");
+        }
+      } catch {
+        // transient network error — keep polling
+      }
+    }, 3000);
+
+    // Elapsed-seconds counter for user feedback
+    const tick = setInterval(() => setElapsed((s) => s + 1), 1000);
+
+    return () => {
+      clearInterval(poll);
+      clearInterval(tick);
+    };
+  }, [renderStatus, message.videoJobId]);
+
+  const videoSrc = `/api/video/${message.videoJobId}/download`;
+
+  return (
+    <div className="w-full max-w-sm">
+      <p className="text-sm text-[#6B6561] mb-2">{message.content}</p>
+      <div className="bg-white border border-[#E8E3DA] rounded-2xl overflow-hidden shadow-sm">
+        {/* Header */}
+        <div className="flex items-center justify-between px-4 py-2.5 bg-[#1B1A17] text-white">
+          <span className="text-sm font-semibold">✦ Brand Video</span>
+          {approval === "approved" && (
+            <span className="text-xs bg-green-500 text-white px-2 py-0.5 rounded-full font-medium">
+              Approved
+            </span>
+          )}
+          {approval === "rejected" && (
+            <span className="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full font-medium">
+              Rejected
+            </span>
+          )}
+        </div>
+
+        {/* Body — pending spinner or video player */}
+        <div className="flex justify-center bg-[#F8F5EE] p-3">
+          {renderStatus === "pending" && (
+            <div
+              className="flex flex-col items-center justify-center gap-3 text-[#9E9893]"
+              style={{ width: 270, height: 480 }}
+            >
+              {/* Spinner */}
+              <svg
+                className="animate-spin"
+                width={36}
+                height={36}
+                viewBox="0 0 24 24"
+                fill="none"
+              >
+                <circle
+                  cx="12"
+                  cy="12"
+                  r="10"
+                  stroke="#E8E3DA"
+                  strokeWidth="3"
+                />
+                <path
+                  d="M12 2a10 10 0 0 1 10 10"
+                  stroke="#FF4800"
+                  strokeWidth="3"
+                  strokeLinecap="round"
+                />
+              </svg>
+              <p className="text-xs font-medium text-center">
+                Rendering video…
+              </p>
+              <p className="text-xs text-center">
+                {elapsed}s elapsed · usually 1–2 min
+              </p>
+            </div>
+          )}
+
+          {renderStatus === "error" && (
+            <div
+              className="flex flex-col items-center justify-center gap-2 text-center px-4"
+              style={{ width: 270, height: 480 }}
+            >
+              <p className="text-sm font-medium text-red-500">Render failed</p>
+              <p className="text-xs text-[#9E9893]">{renderError}</p>
+            </div>
+          )}
+
+          {renderStatus === "done" && (
+            <video
+              src={videoSrc}
+              controls
+              autoPlay
+              loop
+              style={{ width: 270, height: 480, borderRadius: 8 }}
+            />
+          )}
+        </div>
+
+        {/* Actions */}
+        {renderStatus === "done" && approval === "pending" && (
+          <div className="flex gap-2 px-4 pt-1 pb-4">
+            <button
+              onClick={onApprove}
+              className="flex-1 bg-green-600 hover:bg-green-500 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+            >
+              Approve
+            </button>
+            <button
+              onClick={onReject}
+              className="flex-1 bg-[#F2EDE4] hover:bg-[#E8E3DA] text-[#1B1A17] text-sm font-medium py-2 rounded-lg transition-colors border border-[#E8E3DA]"
+            >
+              Reject
+            </button>
+          </div>
+        )}
+
+        <p className="text-xs text-[#9E9893] px-4 pb-3">
+          {formatTime(message.timestamp)}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ── Brand Animation Card ──────────────────────────────────────────────────────
+
+interface BrandAnimationCardProps {
+  message: Message;
+  onApprove: () => void;
+  onReject: () => void;
+  formatTime: (d: Date) => string;
+}
+
+/**
+ * Renders the self-contained HTML returned by the brand agent inside a
+ * sandboxed iframe. The iframe is CSS-scaled from the agent's native 360×640
+ * viewport down to 240×427 so it fits comfortably in the chat column.
+ */
+function BrandAnimationCard({
+  message,
+  onApprove,
+  onReject,
+  formatTime,
+}: BrandAnimationCardProps) {
+  const approval = message.approval;
+
+  return (
+    <div className="w-full max-w-sm">
+      <p className="text-sm text-[#6B6561] mb-2">{message.content}</p>
+      <div className="bg-white border border-[#E8E3DA] rounded-2xl overflow-hidden shadow-sm">
+        {/* Header */}
+        <div className="flex items-center justify-between px-4 py-2.5 bg-[#1B1A17] text-white">
+          <span className="text-sm font-semibold">✦ Brand Animation</span>
+          {approval === "approved" && (
+            <span className="text-xs bg-green-500 text-white px-2 py-0.5 rounded-full font-medium">
+              Approved
+            </span>
+          )}
+          {approval === "rejected" && (
+            <span className="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full font-medium">
+              Rejected
+            </span>
+          )}
+        </div>
+
+        {/* Scaled iframe preview — agent outputs 360×640, displayed at 240×427 */}
+        <div className="flex justify-center bg-[#F8F5EE] p-3">
+          <div
+            className="overflow-hidden rounded-lg border border-[#E8E3DA]"
+            style={{ width: 240, height: 427 }}
+          >
+            <iframe
+              srcDoc={message.html}
+              sandbox="allow-scripts"
+              title="Brand animation preview"
+              style={{
+                width: 360,
+                height: 640,
+                border: "none",
+                transform: "scale(0.667)",
+                transformOrigin: "top left",
+              }}
+            />
+          </div>
+        </div>
+
+        {/* Actions */}
+        {approval === "pending" && (
+          <div className="flex gap-2 px-4 pt-1 pb-4">
+            <button
+              onClick={onApprove}
+              className="flex-1 bg-green-600 hover:bg-green-500 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+            >
+              Approve
+            </button>
+            <button
+              onClick={onReject}
+              className="flex-1 bg-[#F2EDE4] hover:bg-[#E8E3DA] text-[#1B1A17] text-sm font-medium py-2 rounded-lg transition-colors border border-[#E8E3DA]"
+            >
+              Reject
+            </button>
+          </div>
+        )}
+
+        <p className="text-xs text-[#9E9893] px-4 pb-3">
+          {formatTime(message.timestamp)}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ── Draft Card ────────────────────────────────────────────────────────────────
 
 function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps) {
   const platform = platformMap[message.platform!];
