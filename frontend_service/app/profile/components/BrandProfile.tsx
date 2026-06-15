@@ -36,7 +36,6 @@ function Field({ label, hint, value, onChange, rows, span }: FieldProps) {
   );
 }
 
-// ─── File upload slot ─────────────────────────────────────────────────────────
 function FileSlot({
   label, icon, accept, file, onAdd, onRemove,
 }: {
@@ -52,7 +51,6 @@ function FileSlot({
     <div>
       <p className="text-xs font-semibold text-[#1B1A17] mb-2">{label}</p>
       {file ? (
-        /* Uploaded state */
         <div className="flex items-center gap-3 bg-white border border-[#E8E3DA] rounded-xl px-4 py-3">
           <span className="text-[#9E9893] flex-shrink-0">{icon}</span>
           <span className="text-sm text-[#1B1A17] truncate flex-1">{file.name}</span>
@@ -70,7 +68,6 @@ function FileSlot({
           </button>
         </div>
       ) : (
-        /* Empty / drop target state */
         <label
           htmlFor={inputId}
           className="flex flex-col items-center justify-center gap-2 bg-white border border-dashed border-[#E8E3DA] rounded-xl px-4 py-5 cursor-pointer hover:border-[#FF4800]/50 hover:bg-[#FFFAF8] transition-colors text-center"
@@ -95,7 +92,6 @@ function FileSlot({
   );
 }
 
-// ─── Icons ────────────────────────────────────────────────────────────────────
 const PdfIcon = (
   <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
     <rect x="3" y="2" width="14" height="16" rx="2" stroke="currentColor" strokeWidth="1.4"/>
@@ -119,7 +115,6 @@ const WebIcon = (
   </svg>
 );
 
-// ─── Main component ───────────────────────────────────────────────────────────
 export default function BrandProfile() {
   const [brand, setBrand] = useState(DEFAULT_BRAND);
   const [saved, setSaved] = useState(false);
@@ -147,7 +142,6 @@ export default function BrandProfile() {
         Keep it accurate to improve output quality.
       </p>
 
-      {/* Brand fields grid */}
       <div className="grid grid-cols-2 gap-x-8 gap-y-6 mb-8">
         <Field label="Brand Name" hint="Your business or brand name"
           value={brand.name} onChange={(v) => handleChange("name", v)} />
@@ -167,7 +161,6 @@ export default function BrandProfile() {
           value={brand.notes} onChange={(v) => handleChange("notes", v)} rows={3} span />
       </div>
 
-      {/* Knowledge Sources */}
       <div className="border-t border-[#E8E3DA] pt-6 mb-6">
         <div className="flex items-center justify-between mb-1">
           <h2 className="text-sm font-semibold text-[#1B1A17]">Knowledge Sources</h2>
@@ -181,7 +174,6 @@ export default function BrandProfile() {
           Upload documents or add a website the AI will read to understand your brand.
         </p>
 
-        {/* Website URL input */}
         <div className="mb-4">
           <p className="text-xs font-semibold text-[#1B1A17] mb-2">Website URL</p>
           {websiteAdded ? (
@@ -221,7 +213,6 @@ export default function BrandProfile() {
           )}
         </div>
 
-        {/* File upload slots */}
         <div className="grid grid-cols-2 gap-4">
           <FileSlot
             label="PDF Document"
@@ -241,7 +232,6 @@ export default function BrandProfile() {
           />
         </div>
 
-        {/* Summary once sources are added */}
         {totalSources > 0 && (
           <div className="mt-4 bg-green-50 border border-green-200 rounded-xl px-4 py-3">
             <p className="text-xs font-semibold text-green-800 mb-2">
@@ -271,7 +261,6 @@ export default function BrandProfile() {
         )}
       </div>
 
-      {/* Save row */}
       <div className="flex items-center gap-3 pt-2 pb-4">
         <button
           onClick={handleSave}
