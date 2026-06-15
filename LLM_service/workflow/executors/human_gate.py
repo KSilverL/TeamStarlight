@@ -8,20 +8,21 @@ HumanVerdict. A draft that arrived un-approved is flagged
 transparency selling point, MIGRATION_PLAN §5.5).
 
 On resume:
-  - approve            → emit the FinalDraft (workflow output).
-  - approve_after_edit → hand off to the archivist (it emits the FinalDraft with the
-    distilled rules attached).
+  - approve            → hand off to the media_producer as an ApprovedDraft (it emits
+    the FinalDraft, enriched with the animated card + video spec).
+  - approve_after_edit → hand off to the archivist (it distils rules, then hands off to
+    the media_producer with the rules attached).
   - reject             → re-dispatch this platform to the creator for a fresh attempt.
 
-Routing is by message type (MAF delivers ReviewOutcome to the creator and ArchiveJob
-to the archivist along their respective edges).
+Routing is by message type (MAF delivers ReviewOutcome to the creator, ArchiveJob to the
+archivist, and ApprovedDraft to the media_producer along their respective edges).
 """
 
 from agent_framework import Executor, WorkflowContext, handler, response_handler
 
 from ..messages import (
+    ApprovedDraft,
     ArchiveJob,
-    FinalDraft,
     HumanReviewRequest,
     HumanVerdict,
     ReviewOutcome,
@@ -31,7 +32,9 @@ from ..messages import (
 class HumanGateExecutor(Executor):
     @handler
     async def gate(
-        self, outcome: ReviewOutcome, ctx: WorkflowContext[ReviewOutcome | ArchiveJob, FinalDraft]
+        self,
+        outcome: ReviewOutcome,
+        ctx: WorkflowContext[ReviewOutcome | ArchiveJob | ApprovedDraft],
     ) -> None:
         # An un-approved draft only reaches the gate via the circuit-breaker edge,
         # so `not approved` is exactly the "needs human intervention" signal.
@@ -53,7 +56,7 @@ class HumanGateExecutor(Executor):
         self,
         request: HumanReviewRequest,
         verdict: HumanVerdict,
-        ctx: WorkflowContext[ReviewOutcome | ArchiveJob, FinalDraft],
+        ctx: WorkflowContext[ReviewOutcome | ArchiveJob | ApprovedDraft],
     ) -> None:
         if verdict.decision == "reject":
             # Re-draft cycle for this platform. We carry the revision number forward
@@ -89,12 +92,15 @@ class HumanGateExecutor(Executor):
             )
             return
 
-        await ctx.yield_output(
-            FinalDraft(
+        # Plain approve: hand off to the media_producer (no distilled rules to carry).
+        await ctx.send_message(
+            ApprovedDraft(
                 platform=request.platform,
                 draft=request.draft,
                 decision=verdict.decision,
                 comment=request.comment,
                 needs_human_intervention=request.needs_human_intervention,
+                proposed_rules=[],
+                brief=request.brief,
             )
         )

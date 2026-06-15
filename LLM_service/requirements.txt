@@ -4,6 +4,11 @@ httpx>=0.28.1
 typing-extensions>=4.15.0
 pydantic>=2.0.0
 
+# ── HTTP API (FastAPI / ASGI) — the Java backend ↔ Python LLM-service contract (api.py) ──
+# uvicorn[standard] pulls in websockets (the voice intake WS endpoint) + uvloop/httptools.
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
 # ── Production backends (optional; lazy-imported, only needed when USE_MOCK_*=false) ──
 # Azure OpenAI / Foundry chat (LLMService) — required when USE_MOCK_LLM=false:
 openai>=1.0.0

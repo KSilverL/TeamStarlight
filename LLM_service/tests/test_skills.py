@@ -1,14 +1,14 @@
 """
-Platform skills (static injection layer) + HTML preview cards (M4).
+Platform skills — the creator's static injection layer (M4).
 
 Verifies the creator's static layer has real content to read: the skill files load,
-the declared character limit is enforced by the copywriter, and the html_designer
-preview cards render as self-contained, escaped HTML fragments.
+the declared character limit is enforced by the copywriter, and a platform without a
+skill degrades gracefully. (The animated HTML card / video spec produced post-approval
+from skills/brand_animation.md + skills/brand_video.md are covered in test_media.py.)
 """
 
 from __future__ import annotations
 
-from LLM_service.core.preview import render_preview_card
 from LLM_service.core.services.mock import MockLLM
 from LLM_service.skills import char_limit, load_skill, parse_char_limit
 
@@ -59,22 +59,10 @@ async def test_write_copy_without_skill_is_unbounded():
     assert len(draft) > 280                        # no skill → no truncation
 
 
-# ── HTML preview cards (html_designer) ────────────────────────────────────────
+# ── Brand-media skills load (handed to the media_producer) ────────────────────
 
-def test_preview_card_is_self_contained_and_escaped():
-    draft = "Line one\nLine two <script>alert(1)</script> & more"
-    for platform in ("linkedin", "x", "twitter", "instagram", "tiktok"):
-        card = render_preview_card(platform, draft)
-        assert card.startswith('<div class="preview-card')
-        assert "<style" in card and "@keyframes" in card   # self-contained + animated
-        assert "<script>" not in card                       # user copy is escaped
-        assert "&lt;script&gt;" in card
-        assert "Line one<br>Line two" in card               # newlines preserved
-
-
-def test_preview_card_is_platform_specific():
-    draft = "Harvest, in a cup."
-    assert "pc-li" in render_preview_card("linkedin", draft)
-    assert "pc-x" in render_preview_card("x", draft)
-    assert "pc-x" in render_preview_card("twitter", draft)   # twitter shares the X card
-    assert "pc-ig" in render_preview_card("instagram", draft)
+def test_brand_media_skills_load_with_real_content():
+    animation = load_skill("brand_animation")
+    assert animation and "<!DOCTYPE html>" in animation   # the HTML card spec
+    video = load_skill("brand_video")
+    assert video and "stats" in video                     # the video-props spec

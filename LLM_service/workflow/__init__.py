@@ -9,6 +9,7 @@ by default — every executor reaches its backend through core.services.factory.
 
 from .builder import build_workflow
 from .messages import (
+    ApprovedDraft,
     ArchiveJob,
     BrandRule,
     Brief,
@@ -30,6 +31,7 @@ __all__ = [
     "ReviewOutcome",
     "HumanReviewRequest",
     "HumanVerdict",
+    "ApprovedDraft",
     "FinalDraft",
     "ArchiveJob",
     "BrandRule",

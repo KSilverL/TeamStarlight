@@ -1,0 +1,52 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # Frontend — Next.js dev server (hot reload via bind mount)
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: frontend_service
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"
+    environment:
+      # Points the /api/brand proxy at the brand-agent service on the
+      # internal Docker network. Override at runtime if needed.
+      - BRAND_AGENT_URL=http://brand-agent:8000
+      - BRAND_VIDEO_AGENT_URL=http://brand-video-agent:8001
+    depends_on:
+      - brand-agent
+      - brand-video-agent
+
+  # ---------------------------------------------------------------------------
+  # Brand Agent — FastAPI LLM service (demo, isolated from LLM_service core)''
+  # Requires ANTHROPIC_API_KEY to be set in the environment or a .env file.
+  # ---------------------------------------------------------------------------
+  brand-agent:
+    build:
+      context: LLM_service/demos/brand_agent
+      dockerfile: Dockerfile
+    ports:
+      # Expose on host so you can also hit it directly at http://localhost:8000
+      - "8000:8000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+
+  # ---------------------------------------------------------------------------
+  # Brand Video Agent — Remotion render service (demo, isolated from LLM_service core)
+  # Heavy image: Node + Python + headless Chromium + ffmpeg. Build takes ~5 min.
+  # Requires ANTHROPIC_API_KEY to be set in the environment or a .env file.
+  # ---------------------------------------------------------------------------
+  brand-video-agent:
+    build:
+      context: LLM_service/demos/brand_video_agent
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+
+  # ---------------------------------------------------------------------------
+  # backend:
+  #   Containerised Backend Service Here
+  # ---------------------------------------------------------------------------

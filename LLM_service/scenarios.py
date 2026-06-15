@@ -81,9 +81,13 @@ async def scenario_copilot_voice() -> None:
     print(f"  scout proposed topic: {brief.topic}")
     svc = WorkflowService()
     await svc.start(brief.model_dump(), task_id="showcase-copilot")
-    ready = [e for e in svc.buffered_events("showcase-copilot")
-             if e["type"] == "result" and e["status"] == "draft_ready"]
-    print(f"  ✓ HTML preview card produced: {bool(ready and ready[0]['html_preview'].startswith('<div'))}")
+    # Approve every platform → the media_producer renders the animated card + video spec.
+    await svc.review("showcase-copilot", {p: {"decision": "approve"} for p in brief.target_platforms})
+    finals = [e for e in svc.buffered_events("showcase-copilot")
+              if e["type"] == "result" and e["status"] == "final"]
+    card_ok = bool(finals and (finals[0].get("html_preview") or "").startswith("<!DOCTYPE html>"))
+    print(f"  ✓ animated HTML card produced: {card_ok}")
+    print(f"  ✓ video spec produced: {bool(finals and finals[0].get('video_props'))}")
 
 
 async def scenario_brand_training() -> None:

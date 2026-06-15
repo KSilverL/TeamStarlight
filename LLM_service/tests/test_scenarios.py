@@ -8,13 +8,12 @@ Each is a complete run-through of one kind of user, fully mocked/offline:
   4. Brand training    — the self-evolving profile: edit → distil → keep → next run reflects.
 
 Together they exercise: voice/text dual entry, the circuit-breaker transparency flag,
-the self-evolving brand profile, and the HTML preview card.
+the self-evolving brand profile, and the post-approval animated HTML card + video spec.
 """
 
 from __future__ import annotations
 
 from LLM_service.api import WorkflowService
-from LLM_service.core.preview import render_preview_card
 from LLM_service.core.services import factory
 from LLM_service.intake import build_intake
 from LLM_service.workflow import HumanVerdict, build_workflow
@@ -83,10 +82,12 @@ async def test_scenario_vague_idea_copilot_voice():
     svc = WorkflowService()
     snapshot = await svc.start(brief.model_dump(), task_id="copilot-1")
     assert snapshot["status"] == "awaiting_review"
-    # the streamed draft carries a renderable HTML preview card
-    ready = [e for e in svc.buffered_events("copilot-1")
-             if e["type"] == "result" and e["status"] == "draft_ready"]
-    assert ready and ready[0]["html_preview"].startswith('<div class="preview-card')
+    # approving each platform produces the animated card + video spec on the final event
+    await svc.review("copilot-1", {p: {"decision": "approve"} for p in brief.target_platforms})
+    finals = [e for e in svc.buffered_events("copilot-1")
+              if e["type"] == "result" and e["status"] == "final"]
+    assert finals and finals[0]["html_preview"].startswith("<!DOCTYPE html>")
+    assert finals[0]["video_props"] and len(finals[0]["video_props"]["stats"]) == 3
 
 
 # ── 4. Brand training — the self-evolving profile ─────────────────────────────
@@ -127,5 +128,5 @@ async def test_scenario_circuit_breaker_is_flagged(make_brief):
     result = await workflow.run(make_brief(topic="unsafe miracle cure", platforms=("x",)))
     req = result.get_request_info_events()[0].data
     assert req.needs_human_intervention is True
-    # the flagged draft still renders a preview the frontend can show
-    assert render_preview_card("x", req.draft).startswith('<div class="preview-card')
+    # the flagged draft is still surfaced for the human to review at the gate
+    assert req.draft

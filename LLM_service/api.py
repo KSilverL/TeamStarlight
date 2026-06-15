@@ -1,18 +1,24 @@
 """
-HTTP API + SSE for backend / frontend integration (MIGRATION_PLAN §7).
+HTTP API + SSE for the Java backend ↔ Python LLM-service contract (MIGRATION_PLAN §7).
 
-A dependency-free (stdlib `http.server`) wrapper around the MAF "virtual newsroom"
-workflow. Progress is a pure one-way stream, so the frontend subscribes over SSE
-(`GET /tasks/{id}/events`) and watches the editorial newsroom live; the human
-checkpoints resume the RequestPort (`POST /tasks/{id}/review`); the archivist's
-distilled rules are tagged back (`POST /tasks/{id}/archive-tags`).
+A **FastAPI** (ASGI / uvicorn) wrapper around the MAF "virtual newsroom" workflow.
+In the target topology the Python LLM service talks **only to the Java backend**
+(server-to-server), and the Java backend fans out to the frontend — so this service
+exposes a typed, OpenAPI-documented contract (`/docs`, `/openapi.json`) the Java team
+can generate a client from, and needs **no CORS** (no browser calls it directly).
 
-Two layers:
-  - `WorkflowService` — pure async wrapper over the workflow (start / events /
-    review / archive_tags / get). Directly unit-testable; this is where the
-    contract lives. It bridges the MAF event stream to the §7.2 event envelope.
-  - `make_server` / `serve` — a stdlib HTTP layer over `WorkflowService`. Requests
-    run on one shared asyncio loop so each task's in-memory workflow stays consistent.
+Three layers:
+  - Service layer — `WorkflowService` / `IntakeService` / `MediaService`: pure async
+    wrappers over the workflow / intake / media generators. Directly unit-testable;
+    this is where the contract lives. `WorkflowService` bridges the MAF event stream
+    to the §7.2 event envelope.
+  - Schema layer — pydantic request models, so the OpenAPI schema documents every
+    request body. Field-level validation that must return HTTP 400 (not FastAPI's
+    422) stays in the service layer (`_brief_from_inputs` / `_verdict_from_payload`).
+  - Transport layer — FastAPI routers + an `ApiError` exception handler. Because
+    FastAPI is async-native, route handlers `await` the service methods directly
+    (no thread/loop bridge); progress streams over SSE via `StreamingResponse`, and
+    voice intake gets a real WebSocket endpoint (FastAPI native).
 
 Durability: the workflow's checkpoints persist to `factory.get_checkpoint_storage()`
 (PostgreSQL in production), so a RequestPort pause survives a process restart —
@@ -23,6 +29,7 @@ builds on the same CheckpointStorage.
 Run it:
     /opt/anaconda3/envs/TeamProject/bin/python3 -m LLM_service.api
     # honours API_HOST (default 0.0.0.0), API_PORT (default 8080)
+    # interactive contract docs at  http://<host>:<port>/docs
 """
 
 from __future__ import annotations
@@ -30,16 +37,18 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import threading
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
+
+from fastapi import APIRouter, Body, FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from .core.config import load_dotenv
 from .core.events import DONE, INTERRUPTED, RUNNING, progress_event, result_event
-from .core.preview import render_preview_card
 from .core.services import factory
 from .intake import IntakeSession, build_intake
+from .skills import load_skill
 from .workflow import Brief, HumanVerdict, build_workflow
 from .workflow.builder import WORKFLOW_NAME
 
@@ -57,8 +66,8 @@ class ApiError(Exception):
 
 
 def _brief_from_inputs(inputs: dict) -> Brief:
-    """Build the workflow's Brief from the start payload (the M3 intake layer will
-    produce this; here the frontend posts the fields directly)."""
+    """Build the workflow's Brief from the start payload (the M3 intake layer
+    produces this; the Java backend can also post the fields directly)."""
     topic = inputs.get("topic")
     platforms = inputs.get("target_platforms")
     if not topic:
@@ -129,22 +138,24 @@ class WorkflowService:
                                    platform=platform)]
         if etype == "request_info":
             data = ev.data  # HumanReviewRequest — draft cleared the reviewer
+            # The animated card + video spec are produced post-approval (media_producer),
+            # so the gate carries only the text draft for review.
             return [
                 result_event("creator", "draft_ready", platform=data.platform, payload={
                     "draft": data.draft,
                     "critic_comment": data.comment,
-                    "html_preview": render_preview_card(data.platform, data.draft),
                     "needs_human_intervention": data.needs_human_intervention,
                 }),
                 progress_event("human_gate", INTERRUPTED, platform=data.platform),
             ]
         if etype == "output":
-            draft = ev.data  # FinalDraft
+            draft = ev.data  # FinalDraft (enriched by the media_producer)
             node = "archivist" if draft.decision == "approve_after_edit" else "human_gate"
             return [result_event(node, "final", platform=draft.platform, payload={
                 "draft": draft.draft,
                 "decision": draft.decision,
-                "html_preview": render_preview_card(draft.platform, draft.draft),
+                "html_preview": draft.html_card,  # the LLM-rendered animated brand card
+                "video_props": draft.video_props.model_dump() if draft.video_props else None,
                 "needs_human_intervention": draft.needs_human_intervention,
                 "proposed_rules": [r.model_dump() for r in draft.proposed_rules],
             })]
@@ -332,6 +343,47 @@ class IntakeService:
         return brief.model_dump()
 
 
+class MediaService:
+    """Async wrapper over the post-approval media generators, exposed as standalone
+    endpoints for the backend's "Brand Animation" + "Brand Video" content types.
+
+    Both reach the LLM through `factory.get_llm()`, so they honour the same Azure ↔ mock
+    toggle as the workflow. The animated HTML card is synchronous; the video returns a
+    structured `BrandVideoProps` spec (this service does not render an MP4 — that stays
+    external), tracked under a job id so the backend's poll-then-show flow works unchanged.
+    """
+
+    def __init__(self) -> None:
+        self._video_jobs: dict[str, dict] = {}
+
+    async def generate_html(self, prompt: str) -> dict:
+        if not prompt.strip():
+            raise ApiError(400, "'prompt' is required")
+        html = await factory.get_llm().render_html_card(
+            topic=prompt, draft=prompt, tone_hint=None, skill=load_skill("brand_animation"),
+        )
+        return {"html": html}
+
+    async def start_video(self, brief: str) -> dict:
+        if not brief.strip():
+            raise ApiError(400, "'brief' is required")
+        job_id = uuid.uuid4().hex
+        try:
+            props = await factory.get_llm().generate_video_props(
+                topic=brief, draft=brief, tone_hint=None, skill=load_skill("brand_video"),
+            )
+            self._video_jobs[job_id] = {"status": "done", "props": props, "error": None}
+        except Exception as exc:  # surface generation failures to the backend poll
+            self._video_jobs[job_id] = {"status": "error", "props": None, "error": str(exc)}
+        return {"job_id": job_id, "status": self._video_jobs[job_id]["status"]}
+
+    def video_job(self, job_id: str) -> dict:
+        job = self._video_jobs.get(job_id)
+        if job is None:
+            raise ApiError(404, f"unknown video job: {job_id}")
+        return {"job_id": job_id, **job}
+
+
 def _verdict_from_payload(payload: dict) -> HumanVerdict:
     decision = (payload.get("decision") or "").lower()
     if decision not in ("approve", "approve_after_edit", "reject"):
@@ -345,161 +397,229 @@ def _verdict_from_payload(payload: dict) -> HumanVerdict:
     )
 
 
-# ── HTTP layer (stdlib) ───────────────────────────────────────────────────────
+# ── Request schemas (documented in the OpenAPI contract for the Java client) ──
+#
+# Field-level requiredness that must answer HTTP 400 (not FastAPI's 422) is enforced
+# in the service layer, so these models keep their fields optional and tolerate the
+# extra keys the intake layer adds to a brief (e.g. `intake_mode`).
 
-class _Handler(BaseHTTPRequestHandler):
-    service: WorkflowService = None  # type: ignore[assignment]
-    intake: IntakeService = None  # type: ignore[assignment]
-    loop: asyncio.AbstractEventLoop = None  # type: ignore[assignment]
-    server_version = "TeamStarlightAPI/2.0"
+class StartTaskRequest(BaseModel):
+    """Brief fields the workflow starts from. Posted by the Java backend, either
+    field-by-field or by forwarding a finished intake brief (extra keys allowed)."""
+    model_config = ConfigDict(extra="allow")
 
-    def log_message(self, *args) -> None:  # quiet default logging
-        pass
+    topic: Optional[str] = Field(None, description="What the post is about (required)")
+    target_platforms: Optional[list[str]] = Field(
+        None, description="Non-empty list, e.g. ['linkedin', 'instagram'] (required)")
+    user_intent: Optional[str] = None
+    business_id: Optional[str] = Field(None, description="Brand id; required to persist brand rules")
+    tone_hint: Optional[str] = None
+    route: Optional[str] = "direct_generation"
+    task_id: Optional[str] = Field(None, description="Caller-supplied id; auto-generated if omitted")
 
-    def _await(self, coro):
-        return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
 
-    def _send(self, code: int, obj: dict) -> None:
-        body = json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+class VerdictPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
 
-    def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        raw = self.rfile.read(length) if length else b""
-        if not raw:
-            return {}
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            raise ApiError(400, "request body must be valid JSON")
-        if not isinstance(data, dict):
-            raise ApiError(400, "request body must be a JSON object")
-        return data
+    decision: str = Field(..., description="approve | approve_after_edit | reject")
+    edited_draft: Optional[str] = Field(None, description="Required for approve_after_edit")
+    reason: Optional[str] = None
 
-    def _parts(self) -> list[str]:
-        return [p for p in self.path.split("?")[0].split("/") if p]
 
-    # ── SSE streaming ─────────────────────────────────────────────────────────
+class ReviewRequest(BaseModel):
+    verdicts: dict[str, VerdictPayload] = Field(
+        default_factory=dict, description="Map of platform -> verdict; resume the human gate")
 
-    def _stream_events(self, task_id: str) -> None:
-        # 404 early if the task is unknown.
-        try:
-            self._await(self.service.get(task_id))
-        except ApiError as exc:
-            self._send(exc.status, {"error": exc.message})
-            return
 
-        # The stream ends when the task completes, at which point we close the
-        # connection so the client's read loop terminates cleanly.
-        self.close_connection = True
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
+class TagPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
 
-        agen = self.service.events(task_id)
-        try:
-            while True:
-                try:
-                    ev = self._await(agen.__anext__())
-                except StopAsyncIteration:
+    kind: Optional[str] = Field(None, description="must_do | must_avoid")
+    rule: Optional[str] = None
+    keep: bool = False
+
+
+class ArchiveTagsRequest(BaseModel):
+    tags: list[TagPayload] = Field(default_factory=list)
+
+
+class IntakeStartRequest(BaseModel):
+    mode: str = Field(..., description="voice | text")
+    opening_input: Optional[str] = None
+
+
+class IntakeTurnRequest(BaseModel):
+    user_input: str
+
+
+class GenerateHtmlRequest(BaseModel):
+    prompt: str = Field(..., description="Brand brief for the animated HTML card")
+
+
+class GenerateVideoRequest(BaseModel):
+    brief: str = Field(..., description="Brand brief for the BrandVideoProps spec")
+
+
+# ── Dependencies: pull the per-app service singletons off app.state ───────────
+
+def _workflow(request: Request) -> WorkflowService:
+    return request.app.state.workflow
+
+
+def _intake(request: Request) -> IntakeService:
+    return request.app.state.intake
+
+
+def _media(request: Request) -> MediaService:
+    return request.app.state.media
+
+
+# ── Routers ───────────────────────────────────────────────────────────────────
+
+tasks_router = APIRouter(prefix="/tasks", tags=["tasks"])
+intake_router = APIRouter(prefix="/intake", tags=["intake"])
+media_router = APIRouter(tags=["media"])
+
+
+@tasks_router.post("", summary="Start a workflow run from a brief")
+async def start_task(request: Request, body: StartTaskRequest) -> dict:
+    svc = _workflow(request)
+    # Drop unset/None fields so the service's defaults apply (the raw-dict contract:
+    # an absent user_intent means "", not None).
+    inputs = body.model_dump(exclude_none=True)
+    return await svc.start(inputs, task_id=body.task_id)
+
+
+@tasks_router.get("/{task_id}", summary="Snapshot a task (status, outputs, pending gates)")
+async def get_task(request: Request, task_id: str) -> dict:
+    return await _workflow(request).get(task_id)
+
+
+@tasks_router.get("/{task_id}/events", summary="Stream §7.2 progress/result events (SSE)")
+async def task_events(request: Request, task_id: str) -> StreamingResponse:
+    svc = _workflow(request)
+    await svc.get(task_id)  # 404 early if the task is unknown (before we start streaming)
+
+    async def event_stream():
+        async for ev in svc.events(task_id):
+            yield f"data: {json.dumps(ev, default=str)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@tasks_router.post("/{task_id}/review", summary="Resume the human gate with per-platform verdicts")
+async def review_task(request: Request, task_id: str, body: ReviewRequest) -> dict:
+    verdicts = {k: v.model_dump() for k, v in body.verdicts.items()}
+    return await _workflow(request).review(task_id, verdicts)
+
+
+@tasks_router.post("/{task_id}/archive-tags", summary="Keep/discard the archivist's proposed rules")
+async def archive_tags(request: Request, task_id: str, body: ArchiveTagsRequest) -> dict:
+    tags = [t.model_dump() for t in body.tags]
+    return await _workflow(request).archive_tags(task_id, tags)
+
+
+@intake_router.post("", summary="Open an intake conversation (voice or text)")
+async def intake_start(request: Request, body: IntakeStartRequest) -> dict:
+    return await _intake(request).start(body.mode, body.opening_input)
+
+
+@intake_router.post("/{session_id}/turn", summary="Send one user turn to an intake session")
+async def intake_turn(request: Request, session_id: str, body: IntakeTurnRequest) -> dict:
+    return await _intake(request).turn(session_id, body.user_input)
+
+
+@intake_router.get("/{session_id}/brief", summary="Fetch the finished CreativeBrief")
+async def intake_brief(request: Request, session_id: str) -> dict:
+    return await _intake(request).get_brief(session_id)
+
+
+@intake_router.websocket("/{session_id}/voice")
+async def intake_voice(websocket: WebSocket, session_id: str) -> None:
+    """Real-time voice intake bridge. The Java backend relays the browser's audio/turns
+    over this socket; each inbound `{"user_input": "..."}` frame runs one turn on the
+    shared intake engine and the assistant reply is sent back. (The Voice Live audio
+    transcription itself is the VoiceService's concern, behind USE_MOCK_VOICE.)"""
+    svc: IntakeService = websocket.app.state.intake
+    await websocket.accept()
+    try:
+        while True:
+            msg = await websocket.receive_json()
+            try:
+                result = await svc.turn(session_id, msg.get("user_input", ""))
+                await websocket.send_json(result)
+                if result.get("complete"):
                     break
-                self.wfile.write(f"data: {json.dumps(ev, default=str)}\n\n".encode("utf-8"))
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # client disconnected
-        finally:
-            self._await(agen.aclose())
-
-    # ── Routing ───────────────────────────────────────────────────────────────
-
-    def do_GET(self) -> None:
-        parts = self._parts()
-        if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "events":
-            self._stream_events(parts[1])
-            return
-        # WS /intake/{sid}/voice — the browser↔backend↔Voice Live audio bridge.
-        if len(parts) == 3 and parts[0] == "intake" and parts[2] == "voice":
-            self._send(501, {
-                "error": "voice WebSocket bridge not available on this stdlib server",
-                "detail": "The Voice Live audio bridge needs a WebSocket-capable server "
-                          "+ USE_MOCK_VOICE=false. The conversation logic is shared with the "
-                          "text path; drive mock/text intake via POST /intake/{sid}/turn.",
-            })
-            return
-        self._handle("GET")
-
-    def do_POST(self) -> None:
-        self._handle("POST")
-
-    def _dispatch(self, method: str) -> dict:
-        parts = self._parts()
-        # ── Intake (§7.1) ──────────────────────────────────────────────────────
-        if method == "POST" and parts == ["intake"]:
-            body = self._read_json()
-            return self._await(self.intake.start(body.get("mode", ""), body.get("opening_input")))
-        if len(parts) >= 2 and parts[0] == "intake":
-            sid = parts[1]
-            sub = parts[2] if len(parts) > 2 else None
-            if method == "POST" and sub == "turn":
-                body = self._read_json()
-                return self._await(self.intake.turn(sid, body.get("user_input", "")))
-            if method == "GET" and sub == "brief":
-                return self._await(self.intake.get_brief(sid))
-        # ── Tasks (workflow) ───────────────────────────────────────────────────
-        if method == "POST" and parts == ["tasks"]:
-            body = self._read_json()
-            return self._await(self.service.start(body, task_id=body.get("task_id")))
-        if len(parts) >= 2 and parts[0] == "tasks":
-            task_id = parts[1]
-            sub = parts[2] if len(parts) > 2 else None
-            if method == "GET" and sub is None:
-                return self._await(self.service.get(task_id))
-            if method == "POST" and sub == "review":
-                body = self._read_json()
-                return self._await(self.service.review(task_id, body.get("verdicts", {})))
-            if method == "POST" and sub == "archive-tags":
-                body = self._read_json()
-                return self._await(self.service.archive_tags(task_id, body.get("tags", [])))
-        raise ApiError(404, f"no route for {method} {self.path}")
-
-    def _handle(self, method: str) -> None:
-        try:
-            self._send(200, self._dispatch(method))
-        except ApiError as exc:
-            self._send(exc.status, {"error": exc.message})
-        except Exception as exc:  # pragma: no cover - defensive 500
-            self._send(500, {"error": f"internal error: {exc}"})
+            except ApiError as exc:
+                await websocket.send_json({"error": exc.message, "status": exc.status})
+                if exc.status == 404:
+                    break
+    except WebSocketDisconnect:
+        return
+    await websocket.close()
 
 
-def make_server(host: str = "0.0.0.0", port: int = 8080, service: Optional[WorkflowService] = None):
-    """Build a ThreadingHTTPServer with a dedicated asyncio loop in a thread.
-    Returns (httpd, loop); caller runs httpd.serve_forever() and httpd.shutdown()."""
-    loop = asyncio.new_event_loop()
-    threading.Thread(target=loop.run_forever, daemon=True).start()
-    _Handler.service = service or WorkflowService()
-    _Handler.intake = IntakeService()
-    _Handler.loop = loop
-    return ThreadingHTTPServer((host, port), _Handler), loop
+@media_router.post("/generate", summary="Generate a self-contained animated HTML brand card")
+async def generate_html(request: Request, body: GenerateHtmlRequest) -> dict:
+    return await _media(request).generate_html(body.prompt)
+
+
+@media_router.post("/generate-video", summary="Start a BrandVideoProps spec job")
+async def generate_video(request: Request, body: GenerateVideoRequest) -> dict:
+    return await _media(request).start_video(body.brief)
+
+
+@media_router.get("/jobs/{job_id}", summary="Poll a video-spec job")
+async def video_job(request: Request, job_id: str) -> dict:
+    return _media(request).video_job(job_id)
+
+
+# ── App factory ────────────────────────────────────────────────────────────────
+
+def create_app(
+    *,
+    service: Optional[WorkflowService] = None,
+    intake: Optional[IntakeService] = None,
+    media: Optional[MediaService] = None,
+) -> FastAPI:
+    """Build the FastAPI app. Tests inject custom service instances; production uses
+    fresh defaults wired to the toggle-resolved factory backends."""
+
+    app = FastAPI(
+        title="TeamStarlight LLM Service",
+        version="3.0",
+        summary="MAF virtual-newsroom workflow + intake + media, for the Java backend.",
+    )
+    app.state.workflow = service or WorkflowService()
+    app.state.intake = intake or IntakeService()
+    app.state.media = media or MediaService()
+
+    @app.exception_handler(ApiError)
+    async def _api_error_handler(_request: Request, exc: ApiError) -> JSONResponse:
+        return JSONResponse(status_code=exc.status, content={"error": exc.message})
+
+    @app.get("/health", tags=["meta"], summary="Liveness probe")
+    async def health() -> dict:
+        return {"status": "ok"}
+
+    app.include_router(tasks_router)
+    app.include_router(intake_router)
+    app.include_router(media_router)
+    return app
 
 
 def serve(host: Optional[str] = None, port: Optional[int] = None) -> None:
-    # Pull credentials / toggles from LLM_service/.env before reading any env-driven
-    # setting below (and before WorkflowService resolves the service factory).
+    import uvicorn
+
+    # Pull credentials / toggles from LLM_service/.env before resolving anything.
     load_dotenv()
     host = host or os.getenv("API_HOST", "0.0.0.0")
     port = port or int(os.getenv("API_PORT", "8080"))
-    httpd, _loop = make_server(host, port)
-    print(f"TeamStarlight API listening on http://{host}:{port}")
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        httpd.shutdown()
+    uvicorn.run(create_app(), host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":

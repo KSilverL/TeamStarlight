@@ -14,10 +14,12 @@ reject path (and thus the circuit breaker) without any randomness to pin.
 from __future__ import annotations
 
 import asyncio
+import html as _html
 import re
 from typing import Dict, List, Optional
 
 from ...skills import parse_char_limit
+from ..media_schema import BrandVideoProps, StatItem
 from .base import (
     LLMService,
     SafetyResult,
@@ -255,6 +257,83 @@ def _unique(words: list[str]) -> list[str]:
     return out
 
 
+# ── Post-approval media (HTML card + video props) ─────────────────────────────
+# Deterministic, offline stand-ins for the demo generators. A fixed dark palette
+# keeps output reproducible; the production AzureLLM derives a brand palette per brief.
+_MEDIA_PALETTE = ("#0d1117", "#5b8def", "#f0a500")  # primary, secondary, accent
+
+
+def _brand_name(topic: str) -> str:
+    """First 1-2 words of the topic, ALL CAPS (the demo's brandName rule)."""
+    words = [w for w in topic.split() if w]
+    return (" ".join(words[:2]) if words else "Your Brand").upper()[:24]
+
+
+def _brand_initial(topic: str) -> str:
+    for ch in topic:
+        if ch.isalnum():
+            return ch.upper()
+    return "B"
+
+
+def _mock_html_card(topic: str, draft: str, tone_hint: Optional[str]) -> str:
+    """A self-contained, animated 9:16 brand card (CSS-only, no <script>, escaped)."""
+    primary, secondary, accent = _MEDIA_PALETTE
+    brand = _html.escape(_brand_name(topic))
+    initial = _html.escape(_brand_initial(topic))
+    tagline = _html.escape((tone_hint or "Crafted with intent").strip())
+    body = _html.escape(draft).replace("\n", "<br>")
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{brand} — Animated Brand Card</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{background:#000;display:flex;justify-content:center;align-items:center;min-height:100vh;font-family:system-ui,sans-serif}}
+.stage{{position:relative;width:360px;aspect-ratio:9/16;background:{primary};color:#fff;border-radius:18px;overflow:hidden}}
+.scene{{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;padding:28px;opacity:0;animation:fadeIn .8s ease forwards}}
+.scene.s2{{animation-delay:4s}}.scene.s3{{animation-delay:8s}}
+.logo{{width:84px;height:84px;border-radius:24px;background:{secondary};display:flex;align-items:center;justify-content:center;font:700 40px Georgia,serif;animation:riseUp .9s ease both}}
+.brand{{font:700 30px Georgia,serif;margin-top:18px;letter-spacing:1px}}
+.tag{{margin-top:10px;color:{accent};font-size:14px}}
+.rule{{width:64px;height:3px;background:{accent};margin:0 auto 18px;border-radius:2px;animation:drawLine 1s ease both}}
+.body{{font-size:15px;line-height:1.55}}
+.cta{{margin-top:22px;padding:12px 26px;border-radius:999px;background:linear-gradient(90deg,{secondary},{accent});color:#fff;font-weight:700;animation:pulse 2.2s ease-in-out infinite}}
+@keyframes fadeIn{{from{{opacity:0;transform:translateY(14px)}}to{{opacity:1;transform:none}}}}
+@keyframes riseUp{{from{{opacity:0;transform:scale(.6)}}to{{opacity:1;transform:none}}}}
+@keyframes drawLine{{from{{width:0}}to{{width:64px}}}}
+@keyframes pulse{{0%,100%{{transform:scale(1)}}50%{{transform:scale(1.05)}}}}
+</style></head>
+<body><div class="stage">
+<div class="scene s1"><div class="logo">{initial}</div><div class="brand">{brand}</div><div class="tag">{tagline}</div></div>
+<div class="scene s2"><div class="rule"></div><div class="body">{body}</div></div>
+<div class="scene s3"><div class="brand">{brand}</div><div class="cta">Learn more →</div></div>
+</div></body></html>"""
+
+
+def _mock_video_props(topic: str, draft: str, tone_hint: Optional[str]) -> dict:
+    """A deterministic BrandVideoProps-shaped dict (exactly 3 stats)."""
+    primary, secondary, accent = _MEDIA_PALETTE
+    tagline = (tone_hint or "Crafted with intent").strip()[:48] or "Crafted with intent"
+    return BrandVideoProps(
+        brandName=_brand_name(topic),
+        tagline=tagline,
+        primaryColor=primary,
+        secondaryColor=secondary,
+        accentColor=accent,
+        sectionLabel="Why It Matters",
+        stats=[
+            StatItem(value="100%", label="On brand", icon="★"),
+            StatItem(value="3", label="Platforms", icon="◆"),
+            StatItem(value="24/7", label="Always on", icon="●"),
+        ],
+        headline="Ready to dive in?",
+        subtext="Join us and see what the buzz is about.",
+        ctaLabel="Learn More",
+        contact="@brand · brand.com",
+    ).model_dump()
+
+
 # ── LLM ───────────────────────────────────────────────────────────────────────
 
 class MockLLM(LLMService):
@@ -327,6 +406,28 @@ class MockLLM(LLMService):
         if must_do:
             post += f"\n\nFollowing: {', '.join(must_do)}."
         return post
+
+    async def render_html_card(
+        self,
+        *,
+        topic: str,
+        draft: str,
+        tone_hint: Optional[str],
+        skill: str = "",
+    ) -> str:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return _mock_html_card(topic, draft, tone_hint)
+
+    async def generate_video_props(
+        self,
+        *,
+        topic: str,
+        draft: str,
+        tone_hint: Optional[str],
+        skill: str = "",
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return _mock_video_props(topic, draft, tone_hint)
 
     async def distill_rules(
         self,

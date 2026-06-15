@@ -9,8 +9,9 @@ Graph (MIGRATION_PLAN §5.1):
                                  (human       └─ approve OR reject&retry>=3 ─▶ human_gate
                                   reject)            │
                                              human_gate (RequestPort)
-                                               ├─ approve / approve-after-edit ─▶ output
-                                               └─ reject ─▶ creator (re-dispatch)
+                                               ├─ approve            ─▶ media_producer ─▶ output
+                                               ├─ approve_after_edit ─▶ archivist ─▶ media_producer ─▶ output
+                                               └─ reject             ─▶ creator (re-dispatch)
 
 The circuit breaker is expressed purely as the condition on the reviewer's
 outgoing switch-case edge — no executor reads retry state across a service
@@ -36,6 +37,7 @@ from .executors import (
     CreatorExecutor,
     DispatcherExecutor,
     HumanGateExecutor,
+    MediaProducerExecutor,
     ReviewerExecutor,
     ScoutExecutor,
 )
@@ -69,6 +71,7 @@ def build_workflow(
     reviewer = ReviewerExecutor(id="reviewer")
     human_gate = HumanGateExecutor(id="human_gate")
     archivist = ArchivistExecutor(id="archivist")
+    media_producer = MediaProducerExecutor(id="media_producer")
 
     storage = checkpoint_storage if checkpoint_storage is not None else InMemoryCheckpointStorage()
 
@@ -77,7 +80,7 @@ def build_workflow(
             name=name,
             start_executor=dispatcher,
             checkpoint_storage=storage,
-            output_from=[human_gate, archivist],
+            output_from=[media_producer],
         )
         .add_edge(dispatcher, scout)
         .add_edge(scout, creator)
@@ -91,8 +94,12 @@ def build_workflow(
             ],
         )
         # Human verdict routes by message type: reject → creator (re-draft),
-        # approve_after_edit → archivist (distil rules + emit FinalDraft).
+        # approve → media_producer (emit FinalDraft), approve_after_edit → archivist
+        # (distil rules) → media_producer. The media_producer is the sole output node:
+        # it enriches every approved draft with the animated card + video spec.
         .add_edge(human_gate, creator)
         .add_edge(human_gate, archivist)
+        .add_edge(human_gate, media_producer)
+        .add_edge(archivist, media_producer)
         .build()
     )

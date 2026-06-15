@@ -4,8 +4,9 @@ Platform style skills — the creator's **static injection layer** (MIGRATION_PL
 Each `skills/<platform>.md` is a human-edited, version-controlled style guide
 (character limit, tone norms, good/bad examples). The creator loads the matching
 skill and injects it into copywriting: production folds it into the LLM system
-prompt; the mock honours the declared character limit. `html_designer.md` is the
-spec for the platform-simulated preview card (see core/preview.py).
+prompt; the mock honours the declared character limit. The same loader serves the
+post-approval media_producer: `brand_animation.md` (the animated HTML card spec) and
+`brand_video.md` (the structured video-props spec) are handed to the LLM verbatim.
 
 Loaders are cached and dependency-free; an unlisted platform simply yields "" /
 None, so the creator degrades gracefully.

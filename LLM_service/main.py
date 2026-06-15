@@ -36,6 +36,7 @@ AGENTS: dict[str, tuple[str, str]] = {
     "reviewer": ("Reviewer", "red-team screening the draft (safety + brand)"),
     "human_gate": ("Human-Gate", "handing the draft to you"),
     "archivist": ("Archivist", "distilling your edit into brand rules"),
+    "media_producer": ("Media-Producer", "rendering the animated card + video spec"),
 }
 
 
@@ -127,7 +128,8 @@ async def main() -> None:
     _section(get_settings().mode_banner())
 
     print("\n  THE NEWSROOM — agents that hand work to one another:")
-    for executor_id in ("dispatcher", "scout", "creator", "reviewer", "human_gate", "archivist"):
+    for executor_id in ("dispatcher", "scout", "creator", "reviewer", "human_gate",
+                        "archivist", "media_producer"):
         name, role = _agent(executor_id)
         print(f"    • {name} — {role}")
 
@@ -161,6 +163,12 @@ async def main() -> None:
         print(_draft_box(final.draft))
         for rule in getattr(final, "proposed_rules", []):
             print(f"  ↪ proposed brand rule [{rule.kind}]: {rule.rule}")
+        card = getattr(final, "html_card", None)
+        props = getattr(final, "video_props", None)
+        if card:
+            print(f"  ✓ animated HTML card produced ({len(card)} chars)")
+        if props:
+            print(f"  ✓ video spec produced: {props.brandName} — {props.tagline}")
     print()
 
 

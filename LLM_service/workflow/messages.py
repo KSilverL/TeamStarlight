@@ -11,6 +11,7 @@ CheckpointStorage). Each edge in the graph is keyed by message type:
     Draft            ──▶ reviewer
     ReviewOutcome    ──▶ creator (retry) | human_gate   (switch-case edge)
     HumanReviewRequest / HumanVerdict      (RequestPort request / response)
+    ApprovedDraft    ──▶ media_producer   (from human_gate / archivist)
     FinalDraft       ──▶ workflow output
 
 `MAX_RETRIES` is the circuit-breaker threshold: the reviewer counts each rejection
@@ -24,6 +25,8 @@ from __future__ import annotations
 from typing import List, Optional
 
 from pydantic import BaseModel, Field
+
+from ..core.media_schema import BrandVideoProps
 
 # Reject this many times before the circuit breaker forces a human decision.
 MAX_RETRIES = 3
@@ -131,8 +134,24 @@ class BrandRule(BaseModel):
     rationale: str
 
 
+class ApprovedDraft(BaseModel):
+    """human_gate / archivist → media_producer: a draft the human approved (directly
+    or after an edit), on its way to media production. Carries the `brief` so the
+    media_producer can derive the brand card / video from `topic` + `tone_hint`, and
+    any `proposed_rules` the archivist distilled (passed straight through to FinalDraft)."""
+
+    platform: str
+    draft: str
+    decision: str
+    comment: str
+    needs_human_intervention: bool = False
+    proposed_rules: List[BrandRule] = Field(default_factory=list)
+    brief: Brief
+
+
 class FinalDraft(BaseModel):
-    """Workflow output: one approved (or human-edited) platform draft. On the
+    """Workflow output: one approved (or human-edited) platform draft, enriched by the
+    media_producer with an animated HTML card and a structured video spec. On the
     approve_after_edit path the archivist attaches `proposed_rules` (1-3 candidate
     rules) for the user to tag — they are NOT yet persisted to the profile."""
 
@@ -142,3 +161,5 @@ class FinalDraft(BaseModel):
     comment: str
     needs_human_intervention: bool = False
     proposed_rules: List[BrandRule] = Field(default_factory=list)
+    html_card: Optional[str] = None                 # self-contained animated HTML
+    video_props: Optional[BrandVideoProps] = None   # structured 3-scene video spec
