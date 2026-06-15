@@ -1,7 +1,15 @@
 # TeamStarLight
+
 Something something something
 
 ## Docker Run instructions
+
+Run the application using the following command from the home directory:
+
+```
+docker compose up --build
+```
+
 Run the application using the following command from the home directory:
 ```
 docker compose up

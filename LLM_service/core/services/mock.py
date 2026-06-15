@@ -1,0 +1,545 @@
+"""
+Deterministic, offline mock implementations of the four service contracts.
+
+Everything here is pure and reproducible (no network, no randomness) so the whole
+MAF workflow runs fully mocked by default and the test suite is deterministic. The
+return shapes are kept structurally identical to the Azure counterparts in
+azure.py (enforced by tests/test_contract_parity.py).
+
+Safety screening blocks deterministically: a draft is flagged iff it contains the
+`UNSAFE_MARKER` substring. That gives tests a precise lever to drive the reviewer
+reject path (and thus the circuit breaker) without any randomness to pin.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import html as _html
+import re
+from typing import Dict, List, Optional
+
+from ...skills import parse_char_limit
+from ..media_schema import BrandVideoProps, StatItem
+from .base import (
+    LLMService,
+    SafetyResult,
+    SafetyService,
+    StoreService,
+    VoiceService,
+    empty_profile,
+)
+
+# Substring that makes MockSafety flag a draft. MockLLM echoes the topic into the
+# copy, so a brief whose topic contains this marker produces a draft that is
+# rejected on every attempt — exactly what the circuit-breaker test needs.
+UNSAFE_MARKER = "unsafe"
+
+# Platform-differentiated strategy angle (scout). Keyed case-insensitively.
+_PLATFORM_FOCUS: Dict[str, str] = {
+    "linkedin": "business analysis and credibility",
+    "twitter": "emotional resonance and brevity",
+    "x": "emotional resonance and brevity",
+    "instagram": "visual storytelling and lifestyle",
+    "tiktok": "playful, trend-native hooks",
+}
+
+_MOCK_LATENCY = 0.0  # bump for demos; kept 0 so tests are instant
+
+
+def _focus(platform: str) -> str:
+    return _PLATFORM_FOCUS.get(platform.lower(), "general audience engagement")
+
+
+def _alias(platform: str) -> str:
+    """Collapse synonym handles so one copy bank serves both (twitter == x)."""
+    p = platform.lower()
+    return "x" if p == "twitter" else p
+
+
+# Per-platform copy scaffolding for the mock copywriter. Each platform has a bank of
+# opening hooks and calls-to-action; `attempt` indexes into them (mod len), so a
+# rejected draft comes back with a genuinely different hook + CTA instead of the same
+# text. `{topic}` is filled verbatim, which (a) keeps the post on-subject and (b) lets
+# MockSafety keep flagging an `unsafe` topic on every attempt.
+_HOOKS: Dict[str, List[str]] = {
+    "linkedin": [
+        "Here's what most people miss about {topic}.",
+        "We've been heads-down on {topic} — today we can finally share it.",
+        "A quiet bet on {topic} just paid off. Here's the story.",
+        "Three things {topic} taught us this season:",
+    ],
+    "instagram": [
+        "✨ It's here: {topic} ✨",
+        "POV: you just discovered {topic} 👀",
+        "We couldn't keep this in any longer 🙊 — {topic}.",
+        "📌 Save this one — {topic}.",
+    ],
+    "x": [
+        "{topic} is here — and it matters. 🧵",
+        "Hot take: {topic} changes the game.",
+        "Just shipped: {topic}. Quick thread 👇",
+        "Stop scrolling — {topic} is worth 10 seconds.",
+    ],
+    "tiktok": [
+        "wait for it… {topic} 🤯",
+        "nobody's talking about {topic} 🫢",
+        "things i wish i knew about {topic} sooner ⬇️",
+        "ok but {topic} is actually elite 😤",
+    ],
+    "facebook": [
+        "We've got news we're excited to share: {topic}.",
+        "Pull up a chair — let's talk about {topic}.",
+        "Big day for us: {topic} is finally here.",
+        "Here's a little story about {topic}.",
+    ],
+}
+_DEFAULT_HOOKS = [
+    "Let's talk about {topic}.",
+    "Something new: {topic}.",
+    "A fresh angle on {topic}.",
+    "{topic} — here's the latest.",
+]
+
+_CTAS: Dict[str, List[str]] = {
+    "linkedin": [
+        "What's your take? 👇", "Curious how your team approaches this.",
+        "Follow along as we share more.", "Let's connect if this resonates.",
+    ],
+    "instagram": [
+        "Double-tap if you're in 💛", "Tag someone who needs this 👇",
+        "Link in bio 🔗", "Which one's your favorite? 👇",
+    ],
+    "x": [
+        "RT if you agree.", "Reply with your take 👇",
+        "Follow for the full thread.", "What would you add?",
+    ],
+    "tiktok": [
+        "follow for part 2 🎬", "comment your thoughts ⬇️",
+        "save it for later 📲", "duet this 🔥",
+    ],
+    "facebook": [
+        "What do you think? Tell us below 👇", "Share with a friend who'd love this.",
+        "Drop your story in the comments.", "Tap like if you're excited!",
+    ],
+}
+_DEFAULT_CTAS = ["Let us know what you think 👇", "Share if this resonates.",
+                 "Follow for more.", "Tell us your take below."]
+
+# A platform-flavoured hashtag appended after the topic-derived one.
+_PLATFORM_TAGS: Dict[str, str] = {
+    "linkedin": "#Leadership", "instagram": "#instagood",
+    "x": "#news", "tiktok": "#fyp #foryou", "facebook": "",
+}
+
+
+def _enforce_char_limit(post: str, limit: Optional[int]) -> str:
+    """Trim a post to the platform's character limit (from the skill), cutting at a
+    word boundary and marking the cut with an ellipsis. No-op when within limit."""
+    if not limit or len(post) <= limit:
+        return post
+    cut = post[: limit - 1]
+    space = cut.rfind(" ")
+    if space > limit * 0.6:  # only back off to a word boundary if it's not too far
+        cut = cut[:space]
+    return cut.rstrip() + "…"
+
+
+def _hashtags(topic: str, platform: str) -> str:
+    """A topic-derived CamelCase hashtag plus a platform staple."""
+    words = [w for w in _words(topic) if len(w) > 3][:3]
+    topic_tag = "#" + "".join(w.capitalize() for w in words) if words else ""
+    extra = _PLATFORM_TAGS.get(_alias(platform), "")
+    return " ".join(t for t in (topic_tag, extra) if t).strip()
+
+
+def _compose_post(
+    *, platform: str, topic: str, angle: str, intent: str, tone: str,
+    hook: str, cta: str, tags: str,
+) -> str:
+    """Assemble one ready-to-publish, platform-native post from its parts."""
+    p = _alias(platform)
+    intent_line = intent or "share what makes this worth your attention"
+    if p == "linkedin":
+        body = (
+            f"{hook}\n\n"
+            f"Our focus this time: {angle}. We set out to {intent_line}, and we did "
+            f"it in a {tone} voice that stays true to who we are.\n\n"
+            f"The takeaway: {topic} isn't just an announcement — it's a promise we "
+            f"intend to keep.\n\n"
+            f"{cta}"
+        )
+    elif p == "instagram":
+        body = (
+            f"{hook}\n\n"
+            f"💡 {angle}\n"
+            f"🎯 Why it matters: to {intent_line}\n"
+            f"🤝 Made with a {tone} touch\n\n"
+            f"{cta}"
+        )
+    elif p == "x":
+        body = f"{hook}\n\n{angle}. Built to {intent_line}.\n\n{cta}"
+    elif p == "tiktok":
+        body = (
+            f"{hook}\n\n"
+            f"the vibe: {angle} ✨ (yes, it's {tone}) — all to {intent_line}.\n\n"
+            f"{cta}"
+        )
+    else:  # facebook / anything unrecognised
+        body = (
+            f"{hook}\n\n"
+            f"Here's the heart of it: {angle}. We wanted to {intent_line}, and kept "
+            f"the whole thing {tone}.\n\n"
+            f"{cta}"
+        )
+    return f"{body}\n\n{tags}".rstrip()
+
+
+# Platform tokens the mock intake recognises in free text (intake function-calling).
+_PLATFORM_TOKENS = ("linkedin", "instagram", "twitter", "tiktok", "facebook", "youtube")
+# Phrases that signal copilot_mode — "help me decide what to post" → scout tool.
+_COPILOT_TRIGGERS = (
+    "help me think", "what should i post", "give me ideas", "not sure",
+    "brainstorm", "ideas for", "no idea", "suggest", "help me decide",
+)
+# Goal verbs that mark a "to <goal>" clause as the campaign intent.
+_GOAL_VERBS = (
+    "drive|increase|boost|promote|grow|launch|sell|raise|build|get|reach|convert"
+    "|announce|educate|inspire|generate|attract|engage|highlight|showcase|celebrate"
+)
+
+
+def _parse_platforms(text: str) -> list[str]:
+    low = text.lower()
+    found = [p for p in _PLATFORM_TOKENS if p in low]
+    if re.search(r"(?:^|[\s,/])x(?:$|[\s,./])", low):  # standalone "x" → twitter/X
+        found.append("x")
+    return _unique(found)
+
+
+def _free_extract(user_text: str) -> dict:
+    """Pull whatever CreativeBrief fields a single utterance reveals (the mock's
+    stand-in for the LLM's update_brief function call)."""
+    low = user_text.lower()
+    updates: dict = {}
+    platforms = _parse_platforms(user_text)
+    if platforms:
+        updates["target_platforms"] = platforms
+    m = re.search(r"\babout (.+?)(?: on | to | for | targeting |[.;\n]|$)", low)
+    if m:
+        updates["topic"] = m.group(1).strip()
+    # Intent only when "to <goal-verb> …" — avoids capturing "to post about …".
+    m = re.search(rf"\bto ((?:{_GOAL_VERBS})\b[^.;\n]*?)(?: on | for |[.;\n]|$)", low)
+    if m:
+        updates["user_intent"] = m.group(1).strip()
+    m = re.search(r"tone[:=]\s*([^.;\n]+)", low)
+    if m:
+        updates["tone_hint"] = m.group(1).strip()
+    m = re.search(r"business(?:[ _]?id)?[:=]\s*([A-Za-z0-9_\-]+)", user_text)
+    if m:
+        updates["business_id"] = m.group(1)
+    return updates
+
+
+def _words(text: str) -> list[str]:
+    """Lowercase word tokens, stripped of surrounding punctuation (for diffing
+    an AI draft against the human's edited version)."""
+    return [w.strip(".,!?;:'\"()[]—-").lower() for w in text.split() if w.strip(".,!?;:'\"()[]—-")]
+
+
+def _unique(words: list[str]) -> list[str]:
+    """Order-preserving de-dupe."""
+    seen: set = set()
+    out: list[str] = []
+    for w in words:
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+    return out
+
+
+# ── Post-approval media (HTML card + video props) ─────────────────────────────
+# Deterministic, offline stand-ins for the demo generators. A fixed dark palette
+# keeps output reproducible; the production AzureLLM derives a brand palette per brief.
+_MEDIA_PALETTE = ("#0d1117", "#5b8def", "#f0a500")  # primary, secondary, accent
+
+
+def _brand_name(topic: str) -> str:
+    """First 1-2 words of the topic, ALL CAPS (the demo's brandName rule)."""
+    words = [w for w in topic.split() if w]
+    return (" ".join(words[:2]) if words else "Your Brand").upper()[:24]
+
+
+def _brand_initial(topic: str) -> str:
+    for ch in topic:
+        if ch.isalnum():
+            return ch.upper()
+    return "B"
+
+
+def _mock_html_card(topic: str, draft: str, tone_hint: Optional[str]) -> str:
+    """A self-contained, animated 9:16 brand card (CSS-only, no <script>, escaped)."""
+    primary, secondary, accent = _MEDIA_PALETTE
+    brand = _html.escape(_brand_name(topic))
+    initial = _html.escape(_brand_initial(topic))
+    tagline = _html.escape((tone_hint or "Crafted with intent").strip())
+    body = _html.escape(draft).replace("\n", "<br>")
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{brand} — Animated Brand Card</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{background:#000;display:flex;justify-content:center;align-items:center;min-height:100vh;font-family:system-ui,sans-serif}}
+.stage{{position:relative;width:360px;aspect-ratio:9/16;background:{primary};color:#fff;border-radius:18px;overflow:hidden}}
+.scene{{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;padding:28px;opacity:0;animation:fadeIn .8s ease forwards}}
+.scene.s2{{animation-delay:4s}}.scene.s3{{animation-delay:8s}}
+.logo{{width:84px;height:84px;border-radius:24px;background:{secondary};display:flex;align-items:center;justify-content:center;font:700 40px Georgia,serif;animation:riseUp .9s ease both}}
+.brand{{font:700 30px Georgia,serif;margin-top:18px;letter-spacing:1px}}
+.tag{{margin-top:10px;color:{accent};font-size:14px}}
+.rule{{width:64px;height:3px;background:{accent};margin:0 auto 18px;border-radius:2px;animation:drawLine 1s ease both}}
+.body{{font-size:15px;line-height:1.55}}
+.cta{{margin-top:22px;padding:12px 26px;border-radius:999px;background:linear-gradient(90deg,{secondary},{accent});color:#fff;font-weight:700;animation:pulse 2.2s ease-in-out infinite}}
+@keyframes fadeIn{{from{{opacity:0;transform:translateY(14px)}}to{{opacity:1;transform:none}}}}
+@keyframes riseUp{{from{{opacity:0;transform:scale(.6)}}to{{opacity:1;transform:none}}}}
+@keyframes drawLine{{from{{width:0}}to{{width:64px}}}}
+@keyframes pulse{{0%,100%{{transform:scale(1)}}50%{{transform:scale(1.05)}}}}
+</style></head>
+<body><div class="stage">
+<div class="scene s1"><div class="logo">{initial}</div><div class="brand">{brand}</div><div class="tag">{tagline}</div></div>
+<div class="scene s2"><div class="rule"></div><div class="body">{body}</div></div>
+<div class="scene s3"><div class="brand">{brand}</div><div class="cta">Learn more →</div></div>
+</div></body></html>"""
+
+
+def _mock_video_props(topic: str, draft: str, tone_hint: Optional[str]) -> dict:
+    """A deterministic BrandVideoProps-shaped dict (exactly 3 stats)."""
+    primary, secondary, accent = _MEDIA_PALETTE
+    tagline = (tone_hint or "Crafted with intent").strip()[:48] or "Crafted with intent"
+    return BrandVideoProps(
+        brandName=_brand_name(topic),
+        tagline=tagline,
+        primaryColor=primary,
+        secondaryColor=secondary,
+        accentColor=accent,
+        sectionLabel="Why It Matters",
+        stats=[
+            StatItem(value="100%", label="On brand", icon="★"),
+            StatItem(value="3", label="Platforms", icon="◆"),
+            StatItem(value="24/7", label="Always on", icon="●"),
+        ],
+        headline="Ready to dive in?",
+        subtext="Join us and see what the buzz is about.",
+        ctaLabel="Learn More",
+        contact="@brand · brand.com",
+    ).model_dump()
+
+
+# ── LLM ───────────────────────────────────────────────────────────────────────
+
+class MockLLM(LLMService):
+    async def chat(self, messages: List[dict]) -> str:
+        await asyncio.sleep(_MOCK_LATENCY)
+        last = messages[-1]["content"] if messages else ""
+        return f"[MOCK CHAT] {last}"
+
+    async def dispatch(
+        self,
+        *,
+        topic: str,
+        target_platforms: List[str],
+        user_intent: str,
+        route: Optional[str],
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return {
+            "route": route or "direct_generation",
+            "topic": topic,
+            "target_platforms": list(target_platforms),
+            "user_intent": user_intent,
+        }
+
+    async def plan_strategy(
+        self, *, topic: str, platform: str, user_intent: str
+    ) -> str:
+        await asyncio.sleep(_MOCK_LATENCY)
+        intent = user_intent or "raise awareness"
+        return (
+            f"On {platform}, lead with {_focus(platform)}. "
+            f"Anchor it to '{topic}' and aim to {intent}."
+        )
+
+    async def write_copy(
+        self,
+        *,
+        topic: str,
+        platform: str,
+        strategy: str,
+        user_intent: str,
+        must_do: List[str],
+        must_avoid: List[str],
+        examples: List[str],
+        tone_hint: Optional[str],
+        skill: str = "",
+        attempt: int = 1,
+    ) -> str:
+        await asyncio.sleep(_MOCK_LATENCY)
+        tone = tone_hint or "on-brand"
+        angle = _focus(platform)
+        hooks = _HOOKS.get(_alias(platform), _DEFAULT_HOOKS)
+        ctas = _CTAS.get(_alias(platform), _DEFAULT_CTAS)
+        # Rotate hook + CTA by revision so a rejected draft (higher `attempt`) comes
+        # back with a visibly different opening, not the same copy.
+        i = max(attempt - 1, 0)
+        hook = hooks[i % len(hooks)].format(topic=topic)  # topic echoed verbatim
+        cta = ctas[i % len(ctas)]
+        post = _compose_post(
+            platform=platform, topic=topic, angle=angle, intent=user_intent,
+            tone=tone, hook=hook, cta=cta, tags=_hashtags(topic, platform),
+        )
+        # Static skill layer: respect the platform's declared character limit (the mock
+        # honours it by truncating at a word boundary; production folds the whole skill
+        # into the prompt). Applied to the real copy, before the mock-only footer.
+        post = _enforce_char_limit(post, parse_char_limit(skill) if skill else None)
+        # When the brand profile has learned Must-Do rules, echo them as a footer so
+        # the offline learning loop is observable (production folds them into the copy
+        # itself). Absent for cold-start / no-brand users — the post stays clean.
+        if must_do:
+            post += f"\n\nFollowing: {', '.join(must_do)}."
+        return post
+
+    async def render_html_card(
+        self,
+        *,
+        topic: str,
+        draft: str,
+        tone_hint: Optional[str],
+        skill: str = "",
+    ) -> str:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return _mock_html_card(topic, draft, tone_hint)
+
+    async def generate_video_props(
+        self,
+        *,
+        topic: str,
+        draft: str,
+        tone_hint: Optional[str],
+        skill: str = "",
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return _mock_video_props(topic, draft, tone_hint)
+
+    async def distill_rules(
+        self,
+        *,
+        platform: str,
+        original_draft: str,
+        final_draft: str,
+        existing_must_do: List[str],
+        existing_must_avoid: List[str],
+    ) -> List[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        orig_words = _words(original_draft)
+        final_words = _words(final_draft)
+        added = [w for w in _unique(_words(final_draft)) if w not in orig_words]
+        removed = [w for w in _unique(_words(original_draft)) if w not in final_words]
+
+        rules: List[dict] = []
+        if added:
+            phrase = " ".join(added[:6])
+            rule = f"Open with phrasing like: {phrase}"
+            if rule not in existing_must_do:
+                rules.append({
+                    "kind": "must_do",
+                    "rule": rule,
+                    "rationale": "the human added this phrasing in their edit",
+                })
+        if removed:
+            phrase = ", ".join(removed[:5])
+            rule = f"Avoid words like: {phrase}"
+            if rule not in existing_must_avoid:
+                rules.append({
+                    "kind": "must_avoid",
+                    "rule": rule,
+                    "rationale": "the human removed these in their edit",
+                })
+        return rules[:3]
+
+    async def fill_brief(
+        self,
+        *,
+        system_prompt: str,
+        tools: List[dict],
+        history: List[dict],
+        user_text: str,
+        brief_partial: dict,
+        pending_field: Optional[str],
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        updates = _free_extract(user_text)
+        wants_scout = any(trigger in user_text.lower() for trigger in _COPILOT_TRIGGERS)
+        # If the assistant just asked for a specific field, a direct answer slots in —
+        # except a "give me ideas" turn must NOT become the topic (scout proposes it).
+        if pending_field and not updates.get(pending_field):
+            if wants_scout and pending_field == "topic":
+                pass
+            elif pending_field == "target_platforms":
+                platforms = _parse_platforms(user_text)
+                if platforms:
+                    updates["target_platforms"] = platforms
+            elif user_text.strip():
+                updates[pending_field] = user_text.strip()
+        return {"brief_updates": updates, "wants_scout": wants_scout}
+
+
+# ── Safety ────────────────────────────────────────────────────────────────────
+
+class MockSafety(SafetyService):
+    async def check(self, *, text: str) -> SafetyResult:
+        await asyncio.sleep(_MOCK_LATENCY)
+        if UNSAFE_MARKER in text.lower():
+            return SafetyResult(blocked=True, reason=f"flagged: contains '{UNSAFE_MARKER}'")
+        return SafetyResult(blocked=False, reason="ok")
+
+
+# ── Store (in-memory stand-in for the two Postgres tables) ─────────────────────
+
+class MockStore(StoreService):
+    """An in-memory stand-in for the brand_profiles + workflow_checkpoints tables.
+    State lives on the instance, so factory.reset_services() (which drops the
+    singleton) gives every test a clean store."""
+
+    def __init__(self) -> None:
+        self._profiles: Dict[str, dict] = {}
+        self._checkpoints: Dict[str, dict] = {}
+
+    async def get_profile(self, *, business_id: Optional[str]) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        if business_id and business_id in self._profiles:
+            return dict(self._profiles[business_id])
+        return empty_profile(business_id)
+
+    async def upsert_profile(self, *, business_id: str, profile: dict) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        stored = {**empty_profile(business_id), **profile, "id": business_id}
+        self._profiles[business_id] = stored
+
+    async def save_checkpoint(self, *, task_id: str, data: dict) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        self._checkpoints[task_id] = dict(data)
+
+    async def load_checkpoint(self, *, task_id: str) -> Optional[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        stored = self._checkpoints.get(task_id)
+        return dict(stored) if stored is not None else None
+
+
+# ── Voice ──────────────────────────────────────────────────────────────────────
+
+class MockVoice(VoiceService):
+    async def transcribe_turn(self, *, session_id: str, user_audio: str) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        # Deterministic "transcription": the offline script provides the spoken words,
+        # so a faithful transcript is the verbatim text. This makes a voice intake
+        # produce a CreativeBrief identical to the same words typed (§4.4).
+        return {"session_id": session_id, "transcript": user_audio.strip()}

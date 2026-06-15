@@ -2,6 +2,7 @@
 .env
 .vscode
 .pytest_cache
+**/__pycache__/
+*.pyc
 
 CLAUDE.md
-AGENTS.md

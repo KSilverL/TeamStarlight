@@ -4,7 +4,7 @@ import { useState, useRef, useEffect } from "react";
 import Link from "next/link";
 
 type Platform = "x" | "instagram" | "tiktok" | "linkedin";
-type ContentType = "text" | "image" | "video" | "mix";
+type ContentType = "text" | "image" | "video" | "mix" | "brand";
 type ApprovalStatus = "pending" | "approved" | "rejected";
 
 interface DraftContent {
@@ -13,13 +13,37 @@ interface DraftContent {
   imageDesc?: string;
 }
 
+interface VideoStat {
+  value: string;
+  label: string;
+  icon: string;
+}
+
+// The structured brand-video spec the backend generates (BrandVideoProps). This
+// service produces the spec, not a rendered MP4 — the card renders the spec itself.
+interface VideoProps {
+  brandName: string;
+  tagline: string;
+  primaryColor: string;
+  secondaryColor: string;
+  accentColor: string;
+  sectionLabel: string;
+  stats: VideoStat[];
+  headline: string;
+  subtext: string;
+  ctaLabel: string;
+  contact: string;
+}
+
 interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
-  variant?: "status" | "draft";
+  variant?: "status" | "draft" | "html-preview" | "video-pending" | "video-preview";
   platform?: Platform;
   draft?: DraftContent;
+  html?: string;
+  videoJobId?: string;
   approval?: ApprovalStatus;
   timestamp: Date;
 }
@@ -66,6 +90,7 @@ const CONTENT_TYPES: { id: ContentType; label: string }[] = [
   { id: "image", label: "Image" },
   { id: "video", label: "Video" },
   { id: "mix", label: "Mix" },
+  { id: "brand", label: "Brand Animation" },
 ];
 
 const INITIAL_MESSAGES: Message[] = [
@@ -181,9 +206,9 @@ export default function ChatPage() {
     }, 350);
   }
 
-  function handleSend() {
+  async function handleSend() {
     const trimmed = input.trim();
-    if (!trimmed) return;
+    if (!trimmed || isLoading) return;
 
     setMessages((prev) => [
       ...prev,
@@ -199,19 +224,144 @@ export default function ChatPage() {
       textareaRef.current.style.height = "auto";
     }
 
-    setTimeout(() => {
+    if (contentType === "brand") {
+      // Brand animation path — calls the /api/brand proxy → brand agent FastAPI
+      setIsLoading(true);
       setMessages((prev) => [
         ...prev,
         {
           id: (Date.now() + 1).toString(),
-          role: "assistant",
-          content:
-            "Got it — I've noted your feedback and am updating the content strategy. Revised drafts will appear shortly...",
-          variant: "status",
+          role: "assistant" as const,
+          content: "Generating brand animation — this can take up to a minute…",
+          variant: "status" as const,
           timestamp: new Date(),
         },
       ]);
-    }, 700);
+
+      try {
+        const res = await fetch("/api/brand", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ prompt: trimmed }),
+        });
+        const data = await res.json();
+
+        if (!res.ok || data.error) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: (Date.now() + 2).toString(),
+              role: "assistant" as const,
+              content: `Brand agent error: ${data.error ?? "unknown error"}. Make sure the brand agent server is running on port 8000.`,
+              timestamp: new Date(),
+            },
+          ]);
+          return;
+        }
+
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: (Date.now() + 2).toString(),
+            role: "assistant" as const,
+            content: "Here's your brand animation. Review and approve or reject:",
+            variant: "html-preview" as const,
+            html: data.html as string,
+            approval: "pending" as const,
+            timestamp: new Date(),
+          },
+        ]);
+      } catch {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: (Date.now() + 2).toString(),
+            role: "assistant" as const,
+            content:
+              "Could not reach the brand agent. Make sure it is running on port 8000.",
+            timestamp: new Date(),
+          },
+        ]);
+      } finally {
+        setIsLoading(false);
+      }
+    } else if (contentType === "video") {
+      // Video render path — async job on the brand-video-agent (60–180 s)
+      setIsLoading(true);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: (Date.now() + 1).toString(),
+          role: "assistant" as const,
+          content: "Generating your brand video spec…",
+          variant: "status" as const,
+          timestamp: new Date(),
+        },
+      ]);
+
+      try {
+        const res = await fetch("/api/video", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ brief: trimmed }),
+        });
+        const data = await res.json();
+
+        if (!res.ok || data.error) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: (Date.now() + 2).toString(),
+              role: "assistant" as const,
+              content: `Video agent error: ${data.error ?? "unknown error"}. Make sure the brand-video-agent is running on port 8001.`,
+              timestamp: new Date(),
+            },
+          ]);
+          return;
+        }
+
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: (Date.now() + 2).toString(),
+            role: "assistant" as const,
+            content: "Here's your brand video spec:",
+            variant: "video-pending" as const,
+            videoJobId: data.jobId as string,
+            approval: "pending" as const,
+            timestamp: new Date(),
+          },
+        ]);
+      } catch {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: (Date.now() + 2).toString(),
+            role: "assistant" as const,
+            content:
+              "Could not reach the video agent. Make sure it is running on port 8001.",
+            timestamp: new Date(),
+          },
+        ]);
+      } finally {
+        setIsLoading(false);
+      }
+    } else {
+      // Mock path for text / image / mix content types
+      setTimeout(() => {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: (Date.now() + 1).toString(),
+            role: "assistant",
+            content:
+              "Got it — I've noted your feedback and am updating the content strategy. Revised drafts will appear shortly...",
+            variant: "status",
+            timestamp: new Date(),
+          },
+        ]);
+      }, 700);
+    }
   }
 
   function handleTextareaChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
@@ -287,6 +437,8 @@ export default function ChatPage() {
                   key={ct.id}
                   onClick={() => setContentType(ct.id)}
                   className={`px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                    ct.id === "brand" ? "col-span-2" : ""
+                  } ${
                     contentType === ct.id
                       ? "bg-[#FF4800] text-white"
                       : "bg-[#F8F5EE] text-[#6B6561] border border-[#E8E3DA] hover:bg-[#E8E3DA] hover:text-[#1B1A17]"
@@ -366,6 +518,33 @@ export default function ChatPage() {
         {/* Messages */}
         <div className="flex-1 overflow-y-auto px-6 py-6 space-y-5">
           {messages.map((msg) => {
+            if (
+              (msg.variant === "video-pending" || msg.variant === "video-preview") &&
+              msg.videoJobId
+            ) {
+              return (
+                <BrandVideoCard
+                  key={msg.id}
+                  message={msg}
+                  onApprove={() => handleApproval(msg.id, "approved")}
+                  onReject={() => handleApproval(msg.id, "rejected")}
+                  formatTime={formatTime}
+                />
+              );
+            }
+
+            if (msg.variant === "html-preview" && msg.html) {
+              return (
+                <BrandAnimationCard
+                  key={msg.id}
+                  message={msg}
+                  onApprove={() => handleApproval(msg.id, "approved")}
+                  onReject={() => handleApproval(msg.id, "rejected")}
+                  formatTime={formatTime}
+                />
+              );
+            }
+
             if (msg.variant === "draft" && msg.draft && msg.platform) {
               return (
                 <DraftCard
@@ -438,7 +617,7 @@ export default function ChatPage() {
             />
             <button
               onClick={handleSend}
-              disabled={!input.trim()}
+              disabled={!input.trim() || isLoading}
               className="bg-[#FF4800] hover:bg-[#E03E00] disabled:opacity-40 disabled:cursor-not-allowed text-white p-3 rounded-xl transition-colors flex-shrink-0"
               aria-label="Send message"
             >
@@ -459,6 +638,285 @@ interface DraftCardProps {
   onReject: () => void;
   formatTime: (d: Date) => string;
 }
+
+// ── Brand Video Card ──────────────────────────────────────────────────────────
+
+interface BrandVideoCardProps {
+  message: Message;
+  onApprove: () => void;
+  onReject: () => void;
+  formatTime: (d: Date) => string;
+}
+
+/**
+ * Renders a brand video card that polls /api/video/[jobId] until the spec is ready,
+ * then shows the structured BrandVideoProps spec (palette + scenes + CTA). The
+ * backend produces the spec — not a rendered MP4 — so the card visualises the spec
+ * a downstream Remotion render would consume. Polling state is local to each card.
+ */
+function BrandVideoCard({
+  message,
+  onApprove,
+  onReject,
+  formatTime,
+}: BrandVideoCardProps) {
+  const [renderStatus, setRenderStatus] = useState<"pending" | "done" | "error">(
+    message.variant === "video-preview" ? "done" : "pending"
+  );
+  const [elapsed, setElapsed] = useState(0);
+  const [renderError, setRenderError] = useState<string | null>(null);
+  const [props, setProps] = useState<VideoProps | null>(null);
+  const approval = message.approval;
+
+  useEffect(() => {
+    if (renderStatus !== "pending" || !message.videoJobId) return;
+
+    // Poll job status every 1.5 s (spec generation is fast — a single LLM call)
+    const poll = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/video/${message.videoJobId}`);
+        const data = await res.json();
+        if (data.status === "done") {
+          setProps(data.props ?? null);
+          setRenderStatus("done");
+        } else if (data.status === "error") {
+          setRenderStatus("error");
+          setRenderError(data.error ?? "Spec generation failed.");
+        }
+      } catch {
+        // transient network error — keep polling
+      }
+    }, 1500);
+
+    const tick = setInterval(() => setElapsed((s) => s + 1), 1000);
+
+    return () => {
+      clearInterval(poll);
+      clearInterval(tick);
+    };
+  }, [renderStatus, message.videoJobId]);
+
+  return (
+    <div className="w-full max-w-sm">
+      <p className="text-sm text-[#6B6561] mb-2">{message.content}</p>
+      <div className="bg-white border border-[#E8E3DA] rounded-2xl overflow-hidden shadow-sm">
+        {/* Header */}
+        <div className="flex items-center justify-between px-4 py-2.5 bg-[#1B1A17] text-white">
+          <span className="text-sm font-semibold">✦ Brand Video Spec</span>
+          {approval === "approved" && (
+            <span className="text-xs bg-green-500 text-white px-2 py-0.5 rounded-full font-medium">
+              Approved
+            </span>
+          )}
+          {approval === "rejected" && (
+            <span className="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full font-medium">
+              Rejected
+            </span>
+          )}
+        </div>
+
+        {/* Body — pending spinner, error, or the structured spec */}
+        <div className="bg-[#F8F5EE] p-3">
+          {renderStatus === "pending" && (
+            <div className="flex flex-col items-center justify-center gap-3 text-[#9E9893] py-12">
+              <svg className="animate-spin" width={36} height={36} viewBox="0 0 24 24" fill="none">
+                <circle cx="12" cy="12" r="10" stroke="#E8E3DA" strokeWidth="3" />
+                <path d="M12 2a10 10 0 0 1 10 10" stroke="#FF4800" strokeWidth="3" strokeLinecap="round" />
+              </svg>
+              <p className="text-xs font-medium text-center">Generating video spec…</p>
+              <p className="text-xs text-center">{elapsed}s elapsed</p>
+            </div>
+          )}
+
+          {renderStatus === "error" && (
+            <div className="flex flex-col items-center justify-center gap-2 text-center px-4 py-12">
+              <p className="text-sm font-medium text-red-500">Spec generation failed</p>
+              <p className="text-xs text-[#9E9893]">{renderError}</p>
+            </div>
+          )}
+
+          {renderStatus === "done" && props && <VideoSpec props={props} />}
+        </div>
+
+        {/* Actions */}
+        {renderStatus === "done" && approval === "pending" && (
+          <div className="flex gap-2 px-4 pt-1 pb-4">
+            <button
+              onClick={onApprove}
+              className="flex-1 bg-green-600 hover:bg-green-500 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+            >
+              Approve
+            </button>
+            <button
+              onClick={onReject}
+              className="flex-1 bg-[#F2EDE4] hover:bg-[#E8E3DA] text-[#1B1A17] text-sm font-medium py-2 rounded-lg transition-colors border border-[#E8E3DA]"
+            >
+              Reject
+            </button>
+          </div>
+        )}
+
+        <p className="text-xs text-[#9E9893] px-4 pb-3">
+          {formatTime(message.timestamp)}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Visualises a BrandVideoProps spec: a poster-style hero in the brand palette,
+ * the three Scene-2 stats, and the Scene-3 CTA — i.e. the data a Remotion render
+ * turns into the 3-scene video.
+ */
+function VideoSpec({ props }: { props: VideoProps }) {
+  return (
+    <div className="flex flex-col gap-3">
+      {/* Hero / Scene 1 — brand identity in the generated palette */}
+      <div
+        className="rounded-lg p-4 text-center"
+        style={{ background: props.primaryColor, color: "#fff" }}
+      >
+        <div className="text-lg font-bold tracking-wide" style={{ color: props.secondaryColor }}>
+          {props.brandName}
+        </div>
+        <div className="text-xs mt-1 opacity-90">{props.tagline}</div>
+        <div className="flex justify-center gap-1.5 mt-3">
+          {[props.primaryColor, props.secondaryColor, props.accentColor].map((c, i) => (
+            <span
+              key={i}
+              className="w-5 h-5 rounded-full border border-white/30"
+              style={{ background: c }}
+              title={c}
+            />
+          ))}
+        </div>
+      </div>
+
+      {/* Scene 2 — three stats */}
+      <div>
+        <div className="text-[11px] font-semibold text-[#9E9893] uppercase tracking-wider mb-1.5">
+          {props.sectionLabel}
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          {props.stats.map((s, i) => (
+            <div
+              key={i}
+              className="bg-white border border-[#E8E3DA] rounded-lg p-2 text-center"
+            >
+              <div className="text-base" style={{ color: props.accentColor }}>{s.icon}</div>
+              <div className="text-sm font-bold text-[#1B1A17]">{s.value}</div>
+              <div className="text-[10px] text-[#6B6561] leading-tight">{s.label}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Scene 3 — CTA */}
+      <div className="bg-white border border-[#E8E3DA] rounded-lg p-3 text-center">
+        <div className="text-sm font-semibold text-[#1B1A17]">{props.headline}</div>
+        <div className="text-xs text-[#6B6561] mt-1">{props.subtext}</div>
+        <div
+          className="inline-block text-xs font-semibold text-white px-3 py-1.5 rounded-full mt-2"
+          style={{ background: `linear-gradient(90deg, ${props.secondaryColor}, ${props.accentColor})` }}
+        >
+          {props.ctaLabel}
+        </div>
+        <div className="text-[10px] text-[#9E9893] mt-2">{props.contact}</div>
+      </div>
+    </div>
+  );
+}
+
+// ── Brand Animation Card ──────────────────────────────────────────────────────
+
+interface BrandAnimationCardProps {
+  message: Message;
+  onApprove: () => void;
+  onReject: () => void;
+  formatTime: (d: Date) => string;
+}
+
+/**
+ * Renders the self-contained HTML returned by the brand agent inside a
+ * sandboxed iframe. The iframe is CSS-scaled from the agent's native 360×640
+ * viewport down to 240×427 so it fits comfortably in the chat column.
+ */
+function BrandAnimationCard({
+  message,
+  onApprove,
+  onReject,
+  formatTime,
+}: BrandAnimationCardProps) {
+  const approval = message.approval;
+
+  return (
+    <div className="w-full max-w-sm">
+      <p className="text-sm text-[#6B6561] mb-2">{message.content}</p>
+      <div className="bg-white border border-[#E8E3DA] rounded-2xl overflow-hidden shadow-sm">
+        {/* Header */}
+        <div className="flex items-center justify-between px-4 py-2.5 bg-[#1B1A17] text-white">
+          <span className="text-sm font-semibold">✦ Brand Animation</span>
+          {approval === "approved" && (
+            <span className="text-xs bg-green-500 text-white px-2 py-0.5 rounded-full font-medium">
+              Approved
+            </span>
+          )}
+          {approval === "rejected" && (
+            <span className="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full font-medium">
+              Rejected
+            </span>
+          )}
+        </div>
+
+        {/* Scaled iframe preview — agent outputs 360×640, displayed at 240×427 */}
+        <div className="flex justify-center bg-[#F8F5EE] p-3">
+          <div
+            className="overflow-hidden rounded-lg border border-[#E8E3DA]"
+            style={{ width: 240, height: 427 }}
+          >
+            <iframe
+              srcDoc={message.html}
+              sandbox="allow-scripts"
+              title="Brand animation preview"
+              style={{
+                width: 360,
+                height: 640,
+                border: "none",
+                transform: "scale(0.667)",
+                transformOrigin: "top left",
+              }}
+            />
+          </div>
+        </div>
+
+        {/* Actions */}
+        {approval === "pending" && (
+          <div className="flex gap-2 px-4 pt-1 pb-4">
+            <button
+              onClick={onApprove}
+              className="flex-1 bg-green-600 hover:bg-green-500 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+            >
+              Approve
+            </button>
+            <button
+              onClick={onReject}
+              className="flex-1 bg-[#F2EDE4] hover:bg-[#E8E3DA] text-[#1B1A17] text-sm font-medium py-2 rounded-lg transition-colors border border-[#E8E3DA]"
+            >
+              Reject
+            </button>
+          </div>
+        )}
+
+        <p className="text-xs text-[#9E9893] px-4 pb-3">
+          {formatTime(message.timestamp)}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ── Draft Card ────────────────────────────────────────────────────────────────
 
 function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps) {
   const platform = platformMap[message.platform!];

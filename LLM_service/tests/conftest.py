@@ -1,107 +1,117 @@
 """
-Shared fixtures for the integration test suite.
+Shared fixtures for the MAF workflow test suite.
 
-Two autouse fixtures keep every test deterministic and offline:
-  - deterministic_critic: pins critic_node's 10% random safety-block so it never fires
-  - no_azure: clears Azure creds + resets the lazy client singletons → mock-fallback mode
+Autouse fixtures keep every test deterministic, offline, and in mock mode:
+  - _reset_caches: clears cached Settings + service-factory singletons each test
+    (so MockStore's in-memory state never leaks between tests).
+  - mock_environment: clears toggle/Azure env so the default (mock) mode is in force.
+
+MockSafety is deterministic (it flags a draft iff it contains the UNSAFE_MARKER
+substring), so — unlike the old random critic — there is nothing to pin.
 """
 
 from __future__ import annotations
 
+import contextlib
+import threading
+import time
+
 import pytest
+from agent_framework import InMemoryCheckpointStorage
 
-import core.azure_clients as az
-import nodes.phase2_platform as p2
-from core.interfaces import BaseStatusNotifier
-from core.state import AgentState
-from graph.builder import compile_graph
+from LLM_service.core.config import reset_settings
+from LLM_service.core.services.factory import reset_services
+from LLM_service.workflow import Brief, build_workflow
 
-
-class RecordingNotifier(BaseStatusNotifier):
-    """Captures every notify() call so tests can assert on streamed backend events."""
-
-    def __init__(self) -> None:
-        self.events: list[tuple[str, dict]] = []
-
-    async def notify(self, task_id: str, status: dict) -> None:
-        self.events.append((task_id, status))
+_TOGGLE_VARS = ("USE_MOCK", "USE_MOCK_LLM", "USE_MOCK_SAFETY", "USE_MOCK_STORE", "USE_MOCK_VOICE")
+_CRED_VARS = (
+    "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_CHAT_DEPLOYMENT",
+    "AZURE_CONTENTSAFETY_ENDPOINT", "AZURE_CONTENTSAFETY_KEY",
+    "POSTGRES_DSN", "DATABASE_URL",
+    "AZURE_VOICELIVE_ENDPOINT",
+)
 
 
 # ── Autouse determinism / offline patches ─────────────────────────────────────
 
 @pytest.fixture(autouse=True)
-def deterministic_critic(monkeypatch):
-    """
-    critic_node hard-fails ~10% of the time via `random.random() < 0.10`. Pin it high so
-    the safety check always passes; tone always aligns because all drafts are >= 30 chars.
-    """
-    monkeypatch.setattr(p2.random, "random", lambda: 0.99)
+def _reset_caches():
+    """Clear cached Settings and service-factory singletons before and after every
+    test so env/toggle/store changes made by one test never leak into the next."""
+    reset_settings()
+    reset_services()
+    yield
+    reset_settings()
+    reset_services()
 
 
 @pytest.fixture(autouse=True)
-def no_azure(monkeypatch):
-    """
-    Guarantee no real Azure calls: clear credentials and reset the module-level lazy
-    singletons so AzureImageGenerator / AzureChatClient re-initialise in mock mode.
-    """
-    for var in (
-        "AZURE_OPENAI_ENDPOINT",
-        "AZURE_OPENAI_API_KEY",
-        "AZURE_OPENAI_DALLE_DEPLOYMENT",
-        "AZURE_OPENAI_CHAT_DEPLOYMENT",
-    ):
+def mock_environment(monkeypatch):
+    """Force the default (mock) toggle state by clearing toggle + credential env
+    vars, so nothing accidentally hits a real API. Tests that need production mode
+    set the relevant vars themselves and reset."""
+    for var in _TOGGLE_VARS + _CRED_VARS:
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr(az, "_image_generator", None)
-    monkeypatch.setattr(az, "_chat_client", None)
+    reset_settings()
+    reset_services()
 
 
-# ── Graph / config / state factories ──────────────────────────────────────────
-
-@pytest.fixture
-def graph():
-    """Fresh compile per test → fresh MemorySaver → isolated checkpoint store."""
-    return compile_graph()
-
+# ── Workflow / brief factories ────────────────────────────────────────────────
 
 @pytest.fixture
-def make_config():
-    def _make(thread_id: str, notifier: BaseStatusNotifier | None = None) -> dict:
-        return {
-            "configurable": {
-                "notifier": notifier or RecordingNotifier(),
-                "task_id": thread_id,
-                "thread_id": thread_id,
-            }
-        }
-
-    return _make
-
-
-@pytest.fixture
-def make_state():
-    def _make(platforms: tuple[str, ...] = ("X", "Instagram")) -> AgentState:
-        return AgentState(
-            business_description="Artisan coffee roastery",
-            brand_tone="warm, authentic",
+def make_brief():
+    """Build a CreativeBrief. `topic` containing 'unsafe' makes MockSafety reject
+    every draft (used to drive the circuit breaker)."""
+    def _make(
+        topic: str = "spring single-origin coffee launch",
+        platforms: tuple[str, ...] = ("linkedin", "instagram"),
+        **over,
+    ) -> Brief:
+        return Brief(
+            topic=topic,
             target_platforms=list(platforms),
-            content_topics="Ethiopia harvest",
-            notes=None,
-            examples=None,
-            user_preferences=None,
-            current_status="starting",
-            strategy="",
-            rag_structure_context="",
-            outline={},
-            outline_approval="pending",
-            content_approvals={},
-            conversation_platform="",
-            conversation_status="done",
-            conversation_history={},
-            rag_tone_context={},
-            drafts={},
-            media_assets={},
-            critic_comments={},
-            is_passed={},
+            user_intent=over.get("user_intent", "drive signups and tell the farmers' story"),
+            business_id=over.get("business_id", "biz_test_0001"),
+            tone_hint=over.get("tone_hint", "warm, authentic"),
+            route=over.get("route", "direct_generation"),
         )
 
     return _make
+
+
+@pytest.fixture
+def checkpoint_storage() -> InMemoryCheckpointStorage:
+    """A fresh checkpoint store per test, so a test can inspect what the RequestPort
+    pause persisted."""
+    return InMemoryCheckpointStorage()
+
+
+@pytest.fixture
+def workflow(checkpoint_storage):
+    """A freshly built workflow wired to this test's checkpoint store."""
+    return build_workflow(checkpoint_storage=checkpoint_storage)
+
+
+# ── FastAPI HTTP round-trip helper ─────────────────────────────────────────────
+
+@contextlib.contextmanager
+def run_app(app):
+    """Run a FastAPI app on an ephemeral port in a daemon thread; yield its base URL.
+
+    Used by the HTTP/SSE round-trip tests so they exercise the real ASGI server
+    (uvicorn) over a socket — the faithful path for SSE streaming and WebSockets."""
+    import uvicorn
+
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
+    server = uvicorn.Server(config)
+    server.install_signal_handlers = lambda: None  # we're off the main thread
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        while not server.started:
+            time.sleep(0.01)
+        port = server.servers[0].sockets[0].getsockname()[1]
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
