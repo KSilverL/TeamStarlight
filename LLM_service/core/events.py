@@ -1,17 +1,15 @@
 """
-Backend status-event schema.
+Backend status-event schema (the SSE wire format, MIGRATION_PLAN §7.2).
 
-Every node the graph runs emits a **progress** event (running → done, or
-interrupted/error) so the backend can track exactly where a task is. Specific
-nodes additionally emit a **result** event carrying produced content (e.g. a
-finished per-platform draft). These dicts are what `BaseStatusNotifier.notify`
-receives as its `status` argument, so over the webhook the backend sees:
+As the MAF workflow runs, the api.py SSE bridge emits a **progress** event for
+every executor (running → done, or interrupted/error) so the frontend can render
+the "editorial newsroom live" — "the red-team reviewer is checking your content…".
+When a draft is ready (and again as a FinalDraft lands) a **result** event carries
+the produced content. The §7.2 envelope is reused verbatim; only the phase taxonomy
+follows the new executors.
 
-    POST {WEBHOOK_URL}
-    {"task_id": "<id>", "status": <event dict defined here>}
-
-Keeping the schema in one place means the graph wrapper, the nodes, and the
-tests all agree on the wire format.
+    GET /tasks/{id}/events   (text/event-stream)
+    data: <event dict defined here>
 """
 
 from __future__ import annotations
@@ -20,36 +18,23 @@ import time
 from typing import Optional
 
 # ── Event `type` discriminator ────────────────────────────────────────────────
-PROGRESS = "progress"   # "the task is now at node X"
-RESULT = "result"       # "node X produced this content"
+PROGRESS = "progress"   # "the task is now at executor X"
+RESULT = "result"       # "executor X produced this content"
 
 # ── Progress `status` lifecycle ───────────────────────────────────────────────
-RUNNING = "running"          # node entered
-DONE = "done"                # node finished successfully
-INTERRUPTED = "interrupted"  # node paused awaiting human input (interrupt())
-ERROR = "error"              # node raised an exception
+RUNNING = "running"          # executor entered
+DONE = "done"                # executor finished successfully
+INTERRUPTED = "interrupted"  # paused awaiting human input (RequestPort)
+ERROR = "error"              # executor raised an exception
 
-# ── node name → pipeline phase ────────────────────────────────────────────────
+# ── executor id → newsroom phase ──────────────────────────────────────────────
 NODE_PHASE: dict[str, str] = {
-    # Phase 1 — linear planning
-    "planner_node": "phase1",
-    "rag_structure_node": "phase1",
-    "outliner_node": "phase1",
-    "outline_gate": "phase1",
-    # Phase 2 — per-platform fan-out (these carry a `platform`)
-    "platform_router": "phase2",
-    "rag_tone_node": "phase2",
-    "x_creator_node": "phase2",
-    "instagram_creator_node": "phase2",
-    "tiktok_creator_node": "phase2",
-    "linkedin_creator_node": "phase2",
-    "default_creator_node": "phase2",
-    "critic_node": "phase2",
-    "feedback_db_node": "phase2",
-    # Final human review + write-back
-    "final_review_gate": "review",
-    "conversation_node": "review",
-    "feedback_persist_node": "review",
+    "dispatcher": "dispatch",   # 总编导
+    "scout": "scout",           # 热点星探
+    "creator": "create",        # 人格创作者 (per-platform fan-out)
+    "reviewer": "review",       # 红队审核员
+    "human_gate": "review",     # RequestPort 人工审批
+    "archivist": "archive",     # 品牌档案馆长
 }
 
 
@@ -60,11 +45,11 @@ def progress_event(
     platform: Optional[str] = None,
     phase: Optional[str] = None,
 ) -> dict:
-    """Build a progress event ('we are at node X, status Y')."""
+    """Build a progress event ('we are at executor X, status Y')."""
     return {
         "type": PROGRESS,
         "node": node,
-        "phase": phase or NODE_PHASE.get(node, "phase2"),
+        "phase": phase or NODE_PHASE.get(node, "create"),
         "platform": platform,
         "status": status,
         "ts": time.time(),
@@ -82,7 +67,7 @@ def result_event(
     event = {
         "type": RESULT,
         "node": node,
-        "phase": NODE_PHASE.get(node, "phase2"),
+        "phase": NODE_PHASE.get(node, "create"),
         "platform": platform,
         "status": status,
         "ts": time.time(),

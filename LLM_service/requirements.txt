@@ -1,12 +1,16 @@
-langgraph>=0.6.11
-langchain-core>=0.3.86
+# ── Microsoft Agent Framework (MAF) — workflow + executors + RequestPort + checkpoint ──
+agent-framework-core>=1.8.0
 httpx>=0.28.1
 typing-extensions>=4.15.0
-openai>=1.0.0
+pydantic>=2.0.0
 
-# ── Production backends ────────────────────────────────────────────────────────
-# Required when USE_MOCK_RAG=false — Azure AI Search dual-vector store (RAG).
-# Embeddings reuse the `openai` Azure OpenAI client above.
-azure-search-documents>=11.4.0
-# Required only when USE_MOCK_SAFETY=false — Azure AI Content Safety (still a skeleton):
+# ── Production backends (optional; lazy-imported, only needed when USE_MOCK_*=false) ──
+# Azure OpenAI / Foundry chat (LLMService) — required when USE_MOCK_LLM=false:
+openai>=1.0.0
+# agent-framework-azure-ai>=1.8.0    # Foundry / Azure OpenAI chat client (optional)
+# PostgreSQL (StoreService: brand profiles + checkpoints) — required when USE_MOCK_STORE=false:
+# asyncpg>=0.29.0
+# Azure AI Content Safety (SafetyService) — required when USE_MOCK_SAFETY=false:
 # azure-ai-contentsafety>=1.0.0
+# Voice Live API (VoiceService) — STT over a WebSocket; required when USE_MOCK_VOICE=false:
+# websockets>=12.0

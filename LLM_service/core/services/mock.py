@@ -1,599 +1,444 @@
 """
-Mock implementations of every service contract.
+Deterministic, offline mock implementations of the four service contracts.
 
-The LLM/image/safety/critic mocks keep the project's original deterministic
-canned behavior (asyncio.sleep latency + fixed outputs). The RAG mocks are
-different: they back a small **in-memory dual-collection vector store** that
-really persists what the gates approve and returns it on later retrieval — so
-the feedback loop in RAG设计方案 §7 is demonstrable end-to-end in mock mode
-("learn from this approval, retrieve it next time"). Retrieval ranks by
-deterministic keyword overlap instead of real embeddings, and metadata filters
-(platform / business_id / doc_type) are applied exactly as in production.
+Everything here is pure and reproducible (no network, no randomness) so the whole
+MAF workflow runs fully mocked by default and the test suite is deterministic. The
+return shapes are kept structurally identical to the Azure counterparts in
+azure.py (enforced by tests/test_contract_parity.py).
+
+Safety screening blocks deterministically: a draft is flagged iff it contains the
+`UNSAFE_MARKER` substring. That gives tests a precise lever to drive the reviewer
+reject path (and thus the circuit breaker) without any randomness to pin.
 """
 
 from __future__ import annotations
 
 import asyncio
-import random
 import re
-import time
-from typing import Callable, List, Optional
+from typing import Dict, List, Optional
 
+from ...skills import parse_char_limit
 from .base import (
-    EMBED_DIM,
-    BaseChatClient,
-    BaseContentSafety,
-    BaseCopywriter,
-    BaseEmbedder,
-    BaseFeedbackStore,
-    BaseImageGenerator,
-    BaseOutliner,
-    BaseOutlineStore,
-    BasePlanner,
-    BaseStructureRetriever,
-    BaseToneCritic,
-    BaseToneRetriever,
-    ContentDocType,
-    OutlineDocType,
+    LLMService,
     SafetyResult,
-    build_content_situation_text,
-    build_outline_content_text,
-    build_outline_situation_text,
-    dedupe_by_id,
-    format_structure_guidance,
+    SafetyService,
+    StoreService,
+    VoiceService,
+    empty_profile,
 )
 
-# Platform tone baselines — seeded into content_rag as `platform_tone` docs and
-# reused as the cold-start tone guide before any user history exists.
-_PLATFORM_TONE: dict[str, str] = {
-    "X":         "Concise and witty; max 280 chars; use threads for depth; 1-2 hashtags max",
-    "Instagram": "Visual-first; aspirational lifestyle copy; 150-300 chars; 5-10 relevant hashtags",
-    "TikTok":    "Energetic and trend-aware; hook in first 3 words; CTA-heavy; 100-150 chars",
-    "LinkedIn":  "Professional and thought-leadership tone; data-driven; 300-600 chars; no hashtag spam",
-    "Facebook":  "Conversational; community-oriented; 100-250 chars; question-based CTAs work well",
+# Substring that makes MockSafety flag a draft. MockLLM echoes the topic into the
+# copy, so a brief whose topic contains this marker produces a draft that is
+# rejected on every attempt — exactly what the circuit-breaker test needs.
+UNSAFE_MARKER = "unsafe"
+
+# Platform-differentiated strategy angle (scout). Keyed case-insensitively.
+_PLATFORM_FOCUS: Dict[str, str] = {
+    "linkedin": "business analysis and credibility",
+    "twitter": "emotional resonance and brevity",
+    "x": "emotional resonance and brevity",
+    "instagram": "visual storytelling and lifestyle",
+    "tiktok": "playful, trend-native hooks",
+}
+
+_MOCK_LATENCY = 0.0  # bump for demos; kept 0 so tests are instant
+
+
+def _focus(platform: str) -> str:
+    return _PLATFORM_FOCUS.get(platform.lower(), "general audience engagement")
+
+
+def _alias(platform: str) -> str:
+    """Collapse synonym handles so one copy bank serves both (twitter == x)."""
+    p = platform.lower()
+    return "x" if p == "twitter" else p
+
+
+# Per-platform copy scaffolding for the mock copywriter. Each platform has a bank of
+# opening hooks and calls-to-action; `attempt` indexes into them (mod len), so a
+# rejected draft comes back with a genuinely different hook + CTA instead of the same
+# text. `{topic}` is filled verbatim, which (a) keeps the post on-subject and (b) lets
+# MockSafety keep flagging an `unsafe` topic on every attempt.
+_HOOKS: Dict[str, List[str]] = {
+    "linkedin": [
+        "Here's what most people miss about {topic}.",
+        "We've been heads-down on {topic} — today we can finally share it.",
+        "A quiet bet on {topic} just paid off. Here's the story.",
+        "Three things {topic} taught us this season:",
+    ],
+    "instagram": [
+        "✨ It's here: {topic} ✨",
+        "POV: you just discovered {topic} 👀",
+        "We couldn't keep this in any longer 🙊 — {topic}.",
+        "📌 Save this one — {topic}.",
+    ],
+    "x": [
+        "{topic} is here — and it matters. 🧵",
+        "Hot take: {topic} changes the game.",
+        "Just shipped: {topic}. Quick thread 👇",
+        "Stop scrolling — {topic} is worth 10 seconds.",
+    ],
+    "tiktok": [
+        "wait for it… {topic} 🤯",
+        "nobody's talking about {topic} 🫢",
+        "things i wish i knew about {topic} sooner ⬇️",
+        "ok but {topic} is actually elite 😤",
+    ],
+    "facebook": [
+        "We've got news we're excited to share: {topic}.",
+        "Pull up a chair — let's talk about {topic}.",
+        "Big day for us: {topic} is finally here.",
+        "Here's a little story about {topic}.",
+    ],
+}
+_DEFAULT_HOOKS = [
+    "Let's talk about {topic}.",
+    "Something new: {topic}.",
+    "A fresh angle on {topic}.",
+    "{topic} — here's the latest.",
+]
+
+_CTAS: Dict[str, List[str]] = {
+    "linkedin": [
+        "What's your take? 👇", "Curious how your team approaches this.",
+        "Follow along as we share more.", "Let's connect if this resonates.",
+    ],
+    "instagram": [
+        "Double-tap if you're in 💛", "Tag someone who needs this 👇",
+        "Link in bio 🔗", "Which one's your favorite? 👇",
+    ],
+    "x": [
+        "RT if you agree.", "Reply with your take 👇",
+        "Follow for the full thread.", "What would you add?",
+    ],
+    "tiktok": [
+        "follow for part 2 🎬", "comment your thoughts ⬇️",
+        "save it for later 📲", "duet this 🔥",
+    ],
+    "facebook": [
+        "What do you think? Tell us below 👇", "Share with a friend who'd love this.",
+        "Drop your story in the comments.", "Tap like if you're excited!",
+    ],
+}
+_DEFAULT_CTAS = ["Let us know what you think 👇", "Share if this resonates.",
+                 "Follow for more.", "Tell us your take below."]
+
+# A platform-flavoured hashtag appended after the topic-derived one.
+_PLATFORM_TAGS: Dict[str, str] = {
+    "linkedin": "#Leadership", "instagram": "#instagood",
+    "x": "#news", "tiktok": "#fyp #foryou", "facebook": "",
 }
 
 
-# ── In-memory dual-collection vector store ────────────────────────────────────
-
-def _tokens(text: str) -> set[str]:
-    return {t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(t) > 2}
-
-
-def _overlap_score(query: str, doc_text: str) -> float:
-    """Deterministic stand-in for cosine similarity: Jaccard token overlap."""
-    q, d = _tokens(query), _tokens(doc_text)
-    if not q or not d:
-        return 0.0
-    return len(q & d) / len(q | d)
+def _enforce_char_limit(post: str, limit: Optional[int]) -> str:
+    """Trim a post to the platform's character limit (from the skill), cutting at a
+    word boundary and marking the cut with an ellipsis. No-op when within limit."""
+    if not limit or len(post) <= limit:
+        return post
+    cut = post[: limit - 1]
+    space = cut.rfind(" ")
+    if space > limit * 0.6:  # only back off to a word boundary if it's not too far
+        cut = cut[:space]
+    return cut.rstrip() + "…"
 
 
-class _MockVectorDB:
-    """Two named collections (outline / content), each a list of plain doc dicts.
-    Each doc carries `_situation_text` and `_content_text` — the mock analogue of
-    the dual vector fields — so search can target one field or the other."""
+def _hashtags(topic: str, platform: str) -> str:
+    """A topic-derived CamelCase hashtag plus a platform staple."""
+    words = [w for w in _words(topic) if len(w) > 3][:3]
+    topic_tag = "#" + "".join(w.capitalize() for w in words) if words else ""
+    extra = _PLATFORM_TAGS.get(_alias(platform), "")
+    return " ".join(t for t in (topic_tag, extra) if t).strip()
+
+
+def _compose_post(
+    *, platform: str, topic: str, angle: str, intent: str, tone: str,
+    hook: str, cta: str, tags: str,
+) -> str:
+    """Assemble one ready-to-publish, platform-native post from its parts."""
+    p = _alias(platform)
+    intent_line = intent or "share what makes this worth your attention"
+    if p == "linkedin":
+        body = (
+            f"{hook}\n\n"
+            f"Our focus this time: {angle}. We set out to {intent_line}, and we did "
+            f"it in a {tone} voice that stays true to who we are.\n\n"
+            f"The takeaway: {topic} isn't just an announcement — it's a promise we "
+            f"intend to keep.\n\n"
+            f"{cta}"
+        )
+    elif p == "instagram":
+        body = (
+            f"{hook}\n\n"
+            f"💡 {angle}\n"
+            f"🎯 Why it matters: to {intent_line}\n"
+            f"🤝 Made with a {tone} touch\n\n"
+            f"{cta}"
+        )
+    elif p == "x":
+        body = f"{hook}\n\n{angle}. Built to {intent_line}.\n\n{cta}"
+    elif p == "tiktok":
+        body = (
+            f"{hook}\n\n"
+            f"the vibe: {angle} ✨ (yes, it's {tone}) — all to {intent_line}.\n\n"
+            f"{cta}"
+        )
+    else:  # facebook / anything unrecognised
+        body = (
+            f"{hook}\n\n"
+            f"Here's the heart of it: {angle}. We wanted to {intent_line}, and kept "
+            f"the whole thing {tone}.\n\n"
+            f"{cta}"
+        )
+    return f"{body}\n\n{tags}".rstrip()
+
+
+# Platform tokens the mock intake recognises in free text (intake function-calling).
+_PLATFORM_TOKENS = ("linkedin", "instagram", "twitter", "tiktok", "facebook", "youtube")
+# Phrases that signal copilot_mode — "help me decide what to post" → scout tool.
+_COPILOT_TRIGGERS = (
+    "help me think", "what should i post", "give me ideas", "not sure",
+    "brainstorm", "ideas for", "no idea", "suggest", "help me decide",
+)
+# Goal verbs that mark a "to <goal>" clause as the campaign intent.
+_GOAL_VERBS = (
+    "drive|increase|boost|promote|grow|launch|sell|raise|build|get|reach|convert"
+    "|announce|educate|inspire|generate|attract|engage|highlight|showcase|celebrate"
+)
+
+
+def _parse_platforms(text: str) -> list[str]:
+    low = text.lower()
+    found = [p for p in _PLATFORM_TOKENS if p in low]
+    if re.search(r"(?:^|[\s,/])x(?:$|[\s,./])", low):  # standalone "x" → twitter/X
+        found.append("x")
+    return _unique(found)
+
+
+def _free_extract(user_text: str) -> dict:
+    """Pull whatever CreativeBrief fields a single utterance reveals (the mock's
+    stand-in for the LLM's update_brief function call)."""
+    low = user_text.lower()
+    updates: dict = {}
+    platforms = _parse_platforms(user_text)
+    if platforms:
+        updates["target_platforms"] = platforms
+    m = re.search(r"\babout (.+?)(?: on | to | for | targeting |[.;\n]|$)", low)
+    if m:
+        updates["topic"] = m.group(1).strip()
+    # Intent only when "to <goal-verb> …" — avoids capturing "to post about …".
+    m = re.search(rf"\bto ((?:{_GOAL_VERBS})\b[^.;\n]*?)(?: on | for |[.;\n]|$)", low)
+    if m:
+        updates["user_intent"] = m.group(1).strip()
+    m = re.search(r"tone[:=]\s*([^.;\n]+)", low)
+    if m:
+        updates["tone_hint"] = m.group(1).strip()
+    m = re.search(r"business(?:[ _]?id)?[:=]\s*([A-Za-z0-9_\-]+)", user_text)
+    if m:
+        updates["business_id"] = m.group(1)
+    return updates
+
+
+def _words(text: str) -> list[str]:
+    """Lowercase word tokens, stripped of surrounding punctuation (for diffing
+    an AI draft against the human's edited version)."""
+    return [w.strip(".,!?;:'\"()[]—-").lower() for w in text.split() if w.strip(".,!?;:'\"()[]—-")]
+
+
+def _unique(words: list[str]) -> list[str]:
+    """Order-preserving de-dupe."""
+    seen: set = set()
+    out: list[str] = []
+    for w in words:
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+    return out
+
+
+# ── LLM ───────────────────────────────────────────────────────────────────────
+
+class MockLLM(LLMService):
+    async def chat(self, messages: List[dict]) -> str:
+        await asyncio.sleep(_MOCK_LATENCY)
+        last = messages[-1]["content"] if messages else ""
+        return f"[MOCK CHAT] {last}"
+
+    async def dispatch(
+        self,
+        *,
+        topic: str,
+        target_platforms: List[str],
+        user_intent: str,
+        route: Optional[str],
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return {
+            "route": route or "direct_generation",
+            "topic": topic,
+            "target_platforms": list(target_platforms),
+            "user_intent": user_intent,
+        }
+
+    async def plan_strategy(
+        self, *, topic: str, platform: str, user_intent: str
+    ) -> str:
+        await asyncio.sleep(_MOCK_LATENCY)
+        intent = user_intent or "raise awareness"
+        return (
+            f"On {platform}, lead with {_focus(platform)}. "
+            f"Anchor it to '{topic}' and aim to {intent}."
+        )
+
+    async def write_copy(
+        self,
+        *,
+        topic: str,
+        platform: str,
+        strategy: str,
+        user_intent: str,
+        must_do: List[str],
+        must_avoid: List[str],
+        examples: List[str],
+        tone_hint: Optional[str],
+        skill: str = "",
+        attempt: int = 1,
+    ) -> str:
+        await asyncio.sleep(_MOCK_LATENCY)
+        tone = tone_hint or "on-brand"
+        angle = _focus(platform)
+        hooks = _HOOKS.get(_alias(platform), _DEFAULT_HOOKS)
+        ctas = _CTAS.get(_alias(platform), _DEFAULT_CTAS)
+        # Rotate hook + CTA by revision so a rejected draft (higher `attempt`) comes
+        # back with a visibly different opening, not the same copy.
+        i = max(attempt - 1, 0)
+        hook = hooks[i % len(hooks)].format(topic=topic)  # topic echoed verbatim
+        cta = ctas[i % len(ctas)]
+        post = _compose_post(
+            platform=platform, topic=topic, angle=angle, intent=user_intent,
+            tone=tone, hook=hook, cta=cta, tags=_hashtags(topic, platform),
+        )
+        # Static skill layer: respect the platform's declared character limit (the mock
+        # honours it by truncating at a word boundary; production folds the whole skill
+        # into the prompt). Applied to the real copy, before the mock-only footer.
+        post = _enforce_char_limit(post, parse_char_limit(skill) if skill else None)
+        # When the brand profile has learned Must-Do rules, echo them as a footer so
+        # the offline learning loop is observable (production folds them into the copy
+        # itself). Absent for cold-start / no-brand users — the post stays clean.
+        if must_do:
+            post += f"\n\nFollowing: {', '.join(must_do)}."
+        return post
+
+    async def distill_rules(
+        self,
+        *,
+        platform: str,
+        original_draft: str,
+        final_draft: str,
+        existing_must_do: List[str],
+        existing_must_avoid: List[str],
+    ) -> List[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        orig_words = _words(original_draft)
+        final_words = _words(final_draft)
+        added = [w for w in _unique(_words(final_draft)) if w not in orig_words]
+        removed = [w for w in _unique(_words(original_draft)) if w not in final_words]
+
+        rules: List[dict] = []
+        if added:
+            phrase = " ".join(added[:6])
+            rule = f"Open with phrasing like: {phrase}"
+            if rule not in existing_must_do:
+                rules.append({
+                    "kind": "must_do",
+                    "rule": rule,
+                    "rationale": "the human added this phrasing in their edit",
+                })
+        if removed:
+            phrase = ", ".join(removed[:5])
+            rule = f"Avoid words like: {phrase}"
+            if rule not in existing_must_avoid:
+                rules.append({
+                    "kind": "must_avoid",
+                    "rule": rule,
+                    "rationale": "the human removed these in their edit",
+                })
+        return rules[:3]
+
+    async def fill_brief(
+        self,
+        *,
+        system_prompt: str,
+        tools: List[dict],
+        history: List[dict],
+        user_text: str,
+        brief_partial: dict,
+        pending_field: Optional[str],
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        updates = _free_extract(user_text)
+        wants_scout = any(trigger in user_text.lower() for trigger in _COPILOT_TRIGGERS)
+        # If the assistant just asked for a specific field, a direct answer slots in —
+        # except a "give me ideas" turn must NOT become the topic (scout proposes it).
+        if pending_field and not updates.get(pending_field):
+            if wants_scout and pending_field == "topic":
+                pass
+            elif pending_field == "target_platforms":
+                platforms = _parse_platforms(user_text)
+                if platforms:
+                    updates["target_platforms"] = platforms
+            elif user_text.strip():
+                updates[pending_field] = user_text.strip()
+        return {"brief_updates": updates, "wants_scout": wants_scout}
+
+
+# ── Safety ────────────────────────────────────────────────────────────────────
+
+class MockSafety(SafetyService):
+    async def check(self, *, text: str) -> SafetyResult:
+        await asyncio.sleep(_MOCK_LATENCY)
+        if UNSAFE_MARKER in text.lower():
+            return SafetyResult(blocked=True, reason=f"flagged: contains '{UNSAFE_MARKER}'")
+        return SafetyResult(blocked=False, reason="ok")
+
+
+# ── Store (in-memory stand-in for the two Postgres tables) ─────────────────────
+
+class MockStore(StoreService):
+    """An in-memory stand-in for the brand_profiles + workflow_checkpoints tables.
+    State lives on the instance, so factory.reset_services() (which drops the
+    singleton) gives every test a clean store."""
 
     def __init__(self) -> None:
-        self.outline: List[dict] = []
-        self.content: List[dict] = []
-
-    def _col(self, name: str) -> List[dict]:
-        return self.outline if name == "outline" else self.content
-
-    def upsert(self, collection: str, doc: dict) -> None:
-        col = self._col(collection)
-        col[:] = [d for d in col if d.get("id") != doc.get("id")]
-        col.append(doc)
-
-    def search(
-        self,
-        collection: str,
-        *,
-        query: str,
-        field: str,                 # "situation" | "content"
-        k: int,
-        predicate: Callable[[dict], bool],
-    ) -> List[dict]:
-        text_key = "_situation_text" if field == "situation" else "_content_text"
-        scored = [
-            (_overlap_score(query, doc.get(text_key, "")), doc)
-            for doc in self._col(collection)
-            if predicate(doc)
-        ]
-        scored.sort(key=lambda pair: pair[0], reverse=True)
-        # Keep ties stable and drop zero-overlap hits so cold-start seeds only
-        # surface when genuinely relevant.
-        return [doc for score, doc in scored[:k] if score > 0.0]
-
-
-def _seeded_db() -> _MockVectorDB:
-    """Cold-start seeds (§7.1): generic outline templates + per-platform tone."""
-    db = _MockVectorDB()
-    templates = [
-        {
-            "business_type": "generic",
-            "campaign_goal": "product_launch",
-            "title": "Product launch structure",
-            "key_points": ["Hook: the new thing", "Body: why it matters / story", "CTA: try it now"],
-        },
-        {
-            "business_type": "generic",
-            "campaign_goal": "brand_story",
-            "title": "Brand story structure",
-            "key_points": ["Hook: origin moment", "Body: values + craft", "CTA: join the journey"],
-        },
-    ]
-    for i, tpl in enumerate(templates):
-        situation = f"{tpl['business_type']} {tpl['campaign_goal']}"
-        content = f"{tpl['title']} " + " ".join(tpl["key_points"])
-        db.upsert("outline", {
-            "id": f"seed_outline_{i}",
-            "doc_type": OutlineDocType.TEMPLATE,
-            "business_type": tpl["business_type"],
-            "business_id": "__seed__",
-            "campaign_goal": tpl["campaign_goal"],
-            "title": tpl["title"],
-            "key_points": tpl["key_points"],
-            "created_at": time.time(),
-            "_situation_text": situation,
-            "_content_text": content,
-        })
-    for platform, tone in _PLATFORM_TONE.items():
-        db.upsert("content", {
-            "id": f"seed_tone_{platform}",
-            "doc_type": ContentDocType.PLATFORM_TONE,
-            "platform": platform,
-            "business_id": "__seed__",
-            "draft": tone,
-            "created_at": time.time(),
-            "_situation_text": f"{platform} tone style",
-            "_content_text": tone,
-        })
-    return db
-
-
-_DEFAULT_DB: Optional[_MockVectorDB] = None
-
-
-def get_default_vector_db() -> _MockVectorDB:
-    """Process-wide mock store (lazily seeded). Shared by every mock RAG service."""
-    global _DEFAULT_DB
-    if _DEFAULT_DB is None:
-        _DEFAULT_DB = _seeded_db()
-    return _DEFAULT_DB
-
-
-def reset_mock_vector_db() -> None:
-    """Drop the mock store so the next access re-seeds it (called by reset_services)."""
-    global _DEFAULT_DB
-    _DEFAULT_DB = None
-
-
-# ── Primitive clients ─────────────────────────────────────────────────────────
-
-class MockChatClient(BaseChatClient):
-    async def chat(self, messages: List[dict]) -> str:
-        last_user = next(
-            (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
-        )
-        return f"[MOCK REVISION] {last_user}"
-
-
-def _mock_url(platform: str, prompt: str) -> str:
-    return (
-        f"https://mock-cdn.example.com/assets/"
-        f"{platform.lower()}_{abs(hash(prompt)) % 9999:04d}.jpg"
-    )
-
-
-class MockImageGenerator(BaseImageGenerator):
-    async def generate(self, prompt: str, platform: str) -> str:
-        return _mock_url(platform, prompt)
-
-
-class MockEmbedder(BaseEmbedder):
-    """Deterministic pseudo-embedding (token-hash bag). Structurally identical to a
-    real embedding (list[float] of EMBED_DIM); mock retrieval uses token overlap,
-    not these vectors, so the values only need to be stable and correctly shaped."""
-
-    async def embed(self, text: str) -> List[float]:
-        vec = [0.0] * EMBED_DIM
-        for tok in _tokens(text):
-            vec[hash(tok) % EMBED_DIM] += 1.0
-        return vec
-
-
-# ── Phase 1 ───────────────────────────────────────────────────────────────────
-
-class MockPlanner(BasePlanner):
-    async def plan(
-        self,
-        *,
-        business_description: str,
-        brand_tone: str,
-        target_platforms: List[str],
-        content_topics: str,
-        user_preferences: Optional[str],
-    ) -> str:
-        await asyncio.sleep(0.1)  # mock LLM call
-        return (
-            f"Campaign strategy for '{business_description}': "
-            f"Target {target_platforms} using a '{brand_tone}' tone. "
-            f"Core topic: {content_topics}."
-            + (f" User preferences: {user_preferences}." if user_preferences else "")
-        )
-
-
-class MockStructureRetriever(BaseStructureRetriever):
-    """outline_rag read: situation query → situation_vector, filtered to this
-    business_id plus seed templates (§5.1)."""
-
-    def __init__(self, db: Optional[_MockVectorDB] = None) -> None:
-        self._db = db
-
-    def _vdb(self) -> _MockVectorDB:
-        return self._db or get_default_vector_db()
-
-    async def retrieve(
-        self,
-        *,
-        business_description: str,
-        business_type: str,
-        campaign_goal: str,
-        target_platforms: List[str],
-        content_topics: str,
-        user_requirement: Optional[str],
-        examples: Optional[List[str]],
-        business_id: str,
-    ) -> dict:
-        await asyncio.sleep(0.1)  # mock retrieval
-        situ_query = build_outline_situation_text(
-            business_description, campaign_goal, target_platforms
-        )
-        matches = self._vdb().search(
-            "outline",
-            query=f"{situ_query} {business_type}",
-            field="situation",
-            k=3,
-            predicate=lambda d: (
-                d.get("business_id") == business_id
-                or d.get("doc_type") == OutlineDocType.TEMPLATE
-            ),
-        )
-
-        guidance = format_structure_guidance(
-            matches, examples=examples, content_topics=content_topics
-        )
-        return {"guidance": guidance, "matches": matches}
-
-
-class MockOutliner(BaseOutliner):
-    async def generate(
-        self,
-        *,
-        business_description: str,
-        brand_tone: str,
-        target_platforms: List[str],
-        content_topics: str,
-        rag_structure_context: str,
-        notes: Optional[str],
-    ) -> dict:
-        await asyncio.sleep(0.1)  # mock LLM call
-        outline: dict = {
-            "title": f"Campaign: {business_description[:50]}",
-            "key_messages": [
-                content_topics,
-                f"Brand value: {brand_tone}",
-            ],
-            "visual_concept": (
-                "Warm, lifestyle-forward imagery featuring the product in natural settings. "
-                "Color palette: earthy tones with brand accent. Typography: clean sans-serif overlays."
-            ),
-            "tone_notes": brand_tone,
-            "structure_guide": rag_structure_context,
-            "platforms": target_platforms,
-        }
-        if notes:
-            outline["additional_notes"] = notes
-        return outline
-
-
-class MockOutlineStore(BaseOutlineStore):
-    """outline_rag write-back (§4.3): approve → approved_outline, modify → outline_edit_pair."""
-
-    def __init__(self, db: Optional[_MockVectorDB] = None) -> None:
-        self._db = db
-
-    def _vdb(self) -> _MockVectorDB:
-        return self._db or get_default_vector_db()
-
-    async def store(
-        self,
-        *,
-        decision: str,
-        session_id: str,
-        business_id: str,
-        business_type: str,
-        campaign_goal: str,
-        target_platforms: List[str],
-        outline: dict,
-        prev_outline: Optional[dict],
-        user_requirement: Optional[str],
-    ) -> None:
-        await asyncio.sleep(0.06)  # mock async vector DB upsert
-        doc_type = (
-            OutlineDocType.EDIT_PAIR if decision == "modified" else OutlineDocType.APPROVED
-        )
-        doc = {
-            "id": f"outline_{session_id}",
-            "doc_type": doc_type,
-            "business_type": business_type,
-            "business_id": business_id,
-            "campaign_goal": campaign_goal,
-            "platform_targets": ",".join(target_platforms),
-            "outline": outline,
-            "before": prev_outline if doc_type == OutlineDocType.EDIT_PAIR else None,
-            "user_intent": user_requirement or "",
-            "created_at": time.time(),
-            "_situation_text": build_outline_situation_text(
-                outline.get("title", ""), campaign_goal, target_platforms
-            ),
-            "_content_text": build_outline_content_text(outline),
-        }
-        self._vdb().upsert("outline", doc)
-
-
-# ── Phase 2 ───────────────────────────────────────────────────────────────────
-
-class MockToneRetriever(BaseToneRetriever):
-    """content_rag read: dual-query split retrieval in one place (§5.2)."""
-
-    def __init__(self, db: Optional[_MockVectorDB] = None) -> None:
-        self._db = db
-
-    def _vdb(self) -> _MockVectorDB:
-        return self._db or get_default_vector_db()
-
-    async def retrieve(
-        self,
-        *,
-        platform: str,
-        business_id: str,
-        outline: dict,
-        brand_voice: str,
-        user_requirement: Optional[str],
-    ) -> dict:
-        await asyncio.sleep(0.08)  # mock retrieval
-        db = self._vdb()
-        situ_query = build_content_situation_text(platform, outline, brand_voice)
-
-        # Positive — situation match (approved as-is), business-scoped.
-        approved = db.search(
-            "content", query=situ_query, field="situation", k=3,
-            predicate=lambda d: (
-                d.get("platform") == platform
-                and d.get("doc_type") == ContentDocType.APPROVED_EXAMPLE
-                and d.get("business_id") == business_id
-            ),
-        )
-        # Positive — intent match (approved or edited), cross-business style pool.
-        intent_hits: List[dict] = []
-        if user_requirement:
-            intent_hits = db.search(
-                "content", query=user_requirement, field="content", k=2,
-                predicate=lambda d: (
-                    d.get("platform") == platform
-                    and d.get("doc_type") in (
-                        ContentDocType.APPROVED_EXAMPLE, ContentDocType.EDIT_PAIR
-                    )
-                ),
-            )
-        examples = dedupe_by_id(approved, intent_hits)
-
-        # Negative — rejections for contrast (consumed by the critic).
-        rejections = db.search(
-            "content", query=situ_query, field="situation", k=2,
-            predicate=lambda d: (
-                d.get("platform") == platform
-                and d.get("doc_type") == ContentDocType.REJECTION
-                and d.get("business_id") == business_id
-            ),
-        )
-
-        # Tone baseline: platform_tone seed + any learned_preference for this business.
-        tone_doc = db.search(
-            "content", query=f"{platform} tone style", field="situation", k=1,
-            predicate=lambda d: (
-                d.get("platform") == platform
-                and d.get("doc_type") == ContentDocType.PLATFORM_TONE
-            ),
-        )
-        tone_guide = tone_doc[0]["draft"] if tone_doc else _PLATFORM_TONE.get(
-            platform, f"Adapt content naturally for {platform} audiences"
-        )
-        learned = db.search(
-            "content", query=situ_query, field="situation", k=1,
-            predicate=lambda d: (
-                d.get("platform") == platform
-                and d.get("doc_type") == ContentDocType.LEARNED_PREFERENCE
-                and d.get("business_id") == business_id
-            ),
-        )
-        if learned:
-            tone_guide = f"{tone_guide}\nLearned preference: {learned[0]['draft']}"
-
-        return {"tone_guide": tone_guide, "examples": examples, "rejections": rejections}
-
-
-class MockCopywriter(BaseCopywriter):
-    async def draft(
-        self,
-        *,
-        platform: str,
-        outline: dict,
-        tone_guide: str,
-        key_messages: List[str],
-        examples: Optional[List[str]] = None,
-        user_requirement: Optional[str] = None,
-    ) -> str:
-        title = outline.get("title", "Our Campaign")
-        visual_concept = outline.get("visual_concept", "")
-        core_message = key_messages[0] if key_messages else title
-        # The user's explicit ask is the primary signal (§6 role 1): surface it.
-        ask = f" [per request: {user_requirement}]" if user_requirement else ""
-
-        if platform == "X":
-            await asyncio.sleep(0.12)  # mock LLM latency
-            draft = f"{core_message}{ask} — discover the story behind every cup. #singleorigin #craftcoffee"
-            if len(draft) > 280:
-                draft = draft[:277] + "..."
-            return draft
-
-        if platform == "Instagram":
-            await asyncio.sleep(0.15)
-            return (
-                f"✨ {title}{ask}\n\n"
-                f"{core_message}\n\n"
-                f"Visual: {visual_concept[:100]}...\n\n"
-                f"#lifestyle #artisancoffee #singleorigin #sustainability #farmtocup"
-                f" #specialty #authentic #coffeelover #morningritual #craftroast"
-            )
-
-        if platform == "TikTok":
-            await asyncio.sleep(0.15)
-            return (
-                f"[HOOK] POV: You just found your new favourite coffee ☕{ask}\n"
-                f"[BODY] {core_message} — single-origin, traceable to the farm.\n"
-                f"[CTA] Follow for more! Drop a ☕ if you're a coffee snob like us.\n"
-                f"[SOUND] Trending: lo-fi chill beats / 'Coffee Shop Vibes' sound\n"
-                f"#fyp #coffeetok #singleorigin #viral #craftcoffee #aesthetic"
-            )
-
-        if platform == "LinkedIn":
-            await asyncio.sleep(0.13)
-            return (
-                f"At {title.replace('Campaign: ', '')}, we believe quality starts at the source.{ask}\n\n"
-                f"{core_message} — and every step of our supply chain reflects that commitment. "
-                f"From farm partnerships to the roasting process, transparency and craft define who we are.\n\n"
-                f"We're proud to share this journey with our community. "
-                f"Whether you're a fellow founder or simply someone who values authenticity, "
-                f"we'd love to hear your story in the comments.\n\n"
-                f"#SpecialtyCoffee #Sustainability #BusinessStory"
-            )
-
-        # Fallback for unlisted platforms
-        await asyncio.sleep(0.10)
-        return f"[{platform}] {title} | {core_message}{ask} | Tone: {tone_guide[:80]}"
-
-
-class MockContentSafety(BaseContentSafety):
-    async def check(self, *, text: str) -> SafetyResult:
-        await asyncio.sleep(0.05)
-        if random.random() < 0.10:  # 10% probability content safety violation
-            return SafetyResult(
-                blocked=True,
-                reason=(
-                    "CONTENT_SAFETY_BLOCKED: Mock Azure AI Content Safety flagged this content. "
-                    "Please revise and resubmit."
-                ),
-            )
-        return SafetyResult(blocked=False, reason="")
-
-
-class MockToneCritic(BaseToneCritic):
-    async def review(
-        self,
-        *,
-        platform: str,
-        draft: str,
-        rejections: Optional[List[str]] = None,
-    ) -> tuple[bool, str]:
-        await asyncio.sleep(0.05)
-        aligned = platform.lower() in draft.lower() or len(draft) >= 30
-        contrast = (
-            f" Checked against {len(rejections)} prior rejection(s)." if rejections else ""
-        )
-        if aligned:
-            comment = f"Safety check passed. Tone is well-aligned with {platform} guidelines.{contrast}"
-        else:
-            comment = (
-                f"Safety check passed but tone mismatch detected for {platform}. "
-                f"Consider adding platform-native language and increasing content length.{contrast}"
-            )
-        return aligned, comment
-
-
-class MockFeedbackStore(BaseFeedbackStore):
-    """content_rag write-back (§4.4): the human verdict picks the doc_type."""
-
-    def __init__(self, db: Optional[_MockVectorDB] = None) -> None:
-        self._db = db
-
-    def _vdb(self) -> _MockVectorDB:
-        return self._db or get_default_vector_db()
-
-    async def store(
-        self,
-        *,
-        decision: str,
-        session_id: str,
-        platform: str,
-        business_id: str,
-        outline: dict,
-        brand_voice: str,
-        draft: str,
-        original_draft: Optional[str],
-        reason: Optional[str],
-        user_requirement: Optional[str],
-        media_asset: Optional[str],
-    ) -> None:
-        await asyncio.sleep(0.06)  # mock async vector DB upsert
-        base = {
-            "platform": platform,
-            "business_id": business_id,
-            "user_intent": user_requirement or "",
-            "created_at": time.time(),
-            "_situation_text": build_content_situation_text(platform, outline, brand_voice),
-        }
-
-        if decision == "rejected":
-            doc = {
-                **base,
-                "doc_type": ContentDocType.REJECTION,
-                "draft": draft,
-                "rejected_draft": draft,
-                "reason": reason or "unspecified",
-                "_content_text": draft,
-            }
-        elif decision == "edit_approved":
-            before, after = original_draft or "", draft
-            # Trivial edit → keep as a clean positive instead of a noisy edit_pair (§3.2).
-            if _overlap_score(before, after) > 0.95:
-                doc = {
-                    **base,
-                    "doc_type": ContentDocType.APPROVED_EXAMPLE,
-                    "quality_tier": "clean",
-                    "draft": after,
-                    "_content_text": after,
-                }
-            else:
-                doc = {
-                    **base,
-                    "doc_type": ContentDocType.EDIT_PAIR,
-                    "draft": after,            # `after` is the approved content (§3.2)
-                    "before": before,
-                    "after": after,
-                    "edit_types": "mock_edit",
-                    "_content_text": after,
-                }
-        else:  # "approved"
-            doc = {
-                **base,
-                "doc_type": ContentDocType.APPROVED_EXAMPLE,
-                "quality_tier": "clean",
-                "draft": draft,
-                "_content_text": draft,
-            }
-
-        doc["id"] = f"{doc['doc_type']}_{session_id}_{platform}"
-        self._vdb().upsert("content", doc)
+        self._profiles: Dict[str, dict] = {}
+        self._checkpoints: Dict[str, dict] = {}
+
+    async def get_profile(self, *, business_id: Optional[str]) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        if business_id and business_id in self._profiles:
+            return dict(self._profiles[business_id])
+        return empty_profile(business_id)
+
+    async def upsert_profile(self, *, business_id: str, profile: dict) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        stored = {**empty_profile(business_id), **profile, "id": business_id}
+        self._profiles[business_id] = stored
+
+    async def save_checkpoint(self, *, task_id: str, data: dict) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        self._checkpoints[task_id] = dict(data)
+
+    async def load_checkpoint(self, *, task_id: str) -> Optional[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        stored = self._checkpoints.get(task_id)
+        return dict(stored) if stored is not None else None
+
+
+# ── Voice ──────────────────────────────────────────────────────────────────────
+
+class MockVoice(VoiceService):
+    async def transcribe_turn(self, *, session_id: str, user_audio: str) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        # Deterministic "transcription": the offline script provides the spoken words,
+        # so a faithful transcript is the verbatim text. This makes a voice intake
+        # produce a CreativeBrief identical to the same words typed (§4.4).
+        return {"session_id": session_id, "transcript": user_audio.strip()}

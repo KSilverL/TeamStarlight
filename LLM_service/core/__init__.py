@@ -1,3 +1,1 @@
-from .state import AgentState
-from .interfaces import BaseStatusNotifier
-from .notifiers import WebhookStatusNotifier
+"""Core: runtime config + the backend-agnostic service layer (see core.services)."""

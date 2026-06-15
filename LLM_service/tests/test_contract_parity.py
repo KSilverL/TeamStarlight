@@ -1,292 +1,218 @@
 """
-Contract parity: every production implementation must return the SAME structure
-as its mock counterpart. Azure OpenAI traffic is faked (injected clients), so
-these tests are fully offline and deterministic.
+Contract parity: every production (Azure*) implementation must return the SAME
+structure as its mock counterpart. Third-party SDK traffic is faked via the
+overridable seams (`_complete` / `_analyze` / `_containers`), so these tests are
+fully offline and deterministic.
 
-- Implemented services (LLM/image): run both Mock* and Azure* and compare shapes.
-- Skeleton services (Content Safety, RAG retrievers, feedback store): assert the
-  Azure class conforms to the contract and fails loudly (NotImplementedError)
-  until its SDK is wired, while the Mock* returns the documented structure.
+- LLM / Store: run both Mock* and Azure* and compare shapes.
+- Safety / Voice: assert the Azure class conforms to the contract; the parts whose
+  SDK call is still a skeleton fail loudly (NotImplementedError) until wired.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-from typing import List
+import json
 
 import pytest
 
 from LLM_service.core.config import get_settings
-from LLM_service.core.services.azure import (
-    AzureChatClient,
-    AzureContentSafety,
-    AzureCopywriter,
-    AzureEmbedder,
-    AzureFeedbackStore,
-    AzureImageGenerator,
-    AzureOutliner,
-    AzureOutlineStore,
-    AzurePlanner,
-    AzureStructureRetriever,
-    AzureToneCritic,
-    AzureToneRetriever,
-)
-from LLM_service.core.services.base import (
-    EMBED_DIM,
-    BaseChatClient,
-    BaseContentSafety,
-    BaseEmbedder,
-    ContentDocType,
-    OutlineDocType,
-    SafetyResult,
-)
-from LLM_service.core.services.mock import (
-    MockChatClient,
-    MockContentSafety,
-    MockCopywriter,
-    MockEmbedder,
-    MockFeedbackStore,
-    MockImageGenerator,
-    MockOutliner,
-    MockOutlineStore,
-    MockPlanner,
-    MockStructureRetriever,
-    MockToneCritic,
-    MockToneRetriever,
-)
+from LLM_service.core.services import azure, mock, postgres
+from LLM_service.core.services.base import SafetyResult, SafetyService, VoiceService
 
 
-# ── Fakes (no network) ────────────────────────────────────────────────────────
+# ── Fakes / seam overrides (no network) ───────────────────────────────────────
 
-class FakeChatClient(BaseChatClient):
-    """Returns a canned chat reply, standing in for Azure OpenAI."""
+def azure_llm(reply: str) -> azure.AzureLLM:
+    """An AzureLLM whose single chat seam returns a canned reply."""
+    llm = azure.AzureLLM(get_settings())
 
-    def __init__(self, reply: str) -> None:
-        self._reply = reply
+    async def _complete(messages):
+        return reply
 
-    async def chat(self, messages: List[dict]) -> str:
-        return self._reply
-
-
-def fake_openai(chat_content: str = "Generated copy that is plenty long enough.",
-                image_url: str = "https://azure-cdn.example.com/x.png"):
-    """A stand-in AsyncAzureOpenAI client with async chat + image + embeddings."""
-    async def chat_create(**_kw):
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=chat_content))]
-        )
-
-    async def image_generate(**_kw):
-        return SimpleNamespace(data=[SimpleNamespace(url=image_url)])
-
-    async def embed_create(**_kw):
-        return SimpleNamespace(data=[SimpleNamespace(embedding=[0.1, 0.2, 0.3])])
-
-    return SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=chat_create)),
-        images=SimpleNamespace(generate=image_generate),
-        embeddings=SimpleNamespace(create=embed_create),
-    )
+    llm._complete = _complete  # type: ignore[assignment]
+    return llm
 
 
-class FakeEmbedder(BaseEmbedder):
-    """Deterministic stand-in embedder (no network)."""
+def postgres_store() -> postgres.PostgresStore:
+    """A PostgresStore whose row read/write seams are backed by an in-memory
+    {table: {id: doc}} map, so the shaping logic runs without a database."""
+    store = postgres.PostgresStore(get_settings())
+    tables: dict = {}
 
-    async def embed(self, text: str):
-        return [0.0] * EMBED_DIM
+    async def _read(table, key):
+        doc = tables.get(table, {}).get(key)
+        return dict(doc) if doc is not None else None
 
+    async def _write(table, key, doc):
+        tables.setdefault(table, {})[key] = dict(doc)
 
-class FakeSearchIndex:
-    """Stand-in for AzureSearchIndex: returns canned docs and records uploads,
-    so the Azure RAG services run end-to-end without azure-search-documents."""
-
-    def __init__(self, results=None):
-        self._results = results or []
-        self.uploaded: list = []
-
-    async def vector_search(self, *, vector, field, k, filter):
-        return list(self._results)[:k]
-
-    async def upload(self, docs):
-        self.uploaded.extend(docs)
+    store._read = _read    # type: ignore[assignment]
+    store._write = _write  # type: ignore[assignment]
+    return store
 
 
-PLAN_KW = dict(
-    business_description="Artisan coffee roastery",
-    brand_tone="warm, authentic",
-    target_platforms=["X", "Instagram"],
-    content_topics="Ethiopia harvest",
-    user_preferences=None,
-)
-OUTLINE_KW = dict(
-    business_description="Artisan coffee roastery",
-    brand_tone="warm, authentic",
-    target_platforms=["X", "Instagram"],
-    content_topics="Ethiopia harvest",
-    rag_structure_context="hook → body → CTA",
-    notes=None,
-)
+# ── LLM parity ────────────────────────────────────────────────────────────────
 
-
-# ── Implemented services: structural parity ───────────────────────────────────
-
-async def test_chat_client_parity():
+async def test_chat_parity():
     msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
-    m = await MockChatClient().chat(msgs)
-    a = await AzureChatClient(get_settings(), client=fake_openai(chat_content="reply")).chat(msgs)
+    m = await mock.MockLLM().chat(msgs)
+    a = await azure_llm("a reply").chat(msgs)
     assert isinstance(m, str) and isinstance(a, str)
     assert m and a
 
 
-async def test_image_generator_parity():
-    m = await MockImageGenerator().generate("a prompt", "X")
-    a = await AzureImageGenerator(get_settings(), client=fake_openai()).generate("a prompt", "X")
-    assert isinstance(m, str) and isinstance(a, str)
-    assert m.startswith("http") and a.startswith("http")
+async def test_dispatch_parity():
+    kw = dict(topic="coffee launch", target_platforms=["linkedin", "x"],
+              user_intent="signups", route=None)
+    m = await mock.MockLLM().dispatch(**kw)
+    a = await azure_llm(json.dumps({
+        "route": "direct_generation", "topic": "coffee launch",
+        "target_platforms": ["linkedin", "x"], "user_intent": "signups",
+    })).dispatch(**kw)
+    for out in (m, a):
+        assert set(out.keys()) == {"route", "topic", "target_platforms", "user_intent"}
+        assert isinstance(out["target_platforms"], list)
+        assert out["route"] in {"copilot_mode", "direct_generation", "brand_training"}
 
 
-async def test_planner_parity():
-    m = await MockPlanner().plan(**PLAN_KW)
-    a = await AzurePlanner(FakeChatClient("A concise campaign strategy.")).plan(**PLAN_KW)
+async def test_plan_strategy_parity():
+    kw = dict(topic="coffee launch", platform="linkedin", user_intent="signups")
+    m = await mock.MockLLM().plan_strategy(**kw)
+    a = await azure_llm("Lead with business credibility.").plan_strategy(**kw)
     assert isinstance(m, str) and isinstance(a, str)
     assert m and a
 
 
-async def test_outliner_key_parity():
-    m = await MockOutliner().generate(**OUTLINE_KW)
-    a = await AzureOutliner(FakeChatClient('{"title":"T","key_messages":["a","b"]}')).generate(**OUTLINE_KW)
-    assert set(m.keys()) == set(a.keys())
-    for outline in (m, a):
-        assert isinstance(outline["key_messages"], list)
-        assert isinstance(outline["platforms"], list)
-        assert isinstance(outline["title"], str)
-
-
-async def test_outliner_additional_notes_parity():
-    kw = {**OUTLINE_KW, "notes": "Emphasize farmers"}
-    m = await MockOutliner().generate(**kw)
-    a = await AzureOutliner(FakeChatClient("{}")).generate(**kw)
-    assert "additional_notes" in m and "additional_notes" in a
-    assert set(m.keys()) == set(a.keys())
-
-
-@pytest.mark.parametrize("platform", ["X", "Instagram", "TikTok", "LinkedIn", "Reddit"])
-async def test_copywriter_parity(platform):
-    outline = {"title": "Campaign: Coffee", "visual_concept": "warm earthy scene"}
+@pytest.mark.parametrize("platform", ["linkedin", "instagram", "x", "tiktok"])
+async def test_write_copy_parity(platform):
     kw = dict(
-        platform=platform, outline=outline, tone_guide="t", key_messages=["msg"],
-        examples=["a prior approved post"], user_requirement="emphasize the launch",
+        topic="coffee launch", platform=platform, strategy="emotional hook",
+        user_intent="signups", must_do=["open with a stat"], must_avoid=["hype"],
+        examples=["a prior approved post"], tone_hint="warm",
     )
-    m = await MockCopywriter().draft(**kw)
-    a = await AzureCopywriter(FakeChatClient("Platform-native copy, sufficiently long.")).draft(**kw)
+    m = await mock.MockLLM().write_copy(**kw)
+    a = await azure_llm("Platform-native copy, sufficiently long.").write_copy(**kw)
     assert isinstance(m, str) and isinstance(a, str)
     assert m and a
-    if platform == "X":
-        assert len(m) <= 280 and len(a) <= 280
 
 
-async def test_tone_critic_parity():
-    m = await MockToneCritic().review(platform="X", draft="x" * 40, rejections=["a bad past draft"])
-    a = await AzureToneCritic(FakeChatClient('{"aligned": true, "comment": "looks good"}')).review(
-        platform="X", draft="x" * 40, rejections=["a bad past draft"]
+async def test_distill_rules_parity():
+    kw = dict(
+        platform="linkedin", original_draft="keep this boring jargon now",
+        final_draft="keep this crisp punchy now", existing_must_do=[], existing_must_avoid=[],
     )
-    for result in (m, a):
-        assert isinstance(result, tuple) and len(result) == 2
-        assert isinstance(result[0], bool)
-        assert isinstance(result[1], str) and result[1]
-
-
-# ── Content Safety: still a production skeleton (out of RAG scope) ────────────
-
-async def test_content_safety_contract_and_skeleton():
-    res = await MockContentSafety().check(text="a perfectly fine sentence")
-    assert isinstance(res, SafetyResult)
-    assert isinstance(res.blocked, bool) and isinstance(res.reason, str)
-
-    assert isinstance(AzureContentSafety(), BaseContentSafety)
-    with pytest.raises(NotImplementedError):
-        await AzureContentSafety().check(text="hi")
-
-
-# ── RAG services: Mock ↔ Azure structural parity (Azure SDK faked) ────────────
-
-async def test_embedder_parity():
-    m = await MockEmbedder().embed("hello world")
-    a = await AzureEmbedder(get_settings(), client=fake_openai()).embed("hello world")
-    for vec in (m, a):
-        assert isinstance(vec, list) and vec and all(isinstance(x, float) for x in vec)
-    assert len(m) == EMBED_DIM
-
-
-_STRUCT_KW = dict(
-    business_description="Artisan coffee roastery",
-    business_type="coffee_shop",
-    campaign_goal="product_launch",
-    target_platforms=["X", "Instagram"],
-    content_topics="Ethiopia harvest",
-    user_requirement=None,
-    examples=None,
-    business_id="biz_1",
-)
-
-
-async def test_structure_retriever_parity():
-    m = await MockStructureRetriever().retrieve(**_STRUCT_KW)
-    a = await AzureStructureRetriever(
-        FakeEmbedder(),
-        FakeSearchIndex(results=[
-            {"id": "o1", "doc_type": OutlineDocType.APPROVED, "title": "T", "outline_json": "{}"},
-        ]),
-    ).retrieve(**_STRUCT_KW)
+    m = await mock.MockLLM().distill_rules(**kw)
+    a = await azure_llm(json.dumps([
+        {"kind": "must_do", "rule": "Be crisp and punchy", "rationale": "added by the human"},
+        {"kind": "must_avoid", "rule": "Avoid jargon", "rationale": "removed by the human"},
+    ])).distill_rules(**kw)
     for out in (m, a):
-        assert set(out.keys()) == {"guidance", "matches"}
-        assert isinstance(out["guidance"], str) and out["guidance"]
-        assert isinstance(out["matches"], list)
+        assert isinstance(out, list) and 1 <= len(out) <= 3
+        for rule in out:
+            assert set(rule.keys()) == {"kind", "rule", "rationale"}
+            assert rule["kind"] in ("must_do", "must_avoid")
+            assert isinstance(rule["rule"], str) and rule["rule"]
 
 
-_TONE_KW = dict(
-    platform="X", business_id="biz_1", outline={"title": "T"},
-    brand_voice="warm", user_requirement="make it punchy",
-)
+async def test_fill_brief_parity():
+    kw = dict(
+        system_prompt="gather a brief", tools=[], history=[],
+        user_text="Post about cold brew on LinkedIn", brief_partial={}, pending_field="topic",
+    )
+    m = await mock.MockLLM().fill_brief(**kw)
 
+    az = azure_llm("")
 
-async def test_tone_retriever_parity():
-    m = await MockToneRetriever().retrieve(**_TONE_KW)
-    a = await AzureToneRetriever(
-        FakeEmbedder(),
-        FakeSearchIndex(results=[
-            {"id": "c1", "doc_type": ContentDocType.APPROVED_EXAMPLE, "platform": "X", "draft": "hi"},
-        ]),
-    ).retrieve(**_TONE_KW)
+    async def _tools(messages, tools):
+        return {"content": "", "tool_calls": [
+            {"name": "update_brief", "arguments": {"topic": "cold brew", "target_platforms": ["linkedin"]}},
+        ]}
+
+    az._complete_with_tools = _tools  # type: ignore[assignment]
+    a = await az.fill_brief(**kw)
+
     for out in (m, a):
-        assert set(out.keys()) == {"tone_guide", "examples", "rejections"}
-        assert isinstance(out["tone_guide"], str) and out["tone_guide"]
-        assert isinstance(out["examples"], list) and isinstance(out["rejections"], list)
+        assert set(out.keys()) == {"brief_updates", "wants_scout"}
+        assert isinstance(out["brief_updates"], dict)
+        assert isinstance(out["wants_scout"], bool)
 
 
-_OUTLINE_STORE_KW = dict(
-    decision="approved", session_id="s1", business_id="biz_1", business_type="coffee_shop",
-    campaign_goal="product_launch", target_platforms=["X"],
-    outline={"title": "T", "key_messages": ["m"]}, prev_outline=None, user_requirement=None,
-)
+# ── Safety parity ─────────────────────────────────────────────────────────────
+
+async def test_safety_parity():
+    m = await mock.MockSafety().check(text="a perfectly fine sentence")
+    assert isinstance(m, SafetyResult)
+    assert isinstance(m.blocked, bool) and isinstance(m.reason, str)
+
+    # Azure shapes a faked Content Safety analysis into the same SafetyResult contract.
+    az = azure.AzureSafety(get_settings())
+
+    async def _analyze(text):
+        return {"flagged": True, "categories": ["Hate"]}
+
+    az._analyze = _analyze  # type: ignore[assignment]
+    a = await az.check(text="bad text")
+    assert isinstance(a, SafetyResult) and a.blocked is True and "Hate" in a.reason
+
+    # A safe analysis maps to not-blocked, same as the mock's happy path.
+    az_ok = azure.AzureSafety(get_settings())
+
+    async def _analyze_ok(text):
+        return {"flagged": False, "categories": []}
+
+    az_ok._analyze = _analyze_ok  # type: ignore[assignment]
+    a_ok = await az_ok.check(text="fine")
+    assert a_ok.blocked is False
+    assert isinstance(azure.AzureSafety(get_settings()), SafetyService)
 
 
-async def test_outline_store_parity():
-    assert await MockOutlineStore().store(**_OUTLINE_STORE_KW) is None
-    idx = FakeSearchIndex()
-    assert await AzureOutlineStore(FakeEmbedder(), idx).store(**_OUTLINE_STORE_KW) is None
-    assert idx.uploaded and idx.uploaded[0]["doc_type"] == OutlineDocType.APPROVED
+# ── Store parity ──────────────────────────────────────────────────────────────
+
+_PROFILE_KEYS = {"id", "must_do", "must_avoid", "examples", "updated_at"}
 
 
-_FEEDBACK_KW = dict(
-    decision="approved", session_id="s1", platform="X", business_id="biz_1",
-    outline={"title": "T"}, brand_voice="warm", draft="a sufficiently long draft",
-    original_draft=None, reason=None, user_requirement=None, media_asset=None,
-)
+async def test_get_profile_parity_unknown_business():
+    m = await mock.MockStore().get_profile(business_id="nope")
+    a = await postgres_store().get_profile(business_id="nope")
+    for out in (m, a):
+        assert set(out.keys()) == _PROFILE_KEYS
+        assert out["must_do"] == [] and out["must_avoid"] == [] and out["examples"] == []
 
 
-async def test_feedback_store_parity():
-    assert await MockFeedbackStore().store(**_FEEDBACK_KW) is None
-    idx = FakeSearchIndex()
-    assert await AzureFeedbackStore(FakeEmbedder(), idx).store(**_FEEDBACK_KW) is None
-    assert idx.uploaded and idx.uploaded[0]["doc_type"] == ContentDocType.APPROVED_EXAMPLE
+async def test_upsert_then_get_profile_parity():
+    profile = {"must_do": ["data hook"], "must_avoid": ["jargon"], "examples": []}
+    for store in (mock.MockStore(), postgres_store()):
+        await store.upsert_profile(business_id="biz_1", profile=profile)
+        got = await store.get_profile(business_id="biz_1")
+        assert set(got.keys()) == _PROFILE_KEYS
+        assert got["id"] == "biz_1"
+        assert got["must_do"] == ["data hook"]
+        assert got["must_avoid"] == ["jargon"]
+
+
+async def test_checkpoint_roundtrip_parity():
+    for store in (mock.MockStore(), postgres_store()):
+        assert await store.load_checkpoint(task_id="t1") is None
+        await store.save_checkpoint(task_id="t1", data={"state": "paused"})
+        loaded = await store.load_checkpoint(task_id="t1")
+        assert loaded is not None and loaded.get("state") == "paused"
+
+
+# ── Voice parity ──────────────────────────────────────────────────────────────
+
+async def test_voice_parity():
+    m = await mock.MockVoice().transcribe_turn(session_id="s1", user_audio="hello there")
+    assert set(m.keys()) == {"session_id", "transcript"}
+    assert m["session_id"] == "s1" and isinstance(m["transcript"], str)
+
+    # Azure shapes a faked Voice Live transcription into the same contract.
+    az = azure.AzureVoice(get_settings())
+
+    async def _transcribe(user_audio):
+        return "hello there"
+
+    az._transcribe = _transcribe  # type: ignore[assignment]
+    a = await az.transcribe_turn(session_id="s1", user_audio="<base64-audio>")
+    assert set(a.keys()) == {"session_id", "transcript"}
+    assert a["session_id"] == "s1" and a["transcript"] == "hello there"
+    assert isinstance(azure.AzureVoice(get_settings()), VoiceService)
