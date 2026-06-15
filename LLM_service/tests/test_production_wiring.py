@@ -55,6 +55,36 @@ async def test_live_llm_write_copy(monkeypatch):
     assert isinstance(text, str) and text.strip()
 
 
+async def test_live_llm_render_html_card(monkeypatch):
+    _use(monkeypatch,
+         USE_MOCK_LLM="false",
+         AZURE_OPENAI_ENDPOINT=os.getenv("LIVE_AZURE_OPENAI_ENDPOINT"),
+         AZURE_OPENAI_API_KEY=os.getenv("LIVE_AZURE_OPENAI_API_KEY"),
+         AZURE_OPENAI_CHAT_DEPLOYMENT=os.getenv("LIVE_AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4o"))
+    llm = get_llm()
+    assert isinstance(llm, azure.AzureLLM)
+    html = await llm.render_html_card(
+        topic="cold brew launch", draft="Our new cold brew is here — smooth and bold.",
+        tone_hint="warm",
+    )
+    assert isinstance(html, str) and html.lstrip().startswith("<!DOCTYPE html>")
+
+
+async def test_live_llm_generate_video_props(monkeypatch):
+    _use(monkeypatch,
+         USE_MOCK_LLM="false",
+         AZURE_OPENAI_ENDPOINT=os.getenv("LIVE_AZURE_OPENAI_ENDPOINT"),
+         AZURE_OPENAI_API_KEY=os.getenv("LIVE_AZURE_OPENAI_API_KEY"),
+         AZURE_OPENAI_CHAT_DEPLOYMENT=os.getenv("LIVE_AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4o"))
+    llm = get_llm()
+    assert isinstance(llm, azure.AzureLLM)
+    props = await llm.generate_video_props(
+        topic="cold brew launch", draft="Our new cold brew is here — smooth and bold.",
+        tone_hint="warm",
+    )
+    assert isinstance(props, dict) and len(props["stats"]) == 3  # schema-validated
+
+
 async def test_live_safety_check(monkeypatch):
     _use(monkeypatch,
          USE_MOCK_SAFETY="false",

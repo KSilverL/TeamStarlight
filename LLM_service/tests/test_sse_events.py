@@ -14,13 +14,13 @@ in-process test HTTP server on localhost.
 from __future__ import annotations
 
 import json
-import threading
 
 import httpx
 import pytest
 
-from LLM_service.api import WorkflowService, make_server
+from LLM_service.api import WorkflowService, create_app
 from LLM_service.core.services import factory, mock, postgres
+from LLM_service.tests.conftest import run_app
 from LLM_service.workflow import HumanVerdict, build_workflow
 from LLM_service.workflow.builder import WORKFLOW_NAME
 
@@ -79,6 +79,10 @@ async def test_review_approves_all_and_completes():
 
     finals = [e for e in svc.buffered_events("t1") if e["type"] == "result" and e["status"] == "final"]
     assert {e["platform"] for e in finals} == {"linkedin", "instagram"}
+    # the media_producer enriched each final with the animated card + video spec
+    for e in finals:
+        assert e["html_preview"].startswith("<!DOCTYPE html>")
+        assert e["video_props"] and len(e["video_props"]["stats"]) == 3
 
 
 async def test_partial_review_keeps_other_platform_pending():
@@ -167,15 +171,8 @@ def test_no_real_backends_selected_in_mock_mode():
 
 @pytest.fixture
 def http_server():
-    httpd, loop = make_server("127.0.0.1", 0, service=WorkflowService())
-    port = httpd.server_address[1]
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{port}"
-    finally:
-        httpd.shutdown()
-        loop.call_soon_threadsafe(loop.stop)
+    with run_app(create_app(service=WorkflowService())) as base_url:
+        yield base_url
 
 
 def test_http_sse_round_trip(http_server):
@@ -198,7 +195,7 @@ def test_http_sse_round_trip(http_server):
         # SSE: task is done, so the stream replays the buffer and closes.
         events = []
         with client.stream("GET", f"{http_server}/tasks/{task_id}/events") as stream:
-            assert stream.headers["content-type"] == "text/event-stream"
+            assert stream.headers["content-type"].startswith("text/event-stream")
             for line in stream.iter_lines():
                 if line.startswith("data: "):
                     events.append(json.loads(line[6:]))
@@ -217,3 +214,25 @@ def test_http_validation_and_not_found(http_server):
         assert client.post(f"{http_server}/tasks", json={"target_platforms": ["x"]}).status_code == 400
         assert client.get(f"{http_server}/tasks/nope").status_code == 404
         assert client.post(f"{http_server}/tasks/nope/review", json={"verdicts": {}}).status_code == 404
+
+
+# ── G. Standalone media endpoints (frontend Brand Animation + Brand Video) ────
+
+def test_http_media_endpoints(http_server):
+    with httpx.Client(timeout=10) as client:
+        # Brand animation → a self-contained animated HTML document.
+        html_res = client.post(f"{http_server}/generate", json={"prompt": "Luna Skincare — minimalist"})
+        assert html_res.status_code == 200
+        assert html_res.json()["html"].startswith("<!DOCTYPE html>")
+
+        # Brand video → a job that resolves to a structured spec (no MP4).
+        started = client.post(f"{http_server}/generate-video", json={"brief": "Luna Skincare — minimalist"})
+        assert started.status_code == 200
+        job_id = started.json()["job_id"]
+        job = client.get(f"{http_server}/jobs/{job_id}").json()
+        assert job["status"] == "done"
+        assert len(job["props"]["stats"]) == 3
+
+        # Validation + unknown job.
+        assert client.post(f"{http_server}/generate", json={"prompt": ""}).status_code == 400
+        assert client.get(f"{http_server}/jobs/nope").status_code == 404

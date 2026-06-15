@@ -1,0 +1,14 @@
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"
+    volumes:
+      # Mount the project root so host file changes trigger hot reload.
+      - .:/app
+      # Anonymous volume keeps the container's node_modules intact,
+      # preventing the bind mount above from overwriting them with the
+      # (potentially absent or mismatched) host copy.
+      - /app/node_modules

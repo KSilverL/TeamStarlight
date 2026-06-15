@@ -116,6 +116,42 @@ class LLMService(ABC):
         ...
 
     @abstractmethod
+    async def render_html_card(
+        self,
+        *,
+        topic: str,
+        draft: str,
+        tone_hint: Optional[str],
+        skill: str = "",
+    ) -> str:
+        """Generate a SINGLE, self-contained animated HTML document from an approved
+        post (the "生成 HTML" idea, ported from demos/brand_agent). Returns a complete
+        9:16 brand "video card" — inline CSS keyframes + SVG, auto-advancing scenes, no
+        external assets — ready to drop straight into the frontend. `skill` is the
+        static brand-animation style guide (skills/brand_animation.md): production folds
+        it into the prompt, the mock renders a deterministic offline card. The output
+        starts with `<!DOCTYPE html>` and embeds no raw user copy (the draft is escaped),
+        replacing the old template preview card."""
+        ...
+
+    @abstractmethod
+    async def generate_video_props(
+        self,
+        *,
+        topic: str,
+        draft: str,
+        tone_hint: Optional[str],
+        skill: str = "",
+    ) -> dict:
+        """Generate the structured spec for a 3-scene brand video (the "生成视频" idea,
+        ported from demos/brand_video_agent) as a JSON-friendly dict matching
+        core.media_schema.BrandVideoProps (brand identity / three stats / CTA + a 3-colour
+        palette). The LLM produces DATA only — no visual code; the actual Remotion render
+        is external to this service. `skill` is the static spec (skills/brand_video.md).
+        Every impl MUST return exactly 3 `stats`."""
+        ...
+
+    @abstractmethod
     async def distill_rules(
         self,
         *,

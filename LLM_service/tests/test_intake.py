@@ -11,13 +11,13 @@ and that the brief feeds the M1/M2 workflow with zero changes. Fully mocked/offl
 from __future__ import annotations
 
 import json
-import threading
 
 import httpx
 import pytest
 
-from LLM_service.api import IntakeService, WorkflowService, make_server
+from LLM_service.api import IntakeService, WorkflowService, create_app
 from LLM_service.core.services import factory
+from LLM_service.tests.conftest import run_app
 from LLM_service.intake import CreativeBrief, build_intake
 from LLM_service.intake.base import BriefConversation, ConversationalIntake
 from LLM_service.intake.text_intake import TextIntake
@@ -168,14 +168,8 @@ async def test_intake_service_unknown_session_and_bad_mode():
 
 @pytest.fixture
 def http_server():
-    httpd, loop = make_server("127.0.0.1", 0)
-    port = httpd.server_address[1]
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    try:
-        yield f"http://127.0.0.1:{port}"
-    finally:
-        httpd.shutdown()
-        loop.call_soon_threadsafe(loop.stop)
+    with run_app(create_app()) as base_url:
+        yield base_url
 
 
 def test_http_intake_then_start_workflow(http_server):
@@ -197,10 +191,27 @@ def test_http_intake_then_start_workflow(http_server):
         task = client.post(f"{http_server}/tasks", json=brief)
         assert task.status_code == 200 and task.json()["status"] == "awaiting_review"
 
-        # the voice WS bridge is a documented skeleton on this stdlib server
-        ws = client.get(f"{http_server}/intake/{sid}/voice")
-        assert ws.status_code == 501
-
         # validation
         assert client.post(f"{http_server}/intake", json={"mode": "smoke-signals"}).status_code == 400
         assert client.get(f"{http_server}/intake/nope/brief").status_code == 404
+
+
+def test_voice_websocket_bridges_a_turn():
+    """FastAPI gives us a real WebSocket voice endpoint (the stdlib server could only
+    501): a turn frame runs on the shared intake engine and the reply comes back."""
+    from fastapi.testclient import TestClient
+
+    app = create_app()
+    client = TestClient(app)
+    started = client.post("/intake", json={"mode": "voice", "opening_input": _MULTI_OPEN})
+    sid = started.json()["session_id"]
+
+    with client.websocket_connect(f"/intake/{sid}/voice") as ws:
+        ws.send_json({"user_input": _MULTI_TURNS[0]})
+        reply = ws.receive_json()
+        assert "assistant_message" in reply and "complete" in reply
+
+    # an unknown session is reported then the socket closes
+    with client.websocket_connect("/intake/nope/voice") as ws:
+        ws.send_json({"user_input": "hi"})
+        assert ws.receive_json()["status"] == 404

@@ -35,6 +35,7 @@ NODE_PHASE: dict[str, str] = {
     "reviewer": "review",       # 红队审核员
     "human_gate": "review",     # RequestPort 人工审批
     "archivist": "archive",     # 品牌档案馆长
+    "media_producer": "produce",  # 媒体制作人 (animated card + video spec)
 }
 
 

@@ -23,12 +23,25 @@ import json
 from typing import List, Optional
 
 from ..config import Settings
+from ..media_schema import BrandVideoProps
 from .base import (
     LLMService,
     SafetyResult,
     SafetyService,
     VoiceService,
 )
+
+
+def _strip_fences(text: str) -> str:
+    """Drop an accidental ```html / ```json … ``` wrapper the model may add around a
+    raw HTML document or JSON object (ported from demos/brand_agent's post-processing)."""
+    s = text.strip()
+    if s.startswith("```"):
+        newline = s.find("\n")
+        s = s[newline + 1:] if newline != -1 else s[3:]
+    if s.endswith("```"):
+        s = s[:-3]
+    return s.strip()
 
 
 # ── LLM (Azure OpenAI / Foundry chat) ─────────────────────────────────────────
@@ -142,6 +155,59 @@ class AzureLLM(LLMService):
         return await self._complete(
             [{"role": "system", "content": system}, {"role": "user", "content": user}]
         )
+
+    async def render_html_card(
+        self,
+        *,
+        topic: str,
+        draft: str,
+        tone_hint: Optional[str],
+        skill: str = "",
+    ) -> str:
+        style_guide = f"\n\n{skill}" if skill else ""
+        system = (
+            "You are a specialist in brand-specific animated HTML social-media content. "
+            "Given a brand topic and the approved post copy, output a SINGLE, COMPLETE, "
+            "SELF-CONTAINED HTML document and nothing else — no markdown fences, no "
+            "preamble. Start with <!DOCTYPE html> and end with </html>. All CSS, JS and "
+            "SVG must be inline (no external assets)." + style_guide
+        )
+        user = (
+            f"Brand topic: {topic}\n"
+            f"Approved post copy:\n{draft}\n"
+            f"Tone: {tone_hint or 'brand voice'}"
+        )
+        raw = await self._complete(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        )
+        return _strip_fences(raw)
+
+    async def generate_video_props(
+        self,
+        *,
+        topic: str,
+        draft: str,
+        tone_hint: Optional[str],
+        skill: str = "",
+    ) -> dict:
+        schema = json.dumps(BrandVideoProps.model_json_schema())
+        style_guide = f"\n\n{skill}" if skill else ""
+        system = (
+            "You are a brand strategist and creative director for short-form social "
+            "video. Given a brand topic and the approved post copy, return ONLY valid "
+            "JSON (no markdown fences, no prose) matching this JSON Schema — exactly 3 "
+            f"stats:\n{schema}" + style_guide
+        )
+        user = (
+            f"Brand topic: {topic}\n"
+            f"Approved post copy:\n{draft}\n"
+            f"Tone: {tone_hint or 'brand voice'}"
+        )
+        raw = await self._complete(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        )
+        data = json.loads(_strip_fences(raw))
+        return BrandVideoProps(**data).model_dump()
 
     async def distill_rules(
         self,

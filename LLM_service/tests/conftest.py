@@ -12,6 +12,10 @@ substring), so — unlike the old random critic — there is nothing to pin.
 
 from __future__ import annotations
 
+import contextlib
+import threading
+import time
+
 import pytest
 from agent_framework import InMemoryCheckpointStorage
 
@@ -86,3 +90,28 @@ def checkpoint_storage() -> InMemoryCheckpointStorage:
 def workflow(checkpoint_storage):
     """A freshly built workflow wired to this test's checkpoint store."""
     return build_workflow(checkpoint_storage=checkpoint_storage)
+
+
+# ── FastAPI HTTP round-trip helper ─────────────────────────────────────────────
+
+@contextlib.contextmanager
+def run_app(app):
+    """Run a FastAPI app on an ephemeral port in a daemon thread; yield its base URL.
+
+    Used by the HTTP/SSE round-trip tests so they exercise the real ASGI server
+    (uvicorn) over a socket — the faithful path for SSE streaming and WebSockets."""
+    import uvicorn
+
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
+    server = uvicorn.Server(config)
+    server.install_signal_handlers = lambda: None  # we're off the main thread
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        while not server.started:
+            time.sleep(0.01)
+        port = server.servers[0].sockets[0].getsockname()[1]
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
