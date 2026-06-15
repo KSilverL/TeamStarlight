@@ -10,4 +10,8 @@ Run the application using the following command from the home directory:
 docker compose up --build
 ```
 
+Run the application using the following command from the home directory:
+```
+docker compose up
+```
 Make sure you have docker and docker compose installed on your machine and make sure the docker engine is running on your machine.

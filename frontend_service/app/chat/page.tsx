@@ -99,7 +99,58 @@ const INITIAL_MESSAGES: Message[] = [
     role: "assistant",
     content:
       "Welcome to Starlight! I'm your AI social media content assistant. Tell me about your business, brand tone, target audience, and what you'd like to promote — I'll generate platform-specific content and walk you through the approval process.",
-    timestamp: new Date(),
+    timestamp: new Date(Date.now() - 6 * 60 * 1000),
+  },
+  {
+    id: "2",
+    role: "user",
+    content:
+      "We're EcoHome Solutions — we sell sustainable bamboo home products targeting eco-conscious millennials aged 25–40. Our brand tone is warm, aspirational, and educational. We want to promote our new Bamboo Kitchen Collection across Instagram and LinkedIn.",
+    timestamp: new Date(Date.now() - 5 * 60 * 1000),
+  },
+  {
+    id: "3",
+    role: "assistant",
+    content:
+      "Brand profile captured. Generating a multi-platform content strategy for EcoHome Solutions — Bamboo Kitchen Collection...",
+    variant: "status",
+    timestamp: new Date(Date.now() - 4 * 60 * 1000),
+  },
+  {
+    id: "4",
+    role: "assistant",
+    content: "Here's your Instagram draft. Review and approve or reject:",
+    variant: "draft",
+    platform: "instagram",
+    draft: {
+      text: "🌿 Meet your kitchen's new best friend — the Bamboo Kitchen Collection.\n\nCrafted from 100% organic bamboo, each piece is naturally antimicrobial, carbon-negative in production, and built to last a decade. Because sustainable living shouldn't mean settling for less. 🏡",
+      hashtags: [
+        "#EcoHome",
+        "#BambooKitchen",
+        "#SustainableLiving",
+        "#ZeroWaste",
+        "#GreenHome",
+        "#BambooDesign",
+        "#ConsciousLiving",
+        "#EcoConscious",
+      ],
+      imageDesc:
+        "Flat lay of bamboo cutting boards, utensils, and storage containers on white marble with fresh green herbs",
+    },
+    approval: "pending",
+    timestamp: new Date(Date.now() - 3 * 60 * 1000),
+  },
+  {
+    id: "5",
+    role: "assistant",
+    content: "And here's your LinkedIn draft:",
+    variant: "draft",
+    platform: "linkedin",
+    draft: {
+      text: "The sustainable homewares market is projected to reach $150B by 2030 — and EcoHome Solutions is proud to be part of that shift.\n\nToday we're launching the Bamboo Kitchen Collection: premium products that prove sustainable materials can exceed conventional standards.\n\nBamboo grows 3× faster than hardwood, sequesters carbon during growth, and outlasts plastic by decades. We invite designers, buyers, and conscious consumers to explore what responsible innovation looks like.\n\nThe kitchens we design today reflect the values we leave for tomorrow.",
+    },
+    approval: "pending",
+    timestamp: new Date(Date.now() - 2 * 60 * 1000),
   },
 ];
 
@@ -108,10 +159,12 @@ const platformMap = Object.fromEntries(PLATFORMS.map((p) => [p.id, p]));
 export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>(INITIAL_MESSAGES);
   const [input, setInput] = useState("");
-  const [selectedPlatforms, setSelectedPlatforms] = useState<Platform[]>([]);
+  const [selectedPlatforms, setSelectedPlatforms] = useState<Platform[]>([
+    "instagram",
+    "linkedin",
+  ]);
   const [contentType, setContentType] = useState<ContentType>("mix");
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -397,6 +450,26 @@ export default function ChatPage() {
             </div>
           </div>
 
+          {/* Brand Profile */}
+          <div>
+            <h3 className="text-xs font-semibold text-[#9E9893] uppercase tracking-wider mb-3">
+              Brand Profile
+            </h3>
+            <div className="bg-[#F8F5EE] border border-[#E8E3DA] rounded-xl p-3.5 space-y-2.5 text-sm">
+              {[
+                { label: "Business", value: "EcoHome Solutions" },
+                { label: "Tone", value: "Warm, aspirational, educational" },
+                { label: "Topic", value: "Bamboo Kitchen Collection" },
+                { label: "Audience", value: "Eco-conscious millennials, 25–40" },
+                { label: "Notes", value: "Emphasise sustainability & durability" },
+              ].map(({ label, value }) => (
+                <div key={label}>
+                  <span className="text-[#9E9893] text-xs">{label}</span>
+                  <p className="text-[#1B1A17] mt-0.5">{value}</p>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
       </aside>
 
@@ -418,7 +491,7 @@ export default function ChatPage() {
             </button>
             <div>
               <h1 className="font-semibold text-sm text-[#1B1A17]">
-                Starlight
+                EcoHome Solutions — Bamboo Kitchen Collection
               </h1>
               <p className="text-xs text-[#9E9893] mt-0.5">
                 {selectedPlatforms.length} platform

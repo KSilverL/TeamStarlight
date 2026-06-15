@@ -50,3 +50,7 @@ services:
   # backend:
   #   Containerised Backend Service Here
   # ---------------------------------------------------------------------------
+  # llm:
+    # Containerised LLM Service Here
+  # backend:
+    # Containerised Backend Service Here
