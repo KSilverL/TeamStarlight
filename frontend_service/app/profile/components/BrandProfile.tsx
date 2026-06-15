@@ -167,7 +167,7 @@ export default function BrandProfile() {
           value={brand.notes} onChange={(v) => handleChange("notes", v)} rows={3} span />
       </div>
 
-      {/* ── Knowledge Sources ─────────────────────────────────────────── */}
+      {/* Knowledge Sources */}
       <div className="border-t border-[#E8E3DA] pt-6 mb-6">
         <div className="flex items-center justify-between mb-1">
           <h2 className="text-sm font-semibold text-[#1B1A17]">Knowledge Sources</h2>
