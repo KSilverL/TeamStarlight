@@ -16,10 +16,12 @@ from __future__ import annotations
 import asyncio
 import html as _html
 import re
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from ...skills import parse_char_limit
 from ..media_schema import BrandVideoProps, StatItem
+from ..skill_schema import SkillCandidate, SkillRule, UserSkillDoc
 from .base import (
     LLMService,
     SafetyResult,
@@ -381,6 +383,8 @@ class MockLLM(LLMService):
         tone_hint: Optional[str],
         skill: str = "",
         attempt: int = 1,
+        user_skills: str = "",
+        history: Optional[List[dict]] = None,
     ) -> str:
         await asyncio.sleep(_MOCK_LATENCY)
         tone = tone_hint or "on-brand"
@@ -388,8 +392,12 @@ class MockLLM(LLMService):
         hooks = _HOOKS.get(_alias(platform), _DEFAULT_HOOKS)
         ctas = _CTAS.get(_alias(platform), _DEFAULT_CTAS)
         # Rotate hook + CTA by revision so a rejected draft (higher `attempt`) comes
-        # back with a visibly different opening, not the same copy.
-        i = max(attempt - 1, 0)
+        # back with a visibly different opening, not the same copy. Each prior user turn
+        # in `history` advances the rotation too, so a continued conversation (e.g. a
+        # "make it punchier" follow-up the backend assembled) yields a different draft —
+        # the deterministic offline stand-in for production's history-aware re-grounding.
+        prior_turns = sum(1 for m in (history or []) if m.get("role") == "user")
+        i = max(attempt - 1, 0) + prior_turns
         hook = hooks[i % len(hooks)].format(topic=topic)  # topic echoed verbatim
         cta = ctas[i % len(ctas)]
         post = _compose_post(
@@ -405,6 +413,11 @@ class MockLLM(LLMService):
         # itself). Absent for cold-start / no-brand users — the post stays clean.
         if must_do:
             post += f"\n\nFollowing: {', '.join(must_do)}."
+        # Likewise echo the per-user learned-rule block so the user-skill injection is
+        # observable offline (production folds it into the prompt). Empty for users with
+        # no learned rules — the post stays clean.
+        if user_skills:
+            post += f"\n\n{user_skills}"
         return post
 
     async def render_html_card(
@@ -414,8 +427,11 @@ class MockLLM(LLMService):
         draft: str,
         tone_hint: Optional[str],
         skill: str = "",
+        history: Optional[List[dict]] = None,
     ) -> str:
         await asyncio.sleep(_MOCK_LATENCY)
+        # `history` is contextual only here; the offline card is deterministic from the
+        # topic/draft (production folds the prior turns into the prompt).
         return _mock_html_card(topic, draft, tone_hint)
 
     async def generate_video_props(
@@ -425,6 +441,7 @@ class MockLLM(LLMService):
         draft: str,
         tone_hint: Optional[str],
         skill: str = "",
+        history: Optional[List[dict]] = None,
     ) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
         return _mock_video_props(topic, draft, tone_hint)
@@ -464,6 +481,67 @@ class MockLLM(LLMService):
                     "rationale": "the human removed these in their edit",
                 })
         return rules[:3]
+
+    async def summarize_session(
+        self,
+        *,
+        brief: dict,
+        conversation: List[dict],
+        final_drafts: List[dict],
+    ) -> List[SkillCandidate]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        topic = (brief.get("topic") or "your topic").strip()
+        tone = (brief.get("tone_hint") or "clear, consistent").strip()
+        # Platforms of the adopted session: from the approved drafts, else the brief.
+        drafts_by_platform = [
+            (d.get("platform"), d.get("draft") or "")
+            for d in final_drafts if d.get("platform")
+        ]
+        if not drafts_by_platform:
+            drafts_by_platform = [(p, "") for p in (brief.get("target_platforms") or [])]
+
+        # (text, platform, suggested_kind, rationale)
+        proposals: List[tuple] = []
+        for platform, draft in drafts_by_platform:
+            opener = " ".join(_words(draft)[:6])
+            text = (
+                f"Open a {platform} post with phrasing like: {opener}"
+                if opener else f"Lead the {platform} post with a strong, on-topic hook"
+            )
+            proposals.append((text, platform, "positive",
+                              f"mirrors the approved {platform} opening"))
+        # One cross-platform positive + two negatives, so the set is always >= 3.
+        proposals.append((f"Keep a {tone} tone across platforms.", None, "positive",
+                          "the user adopted this voice"))
+        proposals.append((f"Avoid straying from the core topic: {topic}.", None, "negative",
+                          "keeps every post on-message"))
+        proposals.append(("Avoid generic filler that wasn't in the approved copy.", None,
+                          "negative", "the user trimmed filler in the final"))
+
+        return [
+            SkillCandidate(
+                id=f"cand-{i + 1}", text=text, platform=platform,
+                suggested_kind=kind, rationale=rationale,
+            )
+            for i, (text, platform, kind, rationale) in enumerate(proposals[:6])
+        ]
+
+    async def consolidate_skills(
+        self,
+        *,
+        kept: List[SkillCandidate],
+        prior_rules: List[SkillRule],
+    ) -> List[SkillRule]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        # Merge keyed by (normalised text, platform); the current round overrides a
+        # conflicting prior rule outright (new wins).
+        merged: Dict[tuple, SkillRule] = {}
+        for rule in prior_rules:
+            merged[(rule.text.strip().lower(), rule.platform)] = rule
+        for cand in kept:
+            rule = SkillRule(text=cand.text, platform=cand.platform, kind=cand.suggested_kind)
+            merged[(rule.text.strip().lower(), rule.platform)] = rule
+        return list(merged.values())
 
     async def fill_brief(
         self,
@@ -512,6 +590,7 @@ class MockStore(StoreService):
     def __init__(self) -> None:
         self._profiles: Dict[str, dict] = {}
         self._checkpoints: Dict[str, dict] = {}
+        self._user_skills: Dict[str, dict] = {}
 
     async def get_profile(self, *, business_id: Optional[str]) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
@@ -523,6 +602,26 @@ class MockStore(StoreService):
         await asyncio.sleep(_MOCK_LATENCY)
         stored = {**empty_profile(business_id), **profile, "id": business_id}
         self._profiles[business_id] = stored
+
+    async def get_user_skills(self, *, user_id: str) -> Optional[UserSkillDoc]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        stored = self._user_skills.get(user_id)
+        return UserSkillDoc(**stored) if stored is not None else None
+
+    async def upsert_user_skills(
+        self, *, user_id: str, rules: List[SkillRule]
+    ) -> UserSkillDoc:
+        await asyncio.sleep(_MOCK_LATENCY)
+        prior = self._user_skills.get(user_id)
+        doc = UserSkillDoc(
+            user_id=user_id,
+            rules=list(rules),
+            version=(prior["version"] + 1) if prior else 1,
+            updated_at=datetime.now(timezone.utc),
+        )
+        # Store JSON-shaped (datetime → ISO string) so it round-trips like the Postgres doc.
+        self._user_skills[user_id] = doc.model_dump(mode="json")
+        return doc
 
     async def save_checkpoint(self, *, task_id: str, data: dict) -> None:
         await asyncio.sleep(_MOCK_LATENCY)

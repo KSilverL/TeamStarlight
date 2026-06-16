@@ -18,6 +18,7 @@ import pytest
 from LLM_service.core.config import get_settings
 from LLM_service.core.services import azure, mock, postgres
 from LLM_service.core.services.base import SafetyResult, SafetyService, VoiceService
+from LLM_service.core.skill_schema import SkillCandidate, SkillRule, UserSkillDoc
 
 
 # ── Fakes / seam overrides (no network) ───────────────────────────────────────
@@ -177,6 +178,53 @@ async def test_fill_brief_parity():
         assert isinstance(out["wants_scout"], bool)
 
 
+_CANDIDATE_KEYS = {"id", "text", "platform", "suggested_kind", "rationale"}
+
+
+async def test_summarize_session_parity():
+    kw = dict(
+        brief={"topic": "coffee launch", "target_platforms": ["linkedin", "x"], "tone_hint": "warm"},
+        conversation=[{"role": "user", "content": "post about our coffee launch"}],
+        final_drafts=[{"platform": "linkedin", "draft": "Our single-origin is here."},
+                      {"platform": "x", "draft": "Coffee launch — today. 🧵"}],
+    )
+    m = await mock.MockLLM().summarize_session(**kw)
+    a = await azure_llm(json.dumps([
+        {"text": "Open with a data hook", "platform": "linkedin", "suggested_kind": "positive", "rationale": "added"},
+        {"text": "Keep it warm", "platform": None, "suggested_kind": "positive", "rationale": "tone"},
+        {"text": "Avoid hype words", "platform": None, "suggested_kind": "negative", "rationale": "trimmed"},
+    ])).summarize_session(**kw)
+    for out in (m, a):
+        assert isinstance(out, list) and 1 <= len(out) <= 6
+        for cand in out:
+            assert isinstance(cand, SkillCandidate)
+            assert set(cand.model_dump().keys()) == _CANDIDATE_KEYS
+            assert cand.suggested_kind in ("positive", "negative")
+            assert cand.id and cand.text
+
+
+_SKILL_RULE_KEYS = {"text", "platform", "kind"}
+
+
+async def test_consolidate_skills_parity():
+    kept = [SkillCandidate(id="cand-1", text="Open with a stat", platform="linkedin",
+                           suggested_kind="positive", rationale="kept")]
+    prior = [SkillRule(text="Avoid jargon", platform=None, kind="negative")]
+    kw = dict(kept=kept, prior_rules=prior)
+    m = await mock.MockLLM().consolidate_skills(**kw)
+    a = await azure_llm(json.dumps([
+        {"text": "Open with a stat", "platform": "linkedin", "kind": "positive"},
+        {"text": "Avoid jargon", "platform": None, "kind": "negative"},
+    ])).consolidate_skills(**kw)
+    for out in (m, a):
+        assert isinstance(out, list) and out
+        for rule in out:
+            assert isinstance(rule, SkillRule)
+            assert set(rule.model_dump().keys()) == _SKILL_RULE_KEYS
+            assert rule.kind in ("positive", "negative")
+            assert isinstance(rule.text, str) and rule.text
+
+
 # ── Safety parity ─────────────────────────────────────────────────────────────
 
 async def test_safety_parity():
@@ -228,6 +276,27 @@ async def test_upsert_then_get_profile_parity():
         assert got["id"] == "biz_1"
         assert got["must_do"] == ["data hook"]
         assert got["must_avoid"] == ["jargon"]
+
+
+async def test_user_skills_roundtrip_parity():
+    rules = [
+        SkillRule(text="Open with a stat", platform="linkedin", kind="positive"),
+        SkillRule(text="Avoid jargon", platform=None, kind="negative"),
+    ]
+    for store in (mock.MockStore(), postgres_store()):
+        assert await store.get_user_skills(user_id="u1") is None  # cold start
+
+        doc = await store.upsert_user_skills(user_id="u1", rules=rules)
+        assert isinstance(doc, UserSkillDoc) and doc.user_id == "u1" and doc.version == 1
+
+        got = await store.get_user_skills(user_id="u1")
+        assert isinstance(got, UserSkillDoc) and got.version == 1
+        assert [r.model_dump() for r in got.rules] == [r.model_dump() for r in rules]
+
+        # whole-set overwrite auto-increments the version
+        doc2 = await store.upsert_user_skills(user_id="u1", rules=rules[:1])
+        assert doc2.version == 2
+        assert len((await store.get_user_skills(user_id="u1")).rules) == 1
 
 
 async def test_checkpoint_roundtrip_parity():

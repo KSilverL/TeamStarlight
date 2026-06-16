@@ -20,5 +20,6 @@ class CreativeBrief(BaseModel):
     user_intent: str                            # free text: goal / audience / tone
     tone_hint: Optional[str] = None             # inferred voice (for no-brand users)
     business_id: Optional[str] = None           # set when the user has a brand
+    user_id: Optional[str] = None               # the end user; keys per-user learning
     route: Literal["copilot_mode", "direct_generation", "brand_training"]
     intake_mode: Literal["voice", "text"]       # provenance, for the frontend

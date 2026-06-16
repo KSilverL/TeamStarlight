@@ -22,6 +22,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional
 
+from ..skill_schema import SkillCandidate, SkillRule, UserSkillDoc
+
 __all__ = [
     "SafetyResult",
     "LLMService",
@@ -103,6 +105,8 @@ class LLMService(ABC):
         tone_hint: Optional[str],
         skill: str = "",
         attempt: int = 1,
+        user_skills: str = "",
+        history: Optional[List[dict]] = None,
     ) -> str:
         """Return ready-to-publish, platform-native post copy (a real post the user
         can copy-paste — hook, body, CTA, hashtags/emojis — not an outline),
@@ -112,7 +116,14 @@ class LLMService(ABC):
         the prompt, and every impl MUST respect any character limit it declares.
         `attempt` is the 1-based revision number: a rejected draft is re-written with
         a higher `attempt`, so each impl must return a *distinctly different*
-        angle/hook on attempt > 1 rather than repeating the rejected copy."""
+        angle/hook on attempt > 1 rather than repeating the rejected copy. `user_skills`
+        is a pre-rendered MUST DO / MUST AVOID block of the current user's learned rules
+        (the per-`user_id` channel), injected alongside the static `skill`; empty for
+        users with no learned rules. `history` is the prior conversation as a list of
+        {role, content} messages, supplied by the caller (the backend looks it up by
+        conversation id and assembles the payload — this service stays stateless): an
+        impl folds it in as prior turns so a follow-up like "make it punchier" continues
+        the thread. None/empty means a fresh, single-turn generation."""
         ...
 
     @abstractmethod
@@ -123,6 +134,7 @@ class LLMService(ABC):
         draft: str,
         tone_hint: Optional[str],
         skill: str = "",
+        history: Optional[List[dict]] = None,
     ) -> str:
         """Generate a SINGLE, self-contained animated HTML document from an approved
         post (the "生成 HTML" idea, ported from demos/brand_agent). Returns a complete
@@ -131,7 +143,9 @@ class LLMService(ABC):
         static brand-animation style guide (skills/brand_animation.md): production folds
         it into the prompt, the mock renders a deterministic offline card. The output
         starts with `<!DOCTYPE html>` and embeds no raw user copy (the draft is escaped),
-        replacing the old template preview card."""
+        replacing the old template preview card. `history` (optional) is the prior
+        {role, content} conversation the caller assembled, folded in as context so a
+        follow-up card request can build on the thread; None/empty = single-turn."""
         ...
 
     @abstractmethod
@@ -142,13 +156,16 @@ class LLMService(ABC):
         draft: str,
         tone_hint: Optional[str],
         skill: str = "",
+        history: Optional[List[dict]] = None,
     ) -> dict:
         """Generate the structured spec for a 3-scene brand video (the "生成视频" idea,
         ported from demos/brand_video_agent) as a JSON-friendly dict matching
         core.media_schema.BrandVideoProps (brand identity / three stats / CTA + a 3-colour
         palette). The LLM produces DATA only — no visual code; the actual Remotion render
         is external to this service. `skill` is the static spec (skills/brand_video.md).
-        Every impl MUST return exactly 3 `stats`."""
+        Every impl MUST return exactly 3 `stats`. `history` (optional) is the prior
+        {role, content} conversation the caller assembled, folded in as context for a
+        follow-up; None/empty = single-turn."""
         ...
 
     @abstractmethod
@@ -165,6 +182,37 @@ class LLMService(ABC):
         concrete brand-voice rules. Returns a JSON-friendly list of dicts, each
         {"kind": "must_do"|"must_avoid", "rule": str, "rationale": str}. The
         archivist reads the existing rules so it does not re-propose duplicates."""
+        ...
+
+    @abstractmethod
+    async def summarize_session(
+        self,
+        *,
+        brief: dict,
+        conversation: List[dict],
+        final_drafts: List[dict],
+    ) -> List[SkillCandidate]:
+        """Read a whole adopted session (the `brief`, the intake `conversation` as a
+        list of {role, content}, and the approved `final_drafts`) and distil 3-6
+        candidate writing rules for the per-`user_id` learning channel. Each candidate
+        infers a `platform` (None = cross-platform), a `suggested_kind`
+        ("positive"|"negative"), and a short `rationale`, so the user can three-way
+        classify them. This is the user-scoped analogue of `distill_rules` (which is
+        brand-scoped and edit-driven)."""
+        ...
+
+    @abstractmethod
+    async def consolidate_skills(
+        self,
+        *,
+        kept: List[SkillCandidate],
+        prior_rules: List[SkillRule],
+    ) -> List[SkillRule]:
+        """Merge the user's kept candidates (those they did NOT ignore) with their
+        existing `prior_rules` into one deduplicated, refined rule set. On a conflict
+        the current round wins — it overrides the prior rule outright (no conflict
+        report, no second confirmation). Returns the new complete `SkillRule` set the
+        store should persist as the user's whole document."""
         ...
 
     @abstractmethod
@@ -216,6 +264,20 @@ class StoreService(ABC):
     @abstractmethod
     async def upsert_profile(self, *, business_id: str, profile: dict) -> None:
         """Create or replace a Brand_Voice_Profile."""
+        ...
+
+    @abstractmethod
+    async def get_user_skills(self, *, user_id: str) -> Optional[UserSkillDoc]:
+        """Return the user's learned-rule document (the per-`user_id` channel), or
+        None when the user has none yet (cold start)."""
+        ...
+
+    @abstractmethod
+    async def upsert_user_skills(
+        self, *, user_id: str, rules: List[SkillRule]
+    ) -> UserSkillDoc:
+        """Overwrite the user's whole rule set with `rules`, bumping `version` and
+        refreshing `updated_at`, and return the stored document."""
         ...
 
     @abstractmethod

@@ -17,15 +17,26 @@ shaping logic without a database.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from agent_framework import CheckpointStorage, WorkflowCheckpoint
 
 from ..config import Settings
+from ..skill_schema import SkillRule, UserSkillDoc
 from .base import StoreService, empty_profile
 
 
 def _profiles_ddl(table: str) -> str:
+    return (
+        f"CREATE TABLE IF NOT EXISTS {table} ("
+        f"id TEXT PRIMARY KEY, doc JSONB NOT NULL, "
+        f"updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+    )
+
+
+def _user_skills_ddl(table: str) -> str:
+    # Same whole-document-in-JSONB shape as brand_profiles; the user_id is the primary key.
     return (
         f"CREATE TABLE IF NOT EXISTS {table} ("
         f"id TEXT PRIMARY KEY, doc JSONB NOT NULL, "
@@ -57,6 +68,7 @@ class PostgresStore(StoreService):
             self._pool_obj = await asyncpg.create_pool(dsn=s.postgres_dsn)
             async with self._pool_obj.acquire() as conn:
                 await conn.execute(_profiles_ddl(s.postgres_profiles_table))
+                await conn.execute(_user_skills_ddl(s.postgres_user_skills_table))
                 await conn.execute(_checkpoints_ddl(s.postgres_checkpoints_table))
         return self._pool_obj
 
@@ -90,6 +102,25 @@ class PostgresStore(StoreService):
     async def upsert_profile(self, *, business_id: str, profile: dict) -> None:
         doc = {**empty_profile(business_id), **profile, "id": business_id}
         await self._write(self._settings.postgres_profiles_table, business_id, doc)
+
+    async def get_user_skills(self, *, user_id: str) -> Optional[UserSkillDoc]:
+        doc = await self._read(self._settings.postgres_user_skills_table, user_id)
+        return UserSkillDoc(**doc) if doc is not None else None
+
+    async def upsert_user_skills(
+        self, *, user_id: str, rules: List[SkillRule]
+    ) -> UserSkillDoc:
+        prior = await self._read(self._settings.postgres_user_skills_table, user_id)
+        doc = UserSkillDoc(
+            user_id=user_id,
+            rules=list(rules),
+            version=(prior["version"] + 1) if prior else 1,
+            updated_at=datetime.now(timezone.utc),
+        )
+        # Store JSON-shaped (datetime → ISO string) so the JSONB doc round-trips cleanly.
+        await self._write(self._settings.postgres_user_skills_table, user_id,
+                          doc.model_dump(mode="json"))
+        return doc
 
     async def save_checkpoint(self, *, task_id: str, data: dict) -> None:
         await self._write(self._settings.postgres_checkpoints_table, task_id, {"id": task_id, **data})
