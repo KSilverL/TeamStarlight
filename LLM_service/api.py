@@ -47,6 +47,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .core.config import load_dotenv
 from .core.events import DONE, INTERRUPTED, RUNNING, progress_event, result_event
 from .core.services import factory
+from .core.skill_schema import SkillCandidate, SkillDecision
 from .intake import IntakeSession, build_intake
 from .skills import load_skill
 from .workflow import Brief, HumanVerdict, build_workflow
@@ -65,6 +66,32 @@ class ApiError(Exception):
         self.message = message
 
 
+def _normalize_history(raw) -> list[dict]:
+    """Coerce a caller-supplied conversation history into a clean list of
+    {role, content} messages, raising HTTP 400 on a malformed shape.
+
+    The Python service stays stateless: the backend looks the conversation up by its
+    id, assembles the prior turns, and posts them here — this just validates them
+    before they are folded into the LLM prompt. None → []."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ApiError(400, "'history' must be an array of {role, content} messages")
+    out: list[dict] = []
+    for msg in raw:
+        if not isinstance(msg, dict):
+            raise ApiError(400, "each 'history' item must be an object with 'role' and 'content'")
+        role = msg.get("role")
+        content = msg.get("content")
+        if role not in ("user", "assistant", "system") or not isinstance(content, str):
+            raise ApiError(
+                400,
+                "each 'history' item needs a role of user|assistant|system and a string content",
+            )
+        out.append({"role": role, "content": content})
+    return out
+
+
 def _brief_from_inputs(inputs: dict) -> Brief:
     """Build the workflow's Brief from the start payload (the M3 intake layer
     produces this; the Java backend can also post the fields directly)."""
@@ -79,6 +106,7 @@ def _brief_from_inputs(inputs: dict) -> Brief:
         target_platforms=platforms,
         user_intent=inputs.get("user_intent", ""),
         business_id=inputs.get("business_id"),
+        user_id=inputs.get("user_id"),
         tone_hint=inputs.get("tone_hint"),
         route=inputs.get("route", "direct_generation"),
     )
@@ -96,6 +124,8 @@ class _Task:
         self.pending: dict[str, dict] = {}           # request_id -> HumanReviewRequest data
         self.outputs: dict[str, dict] = {}           # platform -> FinalDraft dict
         self.proposed_rules: list[dict] = []         # archivist rules awaiting tagging
+        self.conversation: list[dict] = []           # intake transcript threaded in at start
+        self.skill_candidates: dict[str, dict] = {}  # candidate_id -> SkillCandidate (learn-summarize)
         self.status = "running"
         self.done = False
 
@@ -217,7 +247,9 @@ class WorkflowService:
 
     # ── Public operations ─────────────────────────────────────────────────────
 
-    async def start(self, inputs: dict, task_id: Optional[str] = None) -> dict:
+    async def start(
+        self, inputs: dict, task_id: Optional[str] = None, conversation: Optional[list] = None
+    ) -> dict:
         task_id = task_id or f"task-{uuid.uuid4().hex[:12]}"
         if task_id in self._tasks:
             raise ApiError(409, f"task_id already exists: {task_id}")
@@ -226,6 +258,7 @@ class WorkflowService:
             name=f"{WORKFLOW_NAME}:{task_id}", checkpoint_storage=self._storage()
         )
         task = _Task(task_id, workflow, brief)
+        task.conversation = list(conversation or [])  # intake transcript for per-user learning
         self._tasks[task_id] = task
         return await self._drive(task, message=brief)
 
@@ -271,6 +304,60 @@ class WorkflowService:
                 kept += 1
         await store.upsert_profile(business_id=business_id, profile=profile)
         return {"task_id": task_id, "business_id": business_id, "rules_kept": kept, "profile": profile}
+
+    # ── Per-user learning (the per-`user_id` channel, DB-only) ────────────────
+
+    async def learn_summarize(self, task_id: str) -> dict:
+        """Distil candidate writing rules from the whole adopted session (brief + intake
+        transcript + approved drafts) for the user to three-way classify. The candidates
+        are retained on the task so learn_commit can resolve them by id."""
+        task = self._require(task_id)
+        user_id = task.brief.user_id
+        if not user_id:
+            raise ApiError(400, "task has no user_id; cannot learn user skills")
+        candidates = await factory.get_llm().summarize_session(
+            brief=task.brief.model_dump(),
+            conversation=task.conversation,
+            final_drafts=list(task.outputs.values()),
+        )
+        task.skill_candidates = {c.id: c.model_dump() for c in candidates}
+        return {"candidates": [c.model_dump() for c in candidates]}
+
+    async def learn_commit(self, task_id: str, decisions: list) -> dict:
+        """Apply the user's three-way verdicts: drop the ignored ones, consolidate the
+        kept candidates with the user's prior rules (this round overrides on conflict),
+        and persist the whole set to the user_skills store."""
+        task = self._require(task_id)
+        user_id = task.brief.user_id
+        if not user_id:
+            raise ApiError(400, "task has no user_id; cannot persist user skills")
+        if not isinstance(decisions, list):
+            raise ApiError(400, "'decisions' must be an array of {candidate_id, label, platform?}")
+
+        kept: list[SkillCandidate] = []
+        for d in decisions:
+            label = (d.get("label") or "").lower()
+            if label not in ("positive", "negative", "ignore"):
+                raise ApiError(400, "label must be positive, negative, or ignore")
+            if label == "ignore":
+                continue
+            stored = task.skill_candidates.get(d.get("candidate_id"))
+            if stored is None:
+                continue  # unknown / already-resolved candidate id
+            candidate = SkillCandidate(**stored)
+            # The user's label is the final classification; an explicit platform re-scopes.
+            kept.append(candidate.model_copy(update={
+                "suggested_kind": label,
+                "platform": d.get("platform") or candidate.platform,
+            }))
+
+        store = factory.get_store()
+        prior = await store.get_user_skills(user_id=user_id)
+        merged = await factory.get_llm().consolidate_skills(
+            kept=kept, prior_rules=prior.rules if prior else [],
+        )
+        doc = await store.upsert_user_skills(user_id=user_id, rules=merged)
+        return {"skill_doc": doc.model_dump(mode="json")}
 
     async def get(self, task_id: str) -> dict:
         return self._snapshot(self._require(task_id))
@@ -320,13 +407,22 @@ class IntakeService:
             raise ApiError(404, f"unknown intake session: {session_id}")
         return session
 
-    async def start(self, mode: str, opening_input: Optional[str]) -> dict:
+    async def start(
+        self, mode: str, opening_input: Optional[str], user_id: Optional[str] = None
+    ) -> dict:
         if mode not in ("voice", "text"):
             raise ApiError(400, "mode must be 'voice' or 'text'")
         session = build_intake(mode)
-        result = await session.start(opening_input)
+        result = await session.start(opening_input, user_id=user_id)
         self._sessions[result["session_id"]] = session
         return {"intake_mode": mode, **result}
+
+    def transcript(self, session_id: str) -> list:
+        """The session's {role, content} message history, threaded into a task at start
+        so per-user learning can summarize the whole conversation. Empty for an unknown
+        session, so starting a task never fails on a stale intake session id."""
+        session = self._sessions.get(session_id)
+        return session.transcript(session_id) if session is not None else []
 
     async def turn(self, session_id: str, user_input: str) -> dict:
         session = self._require(session_id)
@@ -356,21 +452,41 @@ class MediaService:
     def __init__(self) -> None:
         self._video_jobs: dict[str, dict] = {}
 
-    async def generate_html(self, prompt: str) -> dict:
+    async def generate_text(
+        self, prompt: str, platform: str = "linkedin", history: Optional[list] = None
+    ) -> dict:
+        """One-shot platform-native post copy from a brief, reusing the creator's
+        `write_copy` (the brand-rule args are empty for this standalone path — the
+        full workflow folds in the brand profile). `history` (assembled by the backend
+        from the conversation store) lets a follow-up turn continue the thread."""
+        if not prompt.strip():
+            raise ApiError(400, "'prompt' is required")
+        platform = platform or "linkedin"
+        text = await factory.get_llm().write_copy(
+            topic=prompt, platform=platform, strategy="", user_intent=prompt,
+            must_do=[], must_avoid=[], examples=[], tone_hint=None,
+            skill=load_skill(platform), history=_normalize_history(history),
+        )
+        return {"text": text, "platform": platform}
+
+    async def generate_html(self, prompt: str, history: Optional[list] = None) -> dict:
         if not prompt.strip():
             raise ApiError(400, "'prompt' is required")
         html = await factory.get_llm().render_html_card(
             topic=prompt, draft=prompt, tone_hint=None, skill=load_skill("brand_animation"),
+            history=_normalize_history(history),
         )
         return {"html": html}
 
-    async def start_video(self, brief: str) -> dict:
+    async def start_video(self, brief: str, history: Optional[list] = None) -> dict:
         if not brief.strip():
             raise ApiError(400, "'brief' is required")
+        prior = _normalize_history(history)
         job_id = uuid.uuid4().hex
         try:
             props = await factory.get_llm().generate_video_props(
                 topic=brief, draft=brief, tone_hint=None, skill=load_skill("brand_video"),
+                history=prior,
             )
             self._video_jobs[job_id] = {"status": "done", "props": props, "error": None}
         except Exception as exc:  # surface generation failures to the backend poll
@@ -413,9 +529,12 @@ class StartTaskRequest(BaseModel):
         None, description="Non-empty list, e.g. ['linkedin', 'instagram'] (required)")
     user_intent: Optional[str] = None
     business_id: Optional[str] = Field(None, description="Brand id; required to persist brand rules")
+    user_id: Optional[str] = Field(None, description="End-user id; required to persist per-user learned skills")
     tone_hint: Optional[str] = None
     route: Optional[str] = "direct_generation"
     task_id: Optional[str] = Field(None, description="Caller-supplied id; auto-generated if omitted")
+    session_id: Optional[str] = Field(
+        None, description="Intake session id; its transcript is threaded in for per-user learning")
 
 
 class VerdictPayload(BaseModel):
@@ -443,21 +562,54 @@ class ArchiveTagsRequest(BaseModel):
     tags: list[TagPayload] = Field(default_factory=list)
 
 
+class DecisionPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    candidate_id: str = Field(..., description="id of the SkillCandidate from learn-summarize")
+    label: str = Field(..., description="positive | negative | ignore")
+    platform: Optional[str] = Field(None, description="Optional override of the inferred platform")
+
+
+class LearnCommitRequest(BaseModel):
+    decisions: list[DecisionPayload] = Field(
+        default_factory=list, description="Per-candidate three-way verdicts to consolidate + persist")
+
+
 class IntakeStartRequest(BaseModel):
     mode: str = Field(..., description="voice | text")
     opening_input: Optional[str] = None
+    user_id: Optional[str] = Field(None, description="End-user id; tags the session for per-user learning")
 
 
 class IntakeTurnRequest(BaseModel):
     user_input: str
 
 
+# `history` is the prior conversation the backend assembled from its store (keyed by
+# conversation id), so multi-turn generation works while this service stays stateless.
+# Typed loosely as a list so a bad item shape answers HTTP 400 (in the service layer)
+# rather than FastAPI's 422; each item is {role: user|assistant|system, content: str}.
+_HISTORY_FIELD = Field(
+    None,
+    description="Prior conversation as [{role, content}], assembled by the backend; "
+                "folded into the prompt so a follow-up turn continues the thread",
+)
+
+
+class GenerateTextRequest(BaseModel):
+    prompt: str = Field(..., description="Brief to turn into platform-native post copy")
+    platform: Optional[str] = Field("linkedin", description="Target platform style (linkedin | instagram | twitter | x | …)")
+    history: Optional[list] = _HISTORY_FIELD
+
+
 class GenerateHtmlRequest(BaseModel):
     prompt: str = Field(..., description="Brand brief for the animated HTML card")
+    history: Optional[list] = _HISTORY_FIELD
 
 
 class GenerateVideoRequest(BaseModel):
     brief: str = Field(..., description="Brand brief for the BrandVideoProps spec")
+    history: Optional[list] = _HISTORY_FIELD
 
 
 # ── Dependencies: pull the per-app service singletons off app.state ───────────
@@ -487,7 +639,10 @@ async def start_task(request: Request, body: StartTaskRequest) -> dict:
     # Drop unset/None fields so the service's defaults apply (the raw-dict contract:
     # an absent user_intent means "", not None).
     inputs = body.model_dump(exclude_none=True)
-    return await svc.start(inputs, task_id=body.task_id)
+    # If the brief came from an intake session, thread that transcript in so per-user
+    # learning can later summarize the whole conversation (transport-layer wiring).
+    conversation = _intake(request).transcript(body.session_id) if body.session_id else None
+    return await svc.start(inputs, task_id=body.task_id, conversation=conversation)
 
 
 @tasks_router.get("/{task_id}", summary="Snapshot a task (status, outputs, pending gates)")
@@ -523,9 +678,20 @@ async def archive_tags(request: Request, task_id: str, body: ArchiveTagsRequest)
     return await _workflow(request).archive_tags(task_id, tags)
 
 
+@tasks_router.post("/{task_id}/learn-summarize", summary="Distil per-user skill candidates from the session")
+async def learn_summarize(request: Request, task_id: str) -> dict:
+    return await _workflow(request).learn_summarize(task_id)
+
+
+@tasks_router.post("/{task_id}/learn-commit", summary="Consolidate + persist the user's kept skills")
+async def learn_commit(request: Request, task_id: str, body: LearnCommitRequest) -> dict:
+    decisions = [d.model_dump() for d in body.decisions]
+    return await _workflow(request).learn_commit(task_id, decisions)
+
+
 @intake_router.post("", summary="Open an intake conversation (voice or text)")
 async def intake_start(request: Request, body: IntakeStartRequest) -> dict:
-    return await _intake(request).start(body.mode, body.opening_input)
+    return await _intake(request).start(body.mode, body.opening_input, body.user_id)
 
 
 @intake_router.post("/{session_id}/turn", summary="Send one user turn to an intake session")
@@ -563,14 +729,19 @@ async def intake_voice(websocket: WebSocket, session_id: str) -> None:
     await websocket.close()
 
 
+@media_router.post("/generate-text", summary="Generate platform-native post copy from a brief")
+async def generate_text(request: Request, body: GenerateTextRequest) -> dict:
+    return await _media(request).generate_text(body.prompt, body.platform or "linkedin", body.history)
+
+
 @media_router.post("/generate", summary="Generate a self-contained animated HTML brand card")
 async def generate_html(request: Request, body: GenerateHtmlRequest) -> dict:
-    return await _media(request).generate_html(body.prompt)
+    return await _media(request).generate_html(body.prompt, body.history)
 
 
 @media_router.post("/generate-video", summary="Start a BrandVideoProps spec job")
 async def generate_video(request: Request, body: GenerateVideoRequest) -> dict:
-    return await _media(request).start_video(body.brief)
+    return await _media(request).start_video(body.brief, body.history)
 
 
 @media_router.get("/jobs/{job_id}", summary="Poll a video-spec job")

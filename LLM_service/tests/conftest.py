@@ -72,6 +72,7 @@ def make_brief():
             target_platforms=list(platforms),
             user_intent=over.get("user_intent", "drive signups and tell the farmers' story"),
             business_id=over.get("business_id", "biz_test_0001"),
+            user_id=over.get("user_id"),
             tone_hint=over.get("tone_hint", "warm, authentic"),
             route=over.get("route", "direct_generation"),
         )

@@ -220,6 +220,13 @@ def test_http_validation_and_not_found(http_server):
 
 def test_http_media_endpoints(http_server):
     with httpx.Client(timeout=10) as client:
+        # Text → platform-native post copy.
+        text_res = client.post(f"{http_server}/generate-text",
+                               json={"prompt": "Luna Skincare — minimalist", "platform": "linkedin"})
+        assert text_res.status_code == 200
+        body = text_res.json()
+        assert body["text"] and body["platform"] == "linkedin"
+
         # Brand animation → a self-contained animated HTML document.
         html_res = client.post(f"{http_server}/generate", json={"prompt": "Luna Skincare — minimalist"})
         assert html_res.status_code == 200
@@ -235,4 +242,25 @@ def test_http_media_endpoints(http_server):
 
         # Validation + unknown job.
         assert client.post(f"{http_server}/generate", json={"prompt": ""}).status_code == 400
+        assert client.post(f"{http_server}/generate-text", json={"prompt": ""}).status_code == 400
         assert client.get(f"{http_server}/jobs/nope").status_code == 404
+
+
+def test_http_media_accepts_conversation_history(http_server):
+    """Multi-turn: the backend assembles prior {role, content} turns (looked up by
+    conversation id) and posts them; the stateless LLM service accepts + uses them."""
+    history = [
+        {"role": "user", "content": "Luna Skincare — minimalist launch post"},
+        {"role": "assistant", "content": "Here's a first draft..."},
+        {"role": "user", "content": "make it punchier and shorter"},
+    ]
+    with httpx.Client(timeout=10) as client:
+        res = client.post(f"{http_server}/generate-text",
+                          json={"prompt": "make it punchier and shorter",
+                                "platform": "linkedin", "history": history})
+        assert res.status_code == 200 and res.json()["text"]
+
+        # A malformed history item answers HTTP 400 (service layer, not FastAPI's 422).
+        bad = client.post(f"{http_server}/generate-text",
+                          json={"prompt": "hi", "history": [{"role": "user"}]})
+        assert bad.status_code == 400

@@ -6,13 +6,17 @@ separate executor nodes). On a ReviewOutcome (a rejected draft routed back by th
 circuit-breaker edge, or a human reject) it re-drafts just that one platform with
 an incremented attempt counter.
 
-Injection has two layers (MIGRATION_PLAN §5.4):
+Injection has three layers (MIGRATION_PLAN §5.4):
   - static : the platform skill file `skills/<platform>.md` (char limit, tone, examples) —
              wired in M4.
   - dynamic: the brand's Brand_Voice_Profile (must_do / must_avoid / examples) from the
              store, ONLY for a branded user. A no-brand user (business_id is None) skips
              the store entirely and relies on `brief.tone_hint` — so the no-brand path
              never reads the DB and can't fail on a misconfigured store.
+  - per-user: the current user's learned rules (the per-`user_id` channel), filtered to
+             this platform (platform-specific + cross-platform) and rendered into a MUST
+             DO / MUST AVOID block. Read in memory, never persisted here; skipped when
+             there is no user_id or no record (behaviour then matches the status quo).
 """
 
 import asyncio
@@ -20,8 +24,24 @@ import asyncio
 from agent_framework import Executor, WorkflowContext, handler
 
 from ...core.services import factory
+from ...core.skill_schema import UserSkillDoc
 from ...skills import load_skill
 from ..messages import Brief, CreativeStrategy, Draft, ReviewOutcome
+
+
+def _user_skill_block(doc: UserSkillDoc, platform: str) -> str:
+    """Render the user's learned rules that apply to this platform (platform-specific +
+    cross-platform `platform is None`) as a MUST DO / MUST AVOID prompt block. Returns ''
+    when none apply, so the creator passes nothing extra."""
+    applicable = [r for r in doc.rules if r.platform is None or r.platform == platform]
+    must_do = [r.text for r in applicable if r.kind == "positive"]
+    must_avoid = [r.text for r in applicable if r.kind == "negative"]
+    sections: list[str] = []
+    if must_do:
+        sections.append("MUST DO:\n" + "\n".join(f"- {t}" for t in must_do))
+    if must_avoid:
+        sections.append("MUST AVOID:\n" + "\n".join(f"- {t}" for t in must_avoid))
+    return "\n".join(sections)
 
 
 async def _draft_one(brief: Brief, platform: str, strategy: str, attempt: int) -> Draft:
@@ -36,6 +56,14 @@ async def _draft_one(brief: Brief, platform: str, strategy: str, attempt: int) -
         must_avoid = profile.get("must_avoid", [])
         examples = [e.get("text", "") for e in profile.get("examples", [])]
 
+    # Per-user layer: fold this user's learned rules (filtered to the platform) into the
+    # prompt alongside the static skill. Skipped without a user_id or a stored record.
+    user_skills = ""
+    if brief.user_id:
+        doc = await factory.get_store().get_user_skills(user_id=brief.user_id)
+        if doc:
+            user_skills = _user_skill_block(doc, platform)
+
     text = await factory.get_llm().write_copy(
         topic=brief.topic,
         platform=platform,
@@ -47,6 +75,7 @@ async def _draft_one(brief: Brief, platform: str, strategy: str, attempt: int) -
         tone_hint=brief.tone_hint,
         skill=load_skill(platform),  # static layer: the platform style guide
         attempt=attempt,
+        user_skills=user_skills,     # per-user layer: this user's learned rules
     )
     return Draft(platform=platform, text=text, attempt=attempt, brief=brief, strategy=strategy)
 
