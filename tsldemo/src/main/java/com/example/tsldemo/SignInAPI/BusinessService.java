@@ -1,8 +1,10 @@
-package com.example.tsldemo;
+package com.example.tsldemo.SignInAPI;
 
 import java.util.List;
 
 import org.springframework.stereotype.Service;
+
+import com.example.tsldemo.Business;
 
 @Service
 public class BusinessService {
@@ -18,6 +20,10 @@ public class BusinessService {
 	
 	public void addBusinessToDB(Business business) {
 		businessRepo.save(business);
+	}
+	
+	public void deleteBusiness(int id) {
+		businessRepo.deleteById(id);
 	}
 	
 }
