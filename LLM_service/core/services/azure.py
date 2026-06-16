@@ -24,6 +24,7 @@ from typing import List, Optional
 
 from ..config import Settings
 from ..media_schema import BrandVideoProps
+from ..skill_schema import SkillCandidate, SkillRule
 from .base import (
     LLMService,
     SafetyResult,
@@ -132,6 +133,8 @@ class AzureLLM(LLMService):
         tone_hint: Optional[str],
         skill: str = "",
         attempt: int = 1,
+        user_skills: str = "",
+        history: Optional[List[dict]] = None,
     ) -> str:
         revision = (
             f" This is revision #{attempt}; a previous version was rejected — take a "
@@ -139,6 +142,7 @@ class AzureLLM(LLMService):
             if attempt > 1 else ""
         )
         style_guide = f"\n\nFollow this platform style guide exactly:\n{skill}" if skill else ""
+        learned = f"\n\nThis user's learned writing rules:\n{user_skills}" if user_skills else ""
         system = (
             f"You are a persona copywriter for {platform}. Write one complete, "
             f"ready-to-publish {platform} post the user can copy-paste as-is — a "
@@ -146,14 +150,17 @@ class AzureLLM(LLMService):
             f"hashtags/emojis. Do NOT return an outline or bullet plan. Respect the "
             f"platform character limit. "
             f"Must do: {must_do or 'n/a'}. Must avoid: {must_avoid or 'n/a'}. "
-            f"Tone: {tone_hint or 'brand voice'}.{revision}{style_guide}"
+            f"Tone: {tone_hint or 'brand voice'}.{revision}{style_guide}{learned}"
         )
         user = (
             f"Topic: {topic}\nStrategy: {strategy}\nGoal: {user_intent}\n"
             f"Positive examples: {examples or 'n/a'}"
         )
+        # Prior turns (assembled by the caller from the conversation store) go between
+        # the system prompt and the current request, so a follow-up continues the thread.
         return await self._complete(
-            [{"role": "system", "content": system}, {"role": "user", "content": user}]
+            [{"role": "system", "content": system}, *(history or []),
+             {"role": "user", "content": user}]
         )
 
     async def render_html_card(
@@ -163,6 +170,7 @@ class AzureLLM(LLMService):
         draft: str,
         tone_hint: Optional[str],
         skill: str = "",
+        history: Optional[List[dict]] = None,
     ) -> str:
         style_guide = f"\n\n{skill}" if skill else ""
         system = (
@@ -178,7 +186,8 @@ class AzureLLM(LLMService):
             f"Tone: {tone_hint or 'brand voice'}"
         )
         raw = await self._complete(
-            [{"role": "system", "content": system}, {"role": "user", "content": user}]
+            [{"role": "system", "content": system}, *(history or []),
+             {"role": "user", "content": user}]
         )
         return _strip_fences(raw)
 
@@ -189,6 +198,7 @@ class AzureLLM(LLMService):
         draft: str,
         tone_hint: Optional[str],
         skill: str = "",
+        history: Optional[List[dict]] = None,
     ) -> dict:
         schema = json.dumps(BrandVideoProps.model_json_schema())
         style_guide = f"\n\n{skill}" if skill else ""
@@ -204,7 +214,8 @@ class AzureLLM(LLMService):
             f"Tone: {tone_hint or 'brand voice'}"
         )
         raw = await self._complete(
-            [{"role": "system", "content": system}, {"role": "user", "content": user}]
+            [{"role": "system", "content": system}, *(history or []),
+             {"role": "user", "content": user}]
         )
         data = json.loads(_strip_fences(raw))
         return BrandVideoProps(**data).model_dump()
@@ -242,6 +253,74 @@ class AzureLLM(LLMService):
                     "rule": r["rule"],
                     "rationale": r.get("rationale", ""),
                 })
+        return out
+
+    async def summarize_session(
+        self,
+        *,
+        brief: dict,
+        conversation: List[dict],
+        final_drafts: List[dict],
+    ) -> List[SkillCandidate]:
+        system = (
+            "You are a writing coach reviewing a completed social-media session. From "
+            "the brief, the conversation, and the approved final drafts, distil 3-6 "
+            "candidate writing rules the user can keep or discard. For each, infer the "
+            "platform (null = applies to all platforms), a suggested_kind ('positive' = "
+            "do more of this, 'negative' = avoid this), and a short rationale. Reply "
+            'with ONLY a JSON array of {"text","platform","suggested_kind","rationale"}.'
+        )
+        user = json.dumps({
+            "brief": brief, "conversation": conversation, "final_drafts": final_drafts,
+        })
+        raw = await self._complete(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        )
+        items = json.loads(_strip_fences(raw))
+        out: List[SkillCandidate] = []
+        for i, item in enumerate(items[:6]):
+            kind = item.get("suggested_kind")
+            text = item.get("text")
+            if kind not in ("positive", "negative") or not text:
+                continue
+            out.append(SkillCandidate(
+                id=item.get("id") or f"cand-{i + 1}",
+                text=text,
+                platform=item.get("platform"),
+                suggested_kind=kind,
+                rationale=item.get("rationale", ""),
+            ))
+        return out
+
+    async def consolidate_skills(
+        self,
+        *,
+        kept: List[SkillCandidate],
+        prior_rules: List[SkillRule],
+    ) -> List[SkillRule]:
+        system = (
+            "You are a brand archivist maintaining one user's writing rules. Merge the "
+            "kept candidates with the user's prior rules into a single deduplicated, "
+            "concise rule set. On any conflict the kept candidate wins — overwrite the "
+            "prior rule. Keep each rule's platform (null = all platforms). Reply with "
+            'ONLY a JSON array of {"text","platform","kind"} where kind is "positive" '
+            'or "negative".'
+        )
+        user = json.dumps({
+            "kept": [c.model_dump() for c in kept],
+            "prior_rules": [r.model_dump() for r in prior_rules],
+        })
+        raw = await self._complete(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        )
+        items = json.loads(_strip_fences(raw))
+        out: List[SkillRule] = []
+        for item in items:
+            kind = item.get("kind")
+            text = item.get("text")
+            if kind not in ("positive", "negative") or not text:
+                continue
+            out.append(SkillRule(text=text, platform=item.get("platform"), kind=kind))
         return out
 
     async def _complete_with_tools(self, messages: List[dict], tools: List[dict]) -> dict:

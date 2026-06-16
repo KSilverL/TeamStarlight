@@ -82,6 +82,7 @@ class _SessionState:
     messages: List[dict] = field(default_factory=list)  # [{role, content}]
     route: str = "direct_generation"
     used_scout: bool = False
+    user_id: Optional[str] = None  # caller-supplied identity; keys per-user learning
 
 
 class BriefConversation:
@@ -174,6 +175,7 @@ class BriefConversation:
             user_intent=bp["user_intent"],
             tone_hint=bp.get("tone_hint"),
             business_id=bp.get("business_id"),
+            user_id=state.user_id,
             route=state.route,
             intake_mode=intake_mode,
         )
@@ -185,8 +187,11 @@ class IntakeSession(ABC):
     """The interface the frontend instantiates per `intake_mode`."""
 
     @abstractmethod
-    async def start(self, opening_user_input: Optional[str]) -> dict:
-        """Returns {session_id, assistant_message, brief_partial, complete}."""
+    async def start(
+        self, opening_user_input: Optional[str], *, user_id: Optional[str] = None
+    ) -> dict:
+        """Returns {session_id, assistant_message, brief_partial, complete}. `user_id`
+        (optional) tags the session's identity so a downstream task can learn per user."""
         ...
 
     @abstractmethod
@@ -216,13 +221,22 @@ class ConversationalIntake(IntakeSession):
             raise KeyError(session_id)
         return state
 
-    async def start(self, opening_user_input: Optional[str] = None) -> dict:
+    async def start(
+        self, opening_user_input: Optional[str] = None, *, user_id: Optional[str] = None
+    ) -> dict:
         session_id = f"intake-{uuid.uuid4().hex[:12]}"
-        state = _SessionState()
+        state = _SessionState(user_id=user_id)
         self._sessions[session_id] = state
         opening = await self._ingest(session_id, opening_user_input) if opening_user_input else None
         result = await self._conversation.begin(state, opening)
         return {"session_id": session_id, **result}
+
+    def transcript(self, session_id: str) -> List[dict]:
+        """The full {role, content} message history for a session (the conversation a
+        downstream task threads into per-user learning). Empty list for an unknown
+        session, so a task start never fails on a stale session id."""
+        state = self._sessions.get(session_id)
+        return list(state.messages) if state is not None else []
 
     async def send_user_turn(self, session_id: str, user_input: str) -> dict:
         state = self._state(session_id)

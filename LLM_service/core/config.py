@@ -121,11 +121,14 @@ class Settings:
     azure_content_safety_endpoint: Optional[str] = None
     azure_content_safety_key: Optional[str] = None
 
-    # ── PostgreSQL (brand profiles + workflow checkpoints) ─────────────────────
-    # One database, two tables (§8): brand_profiles + workflow_checkpoints. Both
-    # store whole documents in a JSONB `doc` column.
+    # ── PostgreSQL (brand profiles + user skills + workflow checkpoints) ───────
+    # One database, three tables (§8): brand_profiles + user_skills +
+    # workflow_checkpoints. Each stores whole documents in a JSONB `doc` column.
+    # DSN comes from DATABASE_URL (preferred, e.g. a Supabase connection string),
+    # falling back to POSTGRES_DSN — see _load().
     postgres_dsn: Optional[str] = None     # postgresql://user:pass@host:5432/newsroom
     postgres_profiles_table: str = "brand_profiles"
+    postgres_user_skills_table: str = "user_skills"
     postgres_checkpoints_table: str = "workflow_checkpoints"
 
     # ── Voice Live API (voice intake) ──────────────────────────────────────────
@@ -202,8 +205,9 @@ def _load() -> Settings:
         or os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT"),
         azure_content_safety_key=os.getenv("AZURE_CONTENTSAFETY_KEY")
         or os.getenv("AZURE_CONTENT_SAFETY_KEY"),
-        postgres_dsn=os.getenv("POSTGRES_DSN") or os.getenv("DATABASE_URL"),
+        postgres_dsn=os.getenv("DATABASE_URL") or os.getenv("POSTGRES_DSN"),
         postgres_profiles_table=os.getenv("POSTGRES_PROFILES_TABLE", "brand_profiles"),
+        postgres_user_skills_table=os.getenv("POSTGRES_USER_SKILLS_TABLE", "user_skills"),
         postgres_checkpoints_table=os.getenv("POSTGRES_CHECKPOINTS_TABLE", "workflow_checkpoints"),
         azure_voicelive_endpoint=os.getenv("AZURE_VOICELIVE_ENDPOINT"),
         azure_voicelive_model=os.getenv("AZURE_VOICELIVE_MODEL", "gpt-realtime"),

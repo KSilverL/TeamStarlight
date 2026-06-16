@@ -4,7 +4,9 @@ import { useState, useRef, useEffect } from "react";
 import Link from "next/link";
 
 type Platform = "x" | "instagram" | "tiktok" | "linkedin";
-type ContentType = "text" | "image" | "video" | "mix" | "brand";
+// The three content kinds the backend can actually generate. Multi-select: one
+// "send" can fan out to several of these at once.
+type ContentType = "text" | "video" | "brand";
 type ApprovalStatus = "pending" | "approved" | "rejected";
 
 interface DraftContent {
@@ -39,7 +41,13 @@ interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
-  variant?: "status" | "draft" | "html-preview" | "video-pending" | "video-preview";
+  variant?:
+    | "status"
+    | "draft"
+    | "text-preview"
+    | "html-preview"
+    | "video-pending"
+    | "video-preview";
   platform?: Platform;
   draft?: DraftContent;
   html?: string;
@@ -87,9 +95,7 @@ const PLATFORMS: {
 
 const CONTENT_TYPES: { id: ContentType; label: string }[] = [
   { id: "text", label: "Text" },
-  { id: "image", label: "Image" },
   { id: "video", label: "Video" },
-  { id: "mix", label: "Mix" },
   { id: "brand", label: "Brand Animation" },
 ];
 
@@ -156,6 +162,14 @@ const INITIAL_MESSAGES: Message[] = [
 
 const platformMap = Object.fromEntries(PLATFORMS.map((p) => [p.id, p]));
 
+// Monotonic message ids — several generators append concurrently when multiple
+// content types are selected, so Date.now() alone would collide.
+let _msgSeq = 0;
+function newId() {
+  _msgSeq += 1;
+  return `m${Date.now().toString(36)}-${_msgSeq}`;
+}
+
 export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>(INITIAL_MESSAGES);
   const [input, setInput] = useState("");
@@ -163,8 +177,9 @@ export default function ChatPage() {
     "instagram",
     "linkedin",
   ]);
-  const [contentType, setContentType] = useState<ContentType>("mix");
+  const [contentTypes, setContentTypes] = useState<ContentType[]>(["text"]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -177,6 +192,12 @@ export default function ChatPage() {
       prev.includes(platform)
         ? prev.filter((p) => p !== platform)
         : [...prev, platform]
+    );
+  }
+
+  function toggleContentType(type: ContentType) {
+    setContentTypes((prev) =>
+      prev.includes(type) ? prev.filter((t) => t !== type) : [...prev, type]
     );
   }
 
@@ -206,161 +227,114 @@ export default function ChatPage() {
     }, 350);
   }
 
+  function pushMessage(msg: Omit<Message, "id" | "timestamp">) {
+    setMessages((prev) => [...prev, { ...msg, id: newId(), timestamp: new Date() }]);
+  }
+
+  // ── Per-content-type generators (each appends its own status + result) ──────
+
+  async function genText(prompt: string) {
+    pushMessage({ role: "assistant", content: "Generating post copy…", variant: "status" });
+    const platform = (selectedPlatforms[0] ?? "linkedin") as Platform;
+    try {
+      const res = await fetch("/api/text", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, platform }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        pushMessage({ role: "assistant", content: `Text generation failed: ${data.error ?? "unknown error"}` });
+        return;
+      }
+      pushMessage({
+        role: "assistant",
+        content: "Here's your post copy. Review and approve or reject:",
+        variant: "text-preview",
+        platform: data.platform as Platform,
+        draft: { text: data.text as string },
+        approval: "pending",
+      });
+    } catch {
+      pushMessage({ role: "assistant", content: "Could not reach the text backend." });
+    }
+  }
+
+  async function genBrand(prompt: string) {
+    pushMessage({
+      role: "assistant",
+      content: "Generating brand animation — this can take up to a minute…",
+      variant: "status",
+    });
+    try {
+      const res = await fetch("/api/brand", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        pushMessage({ role: "assistant", content: `Brand animation failed: ${data.error ?? "unknown error"}` });
+        return;
+      }
+      pushMessage({
+        role: "assistant",
+        content: "Here's your brand animation. Review and approve or reject:",
+        variant: "html-preview",
+        html: data.html as string,
+        approval: "pending",
+      });
+    } catch {
+      pushMessage({ role: "assistant", content: "Could not reach the brand backend." });
+    }
+  }
+
+  async function genVideo(prompt: string) {
+    pushMessage({ role: "assistant", content: "Generating your brand video spec…", variant: "status" });
+    try {
+      const res = await fetch("/api/video", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ brief: prompt }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        pushMessage({ role: "assistant", content: `Video spec failed: ${data.error ?? "unknown error"}` });
+        return;
+      }
+      pushMessage({
+        role: "assistant",
+        content: "Here's your brand video spec:",
+        variant: "video-pending",
+        videoJobId: data.jobId as string,
+        approval: "pending",
+      });
+    } catch {
+      pushMessage({ role: "assistant", content: "Could not reach the video backend." });
+    }
+  }
+
   async function handleSend() {
     const trimmed = input.trim();
-    if (!trimmed || isLoading) return;
+    if (!trimmed || isLoading || contentTypes.length === 0) return;
 
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: Date.now().toString(),
-        role: "user",
-        content: trimmed,
-        timestamp: new Date(),
-      },
-    ]);
+    pushMessage({ role: "user", content: trimmed });
     setInput("");
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
 
-    if (contentType === "brand") {
-      // Brand animation path — calls the /api/brand proxy → brand agent FastAPI
-      setIsLoading(true);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: (Date.now() + 1).toString(),
-          role: "assistant" as const,
-          content: "Generating brand animation — this can take up to a minute…",
-          variant: "status" as const,
-          timestamp: new Date(),
-        },
-      ]);
+    // Fan out to every selected content type at once.
+    const jobs: Promise<void>[] = [];
+    if (contentTypes.includes("text")) jobs.push(genText(trimmed));
+    if (contentTypes.includes("brand")) jobs.push(genBrand(trimmed));
+    if (contentTypes.includes("video")) jobs.push(genVideo(trimmed));
 
-      try {
-        const res = await fetch("/api/brand", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ prompt: trimmed }),
-        });
-        const data = await res.json();
-
-        if (!res.ok || data.error) {
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: (Date.now() + 2).toString(),
-              role: "assistant" as const,
-              content: `Brand agent error: ${data.error ?? "unknown error"}. Make sure the brand agent server is running on port 8000.`,
-              timestamp: new Date(),
-            },
-          ]);
-          return;
-        }
-
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: (Date.now() + 2).toString(),
-            role: "assistant" as const,
-            content: "Here's your brand animation. Review and approve or reject:",
-            variant: "html-preview" as const,
-            html: data.html as string,
-            approval: "pending" as const,
-            timestamp: new Date(),
-          },
-        ]);
-      } catch {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: (Date.now() + 2).toString(),
-            role: "assistant" as const,
-            content:
-              "Could not reach the brand agent. Make sure it is running on port 8000.",
-            timestamp: new Date(),
-          },
-        ]);
-      } finally {
-        setIsLoading(false);
-      }
-    } else if (contentType === "video") {
-      // Video render path — async job on the brand-video-agent (60–180 s)
-      setIsLoading(true);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: (Date.now() + 1).toString(),
-          role: "assistant" as const,
-          content: "Generating your brand video spec…",
-          variant: "status" as const,
-          timestamp: new Date(),
-        },
-      ]);
-
-      try {
-        const res = await fetch("/api/video", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ brief: trimmed }),
-        });
-        const data = await res.json();
-
-        if (!res.ok || data.error) {
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: (Date.now() + 2).toString(),
-              role: "assistant" as const,
-              content: `Video agent error: ${data.error ?? "unknown error"}. Make sure the brand-video-agent is running on port 8001.`,
-              timestamp: new Date(),
-            },
-          ]);
-          return;
-        }
-
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: (Date.now() + 2).toString(),
-            role: "assistant" as const,
-            content: "Here's your brand video spec:",
-            variant: "video-pending" as const,
-            videoJobId: data.jobId as string,
-            approval: "pending" as const,
-            timestamp: new Date(),
-          },
-        ]);
-      } catch {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: (Date.now() + 2).toString(),
-            role: "assistant" as const,
-            content:
-              "Could not reach the video agent. Make sure it is running on port 8001.",
-            timestamp: new Date(),
-          },
-        ]);
-      } finally {
-        setIsLoading(false);
-      }
-    } else {
-      // Mock path for text / image / mix content types
-      setTimeout(() => {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: (Date.now() + 1).toString(),
-            role: "assistant",
-            content:
-              "Got it — I've noted your feedback and am updating the content strategy. Revised drafts will appear shortly...",
-            variant: "status",
-            timestamp: new Date(),
-          },
-        ]);
-      }, 700);
+    setIsLoading(true);
+    try {
+      await Promise.allSettled(jobs);
+    } finally {
+      setIsLoading(false);
     }
   }
 
@@ -426,27 +400,34 @@ export default function ChatPage() {
             </div>
           </div>
 
-          {/* Content Type */}
+          {/* Content Type (multi-select) */}
           <div>
             <h3 className="text-xs font-semibold text-[#9E9893] uppercase tracking-wider mb-3">
               Content Type
+              <span className="ml-1 normal-case font-normal text-[#BDB6AE]">
+                · choose one or more
+              </span>
             </h3>
             <div className="grid grid-cols-2 gap-2">
-              {CONTENT_TYPES.map((ct) => (
-                <button
-                  key={ct.id}
-                  onClick={() => setContentType(ct.id)}
-                  className={`px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
-                    ct.id === "brand" ? "col-span-2" : ""
-                  } ${
-                    contentType === ct.id
-                      ? "bg-[#FF4800] text-white"
-                      : "bg-[#F8F5EE] text-[#6B6561] border border-[#E8E3DA] hover:bg-[#E8E3DA] hover:text-[#1B1A17]"
-                  }`}
-                >
-                  {ct.label}
-                </button>
-              ))}
+              {CONTENT_TYPES.map((ct) => {
+                const active = contentTypes.includes(ct.id);
+                return (
+                  <button
+                    key={ct.id}
+                    onClick={() => toggleContentType(ct.id)}
+                    aria-pressed={active}
+                    className={`px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                      ct.id === "brand" ? "col-span-2" : ""
+                    } ${
+                      active
+                        ? "bg-[#FF4800] text-white"
+                        : "bg-[#F8F5EE] text-[#6B6561] border border-[#E8E3DA] hover:bg-[#E8E3DA] hover:text-[#1B1A17]"
+                    }`}
+                  >
+                    {ct.label}
+                  </button>
+                );
+              })}
             </div>
           </div>
 
@@ -495,8 +476,8 @@ export default function ChatPage() {
               </h1>
               <p className="text-xs text-[#9E9893] mt-0.5">
                 {selectedPlatforms.length} platform
-                {selectedPlatforms.length !== 1 ? "s" : ""} · {contentType}{" "}
-                content
+                {selectedPlatforms.length !== 1 ? "s" : ""} ·{" "}
+                {contentTypes.length ? contentTypes.join(", ") : "no"} content
               </p>
             </div>
           </div>
@@ -545,7 +526,11 @@ export default function ChatPage() {
               );
             }
 
-            if (msg.variant === "draft" && msg.draft && msg.platform) {
+            if (
+              (msg.variant === "draft" || msg.variant === "text-preview") &&
+              msg.draft &&
+              msg.platform
+            ) {
               return (
                 <DraftCard
                   key={msg.id}

@@ -40,6 +40,7 @@ class Brief(BaseModel):
     target_platforms: List[str]
     user_intent: str = ""
     business_id: Optional[str] = None
+    user_id: Optional[str] = None  # the end user; keys the per-user learning channel
     tone_hint: Optional[str] = None
     route: str = "direct_generation"
 

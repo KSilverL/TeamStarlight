@@ -5,8 +5,8 @@ Run from the TeamStarlight/ root:
     /opt/anaconda3/envs/TeamProject/bin/python3 -m LLM_service.main
 
 Drives one workflow run end-to-end in mock mode and narrates it as a live
-multi-agent newsroom: each executor (总编导 dispatcher → 热点星探 scout → 人格创作者
-creator fan-out → 红队审核员 reviewer → 人工闸门 human-gate → 品牌档案馆长 archivist)
+multi-agent newsroom: each executor (dispatcher → scout →
+creator fan-out → reviewer → human-gate → archivist)
 announces itself as it picks up the work, so the agent-to-agent collaboration is
 visible on screen. The run pauses at the RequestPort human gate for a per-platform
 verdict, then resumes.
@@ -92,7 +92,7 @@ async def _stream_segment(workflow, *, message=None, responses=None) -> tuple[li
             requests.append(ev)
             data = ev.data
             flag = "  ⚠ needs human intervention" if data.needs_human_intervention else ""
-            print(f"  ⏸ 人工闸门 Human-Gate · {data.platform} — draft ready for review{flag}")
+            print(f"  ⏸ Human-Gate · {data.platform} — draft ready for review{flag}")
         elif ev.type == "output":
             outputs[ev.data.platform] = ev.data
     return requests, outputs
