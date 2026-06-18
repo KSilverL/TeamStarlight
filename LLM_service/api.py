@@ -1,5 +1,5 @@
 """
-HTTP API + SSE for the Java backend ↔ Python LLM-service contract (MIGRATION_PLAN §7).
+HTTP API + SSE for the Java backend ↔ Python LLM-service contract.
 
 A **FastAPI** (ASGI / uvicorn) wrapper around the MAF "virtual newsroom" workflow.
 In the target topology the Python LLM service talks **only to the Java backend**
@@ -93,8 +93,7 @@ def _normalize_history(raw) -> list[dict]:
 
 
 def _brief_from_inputs(inputs: dict) -> Brief:
-    """Build the workflow's Brief from the start payload (the M3 intake layer
-    produces this; the Java backend can also post the fields directly)."""
+    """Build the workflow's Brief from the start payload."""
     topic = inputs.get("topic")
     platforms = inputs.get("target_platforms")
     if not topic:
@@ -119,7 +118,7 @@ class _Task:
         self.task_id = task_id
         self.workflow = workflow
         self.brief = brief
-        self.events: list[dict] = []                 # full §7.2 event log (SSE replay)
+        self.events: list[dict] = []                 # full event log (SSE replay)
         self.subscribers: list[asyncio.Queue] = []   # live SSE queues
         self.pending: dict[str, dict] = {}           # request_id -> HumanReviewRequest data
         self.outputs: dict[str, dict] = {}           # platform -> FinalDraft dict

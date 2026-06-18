@@ -4,7 +4,7 @@ This document covers all REST endpoints involved in the content calendar feature
 
 - **Frontend** (Next.js, `http://localhost:3000`) — the calendar grid UI and Schedule Post modal
 - **Backend** (Spring Boot, `http://localhost:8080`) — manages scheduled post persistence and job scheduling via Quartz
-- **LLM Service** (LangGraph, `http://localhost:8000`) — generates platform-optimised content on demand inside the modal chat
+- **LLM Service** (MAF, `http://localhost:8080`) — generates platform-optimised content on demand inside the modal chat
 
 ---
 
@@ -26,7 +26,7 @@ The calendar feature has two distinct sub-flows:
     ┌───────────────────────────────┼────────────────────────────────────┐
     │                               │                                    │
     ▼                               ▼                                    ▼
-Frontend ──── GET/POST/PATCH/  ──► Backend ──── POST /llm/generate ──► LLM Service
+Frontend ──── GET/POST/PATCH/  ──► Backend ──── POST /generate-text ──► LLM Service
              DELETE /posts           │                                    │
                                      │◄───────────────────────────────────┘
                                      │         { text, hashtags }
@@ -599,18 +599,20 @@ This endpoint is called **by the Spring Boot backend only** in response to B1. I
 ### C1. Generate Platform Content
 
 **Description**  
-Generates a single platform-specific post draft from a user prompt. Unlike the session-based pipeline used in the main chat interface (which runs the full planning + multi-platform fanout), this is a lightweight single-shot generation call intended for the calendar modal. The LLM service uses the platform name, brand context, and prompt to produce copy that follows each platform's conventions:
+Generates a single platform-specific post draft from a user prompt. Unlike the newsroom workflow used in the main chat interface (which runs the full dispatcher → scout → creator fan-out → reviewer → human-gate run via `POST /tasks`), this is one of the MAF service's **standalone, one-shot media generators** — it does **not** go through the workflow or human gate, so there is no `task_id`. It is the same `POST /generate-text` endpoint the frontend's "Text" content button uses. The LLM service applies the platform's house-style skill (`skills/<platform>.md`) so the copy follows each platform's conventions:
 
 - **Instagram**: visual, emoji-heavy, CTA with "link in bio"
 - **LinkedIn**: formal, thought-leadership framing, no hashtags
 - **TikTok**: Hook / Body / CTA / Sound script format
 - **X**: concise, direct, 1–2 hashtags only
 
+The backend folds the brand profile (and any date/seasonal context) into the `prompt` it forwards. The modal's inline chat is multi-turn: pass the prior turns as `history` so a follow-up ("make it punchier", "shorter") continues the thread. The full contract lives in the repo-root [`API.md`](../API.md).
+
 **Endpoint**  
-`/llm/generate`
+`/generate-text`
 
 **Base URL**  
-`http://localhost:8000`
+`http://localhost:8080`
 
 **Method**  
 `POST`
@@ -620,31 +622,23 @@ None
 
 **Request Body**
 
-| Field             | Type   | Required | Description                                                       |
-|-------------------|--------|----------|-------------------------------------------------------------------|
-| `prompt`          | string | Yes      | The user's description of what to post                            |
-| `platform`        | string | Yes      | One of `"instagram"`, `"linkedin"`, `"tiktok"`, `"x"`            |
-| `date`            | string | Yes      | ISO date string — used for seasonal/temporal relevance            |
-| `businessName`    | string | No       | Brand name to reference in the copy                               |
-| `brandTone`       | string | No       | Voice guidance for the LLM (e.g. `"warm, aspirational, educational"`) |
-| `contentTopics`   | string | No       | Campaign or product context                                       |
-| `avoidLanguage`   | string | No       | Instructions on what to avoid (e.g. `"greenwashing language"`)   |
+| Field      | Type     | Required | Description                                                                                   |
+|------------|----------|----------|-----------------------------------------------------------------------------------------------|
+| `prompt`   | string   | Yes      | The user's description of what to post (the backend folds brand context + date into this)     |
+| `platform` | string   | Yes      | One of `"instagram"`, `"linkedin"`, `"tiktok"`, `"x"`                                          |
+| `history`  | object[] | No       | Prior conversation turns for a multi-turn follow-up: `[{ "role": "user"\|"assistant"\|"system", "content": "..." }]`. Omit or send `[]` for a fresh single-turn generation |
 
 **Example Request**
 
 ```http
-POST /llm/generate HTTP/1.1
-Host: localhost:8000
+POST /generate-text HTTP/1.1
+Host: localhost:8080
 Content-Type: application/json
 
 {
-  "prompt": "Highlight the antimicrobial properties of bamboo and why it's better than plastic for kitchen use",
+  "prompt": "EcoHome Solutions (warm, aspirational, educational; avoid greenwashing). Highlight the antimicrobial properties of bamboo and why it's better than plastic for kitchen use. Intended for 2026-06-15.",
   "platform": "instagram",
-  "date": "2026-06-15",
-  "businessName": "EcoHome Solutions",
-  "brandTone": "warm, aspirational, educational",
-  "contentTopics": "Bamboo Kitchen Collection",
-  "avoidLanguage": "greenwashing language, aggressive CTAs"
+  "history": []
 }
 ```
 
@@ -652,25 +646,20 @@ Content-Type: application/json
 
 ```json
 {
-  "platform": "instagram",
-  "text": "✨ Did you know bamboo is naturally antimicrobial — no chemical treatment needed?\n\nAt EcoHome Solutions, we believe your kitchen tools should protect your family, not harm them. Our Bamboo Kitchen Collection keeps bacteria out and beauty in. 🌿\n\nShop the full collection — link in bio.",
-  "hashtags": [
-    "#EcoHome",
-    "#BambooKitchen",
-    "#SustainableLiving",
-    "#HomeInspo",
-    "#ZeroWaste"
-  ]
+  "text": "✨ Did you know bamboo is naturally antimicrobial — no chemical treatment needed?\n\nAt EcoHome Solutions, we believe your kitchen tools should protect your family, not harm them. Our Bamboo Kitchen Collection keeps bacteria out and beauty in. 🌿\n\nShop the full collection — link in bio.\n\n#EcoHome #BambooKitchen #SustainableLiving #HomeInspo #ZeroWaste",
+  "platform": "instagram"
 }
 ```
+
+> **Note:** The MAF `/generate-text` endpoint returns only `{ text, platform }` — hashtags are
+> embedded in `text` rather than returned as a separate array. The backend (B1) is responsible
+> for splitting hashtags out of the copy into the `hashtags` array the frontend expects.
 
 **Example Unsuccessful Response** — `400 Bad Request`
 
 ```json
 {
-  "error": "INVALID_PLATFORM",
-  "message": "platform must be one of: instagram, linkedin, tiktok, x",
-  "rejectedValue": "snapchat"
+  "error": "prompt is required"
 }
 ```
 
@@ -678,9 +667,7 @@ Content-Type: application/json
 
 ```json
 {
-  "error": "GENERATION_FAILED",
-  "message": "Azure OpenAI chat request failed. Falling back to mock response is disabled in production.",
-  "azureError": "Rate limit exceeded on deployment gpt-4o"
+  "error": "Azure OpenAI chat request failed"
 }
 ```
 
