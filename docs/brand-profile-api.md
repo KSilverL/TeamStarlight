@@ -20,9 +20,9 @@ Frontend (Brand Profile form)
 Backend (Spring Boot)
     │  Persists brand profile per user
     │
-    └── Injected into every LLM generation call as system-level context:
-        - POST /llm/sessions          (chat pipeline, see chat-api.md)
-        - POST /llm/generate          (calendar modal, see calendar-api.md)
+    └── Injected into every MAF LLM generation call as system-level context:
+        - POST /tasks                 (newsroom workflow, see chat-api.md)
+        - POST /generate-text         (calendar modal, see calendar-api.md)
 ```
 
 ---

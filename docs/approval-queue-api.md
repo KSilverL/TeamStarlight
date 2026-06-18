@@ -5,16 +5,16 @@ This document covers all REST endpoints involved in the approval queue feature a
 - **Frontend** (Next.js, `http://localhost:3000`) — the two-panel approval UI in the profile page
 - **Backend** (Spring Boot, `http://localhost:8080`) — persists post records, tracks approval state, and links posts to their originating chat sessions
 
-The LLM service is not directly involved in this flow. Posts enter the approval queue after completing the LangGraph content pipeline (phase 2 critic pass) and being pushed to the backend via the status webhook (`POST /api/internal/status`, documented in `chat-api.md`).
+The LLM service is not directly involved in this flow. Posts enter the approval queue once the MAF newsroom workflow has drafted them and passed the reviewer (the safety + brand red-team screen): the backend learns of each platform's draft by subscribing to the task's **SSE event stream** (`GET /tasks/{id}/events`, documented in `chat-api.md`) — the LangGraph-era status webhook push has been retired.
 
 ---
 
 ## Architecture Overview
 
 ```
-LLM Service
-    │  Webhook: POST /api/internal/status
-    │  (fires per platform after critic passes)
+LLM Service (MAF)
+    │  SSE: GET /tasks/{id}/events
+    │  (backend subscribes; reads each platform's draft_ready / final event)
     ▼
 Backend (Spring Boot)
     │  Creates approval queue record with status "pending"
@@ -50,18 +50,19 @@ The object returned by all approval queue endpoints.
 
 | Field        | Type     | Description                                                                          |
 |--------------|----------|--------------------------------------------------------------------------------------|
-| `id`         | string   | UUID assigned when the post was created from a webhook notification                  |
-| `sessionId`  | string   | The chat session that produced this post (maps to `task_id` / `thread_id`)           |
+| `id`         | string   | UUID assigned when the backend recorded this draft from the MAF event stream         |
+| `sessionId`  | string   | The chat session that produced this post (maps to the MAF `task_id`)                 |
 | `platform`   | string   | One of `"instagram"`, `"linkedin"`, `"tiktok"`, `"x"`                               |
 | `date`       | string   | ISO date string representing when this content is intended for (e.g. `"2026-06-09"`) |
 | `text`       | string   | Generated post body copy, including any platform-specific formatting                  |
 | `hashtags`   | string[] | Generated hashtags. Empty array for platforms like LinkedIn                           |
-| `mediaAssetUrl` | string \| null | URL of the AI-generated image from DALL-E 3, if one was produced          |
-| `criticComment` | string | Summary comment from the LangGraph critic node                                      |
+| `htmlCard`   | string \| null | The post-approval **animated HTML brand card** — a complete, self-contained HTML document (inline CSS/SVG, no external assets) from the MAF `media_producer`. Replaces the old DALL-E 3 image; `null` until the post is approved |
+| `videoProps` | object \| null | The structured `BrandVideoProps` video spec a downstream Remotion render turns into an MP4. Also produced post-approval; `null` until then |
+| `criticComment` | string | Summary comment from the MAF reviewer (the safety + brand red-team screen)         |
 | `status`     | string   | Current approval lifecycle state. See status values below                            |
 | `notes`      | string \| null | Optional reviewer note, typically added on rejection                          |
 | `actionedAt` | string \| null | ISO 8601 timestamp of when the post was approved or rejected. Null if still pending |
-| `createdAt`  | string   | ISO 8601 timestamp of when this record was created (i.e. when the webhook fired)     |
+| `createdAt`  | string   | ISO 8601 timestamp of when this record was created (i.e. when the backend read the draft from the event stream) |
 | `updatedAt`  | string   | ISO 8601 timestamp of the last update                                                |
 
 ### Post Status Values
@@ -124,7 +125,7 @@ Host: localhost:8080
       "date": "2026-06-09",
       "text": "🌿 Meet your kitchen's new best friend — the Bamboo Kitchen Collection.\n\nCrafted from 100% organic bamboo, each piece is naturally antimicrobial, carbon-negative in production, and built to last a decade. Because sustainable living shouldn't mean settling for less. 🏡",
       "hashtags": ["#EcoHome", "#BambooKitchen", "#SustainableLiving", "#ZeroWaste", "#GreenHome"],
-      "mediaAssetUrl": "https://dalle.azure.com/images/abc123.png",
+      "htmlCard": null,
       "criticComment": "Tone aligned. Content passed safety check.",
       "status": "pending",
       "notes": null,
@@ -139,7 +140,7 @@ Host: localhost:8080
       "date": "2026-06-09",
       "text": "The sustainable homewares market is projected to reach $150B by 2030 — and EcoHome Solutions is proud to be part of that shift.\n\nToday we're launching the Bamboo Kitchen Collection: premium products that prove sustainable materials can exceed conventional standards.",
       "hashtags": [],
-      "mediaAssetUrl": "https://dalle.azure.com/images/def456.png",
+      "htmlCard": null,
       "criticComment": "Tone aligned. Content passed safety check.",
       "status": "pending",
       "notes": null,
@@ -170,7 +171,7 @@ Host: localhost:8080
 ## A2. Get Approval Queue Post
 
 **Description**  
-Returns the full detail of a single approval queue post by ID. The frontend calls this when a reviewer clicks a post card in the left panel to populate the right-hand detail panel, including the full post body, hashtags, media asset, and critic comment.
+Returns the full detail of a single approval queue post by ID. The frontend calls this when a reviewer clicks a post card in the left panel to populate the right-hand detail panel, including the full post body, hashtags, the brand card (once approved), and the reviewer comment.
 
 **Endpoint**  
 `/api/approval/posts/{postId}`
@@ -207,7 +208,7 @@ Host: localhost:8080
   "date": "2026-06-09",
   "text": "🌿 Meet your kitchen's new best friend — the Bamboo Kitchen Collection.\n\nCrafted from 100% organic bamboo, each piece is naturally antimicrobial, carbon-negative in production, and built to last a decade. Because sustainable living shouldn't mean settling for less. 🏡",
   "hashtags": ["#EcoHome", "#BambooKitchen", "#SustainableLiving", "#ZeroWaste", "#GreenHome"],
-  "mediaAssetUrl": "https://dalle.azure.com/images/abc123.png",
+  "htmlCard": null,
   "criticComment": "Tone aligned. Content passed safety check.",
   "status": "pending",
   "notes": null,
@@ -282,7 +283,7 @@ Content-Type: application/json
   "date": "2026-06-09",
   "text": "🌿 Meet your kitchen's new best friend — the Bamboo Kitchen Collection.\n\nCrafted from 100% organic bamboo, each piece is naturally antimicrobial, carbon-negative in production, and built to last a decade. Because sustainable living shouldn't mean settling for less. 🏡",
   "hashtags": ["#EcoHome", "#BambooKitchen", "#SustainableLiving", "#ZeroWaste", "#GreenHome"],
-  "mediaAssetUrl": "https://dalle.azure.com/images/abc123.png",
+  "htmlCard": "<!DOCTYPE html>…animated brand card…</html>",
   "criticComment": "Tone aligned. Content passed safety check.",
   "status": "approved",
   "notes": null,
@@ -315,7 +316,7 @@ Content-Type: application/json
   "date": "2026-06-09",
   "text": "🌿 Meet your kitchen's new best friend — the Bamboo Kitchen Collection.\n\nCrafted from 100% organic bamboo, each piece is naturally antimicrobial, carbon-negative in production, and built to last a decade. Because sustainable living shouldn't mean settling for less. 🏡",
   "hashtags": ["#EcoHome", "#BambooKitchen", "#SustainableLiving", "#ZeroWaste", "#GreenHome"],
-  "mediaAssetUrl": "https://dalle.azure.com/images/abc123.png",
+  "htmlCard": null,
   "criticComment": "Tone aligned. Content passed safety check.",
   "status": "rejected",
   "notes": "Too many hashtags — reduce to 3 and soften the opening line",
