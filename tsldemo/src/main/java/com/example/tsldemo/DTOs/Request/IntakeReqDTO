@@ -1,0 +1,18 @@
+package com.example.tsldemo.DTOs.Request;
+
+import jakarta.persistence.Entity;
+
+@Entity
+public class IntakeReqDTO {
+
+	@JsonProperty("mode")
+	private String mode;
+
+	@JsonProperty("opening_input")
+	private String openingInput;
+
+    public IntakeReqDTO(String mode, String openingInput) {
+		this.setMode(mode);
+		this.setOpeningInput(openingInput);
+	}
+}
