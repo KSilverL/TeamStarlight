@@ -4,32 +4,34 @@ This document covers all REST endpoints involved in the chat interface workflow 
 
 - **Frontend** (Next.js, `http://localhost:3000`) - the user-facing React chat UI
 - **Backend** (Spring Boot, `http://localhost:8080`) - the middleware that manages sessions, orchestrates the LLM service, and persists state
-- **LLM Service** (LangGraph, `http://localhost:8000`) - the multi-agent content generation pipeline
+- **LLM Service** (MAF — Microsoft Agent Framework, `http://localhost:8080`) - the multi-agent "virtual newsroom" content workflow
+
+Every session is owned by an authenticated **Business account** — account creation and login are documented separately in [`auth-api.md`](auth-api.md).
 
 ---
 
 ## Architecture Overview
 
-The chat interface drives a two-phase, interrupt-driven pipeline. Each user session maps to a unique LangGraph `thread_id`. The backend is the sole orchestrator: it starts the graph, resumes it at each interrupt, and relays events back to the frontend. The LLM service fires webhook notifications to the backend as each platform pipeline completes.
+The chat interface drives an interrupt-driven workflow. Each user session maps to a MAF **task** (`task_id`). The backend is the sole orchestrator: it starts the task, subscribes to its event stream, submits the human-review verdict, and relays events back to the frontend. The MAF workflow pauses at a **RequestPort review gate** (the MAF analogue of a LangGraph interrupt) and delivers progress to the backend over **Server-Sent Events** rather than a webhook push.
 
 ```
 Frontend (Next.js)
     │  REST calls (sections A–C below)
     ▼
-Backend (Spring Boot) ──────────────────► LLM Service (LangGraph)
+Backend (Spring Boot) ──────────────────► LLM Service (MAF)
     │  REST calls (section D below)             │
-    │◄──────────────────────────────────────────┘
-    │  Webhook push (section E below, POST /api/internal/status)
+    │  SSE subscribe (section E below,          │
+    │  GET /tasks/{id}/events) ◄────────────────┘
     │
     ▼
 Frontend receives updated session state
 ```
 
-**Pipeline Phases:**
+**Workflow phases** — the MAF newsroom runs `dispatcher → scout → creator` (fan-out) `→ reviewer → human-gate → archivist → media_producer`:
 
-1. **Phase 1** - Planning: the graph runs `planner → rag_structure → outliner` then pauses at `outline_gate` (Interrupt 1).
-2. **Phase 2** - Content Creation: on outline approval the graph fans out into per-platform pipelines then pauses at `final_review_gate` (Interrupt 2).
-3. **Conversation Loop** - Optionally, the user enters a multi-turn edit loop for a specific platform before returning to final review.
+1. **Phase 1 — Planning:** the backend confirms the brief and may present a campaign outline for approval before starting generation (the backend's own planning step — the MAF service does not gate on an outline).
+2. **Phase 2 — Content Creation:** the MAF workflow drafts one native post per platform (creator fan-out), screens each through the reviewer, then pauses at the **review gate** for the per-platform approve / edit / reject verdict.
+3. **Conversation Loop** — optionally, the user enters a multi-turn edit loop for a specific platform (backed by the standalone `POST /generate-text` generator) before returning to review.
 
 ---
 
@@ -44,20 +46,20 @@ Frontend receives updated session state
 - [B1. Send Message / Submit Brief](#b1-send-message--submit-brief)
 - [B2. Get Message History](#b2-get-message-history)
 
-**C - Interrupt Decisions (Frontend → Backend)**
-- [C1. Submit Outline Decision (Interrupt 1)](#c1-submit-outline-decision-interrupt-1)
-- [C2. Submit Draft Decisions (Interrupt 2)](#c2-submit-draft-decisions-interrupt-2)
+**C - Review Decisions (Frontend → Backend)**
+- [C1. Submit Outline Decision](#c1-submit-outline-decision)
+- [C2. Submit Draft Decisions](#c2-submit-draft-decisions)
 - [C3. Start Platform Conversation](#c3-start-platform-conversation)
 - [C4. Send Conversation Message](#c4-send-conversation-message)
 - [C5. End Platform Conversation](#c5-end-platform-conversation)
 
 **D - LLM Service Integration (Backend → LLM Service)**
-- [D1. Start Pipeline Run](#d1-start-pipeline-run)
-- [D2. Resume Pipeline at Interrupt](#d2-resume-pipeline-at-interrupt)
-- [D3. Get Pipeline State](#d3-get-pipeline-state)
+- [D1. Start a Task](#d1-start-a-task)
+- [D2. Submit Review Verdicts](#d2-submit-review-verdicts)
+- [D3. Get Task Snapshot](#d3-get-task-snapshot)
 
-**E - Webhook Notifications (LLM Service → Backend)**
-- [E1. Platform Content Status Notification](#e1-platform-content-status-notification)
+**E - Progress Events (LLM Service → Backend, SSE)**
+- [E1. Task Event Stream](#e1-task-event-stream)
 
 ---
 
@@ -66,7 +68,7 @@ Frontend receives updated session state
 ### A1. Create Session
 
 **Description**  
-Creates a new content generation session. The backend assigns a unique `sessionId` (which also becomes the LangGraph `thread_id`), stores the session, and immediately kicks off Phase 1 of the LLM pipeline (D1) asynchronously. The response returns as soon as the session is created - the frontend should then poll `GET /api/sessions/{sessionId}` or listen for server-sent events to track pipeline progress.
+Creates a new content generation session. The backend assigns a unique `sessionId` (which also becomes the MAF `task_id`), stores the session, and immediately starts the MAF task (D1) asynchronously. The response returns as soon as the session is created - the frontend should then poll `GET /api/sessions/{sessionId}` or listen for server-sent events to track progress.
 
 **Endpoint**  
 `/api/sessions`
@@ -116,7 +118,7 @@ Content-Type: application/json
 ```json
 {
   "sessionId": "sess-7f3a1b2c",
-  "threadId": "sess-7f3a1b2c",
+  "taskId": "sess-7f3a1b2c",
   "status": "running",
   "phase": "phase1",
   "targetPlatforms": ["instagram", "linkedin"],
@@ -143,7 +145,7 @@ Content-Type: application/json
 ### A2. Get Session
 
 **Description**  
-Returns the full current state of a session including phase, pipeline status, the generated outline (once available), per-platform drafts, media asset URLs, critic comments, and approval statuses. The frontend polls this endpoint to know when the pipeline has reached an interrupt and content is ready for user review.
+Returns the full current state of a session including phase, workflow status, the generated outline (once available), per-platform drafts, the brand card (generated post-approval), reviewer comments, and approval statuses. The frontend polls this endpoint to know when the workflow has reached the review gate and content is ready for user review.
 
 **Endpoint**  
 `/api/sessions/{sessionId}`
@@ -177,7 +179,7 @@ Host: localhost:8080
   "sessionId": "sess-7f3a1b2c",
   "status": "awaiting_approval",
   "phase": "phase2_review",
-  "currentInterrupt": "final_review_gate",
+  "currentGate": "review_gate",
   "outline": {
     "title": "Living Greener - Bamboo Kitchen Collection",
     "keyMessages": ["sustainable materials", "carbon-negative production", "built to last"],
@@ -189,14 +191,14 @@ Host: localhost:8080
     "instagram": {
       "text": "🌿 Meet your kitchen's new best friend - the Bamboo Kitchen Collection...",
       "hashtags": ["#EcoHome", "#BambooKitchen", "#SustainableLiving"],
-      "mediaAssetUrl": "https://dalle.azure.com/images/abc123.png",
+      "htmlCard": null,
       "criticComment": "Tone aligned. Content passed safety check.",
       "approvalStatus": "pending"
     },
     "linkedin": {
       "text": "The sustainable homewares market is projected to reach $150B by 2030...",
       "hashtags": null,
-      "mediaAssetUrl": "https://dalle.azure.com/images/def456.png",
+      "htmlCard": null,
       "criticComment": "Tone aligned. Content passed safety check.",
       "approvalStatus": "pending"
     }
@@ -213,7 +215,7 @@ Host: localhost:8080
 | Value              | Meaning                                                       |
 |--------------------|---------------------------------------------------------------|
 | `running`          | Pipeline is actively generating content                       |
-| `awaiting_approval`| Paused at an interrupt; user action required                  |
+| `awaiting_approval`| Paused at the review gate; user action required               |
 | `in_conversation`  | User is in a multi-turn edit loop for a specific platform     |
 | `completed`        | All platforms approved; session is finished                   |
 | `failed`           | An unrecoverable error occurred in the pipeline               |
@@ -296,7 +298,7 @@ Host: localhost:8080
 ### B1. Send Message / Submit Brief
 
 **Description**  
-Sends a user message in the chat. On the **first message** of a session this is the brand brief that initiates Phase 1 of the pipeline. On subsequent messages (after all approvals are complete or if the session has not yet been started via A1), this can be used to refine preferences before generation begins. During an active **conversation loop** (after C3), use C4 instead.
+Sends a user message in the chat. On the **first message** of a session this is the brand brief that initiates Phase 1 (the backend confirms the brief and starts the MAF task). On subsequent messages (after all approvals are complete or if the session has not yet been started via A1), this can be used to refine preferences before generation begins. During an active **conversation loop** (after C3), use C4 instead.
 
 The backend appends the user message to the session's message history and returns an immediate acknowledgement. The assistant reply appears asynchronously via the session state (A2).
 
@@ -353,8 +355,8 @@ Content-Type: application/json
 ```json
 {
   "error": "SESSION_IN_WRONG_STATE",
-  "message": "Session sess-7f3a1b2c is currently awaiting an interrupt decision. Use the appropriate decision endpoint instead.",
-  "currentInterrupt": "final_review_gate"
+  "message": "Session sess-7f3a1b2c is currently awaiting a review decision. Use the appropriate decision endpoint instead.",
+  "currentGate": "review_gate"
 }
 ```
 
@@ -458,16 +460,16 @@ Host: localhost:8080
 
 ---
 
-## C - Interrupt Decisions
+## C - Review Decisions
 
-These endpoints resume the LangGraph pipeline at its interrupt checkpoints. Each call triggers the backend to call D2 internally.
+These endpoints carry the user's review decisions. The backend maps each onto the MAF service: the draft and edit decisions (C2–C5) become a `POST /tasks/{id}/review` call (D2); the outline step (C1) is the backend's own planning gate, applied before it starts the MAF task.
 
 ---
 
-### C1. Submit Outline Decision (Interrupt 1)
+### C1. Submit Outline Decision
 
 **Description**  
-Submits the user's decision on the generated campaign outline. This resumes the pipeline at `outline_gate` (Interrupt 1). On approval, Phase 2 begins and the platform-specific content pipelines start running in parallel. On rejection the outline is regenerated. On modification, the user-supplied outline JSON is injected and used directly.
+Submits the user's decision on the generated campaign outline at the backend's planning gate (Phase 1). On approval the backend starts the MAF task (D1) and Phase 2 begins, fanning out the per-platform drafts. On rejection the outline is regenerated. On modification, the user-supplied outline JSON is used directly. (The outline is the backend's own step — the MAF workflow itself gates only on the per-platform draft review.)
 
 **Endpoint**  
 `/api/sessions/{sessionId}/outline/decision`
@@ -542,16 +544,16 @@ Content-Type: application/json
 {
   "error": "SESSION_IN_WRONG_STATE",
   "message": "Session sess-7f3a1b2c is not currently waiting for an outline decision.",
-  "currentInterrupt": "final_review_gate"
+  "currentGate": "review_gate"
 }
 ```
 
 ---
 
-### C2. Submit Draft Decisions (Interrupt 2)
+### C2. Submit Draft Decisions
 
 **Description**  
-Submits per-platform approval decisions at the `final_review_gate` checkpoint. Each platform must be marked `"approved"` or `"rejected"`. Rejected platforms are re-routed through the full platform pipeline (rag → creator → critic) and re-presented for review. Only platforms not yet approved need to be included in each submission.
+Submits per-platform approval decisions at the MAF review gate; the backend forwards them as `POST /tasks/{id}/review` (D2). Each platform must be marked `"approved"` or `"rejected"`. Rejected platforms are re-drafted by the workflow (creator → reviewer) and re-presented for review. Only platforms not yet approved need to be included in each submission.
 
 **Endpoint**  
 `/api/sessions/{sessionId}/drafts/decisions`
@@ -621,7 +623,7 @@ Content-Type: application/json
 ### C3. Start Platform Conversation
 
 **Description**  
-Enters a multi-turn conversation edit loop for a specific platform. This resumes the pipeline at `final_review_gate` with a `chat:{platform}` signal, which routes into `conversation_node`. Once active, the frontend must use C4 to send revision requests and C5 to exit. Other platforms retain their current approval state.
+Enters a multi-turn edit loop for a specific platform. The backend keeps that platform pending at the review gate and revises its draft turn-by-turn via the standalone `POST /generate-text` generator (it owns the conversation history). Once active, the frontend must use C4 to send revision requests and C5 to exit. Other platforms retain their current approval state.
 
 **Endpoint**  
 `/api/sessions/{sessionId}/conversation`
@@ -678,7 +680,7 @@ Content-Type: application/json
 {
   "error": "SESSION_IN_WRONG_STATE",
   "message": "Session sess-7f3a1b2c is not at the final review gate.",
-  "currentInterrupt": "outline_gate"
+  "currentGate": "outline_gate"
 }
 ```
 
@@ -687,7 +689,7 @@ Content-Type: application/json
 ### C4. Send Conversation Message
 
 **Description**  
-Sends a modification request to the active platform conversation. The backend resumes the `conversation_node` interrupt with the user's text. The LLM service calls Azure OpenAI chat to revise the current draft and returns the updated copy. The response includes the revised draft immediately, which the backend also stores in the session and message history.
+Sends a modification request to the active platform edit loop. The backend forwards the user's text to `POST /generate-text` (passing the prior turns as `history`); the MAF service revises the current draft and returns the updated copy. The response includes the revised draft immediately, which the backend also stores in the session and message history.
 
 **Endpoint**  
 `/api/sessions/{sessionId}/conversation/message`
@@ -752,7 +754,7 @@ Content-Type: application/json
 ### C5. End Platform Conversation
 
 **Description**  
-Exits the active conversation loop and returns the pipeline to `final_review_gate`. The backend resumes `conversation_node` with the string `"done"`, which sets `conversation_status` to `"done"` and routes back to the final review gate. The finalised draft from the last revision is presented again alongside any other pending platforms.
+Exits the active edit loop and returns the platform to the review gate. The backend sets `conversationStatus` to `"done"`; the finalised draft from the last revision is presented again (as the platform's pending draft) alongside any other pending platforms, ready for the C2 verdict.
 
 **Endpoint**  
 `/api/sessions/{sessionId}/conversation/end`
@@ -790,7 +792,7 @@ Host: localhost:8080
   "conversationPlatform": "linkedin",
   "conversationStatus": "done",
   "status": "awaiting_approval",
-  "currentInterrupt": "final_review_gate",
+  "currentGate": "review_gate",
   "message": "Conversation ended. Returned to final review gate."
 }
 ```
@@ -808,275 +810,19 @@ Host: localhost:8080
 
 ## D - LLM Service Integration
 
-These endpoints are called **by the Spring Boot backend only** and are not intended to be called directly by the frontend. They map directly to LangGraph `astream()` and `get_state()` calls over the REST interface exposed by the LLM service.
+These endpoints are called **by the Spring Boot backend only** and are not intended to be called directly by the frontend. They are the MAF newsroom service's REST surface (`LLM_service/api.py`); the backend maps each frontend session/decision onto them. The complete, authoritative contract — every field, the SSE envelope, and a ready-made Java client — lives in the repo-root [`API.md`](../API.md).
+
+> **Migration note:** the LangGraph endpoints this section used to document (`POST /llm/sessions`, `PUT /llm/sessions/{threadId}/resume`, `GET /llm/sessions/{threadId}/state`) and their `astream()` / `get_state()` / `Command(resume=...)` semantics have been **replaced** by the MAF **task** surface below. What was the LangGraph `thread_id` is now the MAF `task_id`, and a single per-platform **review gate** (a MAF RequestPort) replaces the old two-interrupt model.
 
 ---
 
-### D1. Start Pipeline Run
+### D1. Start a Task
 
 **Description**  
-Starts a new LangGraph graph run for the given `threadId`. The backend calls this immediately after session creation (A1). The LLM service streams through Phase 1 asynchronously (`planner → rag_structure → outliner`) and pauses at `outline_gate`. The backend is notified of progress via the webhook (E1) and by polling D3.
+Starts a new MAF newsroom run from a `CreativeBrief`. The backend calls this once the brief is confirmed (A1/B1). The service runs dispatcher → scout → creator (one draft per platform) → reviewer, then pauses at the human-review gate with `status: "awaiting_review"`. The backend watches progress over SSE (E1) and submits the verdict via D2.
 
 **Endpoint**  
-`/llm/sessions`
-
-**Base URL**  
-`http://localhost:8000`
-
-**Method**  
-`POST`
-
-**Query Parameters**  
-None
-
-**Request Body**
-
-| Field                  | Type     | Required | Description                                                          |
-|------------------------|----------|----------|----------------------------------------------------------------------|
-| `threadId`             | string   | Yes      | Unique identifier for this LangGraph run (matches `sessionId`)       |
-| `taskId`               | string   | Yes      | Task ID passed to the webhook notifier                               |
-| `businessDescription`  | string   | Yes      | Maps to `AgentState.business_description`                            |
-| `brandTone`            | string   | Yes      | Maps to `AgentState.brand_tone`                                      |
-| `targetPlatforms`      | string[] | Yes      | Maps to `AgentState.target_platforms`                                |
-| `contentTopics`        | string   | Yes      | Maps to `AgentState.content_topics`                                  |
-| `notes`                | string   | No       | Maps to `AgentState.notes`                                           |
-| `examples`             | string   | No       | Maps to `AgentState.examples`                                        |
-| `userPreferences`      | string   | No       | Maps to `AgentState.user_preferences`                                |
-
-**Example Request**
-
-```http
-POST /llm/sessions HTTP/1.1
-Host: localhost:8000
-Content-Type: application/json
-
-{
-  "threadId": "sess-7f3a1b2c",
-  "taskId": "sess-7f3a1b2c",
-  "businessDescription": "EcoHome Solutions - sustainable bamboo home products",
-  "brandTone": "warm, aspirational, educational",
-  "targetPlatforms": ["instagram", "linkedin"],
-  "contentTopics": "Bamboo Kitchen Collection launch",
-  "notes": "Emphasise sustainability and durability",
-  "userPreferences": "Prefer storytelling over promotional copy"
-}
-```
-
-**Example Successful Response** - `202 Accepted`
-
-```json
-{
-  "threadId": "sess-7f3a1b2c",
-  "status": "running",
-  "currentNode": "planner_node",
-  "message": "Phase 1 pipeline started."
-}
-```
-
-**Example Unsuccessful Response** - `409 Conflict`
-
-```json
-{
-  "error": "THREAD_ALREADY_EXISTS",
-  "message": "A run with threadId sess-7f3a1b2c already exists. Use PUT /llm/sessions/{threadId}/resume to continue."
-}
-```
-
----
-
-### D2. Resume Pipeline at Interrupt
-
-**Description**  
-Resumes a paused LangGraph graph at an interrupt checkpoint. The backend calls this in response to every decision the frontend submits (C1–C5). The `resumeValue` field maps directly to the `Command(resume=...)` value that LangGraph expects at each interrupt:
-
-| Interrupt            | `resumeValue` shape                                                                 |
-|----------------------|-------------------------------------------------------------------------------------|
-| `outline_gate`       | `"approved"` \| `"rejected"` \| `{ "outline": { ... } }`                          |
-| `final_review_gate`  | `{ "instagram": "approved", "linkedin": "rejected" }` \| `"chat:{platform}"`       |
-| `conversation_node`  | Any string (modification request) \| `"done"`                                       |
-
-**Endpoint**  
-`/llm/sessions/{threadId}/resume`
-
-**Base URL**  
-`http://localhost:8000`
-
-**Method**  
-`PUT`
-
-**Path Parameters**
-
-| Parameter  | Type   | Required | Description                                 |
-|------------|--------|----------|---------------------------------------------|
-| `threadId` | string | Yes      | The LangGraph thread ID to resume           |
-
-**Query Parameters**  
-None
-
-**Request Body**
-
-| Field         | Type                  | Required | Description                                                    |
-|---------------|-----------------------|----------|----------------------------------------------------------------|
-| `resumeValue` | string \| object      | Yes      | The value to pass to `Command(resume=...)` in LangGraph        |
-
-**Example Request - Approve Outline**
-
-```http
-PUT /llm/sessions/sess-7f3a1b2c/resume HTTP/1.1
-Host: localhost:8000
-Content-Type: application/json
-
-{
-  "resumeValue": "approved"
-}
-```
-
-**Example Request - Submit Draft Approvals**
-
-```http
-PUT /llm/sessions/sess-7f3a1b2c/resume HTTP/1.1
-Host: localhost:8000
-Content-Type: application/json
-
-{
-  "resumeValue": {
-    "instagram": "approved",
-    "linkedin": "rejected"
-  }
-}
-```
-
-**Example Request - Send Conversation Message**
-
-```http
-PUT /llm/sessions/sess-7f3a1b2c/resume HTTP/1.1
-Host: localhost:8000
-Content-Type: application/json
-
-{
-  "resumeValue": "Make the opening more personal and remove the market statistics"
-}
-```
-
-**Example Successful Response** - `202 Accepted`
-
-```json
-{
-  "threadId": "sess-7f3a1b2c",
-  "status": "running",
-  "currentNode": "platform_pipeline",
-  "message": "Graph resumed successfully."
-}
-```
-
-**Example Unsuccessful Response** - `404 Not Found`
-
-```json
-{
-  "error": "THREAD_NOT_FOUND",
-  "message": "No active graph run found for threadId sess-7f3a1b2c."
-}
-```
-
-**Example Unsuccessful Response** - `409 Conflict`
-
-```json
-{
-  "error": "GRAPH_NOT_INTERRUPTED",
-  "message": "Thread sess-7f3a1b2c is not currently paused at an interrupt. Wait for the pipeline to reach the next checkpoint."
-}
-```
-
----
-
-### D3. Get Pipeline State
-
-**Description**  
-Returns the current LangGraph checkpoint state for a thread. The backend uses this to read the generated outline, drafts, media assets, and critic comments after each phase completes, then maps the state into the session model stored in its own database.
-
-**Endpoint**  
-`/llm/sessions/{threadId}/state`
-
-**Base URL**  
-`http://localhost:8000`
-
-**Method**  
-`GET`
-
-**Path Parameters**
-
-| Parameter  | Type   | Required | Description                                |
-|------------|--------|----------|--------------------------------------------|
-| `threadId` | string | Yes      | The LangGraph thread ID                    |
-
-**Query Parameters**  
-None
-
-**Example Request**
-
-```http
-GET /llm/sessions/sess-7f3a1b2c/state HTTP/1.1
-Host: localhost:8000
-```
-
-**Example Successful Response** - `200 OK`
-
-```json
-{
-  "threadId": "sess-7f3a1b2c",
-  "nextNodes": ["final_review_gate"],
-  "interruptedAt": "final_review_gate",
-  "values": {
-    "currentStatus": "awaiting_final_review",
-    "outline": {
-      "title": "Living Greener - Bamboo Kitchen Collection",
-      "keyMessages": ["sustainable materials", "carbon-negative production"],
-      "visualConcept": "Flat lay of bamboo utensils on white marble with fresh herbs",
-      "toneNotes": "Warm and aspirational"
-    },
-    "drafts": {
-      "instagram": "🌿 Meet your kitchen's new best friend...",
-      "linkedin": "The sustainable homewares market is projected to reach $150B by 2030..."
-    },
-    "mediaAssets": {
-      "instagram": "https://dalle.azure.com/images/abc123.png",
-      "linkedin": "https://dalle.azure.com/images/def456.png"
-    },
-    "criticComments": {
-      "instagram": "Tone aligned. Content passed safety check.",
-      "linkedin": "Tone aligned. Content passed safety check."
-    },
-    "contentApprovals": {
-      "instagram": "pending",
-      "linkedin": "pending"
-    },
-    "conversationStatus": "done"
-  }
-}
-```
-
-**Example Unsuccessful Response** - `404 Not Found`
-
-```json
-{
-  "error": "THREAD_NOT_FOUND",
-  "message": "No graph state found for threadId sess-7f3a1b2c."
-}
-```
-
----
-
-## E - Webhook Notifications
-
-### E1. Platform Content Status Notification
-
-**Description**  
-Called **by the LLM service** to push real-time per-platform completion events to the backend. The `feedback_db_node` fires this after each platform's draft passes the critic. The backend uses the payload to update its internal session state and can optionally push an event to any connected frontend clients (e.g. via Server-Sent Events or WebSocket) so the draft appears in the chat without requiring a full poll.
-
-The LLM service silently drops the notification if this endpoint is unreachable (2-second timeout, no retry). The backend must therefore also poll D3 as a fallback to catch any missed events.
-
-**Endpoint**  
-`/api/internal/status`
+`/tasks`
 
 **Base URL**  
 `http://localhost:8080`
@@ -1087,47 +833,129 @@ The LLM service silently drops the notification if this endpoint is unreachable 
 **Query Parameters**  
 None
 
-**Request Body** *(sent by LLM service)*
+**Request Body** *(the `CreativeBrief` — see [`API.md`](../API.md) for the full field list)*
 
-| Field     | Type   | Required | Description                                                          |
-|-----------|--------|----------|----------------------------------------------------------------------|
-| `taskId`  | string | Yes      | The session / thread ID this notification belongs to                 |
-| `status`  | object | Yes      | Per-platform content result payload                                  |
+| Field               | Type     | Required    | Description                                                        |
+|---------------------|----------|-------------|--------------------------------------------------------------------|
+| `topic`             | string   | Yes         | What to post about (the backend maps `contentTopics` here)         |
+| `target_platforms`  | string[] | Yes         | e.g. `["instagram", "linkedin"]`                                   |
+| `user_intent`       | string   | recommended | Goal / audience                                                    |
+| `business_id`       | string   | recommended | Per-brand ID — keys the learned brand-voice rules                  |
+| `user_id`           | string   | optional    | End-user ID — enables the per-user learning channel (`/learn-*`)   |
+| `tone_hint`         | string   | optional    | Voice hint for users without a saved brand                         |
+| `task_id`           | string   | optional    | Supply your own (e.g. the `sessionId`); else auto-generated        |
 
-`status` object fields:
-
-| Field            | Type   | Description                                            |
-|------------------|--------|--------------------------------------------------------|
-| `platform`       | string | The platform this content was generated for            |
-| `draft`          | string | The generated post copy that passed the critic         |
-| `mediaAssetUrl`  | string | URL of the Azure DALL-E 3 generated image              |
-| `criticComment`  | string | Summary comment from the critic node                   |
-
-**Example Request** *(from LLM service → backend)*
+**Example Request**
 
 ```http
-POST /api/internal/status HTTP/1.1
+POST /tasks HTTP/1.1
 Host: localhost:8080
 Content-Type: application/json
 
 {
-  "taskId": "sess-7f3a1b2c",
-  "status": {
-    "platform": "instagram",
-    "draft": "🌿 Meet your kitchen's new best friend - the Bamboo Kitchen Collection.\n\nCrafted from 100% organic bamboo, each piece is naturally antimicrobial, carbon-negative in production, and built to last a decade.",
-    "mediaAssetUrl": "https://dalle.azure.com/images/abc123.png",
-    "criticComment": "Tone aligned. Content passed safety check."
+  "task_id": "sess-7f3a1b2c",
+  "topic": "Bamboo Kitchen Collection launch",
+  "target_platforms": ["instagram", "linkedin"],
+  "user_intent": "drive awareness with eco-conscious millennials",
+  "business_id": "biz_ecohome",
+  "tone_hint": "warm, aspirational, educational"
+}
+```
+
+**Example Successful Response** - `200 OK` *(task snapshot — see D3)*
+
+```json
+{
+  "task_id": "sess-7f3a1b2c",
+  "status": "awaiting_review",
+  "pending": [
+    { "request_id": "req-ig", "platform": "instagram", "draft": "🌿 Meet your kitchen's new best friend...",
+      "comment": "approved by red team", "needs_human_intervention": false }
+  ],
+  "outputs": [],
+  "proposed_rules": []
+}
+```
+
+**Example Unsuccessful Response** - `409 Conflict`
+
+```json
+{
+  "error": "task_id sess-7f3a1b2c already exists"
+}
+```
+
+---
+
+### D2. Submit Review Verdicts
+
+**Description**  
+Resumes a task paused at the review gate by submitting one or more per-platform verdicts. The backend calls this when the frontend submits a draft decision (C2) or finishes a platform edit loop (C5). It replaces the old LangGraph `Command(resume=...)` resume call. You can address a subset of pending platforms at a time — unaddressed ones stay pending. Each verdict's `decision` is one of:
+
+| `decision`            | Effect                                                                        |
+|-----------------------|-------------------------------------------------------------------------------|
+| `approve`             | Platform finalized as-is                                                       |
+| `approve_after_edit`  | Finalized with your `edited_draft`; the service proposes brand rules (see `proposed_rules`) |
+| `reject`              | Platform re-drafts and returns to `awaiting_review`                            |
+
+**Endpoint**  
+`/tasks/{task_id}/review`
+
+**Base URL**  
+`http://localhost:8080`
+
+**Method**  
+`POST`
+
+**Path Parameters**
+
+| Parameter  | Type   | Required | Description                          |
+|------------|--------|----------|--------------------------------------|
+| `task_id`  | string | Yes      | The MAF task to resume (the `sessionId`) |
+
+**Query Parameters**  
+None
+
+**Request Body**
+
+| Field      | Type   | Required | Description                                                                                  |
+|------------|--------|----------|----------------------------------------------------------------------------------------------|
+| `verdicts` | object | Yes      | Map of platform → `{ "decision": ..., "edited_draft"?: ..., "reason"?: ... }`. `edited_draft` is required when `decision` is `approve_after_edit` |
+
+**Example Request**
+
+```http
+POST /tasks/sess-7f3a1b2c/review HTTP/1.1
+Host: localhost:8080
+Content-Type: application/json
+
+{
+  "verdicts": {
+    "instagram": { "decision": "approve" },
+    "linkedin":  { "decision": "approve_after_edit", "edited_draft": "At EcoHome Solutions, we believe..." },
+    "twitter":   { "decision": "reject", "reason": "too formal" }
   }
 }
 ```
 
-**Example Successful Response** - `200 OK`
+**Example Successful Response** - `200 OK` *(updated task snapshot — see D3)*
 
 ```json
 {
-  "received": true,
-  "sessionId": "sess-7f3a1b2c",
-  "platform": "instagram"
+  "task_id": "sess-7f3a1b2c",
+  "status": "awaiting_review",
+  "pending": [
+    { "request_id": "req-tw", "platform": "twitter", "draft": "…re-drafted copy…",
+      "comment": "approved by red team", "needs_human_intervention": false }
+  ],
+  "outputs": [
+    { "platform": "instagram", "draft": "🌿 Meet your kitchen's...", "decision": "approve",
+      "comment": "approved by red team", "needs_human_intervention": false, "proposed_rules": [],
+      "html_card": "<!DOCTYPE html>…</html>", "video_props": { "brandName": "EcoHome", "…": "…" } }
+  ],
+  "proposed_rules": [
+    { "kind": "must_do", "rule": "Open with a personal story", "rationale": "the human added this phrasing in their edit" }
+  ]
 }
 ```
 
@@ -1135,9 +963,123 @@ Content-Type: application/json
 
 ```json
 {
-  "error": "SESSION_NOT_FOUND",
-  "message": "No session found for taskId sess-7f3a1b2c. Notification discarded."
+  "error": "unknown task_id sess-7f3a1b2c"
 }
 ```
 
-> **Note:** The LLM service does not retry on failure. If the backend is unavailable when the notification fires, the backend must recover the state by calling D3 (`GET /llm/sessions/{threadId}/state`) when the session next receives a request from the frontend.
+**Example Unsuccessful Response** - `409 Conflict`
+
+```json
+{
+  "error": "task sess-7f3a1b2c is not awaiting review"
+}
+```
+
+---
+
+### D3. Get Task Snapshot
+
+**Description**  
+Returns the current snapshot of a task. The backend uses this to read the pending drafts, finalized outputs (each with its `html_card` + `video_props`), and any `proposed_rules` after each step, then maps the snapshot into the session model stored in its own database. The same snapshot shape is returned by D1 and D2. Use it as a fallback after an SSE disconnect (E1).
+
+**Endpoint**  
+`/tasks/{task_id}`
+
+**Base URL**  
+`http://localhost:8080`
+
+**Method**  
+`GET`
+
+**Path Parameters**
+
+| Parameter  | Type   | Required | Description                  |
+|------------|--------|----------|------------------------------|
+| `task_id`  | string | Yes      | The MAF task (the `sessionId`) |
+
+**Query Parameters**  
+None
+
+**Example Request**
+
+```http
+GET /tasks/sess-7f3a1b2c HTTP/1.1
+Host: localhost:8080
+```
+
+**Example Successful Response** - `200 OK`
+
+```json
+{
+  "task_id": "sess-7f3a1b2c",
+  "status": "awaiting_review",
+  "pending": [
+    { "request_id": "req-ig", "platform": "instagram", "draft": "🌿 Meet your kitchen's new best friend...",
+      "comment": "approved by red team", "needs_human_intervention": false },
+    { "request_id": "req-li", "platform": "linkedin", "draft": "The sustainable homewares market is projected to reach $150B by 2030...",
+      "comment": "approved by red team", "needs_human_intervention": false }
+  ],
+  "outputs": [],
+  "proposed_rules": []
+}
+```
+
+`status` is the state machine: `awaiting_review` (paused at the gate — drive review off `pending`) → `completed` (all platforms finalized — read `outputs`); `running` is transient. The post-approval `html_card` + `video_props` appear on each finalized item in `outputs` (see D2).
+
+**Example Unsuccessful Response** - `404 Not Found`
+
+```json
+{
+  "error": "unknown task_id sess-7f3a1b2c"
+}
+```
+
+---
+
+## E - Progress Events (SSE)
+
+### E1. Task Event Stream
+
+**Description**  
+The backend learns of per-platform progress by **subscribing to the task's SSE stream**, which replaces the LangGraph-era status webhook push (`POST /api/internal/status`). The backend opens one long-lived `GET` per task; the MAF service replays all events so far, streams live updates, and **closes the stream when the task completes**. The backend relays the events it cares about to connected frontend clients (over its own SSE/WebSocket) so a draft appears in the chat without a full poll.
+
+**Endpoint**  
+`/tasks/{task_id}/events`
+
+**Base URL**  
+`http://localhost:8080`
+
+**Method**  
+`GET` *(content type `text/event-stream`)*
+
+**Path Parameters**
+
+| Parameter | Type   | Required | Description                    |
+|-----------|--------|----------|--------------------------------|
+| `task_id` | string | Yes      | The MAF task (the `sessionId`)  |
+
+**Event Format**  
+Each line is `data: <json>\n\n`. Switch on `type`:
+
+- **`progress`** — the run moved to a new MAF executor (`dispatcher` / `scout` / `creator` / `reviewer` / `human_gate` / `archivist` / `media_producer` / `workflow`). `status` flows `running` → `done` | `interrupted` (waiting for review) | `error`; a terminal `{ "node": "workflow", "status": "done" }` ends the task.
+- **`result`** — content is ready. At the gate, a `draft_ready` result carries the text `draft` + `critic_comment` (the reviewer's note). After `/review`, a `final` result is enriched by the `media_producer` with `html_preview` (the animated HTML brand card) + `video_props` (the video spec).
+
+**Example Stream** *(MAF LLM service → backend)*
+
+```http
+GET /tasks/sess-7f3a1b2c/events HTTP/1.1
+Host: localhost:8080
+Accept: text/event-stream
+```
+
+```
+data: {"type":"progress","node":"creator","phase":"create","platform":"instagram","status":"running","ts":1781105228.4}
+
+data: {"type":"result","node":"creator","phase":"create","platform":"instagram","status":"draft_ready","draft":"🌿 Meet your kitchen's new best friend...","critic_comment":"approved by red team","needs_human_intervention":false}
+
+data: {"type":"result","node":"archivist","phase":"archive","platform":"instagram","status":"final","draft":"...final copy...","decision":"approve","html_preview":"<!DOCTYPE html>…</html>","video_props":{"brandName":"EcoHome","...":"..."},"needs_human_intervention":false,"proposed_rules":[]}
+
+data: {"type":"progress","node":"workflow","status":"done","platform":null,"ts":1781105320.1}
+```
+
+> **Note:** SSE replaces the old webhook push — there is no `POST /api/internal/status`, and no silent-drop/timeout semantics. After a disconnect the backend reconnects (the stream replays from the start) or falls back to the D3 snapshot (`GET /tasks/{task_id}`). Media is no longer a DALL-E 3 image: the `media_producer` emits the `html_preview` brand card + `video_props` spec on the `final` event. See the repo-root [`API.md`](../API.md) for the complete envelope.
