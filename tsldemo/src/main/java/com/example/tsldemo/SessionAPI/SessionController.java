@@ -9,6 +9,9 @@ import org.springframework.web.bind.annotation.*;
 
 import com.example.tsldemo.Message;
 import com.example.tsldemo.Session;
+import com.example.tsldemo.DTOs.Request.IntakeReqDTO;
+import com.example.tsldemo.DTOs.ResponseReceived.IntakeRespDTO;
+import com.example.tsldemo.DTOs.ResponseToFrontEnd.FrontIntakeRespDTO;
 
 @RestController
 public class SessionController {
@@ -34,14 +37,14 @@ public class SessionController {
 		this.service = service;
 	}
 	
-
+	// Must call this first to create a session before any other  
 	@PostMapping("/api/sessions") 
-	public String addSession(@RequestBody Request request) {
-		Session s = new Session();
-		s.setTargetPlatforms(request.targetPlatforms);
-		service.addSession(s);
+	public FrontIntakeRespDTO addSession(@RequestBody IntakeReqDTO intakeDTO) {
+
+		IntakeRespDTO intakeResp = service.createSession(intakeDTO);
+		FrontIntakeRespDTO resp = new FrontIntakeRespDTO(intakeResp.assistantMessage(), intakeResp.brief_partial().targetPlatforms()[0]);
 		
-		return s.toString();
+		return resp;
 		
 	}
 	
