@@ -27,6 +27,7 @@ public class Session {
 	private String contentTopics;
 
 	@OneToMany(mappedBy = "session", cascade = CascadeType.ALL, orphanRemoval = true)
+	@JsonIgnore
 	private List<Message> messages = new ArrayList<>();
 
 	@ManyToOne

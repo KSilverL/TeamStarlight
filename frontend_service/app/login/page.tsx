@@ -34,8 +34,8 @@ function LoginForm() {
         return;
       }
 
-      /* Store the email so other pages know who is logged in. */
       localStorage.setItem("starlight_user", email);
+      localStorage.setItem("starlight_token", data.token);
       router.push("/chat");
     } catch {
       setError("Could not reach the server. Please try again.");

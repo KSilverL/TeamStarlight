@@ -10,17 +10,19 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const upstream = await fetch(
-      `${BACKEND_URL}/verifyLogin?email=${encodeURIComponent(email)}&password=${encodeURIComponent(password)}`
-    );
+    const upstream = await fetch(`${BACKEND_URL}/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
 
-    const text = await upstream.text();
+    const data = await upstream.json();
 
-    if (text === "Access Granted") {
-      return Response.json({ success: true });
+    if (!upstream.ok) {
+      return Response.json({ error: data.error ?? "Invalid email or password" }, { status: upstream.status });
     }
 
-    return Response.json({ error: "Invalid email or password" }, { status: 401 });
+    return Response.json({ token: data.token });
   } catch {
     return Response.json({ error: "Backend unreachable" }, { status: 502 });
   }

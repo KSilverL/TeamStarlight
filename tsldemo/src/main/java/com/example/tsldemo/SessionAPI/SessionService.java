@@ -9,15 +9,20 @@ import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
 
+import com.example.tsldemo.Business;
 import com.example.tsldemo.Message;
 import com.example.tsldemo.Session;
 import com.example.tsldemo.DTOs.Request.IntakeReqDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.IntakeRespDTO;
+import com.example.tsldemo.SignInAPI.BusinessRepository;
 
 @Service
 public class SessionService {
 	@Autowired
 	private SessionRepository repo;
+
+	@Autowired
+	private BusinessRepository businessRepo;
 
 	private final RestClient restClient;
 
@@ -28,7 +33,7 @@ public class SessionService {
         this.restClient = restClient;
     }
 
-	public IntakeRespDTO createSession(IntakeReqDTO intakeDTO) {
+	public IntakeRespDTO createSession(IntakeReqDTO intakeDTO, int businessId) {
         IntakeRespDTO intakeResp = restClient.post()
                 .uri(llmServiceBaseUrl + "/intake")
 				.contentType(MediaType.APPLICATION_JSON)
@@ -36,11 +41,16 @@ public class SessionService {
                 .retrieve()
                 .body(IntakeRespDTO.class);
 
-		// Persist the session using the LLM service's session_id so both systems
-		// share the same identifier for future resume calls.
 		Session session = new Session(intakeResp.sessionId());
-		repo.save(session);
 
+		if (businessId > 0) {
+			Business business = businessRepo.findById(businessId).orElse(null);
+			if (business != null) {
+				session.setUser(business);
+			}
+		}
+
+		repo.save(session);
 		return intakeResp;
     }
 
@@ -50,6 +60,10 @@ public class SessionService {
 	
 	public List<Session> getSessions() {
 		return repo.findAll();
+	}
+
+	public List<Session> getSessionsByUser(int businessId) {
+		return repo.findByUser_Id(businessId);
 	}
 	
 	public Optional<Session> getSessionBy(String id) {

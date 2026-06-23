@@ -7,6 +7,8 @@ import java.util.Optional;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 
+import com.example.tsldemo.auth.JwtUtil;
+
 import com.example.tsldemo.Message;
 import com.example.tsldemo.Session;
 import com.example.tsldemo.DTOs.Request.IntakeReqDTO;
@@ -31,32 +33,44 @@ public class SessionController {
 	private SessionService service;
 	@Autowired
 	private MessageService msgServ;
-	
-	
+	@Autowired
+	private JwtUtil jwtUtil;
+
 	public SessionController(SessionService service) {
 		this.service = service;
 	}
-	
-	// Must call this first to create a session before any other  
-	@PostMapping("/api/sessions") 
-	public FrontIntakeRespDTO addSession(@RequestBody IntakeReqDTO intakeDTO) {
 
-		IntakeRespDTO intakeResp = service.createSession(intakeDTO);
+	// Must call this first to create a session before any other
+	@PostMapping("/api/sessions")
+	public FrontIntakeRespDTO addSession(
+			@RequestBody IntakeReqDTO intakeDTO,
+			@RequestHeader(value = "Authorization", required = false) String authHeader) {
+
+		int businessId = -1;
+		if (authHeader != null && authHeader.startsWith("Bearer ")) {
+			businessId = jwtUtil.extractBusinessId(authHeader.substring(7));
+		}
+
+		IntakeRespDTO intakeResp = service.createSession(intakeDTO, businessId);
 		String[] platforms = intakeResp.brief_partial() != null ? intakeResp.brief_partial().targetPlatforms() : null;
 		String firstPlatform = (platforms != null && platforms.length > 0) ? platforms[0] : null;
-		FrontIntakeRespDTO resp = new FrontIntakeRespDTO(
+		return new FrontIntakeRespDTO(
 			intakeResp.sessionId(),
 			intakeResp.assistantMessage(),
 			firstPlatform
 		);
-		
-		return resp;
-		
 	}
 	
 	@GetMapping("/api/sessions")
-	public List<Session> getAllSessions() {
-		return service.getSessions();
+	public List<Session> getUserSessions(
+			@RequestHeader(value = "Authorization", required = false) String authHeader) {
+		if (authHeader != null && authHeader.startsWith("Bearer ")) {
+			int businessId = jwtUtil.extractBusinessId(authHeader.substring(7));
+			if (businessId > 0) {
+				return service.getSessionsByUser(businessId);
+			}
+		}
+		return List.of();
 	}
 	
 	
