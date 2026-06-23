@@ -6,6 +6,16 @@ This document covers all REST endpoints exposed by the TeamStarlight system. The
 
 ## Table of Contents
 
+- [Auth](#auth)
+  - [Login](#login)
+- [Sessions](#sessions)
+  - [Create Session](#create-session)
+  - [List Sessions](#list-sessions)
+  - [Get Session Messages](#get-session-messages)
+- [Content Generation](#content-generation)
+  - [Generate Text](#generate-text)
+  - [Generate Brand Animation](#generate-brand-animation)
+  - [Generate Brand Video](#generate-brand-video)
 - [Search](#search)
 - [Users](#users)
   - [List Users](#list-users)
@@ -13,6 +23,157 @@ This document covers all REST endpoints exposed by the TeamStarlight system. The
   - [Get User by ID](#get-user-by-id)
   - [Delete User](#delete-user)
 - [LLM Service Progress (SSE)](#llm-service-progress-sse)
+
+---
+
+## Auth
+
+### Login
+
+Proxies to `POST /login` on the Spring Boot backend. Returns a JWT on success.
+
+**Endpoint:** `POST /api/auth/login`
+
+**Request Body**
+
+| Field      | Type   | Required |
+|------------|--------|----------|
+| `email`    | string | Yes      |
+| `password` | string | Yes      |
+
+**Success `200`**
+```json
+{ "token": "eyJhbGciOiJIUzI1NiJ9..." }
+```
+
+**Failure `401`**
+```json
+{ "error": "Invalid email or password" }
+```
+
+---
+
+## Sessions
+
+All session endpoints forward `Authorization: Bearer <token>` to the backend.
+
+### Create Session
+
+Proxies to `POST /api/sessions` on the Spring Boot backend, which starts an LLM intake conversation and persists the session linked to the authenticated user.
+
+**Endpoint:** `POST /api/sessions`
+
+**Headers:** `Authorization: Bearer <token>`
+
+**Request Body**
+
+| Field           | Type   | Required |
+|-----------------|--------|----------|
+| `opening_input` | string | No       |
+
+**Success `200`**
+```json
+{
+  "session_id": "a1b2c3d4...",
+  "assistant_message": "...",
+  "target_platforms": null
+}
+```
+
+---
+
+### List Sessions
+
+Proxies to `GET /api/sessions` on the Spring Boot backend. Returns sessions owned by the authenticated user.
+
+**Endpoint:** `GET /api/sessions`
+
+**Headers:** `Authorization: Bearer <token>`
+
+**Success `200`** — array of session objects (see `chat-api.md` A3 for shape).
+
+---
+
+### Get Session Messages
+
+Proxies to `GET /api/sessions/{id}/messages` on the Spring Boot backend.
+
+**Endpoint:** `GET /api/sessions/{id}/messages`
+
+**Headers:** `Authorization: Bearer <token>`
+
+**Success `200`** — array of message objects:
+```json
+[
+  {
+    "messageId": 1,
+    "role": "user",
+    "content": "...",
+    "timestamp": "2026-06-23T10:00:00"
+  }
+]
+```
+
+---
+
+## Content Generation
+
+These endpoints proxy directly to the LLM service. All accept an optional `history` array (`[{role, content}]`) for multi-turn continuity.
+
+### Generate Text
+
+**Endpoint:** `POST /api/text`
+
+**Request Body**
+
+| Field      | Type     | Required |
+|------------|----------|----------|
+| `prompt`   | string   | Yes      |
+| `platform` | string   | No       |
+| `history`  | object[] | No       |
+
+**Success `200`**
+```json
+{ "text": "...", "platform": "linkedin" }
+```
+
+---
+
+### Generate Brand Animation
+
+**Endpoint:** `POST /api/brand`
+
+**Request Body**
+
+| Field     | Type     | Required |
+|-----------|----------|----------|
+| `prompt`  | string   | Yes      |
+| `history` | object[] | No       |
+
+**Success `200`**
+```json
+{ "html": "<!DOCTYPE html>..." }
+```
+
+---
+
+### Generate Brand Video
+
+**Endpoint:** `POST /api/video`
+
+**Request Body**
+
+| Field     | Type     | Required |
+|-----------|----------|----------|
+| `brief`   | string   | Yes      |
+| `history` | object[] | No       |
+
+**Success `202`**
+```json
+{ "jobId": "abc123" }
+```
+
+Poll `GET /api/video/{jobId}` for the result.
 
 ---
 

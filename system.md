@@ -188,7 +188,25 @@ graph LR
 
 ---
 
-## API Surface (LLM Service)
+## API Surface (Java Backend — port 8081)
+
+All session and content endpoints require `Authorization: Bearer <token>` except `/login` and `/signIn`.
+
+| Group | Endpoint | Purpose |
+|---|---|---|
+| **Auth** | `POST /login` | Verify credentials, return `{"token": "<jwt>"}` |
+| **Signup** | `POST /signIn` | Register a new business account |
+| **Sessions** | `POST /api/sessions` | Create a session — calls LLM `/intake`, persists to DB, associates with authenticated user |
+| | `GET /api/sessions` | List sessions for the authenticated user |
+| | `GET /api/sessions/{id}/messages` | Fetch stored messages for a session |
+| | `POST /api/sessions/{id}/messages` | Append a message to a session |
+
+### Auth flow
+Login issues a JWT (7-day expiry, HMAC-SHA256) encoding the `businessId`. Clients send it as `Authorization: Bearer <token>` on every protected request. The secret is configured via the `JWT_SECRET` env var (defaults to a development placeholder).
+
+---
+
+## API Surface (LLM Service — port 8080)
 
 | Group | Endpoint | Purpose |
 |---|---|---|
@@ -203,9 +221,9 @@ graph LR
 | **Learning** | `POST /tasks/{id}/archive-tags` | Save proposed brand-voice rules to brand profile |
 | | `POST /tasks/{id}/learn-summarize` | Propose per-user writing rule candidates |
 | | `POST /tasks/{id}/learn-commit` | Classify and persist user rule decisions |
-| **Media** | `POST /generate-text` | One-shot platform copy (multi-turn capable) |
-| | `POST /generate` | One-shot animated HTML brand card |
-| | `POST /generate-video` | Start a `BrandVideoProps` spec job |
+| **Media** | `POST /generate-text` | One-shot platform copy — accepts optional `history: [{role, content}]` for multi-turn continuity |
+| | `POST /generate` | One-shot animated HTML brand card — accepts optional `history` |
+| | `POST /generate-video` | Start a `BrandVideoProps` spec job — accepts optional `history` |
 | | `GET /jobs/{job_id}` | Fetch video spec JSON |
 
 ---
