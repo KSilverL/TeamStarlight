@@ -202,6 +202,24 @@ export default function ChatPage() {
   const historyRef = useRef<{ role: "user" | "assistant"; content: string }[]>([]);
   // Registered once on the first send; null until then.
   const sessionIdRef = useRef<string | null>(null);
+
+  /** Fire-and-forget: persist a message to the backend. Non-fatal if it fails. */
+  async function persistMessage(sessionId: string, role: "user" | "assistant", content: string) {
+    const token = localStorage.getItem("starlight_token");
+    try {
+      await fetch(`/api/sessions/${sessionId}/messages`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ role, content }),
+      });
+    } catch {
+      // Non-fatal — message is already visible in the UI
+      console.log("Persistance failure. Request not saved to session.")
+    }
+  }
   const [pastSessions, setPastSessions] = useState<SessionSummary[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
@@ -344,6 +362,9 @@ export default function ChatPage() {
         ...historyRef.current,
         { role: "assistant", content: data.text as string },
       ];
+      if (sessionIdRef.current) {
+        persistMessage(sessionIdRef.current, "assistant", data.text as string);
+      }
       pushMessage({
         role: "assistant",
         content: "Here's your post copy. Review and approve or reject:",
@@ -378,6 +399,9 @@ export default function ChatPage() {
         ...historyRef.current,
         { role: "assistant", content: "[brand animation generated]" },
       ];
+      if (sessionIdRef.current) {
+        persistMessage(sessionIdRef.current, "assistant", "[brand animation generated]");
+      }
       pushMessage({
         role: "assistant",
         content: "Here's your brand animation. Review and approve or reject:",
@@ -407,6 +431,9 @@ export default function ChatPage() {
         ...historyRef.current,
         { role: "assistant", content: "[brand video spec generated]" },
       ];
+      if (sessionIdRef.current) {
+        persistMessage(sessionIdRef.current, "assistant", "[brand video spec generated]");
+      }
       pushMessage({
         role: "assistant",
         content: "Here's your brand video spec:",
@@ -454,6 +481,11 @@ export default function ChatPage() {
       } catch (err) {
         console.error("Session registration failed:", err);
       }
+    }
+
+    // Persist the user message now that we have a session ID.
+    if (sessionIdRef.current) {
+      persistMessage(sessionIdRef.current, "user", trimmed);
     }
 
     // Fan out to every selected content type at once.

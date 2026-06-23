@@ -74,18 +74,19 @@ public class SessionController {
 	}
 	
 	
-	@PostMapping("/api/sessions/{id}/messages") 
-	public Message addMessages(@PathVariable String id, @RequestBody String content) {
-		int sIndex = content.indexOf(":") + 1;
-		int eIndex = content.lastIndexOf("}");
-		String cleanedMessage = content.substring(sIndex, eIndex);
-		
-		Message msg = new Message("user", cleanedMessage);
-		
+	private static class MessageRequest {
+		public String role;
+		public String content;
+	}
+
+	@PostMapping("/api/sessions/{id}/messages")
+	public Message addMessages(@PathVariable String id, @RequestBody MessageRequest request) {
+		Message msg = new Message(
+			request.role != null ? request.role : "user",
+			request.content != null ? request.content : ""
+		);
 		service.updateSession(id, msg);
-				
 		return msg;
-		
 	}
 	
 	@GetMapping("/api/sessions/{id}/messages") 
