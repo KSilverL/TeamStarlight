@@ -5,4 +5,6 @@
 **/__pycache__/
 *.pyc
 
+AGENTS.md
 CLAUDE.md
+demos/

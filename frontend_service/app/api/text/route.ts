@@ -1,9 +1,11 @@
 import { NextRequest } from "next/server";
 
-// Text generation goes through the same backend as the brand card (the dev
-// Java-stand-in, or the real Java backend later).
+// TEXT_AGENT_URL points at the main LLM service (/generate-text).
+// Falls back to BRAND_AGENT_URL for the demo brand-agent, then localhost.
 const TEXT_AGENT_URL =
-  process.env.BRAND_AGENT_URL ?? "http://localhost:8090";
+  process.env.TEXT_AGENT_URL ??
+  process.env.BRAND_AGENT_URL ??
+  "http://localhost:8080";
 
 export async function POST(request: NextRequest) {
   const body = await request.json();
