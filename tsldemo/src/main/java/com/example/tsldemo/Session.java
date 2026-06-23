@@ -1,48 +1,47 @@
 package com.example.tsldemo;
 
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Random;
 import java.time.LocalDateTime;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
-import com.fasterxml.jackson.annotation.JsonProperty;
 
 import jakarta.persistence.*;
 
 @Entity
 @Table
 public class Session {
-	
+
 	@Id
 	private String id;
 	private String createdAt;
 	private String updatedAt;
 	private String status;
 	private String phase;
-	private String[] targetPlatforms;
+
+	@ElementCollection
+	@CollectionTable(name = "session_target_platforms", joinColumns = @JoinColumn(name = "session_id"))
+	@Column(name = "platform")
+	private List<String> targetPlatforms;
+
 	private String contentTopics;
-	
+
 	@OneToMany(mappedBy = "session", cascade = CascadeType.ALL, orphanRemoval = true)
-	private List<Message> messages;
-	
+	private List<Message> messages = new ArrayList<>();
+
 	@ManyToOne
-	@JoinTable(name = "user_id")
+	@JoinColumn(name = "user_id")
 	@JsonIgnore
 	private Business user;
-	
-	public Session() {
-		this.id = createId();
-		this.status = "running"; //default setting
+
+	// id comes from the LLM service so both systems share the same session identifier
+	public Session(String id) {
+		this.id = id;
+		this.status = "running";
 		this.createdAt = LocalDateTime.now().toString();
 	}
-	
-	private String createId() {
-		Random rand = new Random();
-		int intId = rand.nextInt();
-		String hexId = Integer.toHexString(intId);
-		
-		return "sess-" + hexId;
-	}
+
+	public Session() {}
 
 //	@JsonProperty("userId")
 //	public int getUserId() {
@@ -85,12 +84,12 @@ public class Session {
 		this.phase = phase;
 	}
 
-	public String[] getTargetPlatforms() {
+	public List<String> getTargetPlatforms() {
 		return targetPlatforms;
 	}
 
-	public void setTargetPlatforms(String[] strings) {
-		this.targetPlatforms = strings;
+	public void setTargetPlatforms(List<String> platforms) {
+		this.targetPlatforms = platforms;
 	}
 
 	public String getContentTopics() {

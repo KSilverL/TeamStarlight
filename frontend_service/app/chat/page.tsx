@@ -182,6 +182,11 @@ export default function ChatPage() {
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Conversation history persisted for the lifetime of this page mount so each
+  // request continues the same thread rather than starting a new LLM session.
+  const historyRef = useRef<{ role: "user" | "assistant"; content: string }[]>([]);
+  // Registered once on the first send; null until then.
+  const sessionIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -240,13 +245,17 @@ export default function ChatPage() {
       const res = await fetch("/api/text", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, platform }),
+        body: JSON.stringify({ prompt, platform, history: historyRef.current }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
         pushMessage({ role: "assistant", content: `Text generation failed: ${data.error ?? "unknown error"}` });
         return;
       }
+      historyRef.current = [
+        ...historyRef.current,
+        { role: "assistant", content: data.text as string },
+      ];
       pushMessage({
         role: "assistant",
         content: "Here's your post copy. Review and approve or reject:",
@@ -270,13 +279,17 @@ export default function ChatPage() {
       const res = await fetch("/api/brand", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
+        body: JSON.stringify({ prompt, history: historyRef.current }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
         pushMessage({ role: "assistant", content: `Brand animation failed: ${data.error ?? "unknown error"}` });
         return;
       }
+      historyRef.current = [
+        ...historyRef.current,
+        { role: "assistant", content: "[brand animation generated]" },
+      ];
       pushMessage({
         role: "assistant",
         content: "Here's your brand animation. Review and approve or reject:",
@@ -295,13 +308,17 @@ export default function ChatPage() {
       const res = await fetch("/api/video", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ brief: prompt }),
+        body: JSON.stringify({ brief: prompt, history: historyRef.current }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
         pushMessage({ role: "assistant", content: `Video spec failed: ${data.error ?? "unknown error"}` });
         return;
       }
+      historyRef.current = [
+        ...historyRef.current,
+        { role: "assistant", content: "[brand video spec generated]" },
+      ];
       pushMessage({
         role: "assistant",
         content: "Here's your brand video spec:",
@@ -319,9 +336,27 @@ export default function ChatPage() {
     if (!trimmed || isLoading || contentTypes.length === 0) return;
 
     pushMessage({ role: "user", content: trimmed });
+    historyRef.current = [...historyRef.current, { role: "user", content: trimmed }];
     setInput("");
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
+    }
+
+    // Register a new session in the backend on the first message of each chat.
+    if (sessionIdRef.current === null) {
+      try {
+        const res = await fetch("/api/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ opening_input: trimmed }),
+        });
+        const data = await res.json();
+        if (res.ok && data.session_id) {
+          sessionIdRef.current = data.session_id;
+        }
+      } catch (err) {
+        console.error("Session registration failed:", err);
+      }
     }
 
     // Fan out to every selected content type at once.

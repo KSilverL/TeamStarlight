@@ -11,6 +11,7 @@ export async function POST(request: NextRequest) {
   const body = await request.json();
   const prompt: string = body.prompt ?? "";
   const platform: string = body.platform ?? "linkedin";
+  const history: unknown = body.history ?? undefined;
 
   if (!prompt.trim()) {
     return new Response(JSON.stringify({ error: "prompt is required" }), {
@@ -23,7 +24,7 @@ export async function POST(request: NextRequest) {
     const upstream = await fetch(`${TEXT_AGENT_URL}/generate-text`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, platform }),
+      body: JSON.stringify({ prompt, platform, ...(history ? { history } : {}) }),
     });
 
     if (!upstream.ok) {

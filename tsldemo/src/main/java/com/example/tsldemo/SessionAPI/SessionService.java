@@ -29,13 +29,18 @@ public class SessionService {
     }
 
 	public IntakeRespDTO createSession(IntakeReqDTO intakeDTO) {
-
         IntakeRespDTO intakeResp = restClient.post()
                 .uri(llmServiceBaseUrl + "/intake")
 				.contentType(MediaType.APPLICATION_JSON)
 				.body(intakeDTO)
                 .retrieve()
                 .body(IntakeRespDTO.class);
+
+		// Persist the session using the LLM service's session_id so both systems
+		// share the same identifier for future resume calls.
+		Session session = new Session(intakeResp.sessionId());
+		repo.save(session);
+
 		return intakeResp;
     }
 

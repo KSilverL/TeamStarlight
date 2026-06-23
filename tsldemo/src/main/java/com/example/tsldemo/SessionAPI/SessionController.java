@@ -42,7 +42,13 @@ public class SessionController {
 	public FrontIntakeRespDTO addSession(@RequestBody IntakeReqDTO intakeDTO) {
 
 		IntakeRespDTO intakeResp = service.createSession(intakeDTO);
-		FrontIntakeRespDTO resp = new FrontIntakeRespDTO(intakeResp.assistantMessage(), intakeResp.brief_partial().targetPlatforms()[0]);
+		String[] platforms = intakeResp.brief_partial() != null ? intakeResp.brief_partial().targetPlatforms() : null;
+		String firstPlatform = (platforms != null && platforms.length > 0) ? platforms[0] : null;
+		FrontIntakeRespDTO resp = new FrontIntakeRespDTO(
+			intakeResp.sessionId(),
+			intakeResp.assistantMessage(),
+			firstPlatform
+		);
 		
 		return resp;
 		

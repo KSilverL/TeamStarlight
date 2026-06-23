@@ -5,6 +5,7 @@ const BRAND_AGENT_URL = process.env.BRAND_AGENT_URL ?? "http://localhost:8000";
 export async function POST(request: NextRequest) {
   const body = await request.json();
   const prompt: string = body.prompt ?? "";
+  const history: unknown = body.history ?? undefined;
 
   if (!prompt.trim()) {
     return new Response(JSON.stringify({ error: "prompt is required" }), {
@@ -17,7 +18,7 @@ export async function POST(request: NextRequest) {
     const upstream = await fetch(`${BRAND_AGENT_URL}/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({ prompt, ...(history ? { history } : {}) }),
     });
 
     if (!upstream.ok) {
