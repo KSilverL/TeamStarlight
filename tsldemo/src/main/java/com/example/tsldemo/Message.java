@@ -25,7 +25,7 @@ public class Message {
 	private String timestamp;
 	
 	@ManyToOne
-	@JoinTable(name = "session_id")
+	@JoinColumn(name = "session_id")
 	@JsonIgnore
 	private Session session;
 	

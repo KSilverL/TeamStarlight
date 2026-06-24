@@ -1,14 +1,17 @@
 import { NextRequest } from "next/server";
 
-// Text generation goes through the same backend as the brand card (the dev
-// Java-stand-in, or the real Java backend later).
+// TEXT_AGENT_URL points at the main LLM service (/generate-text).
+// Falls back to BRAND_AGENT_URL for the demo brand-agent, then localhost.
 const TEXT_AGENT_URL =
-  process.env.BRAND_AGENT_URL ?? "http://localhost:8090";
+  process.env.TEXT_AGENT_URL ??
+  process.env.BRAND_AGENT_URL ??
+  "http://localhost:8080";
 
 export async function POST(request: NextRequest) {
   const body = await request.json();
   const prompt: string = body.prompt ?? "";
   const platform: string = body.platform ?? "linkedin";
+  const history: unknown = body.history ?? undefined;
 
   if (!prompt.trim()) {
     return new Response(JSON.stringify({ error: "prompt is required" }), {
@@ -21,7 +24,7 @@ export async function POST(request: NextRequest) {
     const upstream = await fetch(`${TEXT_AGENT_URL}/generate-text`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, platform }),
+      body: JSON.stringify({ prompt, platform, ...(history ? { history } : {}) }),
     });
 
     if (!upstream.ok) {
