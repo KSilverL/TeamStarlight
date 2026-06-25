@@ -18,8 +18,10 @@ import time
 from typing import Optional
 
 # ── Event `type` discriminator ────────────────────────────────────────────────
-PROGRESS = "progress"   # "the task is now at executor X"
-RESULT = "result"       # "executor X produced this content"
+PROGRESS = "progress"               # "the task is now at executor X"
+RESULT = "result"                   # "executor X produced this content"
+AGENT_UTTERANCE = "agent_utterance" # "a roundtable participant just spoke"
+DISCUSSION_CONSENSUS = "discussion_consensus"  # the table converged (a RESULT status)
 
 # ── Progress `status` lifecycle ───────────────────────────────────────────────
 RUNNING = "running"          # executor entered
@@ -76,3 +78,60 @@ def result_event(
     if payload:
         event.update(payload)
     return event
+
+
+# ── Roundtable discussion events (Phase 4) ────────────────────────────────────
+# One table == one platform, so `table_id` and `platform` carry the same value. Both
+# builders keep the §7.2 envelope keys (type/node/phase/platform/status/ts) so the SSE
+# stream stays uniform, and add the discussion-specific fields on top.
+
+def agent_utterance_event(
+    *,
+    table_id: str,
+    speaker: str,
+    role: str,
+    text: str,
+    round_index: int,
+) -> dict:
+    """One persona/user turn in a roundtable (emitted as each turn completes). `node`
+    doubles as the speaker for envelope uniformity; `agent_id` mirrors `speaker`."""
+    return {
+        "type": AGENT_UTTERANCE,
+        "node": speaker,
+        "phase": "discuss",
+        "platform": table_id,
+        "status": "done",
+        "ts": time.time(),
+        "table_id": table_id,
+        "speaker": speaker,
+        "agent_id": speaker,
+        "role": role,
+        "text": text,
+        "round_index": round_index,
+    }
+
+
+def discussion_consensus_event(
+    *,
+    table_id: str,
+    strategy: dict,
+    rounds_used: int,
+    converged: bool,
+    turns: int,
+) -> dict:
+    """The table's converged result (emitted once, after the last utterance). A RESULT-type
+    event with status `discussion_consensus`; `strategy` is the platform→angle dict that the
+    creator consumes downstream."""
+    return {
+        "type": RESULT,
+        "node": "roundtable",
+        "phase": "discuss",
+        "platform": table_id,
+        "status": DISCUSSION_CONSENSUS,
+        "ts": time.time(),
+        "table_id": table_id,
+        "strategy": strategy,
+        "rounds_used": rounds_used,
+        "converged": converged,
+        "turns": turns,
+    }

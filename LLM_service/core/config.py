@@ -85,6 +85,28 @@ def load_dotenv(path: Union[str, Path, None] = None, *, override: bool = False) 
     return True
 
 
+def _env_int(name: str, default: int) -> int:
+    """Parse an int env var, falling back to `default` when unset or malformed."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Parse a float env var, falling back to `default` when unset or malformed."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return default
+
+
 def _env_bool(name: str) -> Optional[bool]:
     """
     Parse a boolean env var. Returns None when the var is unset, blank, or
@@ -130,12 +152,46 @@ class Settings:
     postgres_profiles_table: str = "brand_profiles"
     postgres_user_skills_table: str = "user_skills"
     postgres_checkpoints_table: str = "workflow_checkpoints"
+    # libpq-style sslmode. Unset → let the DSN decide (Supabase works without it).
+    # Azure Cosmos DB for PostgreSQL *requires* SSL, so set POSTGRES_SSLMODE=require
+    # there. Honoured by PostgresStore._pool / PostgresCheckpointStorage._pool.
+    postgres_sslmode: Optional[str] = None
 
     # ── Voice Live API (voice intake) ──────────────────────────────────────────
     azure_voicelive_endpoint: Optional[str] = None
     azure_voicelive_model: str = "gpt-realtime"
     azure_voicelive_api_version: str = "2026-04-10"
     azure_voicelive_api_key: Optional[str] = None   # falls back to the OpenAI key (same resource)
+
+    # ── Roundtable (multi-persona discussion stage) ────────────────────────────
+    # ROUNDTABLE_ENABLED gates the drop-in replacement of `scout` (wired in Phase 6);
+    # off → the pipeline behaves exactly as today. max_rounds is the per-table hard cap
+    # that stops an infinite debate. The two model tiers (cheap personas / stronger
+    # manager) are read in the production path (Phase 2); the mock path ignores them.
+    roundtable_enabled: bool = False
+    # Each persona turn is now a short, single-point contribution (see roundtable/personas.py),
+    # so the table can afford MANY more short exchanges — the cap is raised accordingly. It is
+    # still the per-table hard stop on the debate.
+    roundtable_max_rounds: int = 12
+    # Hard backstop on how long a single persona turn may be (None → no cap, rely on the prompt).
+    # Keeps turns short like a real discussion; passed to the persona chat clients as
+    # `max_completion_tokens`. The LLM manager is NOT capped (it needs room for the final strategy).
+    roundtable_persona_max_tokens: Optional[int] = None
+    # The personas run on a cheaper, rate-limit-friendlier model; only the LLM manager keeps
+    # the main (gpt-5.4) deployment. The personas may live on a SEPARATE Azure resource
+    # (its own endpoint + key); when those are unset they fall back to the main resource and
+    # only the deployment name (roundtable_persona_model) differs.
+    roundtable_persona_model: Optional[str] = None
+    roundtable_manager_model: Optional[str] = None
+    roundtable_persona_endpoint: Optional[str] = None
+    roundtable_persona_api_key: Optional[str] = None
+    # How long the table waits for a user who raised a hand to actually send their message
+    # before proceeding without them (seconds) — bounds the "stop and wait for the user" pause.
+    roundtable_user_turn_timeout: float = 300.0
+    # Per-user learning write-back from the roundtable (transcript + interjections + verdict).
+    # LEARNING_ENABLED=false still READS stored skills but writes none (regression/isolation).
+    learning_enabled: bool = True
+    preference_summary_model: Optional[str] = None  # cheap tier for the prod summary call
 
     # ── Backend status webhook (legacy transport; SSE replaces it in M2) ───────
     webhook_url: str = "http://localhost:9999/status"
@@ -190,6 +246,7 @@ class Settings:
 
 def _load() -> Settings:
     use_mock = _env_bool("USE_MOCK")
+    learning = _env_bool("LEARNING_ENABLED")
     return Settings(
         use_mock=True if use_mock is None else use_mock,
         use_mock_llm=_env_bool("USE_MOCK_LLM"),
@@ -209,10 +266,23 @@ def _load() -> Settings:
         postgres_profiles_table=os.getenv("POSTGRES_PROFILES_TABLE", "brand_profiles"),
         postgres_user_skills_table=os.getenv("POSTGRES_USER_SKILLS_TABLE", "user_skills"),
         postgres_checkpoints_table=os.getenv("POSTGRES_CHECKPOINTS_TABLE", "workflow_checkpoints"),
+        postgres_sslmode=os.getenv("POSTGRES_SSLMODE"),
         azure_voicelive_endpoint=os.getenv("AZURE_VOICELIVE_ENDPOINT"),
         azure_voicelive_model=os.getenv("AZURE_VOICELIVE_MODEL", "gpt-realtime"),
         azure_voicelive_api_version=os.getenv("AZURE_VOICELIVE_API_VERSION", "2026-04-10"),
         azure_voicelive_api_key=os.getenv("AZURE_VOICELIVE_API_KEY"),
+        roundtable_enabled=bool(_env_bool("ROUNDTABLE_ENABLED")),
+        roundtable_max_rounds=_env_int("ROUNDTABLE_MAX_ROUNDS", 12),
+        roundtable_persona_max_tokens=(
+            _env_int("ROUNDTABLE_PERSONA_MAX_TOKENS", 0) or None
+        ),
+        roundtable_persona_model=os.getenv("ROUNDTABLE_PERSONA_MODEL"),
+        roundtable_manager_model=os.getenv("ROUNDTABLE_MANAGER_MODEL"),
+        roundtable_persona_endpoint=os.getenv("AZURE_PERSONA_ENDPOINT"),
+        roundtable_persona_api_key=os.getenv("AZURE_PERSONA_API_KEY"),
+        roundtable_user_turn_timeout=_env_float("ROUNDTABLE_USER_TURN_TIMEOUT", 300.0),
+        learning_enabled=True if learning is None else learning,
+        preference_summary_model=os.getenv("PREFERENCE_SUMMARY_MODEL"),
         webhook_url=os.getenv("WEBHOOK_URL", "http://localhost:9999/status"),
         webhook_enabled=_env_bool("WEBHOOK_ENABLED"),
     )

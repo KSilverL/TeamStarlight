@@ -271,17 +271,18 @@ This endpoint is **exposed by the MAF LLM service** and **consumed by the Spring
 | `task_id` | string | Yes      | The content-generation task to watch (returned by `POST /tasks`) |
 
 **Event Format**  
-Each line is `data: <json>\n\n`. The stream replays all events so far, continues live, and **closes when the task completes**. Switch on the `type` field — `progress` (the run moved to a new executor) or `result` (content is ready). Example `result` events:
+Each line is `data: <json>\n\n`. The stream replays all events so far, continues live, and **closes when the task completes**. Switch on the `type` field — `progress` (the run moved to a new executor) or `result` (content is ready); when the optional roundtable stage runs, the same stream also carries `agent_utterance` (one per discussion turn) and `discussion_consensus` events first. Example `result` events:
 
 | Field          | Type   | Description                                                                 |
 |----------------|--------|-----------------------------------------------------------------------------|
-| `type`         | string | `"progress"` or `"result"`                                                  |
-| `node`         | string | The MAF executor (`dispatcher` / `scout` / `creator` / `reviewer` / `human_gate` / `archivist` / `media_producer` / `workflow`) |
+| `type`         | string | `"progress"` or `"result"` (plus `"agent_utterance"` in roundtable mode)    |
+| `node`         | string | The MAF executor (`dispatcher` / `scout` / `creator` / `reviewer` / `human_gate` / `media_producer` / `workflow`; the in-graph `archivist` was removed). The `final` result is emitted under `human_gate` (text runs) or `media_producer` (media-only runs, which have no gate) |
 | `platform`     | string | The target platform (e.g. `"instagram"`); `null` for non-per-platform steps |
-| `status`       | string | `running` → `done` / `interrupted` / `error`, or `draft_ready` / `final` on a result |
+| `status`       | string | `running` → `done` / `interrupted` / `error`, or `draft_ready` / `final` / `discussion_consensus` on a result |
 | `draft`        | string | The generated post copy                                                     |
-| `html_preview` | string | A complete, self-contained **animated HTML brand card** (only on the `final` result) — replaces the old DALL-E image |
-| `video_props`  | object | A structured `BrandVideoProps` spec a downstream Remotion render turns into an MP4 (only on the `final` result) |
+| `content_types`| string[] | (on `final`) what the task requested — any of `text` / `brand` / `video`; gates the two media fields below. The backend chooses this at `POST /tasks` (omit → `["text"]`; brand & video are off unless listed). Omitting `text` is a **media-only** run: no review gate, and `draft` comes back `""` |
+| `html_preview` | string | A complete, self-contained **animated HTML brand card** (only on the `final` result, and only when `"brand"` was requested) — replaces the old DALL-E image |
+| `video_props`  | object | A structured `BrandVideoProps` spec a downstream Remotion render turns into an MP4 (only on the `final` result, and only when `"video"` was requested) |
 
 **Example Stream** *(MAF LLM service → backend)*
 
@@ -304,3 +305,10 @@ data: {"type":"progress","node":"workflow","status":"done","platform":null,"ts":
 > (`video_props`) — both appear only on the `final` result event, after the human approves. See
 > the repo-root [`API.md`](../API.md) for the complete SSE envelope and the standalone media
 > endpoints (`POST /generate-text`, `POST /generate`, `POST /generate-video`).
+
+> **Newer LLM-service surface** (also in the repo-root [`API.md`](../API.md)): an **optional
+> roundtable** discussion stage (`ROUNDTABLE_ENABLED`) streams `agent_utterance` + `discussion_consensus`
+> events on this same channel and lets the user join via `POST /tasks/{id}/raise-hand` + `POST /tasks/{id}/say`;
+> and learning is now an explicit opt-in step, `POST /tasks/{id}/confirm-learning`, run after the
+> task completes (it replaces the automatic, in-graph archivist). The backend proxies these through
+> to the frontend the same way it relays the rest of the stream.

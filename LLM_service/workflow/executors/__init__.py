@@ -1,16 +1,19 @@
 """The workflow executors: dispatcher, scout, creator, reviewer, human_gate,
-archivist, media_producer.
+media_producer.
 
 Each is a thin MAF Executor that reads its input message, reaches its backend via
 core.services.factory (so it stays mock/prod-agnostic), and emits the next typed
 message. They hold no per-run state, so MAF can checkpoint and resume them across
 the RequestPort pause.
+
+Brand-voice rule distillation is no longer an in-graph executor: it runs at the service
+layer after the user confirms learning (see api.py confirm_learning + workflow/learning/).
 """
 
-from .archivist import ArchivistExecutor
 from .creator import CreatorExecutor
 from .dispatcher import DispatcherExecutor
 from .human_gate import HumanGateExecutor
+from .media_entry import MediaEntryExecutor
 from .media_producer import MediaProducerExecutor
 from .reviewer import ReviewerExecutor
 from .scout import ScoutExecutor
@@ -21,6 +24,6 @@ __all__ = [
     "CreatorExecutor",
     "ReviewerExecutor",
     "HumanGateExecutor",
-    "ArchivistExecutor",
+    "MediaEntryExecutor",
     "MediaProducerExecutor",
 ]

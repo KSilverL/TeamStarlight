@@ -1,53 +1,38 @@
 """
 Per-user personalized learning (the per-`user_id` channel, DB-only).
 
-A second learning loop alongside the brand-voice profile: the user reviews a whole
-adopted session and three-way classifies (positive / negative / ignore) candidate
-writing rules. Kept rules are consolidated with the user's prior rules (this round
-overrides on conflict) and persisted to the `user_skills` store; on the next run the
-creator folds the user's platform-applicable rules into the prompt. Nothing is written
-to a file — `skills/` is untouched.
+A second learning loop alongside the brand-voice profile, keyed by `user_id`. One unified
+distiller (`summarize_preferences`) learns from whatever user signal a run produced — the
+user's intake turns and/or roundtable interjections, plus their verdicts/edits — behind the
+confirmation gate (`POST /tasks/{id}/confirm-learning`). Kept rules are consolidated with the
+user's prior rules (this round overrides on conflict) and persisted to the `user_skills` store;
+on the next run the creator folds the user's platform-applicable rules into the prompt. Nothing
+is written to a file — `skills/` is untouched.
 
-Everything runs fully mocked; the MockStore singleton (reset per test) stands in for
-the user_skills table.
+The roundtable-signal half of this channel is covered in `test_learning.py`; this file covers
+the per-user types (consolidate / store), the creator read-side injection, and the
+**non-roundtable** confirm-learning path (learning from the intake conversation).
+
+Everything runs fully mocked; the MockStore singleton (reset per test) stands in for the
+user_skills table.
 """
 
 from __future__ import annotations
 
 import httpx
-import pytest
 
-from LLM_service.api import ApiError, WorkflowService, create_app
+from LLM_service.api import WorkflowService, create_app
 from LLM_service.core.services import factory
 from LLM_service.core.services.mock import MockLLM, MockStore
 from LLM_service.core.skill_schema import SkillCandidate, SkillRule, UserSkillDoc
 from LLM_service.tests.conftest import run_app
-from LLM_service.workflow import build_workflow
+from LLM_service.workflow import Brief, build_workflow
 
 
 async def _run_to_gate(workflow, brief):
     result = await workflow.run(brief)
     event = result.get_request_info_events()[0]
     return event.request_id, event.data
-
-
-# ── summarize_session distils a tageable candidate set ────────────────────────
-
-async def test_summarize_session_yields_3_to_6_shaped_candidates():
-    candidates = await MockLLM().summarize_session(
-        brief={"topic": "ethiopia harvest", "target_platforms": ["linkedin", "instagram"],
-               "tone_hint": "warm, authentic"},
-        conversation=[{"role": "user", "content": "post about our harvest"}],
-        final_drafts=[{"platform": "linkedin", "draft": "Our harvest is here."},
-                      {"platform": "instagram", "draft": "Harvest time ✨"}],
-    )
-    assert 3 <= len(candidates) <= 6
-    assert all(isinstance(c, SkillCandidate) for c in candidates)
-    assert all(c.suggested_kind in ("positive", "negative") for c in candidates)
-    assert {c.id for c in candidates} == {f"cand-{i + 1}" for i in range(len(candidates))}
-    # both platform-scoped and cross-platform (None) candidates are proposed
-    assert any(c.platform == "linkedin" for c in candidates)
-    assert any(c.platform is None for c in candidates)
 
 
 # ── consolidate_skills: this round overrides the prior rule on conflict ───────
@@ -87,71 +72,45 @@ async def test_get_upsert_user_skills_roundtrip_and_version_increment():
     assert (await store.get_user_skills(user_id="u1")).rules == []
 
 
-# ── learn-commit: filter ignore → consolidate → persist ───────────────────────
+# ── Non-roundtable confirm-learning: learn from the user's intake turns ───────
 
-async def _completed_task(svc: WorkflowService, *, user_id, task_id="t1", platforms=("linkedin",)):
-    await svc.start({"topic": "ethiopia harvest", "target_platforms": list(platforms),
-                     "user_id": user_id}, task_id=task_id)
-    await svc.review(task_id, {p: {"decision": "approve"} for p in platforms})
-
-
-async def test_learn_commit_drops_ignore_consolidates_and_persists():
+async def test_confirm_learning_learns_user_prefs_without_a_roundtable():
+    """A plain (non-roundtable) run still feeds the unified distiller the user's intake turns,
+    so confirm-learning persists per-user skills and a later run folds them into the draft."""
     svc = WorkflowService()
-    await _completed_task(svc, user_id="u_commit")
-
-    candidates = (await svc.learn_summarize("t1"))["candidates"]
-    assert 3 <= len(candidates) <= 6
-
-    keep, drop = candidates[0], candidates[1]
-    res = await svc.learn_commit("t1", [
-        {"candidate_id": keep["id"], "label": "positive"},
-        {"candidate_id": drop["id"], "label": "ignore"},
-    ])
-    doc = res["skill_doc"]
-    assert doc["version"] == 1
-    texts = [r["text"] for r in doc["rules"]]
-    assert keep["text"] in texts          # kept candidate persisted
-    assert drop["text"] not in texts      # ignored candidate dropped
-
-    # persisted to the same MockStore singleton the creator reads on the next run
-    stored = await factory.get_store().get_user_skills(user_id="u_commit")
-    assert stored is not None and stored.version == 1
-    assert keep["text"] in [r.text for r in stored.rules]
-
-
-async def test_learn_commit_platform_override_rescopes_a_rule():
-    svc = WorkflowService()
-    await _completed_task(svc, user_id="u_override")
-    candidates = (await svc.learn_summarize("t1"))["candidates"]
-
-    cross = next(c for c in candidates if c["platform"] is None)  # cross-platform candidate
-    res = await svc.learn_commit("t1", [
-        {"candidate_id": cross["id"], "label": cross["suggested_kind"], "platform": "instagram"},
-    ])
-    rules = res["skill_doc"]["rules"]
-    assert any(r["text"] == cross["text"] and r["platform"] == "instagram" for r in rules)
-
-
-async def test_learn_endpoints_require_a_user_id():
-    svc = WorkflowService()
-    await svc.start({"topic": "harvest", "target_platforms": ["linkedin"]}, task_id="t1")  # no user_id
+    await svc.start(
+        {"topic": "ethiopia harvest", "target_platforms": ["linkedin"], "user_id": "u_nort"},
+        task_id="t1",
+        conversation=[{"role": "user", "content": "always mention fair-trade sourcing"}],
+    )
     await svc.review("t1", {"linkedin": {"decision": "approve"}})
 
-    with pytest.raises(ApiError) as summ:
-        await svc.learn_summarize("t1")
-    assert summ.value.status == 400
-    with pytest.raises(ApiError) as commit:
-        await svc.learn_commit("t1", [])
-    assert commit.value.status == 400
+    res = await svc.confirm_learning("t1", learn=True)
+    summary = res["preference_summary"]
+    assert summary is not None and summary["learned_skills"]
+    assert any("fair-trade sourcing" in ev for ev in summary["evidence"])
+
+    # Persisted to the user_skills store the creator reads on the next run.
+    stored = await factory.get_store().get_user_skills(user_id="u_nort")
+    assert stored is not None and any("fair-trade sourcing" in r.text for r in stored.rules)
+
+    # Read-back loop: the next run for the same user folds the learned rule into the draft.
+    _, data = await _run_to_gate(
+        build_workflow(), Brief(topic="spring lineup", target_platforms=["linkedin"],
+                                user_intent="drive signups", user_id="u_nort"))
+    assert "fair-trade sourcing" in data.draft
 
 
-async def test_learn_commit_rejects_an_invalid_label():
+async def test_confirm_learning_user_channel_skipped_without_a_user_id():
+    """No user_id → the per-user channel writes nothing (the brand channel is independent)."""
     svc = WorkflowService()
-    await _completed_task(svc, user_id="u_bad")
-    candidates = (await svc.learn_summarize("t1"))["candidates"]
-    with pytest.raises(ApiError) as exc:
-        await svc.learn_commit("t1", [{"candidate_id": candidates[0]["id"], "label": "maybe"}])
-    assert exc.value.status == 400
+    await svc.start(
+        {"topic": "harvest", "target_platforms": ["linkedin"]}, task_id="t1",
+        conversation=[{"role": "user", "content": "always mention fair-trade sourcing"}],
+    )
+    await svc.review("t1", {"linkedin": {"decision": "approve"}})
+    res = await svc.confirm_learning("t1", learn=True)
+    assert res["preference_summary"] is None
 
 
 # ── creator injection: platform-filtered, in-memory, skipped when absent ──────
@@ -182,15 +141,15 @@ async def test_creator_skips_injection_without_a_user_record(make_brief):
     assert "MUST DO:" not in data2.draft and "MUST AVOID:" not in data2.draft
 
 
-# ── Full HTTP round-trip: intake session → task → learn-summarize → learn-commit ─
+# ── Full HTTP round-trip: intake session → task → confirm-learning ────────────
 
-def test_http_learn_round_trip():
+def test_http_confirm_learning_round_trip():
     with run_app(create_app()) as base_url:
         with httpx.Client(timeout=10) as client:
             # 1) Open an intake session — its transcript threads into the task.
             sid = client.post(f"{base_url}/intake", json={
                 "mode": "text", "user_id": "u_http",
-                "opening_input": "Post about ethiopia harvest on linkedin to drive signups",
+                "opening_input": "Post about ethiopia harvest on linkedin; always mention fair-trade sourcing",
             }).json()["session_id"]
 
             # 2) Start a task with the user + intake session id.
@@ -202,20 +161,15 @@ def test_http_learn_round_trip():
             task_id = started.json()["task_id"]
             assert started.json()["status"] == "awaiting_review"
 
-            # 3) Approve, then learn from the adopted session.
+            # 3) Approve, then confirm learning from the adopted session.
             client.post(f"{base_url}/tasks/{task_id}/review",
                         json={"verdicts": {"linkedin": {"decision": "approve"}}})
 
-            candidates = client.post(
-                f"{base_url}/tasks/{task_id}/learn-summarize").json()["candidates"]
-            assert 3 <= len(candidates) <= 6
-
-            committed = client.post(f"{base_url}/tasks/{task_id}/learn-commit", json={
-                "decisions": [{"candidate_id": candidates[0]["id"], "label": "positive"},
-                              {"candidate_id": candidates[1]["id"], "label": "ignore"}],
-            })
-            assert committed.status_code == 200
-            doc = committed.json()["skill_doc"]
-            assert doc["version"] == 1 and doc["user_id"] == "u_http"
-            assert candidates[0]["text"] in [r["text"] for r in doc["rules"]]
-            assert candidates[1]["text"] not in [r["text"] for r in doc["rules"]]
+            confirmed = client.post(f"{base_url}/tasks/{task_id}/confirm-learning",
+                                    json={"learn": True})
+            assert confirmed.status_code == 200
+            body = confirmed.json()
+            assert body["learned"] is True
+            summary = body["preference_summary"]
+            assert summary is not None and summary["user_id"] == "u_http"
+            assert summary["learned_skills"]

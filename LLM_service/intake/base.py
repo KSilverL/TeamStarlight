@@ -73,7 +73,6 @@ _QUESTIONS = {
     "target_platforms": "Which platforms should I write for? (e.g. LinkedIn, Instagram, Twitter)",
     "user_intent": "What's the goal — who's the audience and what should this campaign achieve?",
 }
-_TRAINING_CUES = ("train", "learn my", "my style", "brand voice")
 
 
 @dataclass
@@ -149,14 +148,11 @@ class BriefConversation:
 
     @staticmethod
     def _finalize_route(state: _SessionState) -> None:
-        if state.used_scout:
-            state.route = "copilot_mode"
-            return
-        intent = (state.brief_partial.get("user_intent") or "").lower()
-        if state.brief_partial.get("business_id") and any(c in intent for c in _TRAINING_CUES):
-            state.route = "brand_training"
-        else:
-            state.route = "direct_generation"
+        # The user is here to generate content; whether to *learn* from this
+        # conversation is decided at the END (POST /tasks/{id}/confirm-learning),
+        # not at intake. So intake only ever produces direct_generation (or
+        # copilot_mode when the scout proposed the topic) — never brand_training.
+        state.route = "copilot_mode" if state.used_scout else "direct_generation"
 
     @staticmethod
     def _summary(brief_partial: dict) -> str:
