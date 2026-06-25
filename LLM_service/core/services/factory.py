@@ -109,6 +109,8 @@ def get_chat_client(
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
     max_tokens: Optional[int] = None,
+    reasoning_effort: Optional[str] = None,
+    verbosity: Optional[str] = None,
 ):
     """Return a fresh MAF chat client for one roundtable seat, resolved by the LLM toggle.
     Unlike the other getters this is NOT cached: the mock client is stateful (per-persona
@@ -121,7 +123,10 @@ def get_chat_client(
     unset; the builder passes the main endpoint/key + ROUNDTABLE_MANAGER_MODEL explicitly for
     the manager so it stays on the main (gpt-5.4) deployment. `max_tokens` caps a single turn
     (personas pass the ROUNDTABLE_PERSONA_MAX_TOKENS budget to keep turns short; the manager
-    leaves it None so it has room for the final strategy)."""
+    leaves it None so it has room for the final strategy). `reasoning_effort` (e.g. "minimal" for
+    persona seats) keeps a reasoning model from spending the whole `max_tokens` budget on hidden
+    reasoning — the manager omits it (None) to keep full reasoning for the strategy ledger.
+    `verbosity` ("low" for persona seats) keeps a turn to one short spoken point, not an essay."""
     s = get_settings()
     if s.mock_llm():
         return mock.MockChatClient(agent_name=agent_name)
@@ -132,7 +137,8 @@ def get_chat_client(
              "AZURE_OPENAI_ENDPOINT/_API_KEY (or AZURE_PERSONA_ENDPOINT/_API_KEY for personas)",
              "USE_MOCK_LLM=true")
     return azure.AzureChatClient(
-        s, agent_name=agent_name, model=mdl, endpoint=ep, api_key=key, max_tokens=max_tokens
+        s, agent_name=agent_name, model=mdl, endpoint=ep, api_key=key,
+        max_tokens=max_tokens, reasoning_effort=reasoning_effort, verbosity=verbosity,
     )
 
 

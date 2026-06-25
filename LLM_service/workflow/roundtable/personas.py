@@ -104,9 +104,15 @@ def build_personas(
     profile, and the user's learned skills into the right seats. `chat_client_factory`
     maps a persona name → a fresh chat client (defaults to factory.get_chat_client, capped
     to the persona token budget so turns stay short)."""
-    persona_max_tokens = get_settings().roundtable_persona_max_tokens
+    settings = get_settings()
+    persona_max_tokens = settings.roundtable_persona_max_tokens
+    persona_reasoning = settings.roundtable_persona_reasoning_effort
+    persona_verbosity = settings.roundtable_persona_verbosity
     make_client = chat_client_factory or (
-        lambda name: factory.get_chat_client(agent_name=name, max_tokens=persona_max_tokens)
+        lambda name: factory.get_chat_client(
+            agent_name=name, max_tokens=persona_max_tokens,
+            reasoning_effort=persona_reasoning, verbosity=persona_verbosity,
+        )
     )
 
     skill_md = load_skill(platform)

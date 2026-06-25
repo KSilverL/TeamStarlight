@@ -391,6 +391,8 @@ class AzureChatClient(BaseChatClient):
         endpoint: Optional[str] = None,
         api_key: Optional[str] = None,
         max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
+        verbosity: Optional[str] = None,
     ) -> None:
         super().__init__()
         self._settings = settings
@@ -402,6 +404,13 @@ class AzureChatClient(BaseChatClient):
         self._model = model or settings.roundtable_persona_model or settings.azure_chat_deployment
         # Optional per-turn length cap (persona seats keep turns short; None → model default).
         self._max_tokens = max_tokens
+        # Reasoning effort for gpt-5.x reasoning models. Persona seats pass "minimal" so the hidden
+        # reasoning pass doesn't consume the whole max_tokens budget (which returns EMPTY content)
+        # and turns stay fast; the manager leaves it None (full reasoning for the strategy ledger).
+        self._reasoning_effort = reasoning_effort
+        # Output verbosity (gpt-5.x). Persona seats pass "low" so a turn is one short spoken point
+        # (a sentence or two), not an essay — keeping the roundtable fast. None → model default.
+        self._verbosity = verbosity
         self._client = None  # lazily built AsyncOpenAI (Azure v1 surface)
 
     def _ensure_client(self):
@@ -421,14 +430,33 @@ class AzureChatClient(BaseChatClient):
         if self._max_tokens:
             # gpt-5.x / o-series reject the legacy `max_tokens`; use `max_completion_tokens`.
             kwargs["max_completion_tokens"] = self._max_tokens
+        if self._reasoning_effort:
+            # "minimal" → no reasoning tokens, so a small max_tokens cap isn't swallowed whole.
+            kwargs["reasoning_effort"] = self._reasoning_effort
+        if self._verbosity:
+            kwargs["verbosity"] = self._verbosity
         resp = await client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content or ""
 
     @staticmethod
-    def _to_openai_messages(messages) -> List[dict]:
-        """Coerce the MAF Message sequence the orchestrator passes into the
-        {role, content} dicts the OpenAI chat API expects."""
+    def _instructions_from_options(options) -> str:
+        """MAF hands an Agent's `instructions` (the persona's whole system prompt) NOT in the
+        message list but on the per-call `options` (a dict with an `instructions` key). A client
+        that ignores `options` therefore drops every persona's role — the seat speaks with no
+        brand/skill/style context. Pull it out so it can be prepended as a system message."""
+        if isinstance(options, dict):
+            return options.get("instructions") or ""
+        return getattr(options, "instructions", None) or ""
+
+    @classmethod
+    def _to_openai_messages(cls, messages, options=None) -> List[dict]:
+        """Coerce the MAF Message sequence the orchestrator passes into the {role, content}
+        dicts the OpenAI chat API expects, prepending the agent `instructions` (carried on
+        `options`, not in `messages`) as the leading system message."""
         out: List[dict] = []
+        instructions = cls._instructions_from_options(options)
+        if instructions:
+            out.append({"role": "system", "content": instructions})
         for m in messages or []:
             role = getattr(m, "role", None)
             role = getattr(role, "value", role) or "user"
@@ -444,7 +472,7 @@ class AzureChatClient(BaseChatClient):
         return ChatResponse(messages=[Message("assistant", [text])])
 
     def _inner_get_response(self, *, messages, stream, options, **kwargs):
-        prompt = self._to_openai_messages(messages)
+        prompt = self._to_openai_messages(messages, options)
         if stream:
             async def gen():
                 text = await self._complete(prompt)
