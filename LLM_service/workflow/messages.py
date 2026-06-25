@@ -31,6 +31,16 @@ from ..core.media_schema import BrandVideoProps
 # Reject this many times before the circuit breaker forces a human decision.
 MAX_RETRIES = 3
 
+# The deliverables a run can produce, chosen by the backend per task (Brief.content_types):
+#   "text"  — the platform post copy (the creator's draft).
+#   "brand" — the animated, self-contained HTML brand card (media_producer).
+#   "video" — the structured BrandVideoProps video spec (media_producer).
+# `text` is the workflow's spine — it is ALWAYS drafted (the human reviews it at the gate and
+# the media is derived from it), so it is on regardless of the list. `brand` and `video` are the
+# genuinely optional, more expensive artifacts: they are OFF unless the backend lists them.
+CONTENT_TYPES = ("text", "brand", "video")
+DEFAULT_CONTENT_TYPES = ["text"]  # not-default-on for brand/video; the backend opts them in
+
 
 class Brief(BaseModel):
     """The structured creative brief — the workflow input. In M3 the intake layer
@@ -43,6 +53,9 @@ class Brief(BaseModel):
     user_id: Optional[str] = None  # the end user; keys the per-user learning channel
     tone_hint: Optional[str] = None
     route: str = "direct_generation"
+    # Which deliverables to produce (see CONTENT_TYPES). The backend passes this at POST /tasks;
+    # brand/video are off unless listed. `text` is always produced (the review/media spine).
+    content_types: List[str] = Field(default_factory=lambda: list(DEFAULT_CONTENT_TYPES))
 
 
 class DispatchPlan(BaseModel):
@@ -162,5 +175,8 @@ class FinalDraft(BaseModel):
     comment: str
     needs_human_intervention: bool = False
     proposed_rules: List[BrandRule] = Field(default_factory=list)
-    html_card: Optional[str] = None                 # self-contained animated HTML
-    video_props: Optional[BrandVideoProps] = None   # structured 3-scene video spec
+    # Echoes the brief's requested deliverables; `html_card` / `video_props` are populated
+    # only when "brand" / "video" are in `content_types` (else None).
+    content_types: List[str] = Field(default_factory=lambda: list(DEFAULT_CONTENT_TYPES))
+    html_card: Optional[str] = None                 # self-contained animated HTML ("brand")
+    video_props: Optional[BrandVideoProps] = None   # structured 3-scene video spec ("video")

@@ -1,5 +1,11 @@
 # ── Microsoft Agent Framework (MAF) — workflow + executors + RequestPort + checkpoint ──
-agent-framework-core>=1.8.0
+# Pinned (not >=): MAF orchestration is a new/experimental GA surface whose API still
+# shifts between releases (see docs/roundtable_api_notes.md). Bump deliberately, re-running
+# LLM_service/scratch/roundtable_spike.py + the suite after any change.
+agent-framework-core==1.9.0
+# Magentic / GroupChat orchestration (the roundtable stage) lives in a SEPARATE package —
+# NOT bundled with -core. Required once ROUNDTABLE_ENABLED is wired; the spike imports it.
+agent-framework-orchestrations==1.0.0
 httpx>=0.28.1
 typing-extensions>=4.15.0
 pydantic>=2.0.0

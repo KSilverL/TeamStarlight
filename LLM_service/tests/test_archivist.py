@@ -13,6 +13,7 @@ the brand_profiles table.
 
 from __future__ import annotations
 
+from LLM_service.api import WorkflowService
 from LLM_service.core.services import factory
 from LLM_service.core.services.mock import MockLLM
 from LLM_service.workflow import HumanVerdict, build_workflow
@@ -53,63 +54,76 @@ async def test_distill_skips_rules_already_on_record():
     assert not any(r["kind"] == "must_do" for r in rules)
 
 
-# ── Archivist only fires on approve_after_edit ────────────────────────────────
+# ── Brand-voice distillation is confirmation-gated (service-level) ─────────────
 
-async def test_approve_after_edit_attaches_proposed_rules(make_brief):
-    workflow = build_workflow()
-    rid, _ = await _run_to_gate(workflow, make_brief(platforms=("linkedin",), business_id="biz_arch"))
+async def test_confirm_learning_distills_brand_rules_after_edit():
+    svc = WorkflowService()
+    await svc.start(
+        {"topic": "ethiopia harvest", "target_platforms": ["linkedin"], "business_id": "biz_arch"},
+        task_id="t1",
+    )
+    await svc.review("t1", {"linkedin": {
+        "decision": "approve_after_edit",
+        "edited_draft": "Limited microlot drop — 1200 farmers, one harvest.",
+    }})
 
-    result = await workflow.run(responses={
-        rid: HumanVerdict(decision="approve_after_edit",
-                          edited_draft="Limited microlot drop — 1200 farmers, one harvest.")
-    })
-    out = result.get_outputs()[0]
-    assert out.decision == "approve_after_edit"
-    assert 1 <= len(out.proposed_rules) <= 3
-    assert {r.kind for r in out.proposed_rules} <= {"must_do", "must_avoid"}
-    assert any(r.kind == "must_do" for r in out.proposed_rules)
+    res = await svc.confirm_learning("t1", learn=True)
+    assert res["learned"] is True
+    rules = res["brand_rules"]
+    assert 1 <= len(rules) <= 3
+    assert {r["kind"] for r in rules} <= {"must_do", "must_avoid"}
+    assert any(r["kind"] == "must_do" for r in rules)
+
+    # The archivist wrote them STRAIGHT to the brand profile (no separate tagging step).
+    profile = await factory.get_store().get_profile(business_id="biz_arch")
+    assert any(r["rule"] in profile["must_do"] for r in rules if r["kind"] == "must_do")
 
 
-async def test_plain_approve_does_not_invoke_archivist(make_brief):
-    workflow = build_workflow()
-    rid, _ = await _run_to_gate(workflow, make_brief(platforms=("linkedin",)))
+async def test_decline_learning_distills_nothing():
+    svc = WorkflowService()
+    await svc.start(
+        {"topic": "harvest", "target_platforms": ["linkedin"], "business_id": "biz_decline"},
+        task_id="t1",
+    )
+    await svc.review("t1", {"linkedin": {
+        "decision": "approve_after_edit", "edited_draft": "A crisp punchy edit.",
+    }})
 
-    result = await workflow.run(responses={rid: HumanVerdict(decision="approve")})
-    out = result.get_outputs()[0]
-    assert out.decision == "approve"
-    assert out.proposed_rules == []
+    res = await svc.confirm_learning("t1", learn=False)
+    assert res["learned"] is False and res["brand_rules"] == []
+    # Nothing written to the profile without the user's opt-in.
+    profile = await factory.get_store().get_profile(business_id="biz_decline")
+    assert profile["must_do"] == [] and profile["must_avoid"] == []
 
 
 # ── The full learning loop (acceptance) ───────────────────────────────────────
 
-async def test_edit_then_tagged_rule_persists_and_creator_uses_it_next_run(make_brief):
+async def test_edit_then_confirmed_rule_persists_and_creator_uses_it_next_run(make_brief):
     biz = "biz_learning_loop"
+    svc = WorkflowService()
 
-    # 1) First run, human edits the draft → archivist proposes rules.
-    wf1 = build_workflow()
-    rid, _ = await _run_to_gate(wf1, make_brief(topic="ethiopia harvest", platforms=("linkedin",), business_id=biz))
-    edited = "Lead with a striking single-origin microlot statistic."
-    out = (await wf1.run(responses={
-        rid: HumanVerdict(decision="approve_after_edit", edited_draft=edited)
-    })).get_outputs()[0]
-    must_do = [r for r in out.proposed_rules if r.kind == "must_do"]
-    assert must_do, "an edit that adds phrasing should propose a must_do rule"
+    # 1) First run, human edits the draft → confirm learning → brand rules proposed.
+    await svc.start(
+        {"topic": "ethiopia harvest", "target_platforms": ["linkedin"], "business_id": biz},
+        task_id="t1",
+    )
+    await svc.review("t1", {"linkedin": {
+        "decision": "approve_after_edit",
+        "edited_draft": "Lead with a striking single-origin microlot statistic.",
+    }})
+    res = await svc.confirm_learning("t1", learn=True)
+    must_do = [r for r in res["brand_rules"] if r["kind"] == "must_do"]
+    assert must_do, "an edit that adds phrasing should distil a must_do rule"
 
-    # 2) User tags the must_do rule as a keeper → written to the store (the store the
-    #    workflow's creator reads from — same MockStore singleton this test session).
+    # 2) The archivist wrote the rule straight into the profile on confirm (no tagging step).
     store = factory.get_store()
-    profile = await store.get_profile(business_id=biz)
-    assert profile["must_do"] == []  # nothing learned yet
-    profile["must_do"].append(must_do[0].rule)
-    await store.upsert_profile(business_id=biz, profile=profile)
-
     saved = await store.get_profile(business_id=biz)
-    assert must_do[0].rule in saved["must_do"]
+    assert any(r["rule"] in saved["must_do"] for r in must_do)
 
     # 3) Next generation for the same business → the creator reads the learned rule.
     wf2 = build_workflow()
     _, data = await _run_to_gate(wf2, make_brief(topic="kenya peaberry", platforms=("linkedin",), business_id=biz))
-    assert must_do[0].rule in data.draft
+    assert any(r["rule"] in data.draft for r in must_do)
 
 
 async def test_no_brand_user_gets_no_learned_rules(make_brief):

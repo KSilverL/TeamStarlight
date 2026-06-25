@@ -22,6 +22,7 @@ from agent_framework import InMemoryCheckpointStorage
 from LLM_service.core.config import reset_settings
 from LLM_service.core.services.factory import reset_services
 from LLM_service.workflow import Brief, build_workflow
+from LLM_service.workflow.roundtable import reset_gates
 
 _TOGGLE_VARS = ("USE_MOCK", "USE_MOCK_LLM", "USE_MOCK_SAFETY", "USE_MOCK_STORE", "USE_MOCK_VOICE")
 _CRED_VARS = (
@@ -40,9 +41,11 @@ def _reset_caches():
     test so env/toggle/store changes made by one test never leak into the next."""
     reset_settings()
     reset_services()
+    reset_gates()
     yield
     reset_settings()
     reset_services()
+    reset_gates()
 
 
 @pytest.fixture(autouse=True)
@@ -75,6 +78,8 @@ def make_brief():
             user_id=over.get("user_id"),
             tone_hint=over.get("tone_hint", "warm, authentic"),
             route=over.get("route", "direct_generation"),
+            # Default to text only (brand/video are opt-in); media tests pass all three.
+            content_types=over.get("content_types", ["text"]),
         )
 
     return _make

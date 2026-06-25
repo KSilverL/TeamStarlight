@@ -22,6 +22,15 @@ from __future__ import annotations
 import json
 from typing import List, Optional
 
+from agent_framework import (
+    BaseChatClient,
+    ChatResponse,
+    ChatResponseUpdate,
+    Content,
+    Message,
+)
+from agent_framework._types import ResponseStream
+
 from ..config import Settings
 from ..media_schema import BrandVideoProps
 from ..skill_schema import SkillCandidate, SkillRule
@@ -86,7 +95,7 @@ class AzureLLM(LLMService):
     ) -> dict:
         system = (
             "You are the dispatcher of a marketing newsroom. Confirm the brief and "
-            "choose a route: copilot_mode, direct_generation, or brand_training. "
+            "choose a route: copilot_mode or direct_generation. "
             'Reply with JSON: {"route","topic","target_platforms","user_intent"}.'
         )
         user = json.dumps(
@@ -228,10 +237,12 @@ class AzureLLM(LLMService):
         final_draft: str,
         existing_must_do: List[str],
         existing_must_avoid: List[str],
+        transcript: Optional[List[dict]] = None,
     ) -> List[dict]:
         system = (
-            "You are a brand archivist. Compare the AI draft with the human's final "
-            "edit and distil 1-3 concrete writing rules. Do not repeat existing rules. "
+            "You are a brand archivist. From the AI draft, the human's final edit, AND the "
+            "roundtable discussion, distil 1-3 concrete brand-voice rules. The discussion "
+            "counts even when the draft was approved unedited. Do not repeat existing rules. "
             'Reply with a JSON array of {"kind":"must_do"|"must_avoid","rule","rationale"}.'
         )
         user = json.dumps({
@@ -240,6 +251,7 @@ class AzureLLM(LLMService):
             "human_final": final_draft,
             "existing_must_do": existing_must_do,
             "existing_must_avoid": existing_must_avoid,
+            "transcript": transcript or [],
         })
         raw = await self._complete(
             [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -253,43 +265,6 @@ class AzureLLM(LLMService):
                     "rule": r["rule"],
                     "rationale": r.get("rationale", ""),
                 })
-        return out
-
-    async def summarize_session(
-        self,
-        *,
-        brief: dict,
-        conversation: List[dict],
-        final_drafts: List[dict],
-    ) -> List[SkillCandidate]:
-        system = (
-            "You are a writing coach reviewing a completed social-media session. From "
-            "the brief, the conversation, and the approved final drafts, distil 3-6 "
-            "candidate writing rules the user can keep or discard. For each, infer the "
-            "platform (null = applies to all platforms), a suggested_kind ('positive' = "
-            "do more of this, 'negative' = avoid this), and a short rationale. Reply "
-            'with ONLY a JSON array of {"text","platform","suggested_kind","rationale"}.'
-        )
-        user = json.dumps({
-            "brief": brief, "conversation": conversation, "final_drafts": final_drafts,
-        })
-        raw = await self._complete(
-            [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        )
-        items = json.loads(_strip_fences(raw))
-        out: List[SkillCandidate] = []
-        for i, item in enumerate(items[:6]):
-            kind = item.get("suggested_kind")
-            text = item.get("text")
-            if kind not in ("positive", "negative") or not text:
-                continue
-            out.append(SkillCandidate(
-                id=item.get("id") or f"cand-{i + 1}",
-                text=text,
-                platform=item.get("platform"),
-                suggested_kind=kind,
-                rationale=item.get("rationale", ""),
-            ))
         return out
 
     async def consolidate_skills(
@@ -322,6 +297,31 @@ class AzureLLM(LLMService):
                 continue
             out.append(SkillRule(text=text, platform=item.get("platform"), kind=kind))
         return out
+
+    async def summarize_preferences(
+        self,
+        *,
+        transcript: List[dict],
+        verdicts: List[dict],
+    ) -> List[dict]:
+        system = (
+            "You distil ONE user's writing preferences from their content-strategy session. "
+            "Read the transcript of the user's own turns (roundtable discussion turns and/or "
+            "their intake turns) and their final verdicts/edits, then list 0-3 concrete "
+            "preferences. Each must trace to a specific user turn or edit. Reply with ONLY a "
+            'JSON array of {"skill": str, "evidence": str}. Uses the cheap summary tier.'
+        )
+        user = json.dumps({"transcript": transcript, "verdicts": verdicts})
+        raw = await self._complete(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        )
+        items = json.loads(_strip_fences(raw))
+        out: List[dict] = []
+        for item in items:
+            skill = item.get("skill")
+            if skill:
+                out.append({"skill": skill, "evidence": item.get("evidence", "")})
+        return out[:3]
 
     async def _complete_with_tools(self, messages: List[dict], tools: List[dict]) -> dict:
         """Function-calling completion. Returns {"content": str, "tool_calls":
@@ -367,6 +367,96 @@ class AzureLLM(LLMService):
             elif call["name"] == "scout_trends":
                 wants_scout = True
         return {"brief_updates": updates, "wants_scout": wants_scout}
+
+
+# ── Chat client (roundtable personas + manager) ───────────────────────────────
+
+class AzureChatClient(BaseChatClient):
+    """Production chat client for one roundtable seat (a persona, or the LLM manager),
+    backed by the Azure OpenAI v1 surface — the same plain `AsyncOpenAI(base_url=…)` as
+    AzureLLM (the M4 endpoint gotcha in CLAUDE.md: do NOT use AsyncAzureOpenAI). The
+    `model` is the deployment for this seat's tier (persona = mini, manager = stronger).
+
+    Like the other Azure impls, the network call goes through one overridable seam
+    (`_complete`) and the SDK is lazy-imported, so contract-parity tests exercise the
+    response shaping (the MockChatClient analogue) with no network. Streaming yields a
+    single update with the full text — enough for the orchestrator, no token streaming."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        agent_name: str,
+        model: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        api_key: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self._settings = settings
+        self._agent_name = agent_name
+        # Each seat can point at its own resource: personas on a rate-limit-friendlier endpoint,
+        # the manager on the main one. Falls back to the main Azure OpenAI resource when unset.
+        self._endpoint = endpoint or settings.azure_openai_endpoint
+        self._api_key = api_key or settings.azure_openai_api_key
+        self._model = model or settings.roundtable_persona_model or settings.azure_chat_deployment
+        # Optional per-turn length cap (persona seats keep turns short; None → model default).
+        self._max_tokens = max_tokens
+        self._client = None  # lazily built AsyncOpenAI (Azure v1 surface)
+
+    def _ensure_client(self):
+        if self._client is None:
+            from openai import AsyncOpenAI  # lazy import
+
+            self._client = AsyncOpenAI(
+                base_url=(self._endpoint or "").rstrip("/"),
+                api_key=self._api_key,
+            )
+        return self._client
+
+    async def _complete(self, messages: List[dict]) -> str:
+        """Single seam through which all chat traffic flows (overridable in tests)."""
+        client = self._ensure_client()
+        kwargs: dict = {"model": self._model, "messages": messages}
+        if self._max_tokens:
+            # gpt-5.x / o-series reject the legacy `max_tokens`; use `max_completion_tokens`.
+            kwargs["max_completion_tokens"] = self._max_tokens
+        resp = await client.chat.completions.create(**kwargs)
+        return resp.choices[0].message.content or ""
+
+    @staticmethod
+    def _to_openai_messages(messages) -> List[dict]:
+        """Coerce the MAF Message sequence the orchestrator passes into the
+        {role, content} dicts the OpenAI chat API expects."""
+        out: List[dict] = []
+        for m in messages or []:
+            role = getattr(m, "role", None)
+            role = getattr(role, "value", role) or "user"
+            text = getattr(m, "text", None)
+            out.append({"role": str(role), "content": text if text is not None else str(m)})
+        return out
+
+    @staticmethod
+    def _finalize(updates) -> ChatResponse:
+        text = "".join(getattr(u, "text", "") or "" for u in updates)
+        # `contents` is a Sequence — a bare str is iterated into one content PER CHARACTER,
+        # so `Message.text` comes back space-separated ("h e l l o"). Wrap it in a list.
+        return ChatResponse(messages=[Message("assistant", [text])])
+
+    def _inner_get_response(self, *, messages, stream, options, **kwargs):
+        prompt = self._to_openai_messages(messages)
+        if stream:
+            async def gen():
+                text = await self._complete(prompt)
+                yield ChatResponseUpdate(role="assistant", contents=[Content(type="text", text=text)])
+
+            return ResponseStream(gen(), finalizer=self._finalize)
+
+        async def go():
+            text = await self._complete(prompt)
+            return ChatResponse(messages=[Message("assistant", [text])])
+
+        return go()
 
 
 # ── Safety (Azure AI Content Safety) ──────────────────────────────────────────
