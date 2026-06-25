@@ -177,6 +177,16 @@ class Settings:
     # Keeps turns short like a real discussion; passed to the persona chat clients as
     # `max_completion_tokens`. The LLM manager is NOT capped (it needs room for the final strategy).
     roundtable_persona_max_tokens: Optional[int] = None
+    # Reasoning effort for the persona seats (gpt-5.x are reasoning models). A persona turn is
+    # one short spoken point, so it needs NO hidden reasoning — and at a small max_tokens cap the
+    # reasoning pass would eat the whole budget, returning EMPTY content (finish_reason=length).
+    # "minimal" → reasoning_tokens=0, so the cap is spent on the visible answer and turns are ~2x
+    # faster. Blank/None → omit the param (use for a non-reasoning persona model). Manager unaffected.
+    roundtable_persona_reasoning_effort: Optional[str] = "minimal"
+    # Output verbosity for the persona seats (gpt-5.x). "low" keeps a turn to one short spoken
+    # point (a sentence or two) instead of an essay — faster turns + the intended discussion feel.
+    # Blank/None → omit (use for a non-gpt-5 persona model). Manager unaffected.
+    roundtable_persona_verbosity: Optional[str] = "low"
     # The personas run on a cheaper, rate-limit-friendlier model; only the LLM manager keeps
     # the main (gpt-5.4) deployment. The personas may live on a SEPARATE Azure resource
     # (its own endpoint + key); when those are unset they fall back to the main resource and
@@ -275,6 +285,12 @@ def _load() -> Settings:
         roundtable_max_rounds=_env_int("ROUNDTABLE_MAX_ROUNDS", 12),
         roundtable_persona_max_tokens=(
             _env_int("ROUNDTABLE_PERSONA_MAX_TOKENS", 0) or None
+        ),
+        roundtable_persona_reasoning_effort=(
+            os.getenv("ROUNDTABLE_PERSONA_REASONING_EFFORT", "minimal").strip() or None
+        ),
+        roundtable_persona_verbosity=(
+            os.getenv("ROUNDTABLE_PERSONA_VERBOSITY", "low").strip() or None
         ),
         roundtable_persona_model=os.getenv("ROUNDTABLE_PERSONA_MODEL"),
         roundtable_manager_model=os.getenv("ROUNDTABLE_MANAGER_MODEL"),
