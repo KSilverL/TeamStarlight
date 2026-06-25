@@ -19,6 +19,15 @@ import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+from agent_framework import (
+    BaseChatClient,
+    ChatResponse,
+    ChatResponseUpdate,
+    Content,
+    Message,
+)
+from agent_framework._types import ResponseStream
+
 from ...skills import parse_char_limit
 from ..media_schema import BrandVideoProps, StatItem
 from ..skill_schema import SkillCandidate, SkillRule, UserSkillDoc
@@ -454,6 +463,7 @@ class MockLLM(LLMService):
         final_draft: str,
         existing_must_do: List[str],
         existing_must_avoid: List[str],
+        transcript: Optional[List[dict]] = None,
     ) -> List[dict]:
         await asyncio.sleep(_MOCK_LATENCY)
         orig_words = _words(original_draft)
@@ -462,69 +472,30 @@ class MockLLM(LLMService):
         removed = [w for w in _unique(_words(original_draft)) if w not in final_words]
 
         rules: List[dict] = []
+
+        def _add(kind: str, rule: str, rationale: str) -> None:
+            existing = existing_must_do if kind == "must_do" else existing_must_avoid
+            if rule not in existing and not any(r["rule"] == rule for r in rules):
+                rules.append({"kind": kind, "rule": rule, "rationale": rationale})
+
         if added:
-            phrase = " ".join(added[:6])
-            rule = f"Open with phrasing like: {phrase}"
-            if rule not in existing_must_do:
-                rules.append({
-                    "kind": "must_do",
-                    "rule": rule,
-                    "rationale": "the human added this phrasing in their edit",
-                })
+            _add("must_do", f"Open with phrasing like: {' '.join(added[:6])}",
+                 "the human added this phrasing in their edit")
         if removed:
-            phrase = ", ".join(removed[:5])
-            rule = f"Avoid words like: {phrase}"
-            if rule not in existing_must_avoid:
-                rules.append({
-                    "kind": "must_avoid",
-                    "rule": rule,
-                    "rationale": "the human removed these in their edit",
-                })
+            _add("must_avoid", f"Avoid words like: {', '.join(removed[:5])}",
+                 "the human removed these in their edit")
+        # Transcript-derived signal: what the brand-voice persona and the user argued for in
+        # this platform's discussion — lets a plain approve (no edit) still learn a brand rule.
+        for turn in transcript or []:
+            if turn.get("platform") not in (None, platform):
+                continue
+            text = (turn.get("text") or "").strip()
+            if not text:
+                continue
+            if turn.get("speaker") == "brand_voice" or turn.get("role") == "user":
+                _add("must_do", f"From the discussion: {text}",
+                     f"raised in the {platform} roundtable")
         return rules[:3]
-
-    async def summarize_session(
-        self,
-        *,
-        brief: dict,
-        conversation: List[dict],
-        final_drafts: List[dict],
-    ) -> List[SkillCandidate]:
-        await asyncio.sleep(_MOCK_LATENCY)
-        topic = (brief.get("topic") or "your topic").strip()
-        tone = (brief.get("tone_hint") or "clear, consistent").strip()
-        # Platforms of the adopted session: from the approved drafts, else the brief.
-        drafts_by_platform = [
-            (d.get("platform"), d.get("draft") or "")
-            for d in final_drafts if d.get("platform")
-        ]
-        if not drafts_by_platform:
-            drafts_by_platform = [(p, "") for p in (brief.get("target_platforms") or [])]
-
-        # (text, platform, suggested_kind, rationale)
-        proposals: List[tuple] = []
-        for platform, draft in drafts_by_platform:
-            opener = " ".join(_words(draft)[:6])
-            text = (
-                f"Open a {platform} post with phrasing like: {opener}"
-                if opener else f"Lead the {platform} post with a strong, on-topic hook"
-            )
-            proposals.append((text, platform, "positive",
-                              f"mirrors the approved {platform} opening"))
-        # One cross-platform positive + two negatives, so the set is always >= 3.
-        proposals.append((f"Keep a {tone} tone across platforms.", None, "positive",
-                          "the user adopted this voice"))
-        proposals.append((f"Avoid straying from the core topic: {topic}.", None, "negative",
-                          "keeps every post on-message"))
-        proposals.append(("Avoid generic filler that wasn't in the approved copy.", None,
-                          "negative", "the user trimmed filler in the final"))
-
-        return [
-            SkillCandidate(
-                id=f"cand-{i + 1}", text=text, platform=platform,
-                suggested_kind=kind, rationale=rationale,
-            )
-            for i, (text, platform, kind, rationale) in enumerate(proposals[:6])
-        ]
 
     async def consolidate_skills(
         self,
@@ -542,6 +513,35 @@ class MockLLM(LLMService):
             rule = SkillRule(text=cand.text, platform=cand.platform, kind=cand.suggested_kind)
             merged[(rule.text.strip().lower(), rule.platform)] = rule
         return list(merged.values())
+
+    async def summarize_preferences(
+        self,
+        *,
+        transcript: List[dict],
+        verdicts: List[dict],
+    ) -> List[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        out: List[dict] = []
+        # The user's own turns are the strongest signal — honour what they steered toward,
+        # with evidence pointing straight back at the interjection.
+        for turn in transcript or []:
+            is_user = turn.get("role") == "user" or turn.get("speaker") == "user"
+            text = (turn.get("text") or "").strip()
+            if is_user and text:
+                where = turn.get("platform") or turn.get("table_id") or "the"
+                out.append({
+                    "skill": f"Honour the user's steer: {text}",
+                    "evidence": f"user interjection in the {where} discussion: {text}",
+                })
+        # An edit is the next-strongest signal — mirror the phrasing the user reached for.
+        for v in verdicts or []:
+            if v.get("decision") == "approve_after_edit" and (v.get("edited_draft") or "").strip():
+                phrase = " ".join(_words(v["edited_draft"])[:6])
+                out.append({
+                    "skill": f"Open with phrasing like: {phrase}",
+                    "evidence": f"user edited the {v.get('platform', '')} draft",
+                })
+        return out[:3]
 
     async def fill_brief(
         self,
@@ -570,6 +570,77 @@ class MockLLM(LLMService):
         return {"brief_updates": updates, "wants_scout": wants_scout}
 
 
+# ── Chat client (roundtable personas) ──────────────────────────────────────────
+# The roundtable runs real MAF Magentic agents; each persona is an `Agent` backed by a
+# chat client. This mock implements the installed `BaseChatClient` contract and returns
+# deterministic, scripted text keyed by (agent_name, call_index) — so a discussion is
+# fully reproducible offline (the production counterpart, an OpenAIChatClient, lands in
+# Phase 2). The agent name encodes the persona role; `call_index` advances each turn.
+
+_ROUNDTABLE_PERSONA_LINES: Dict[str, List[str]] = {
+    "platform_editor": [
+        "For this platform, open with a native hook and keep the format tight.",
+        "Trim it to the platform's rhythm — short lines, one clear call to action.",
+    ],
+    "trend_scout": [
+        "Tie it to a current, on-topic trend so it rides discovery.",
+        "Add a timely angle the audience is already talking about.",
+    ],
+    "brand_voice": [
+        "Keep it on-brand: honour the must-do rules and steer clear of the must-avoid list.",
+        "Protect the brand voice — consistency beats novelty here.",
+    ],
+    "user_advocate": [
+        "Match this user's learned preferences and protect their personal voice.",
+        "Lean into what this user has liked before; skip what they've rejected.",
+    ],
+    "audience_advocate": [
+        "From the reader's seat: lead with the benefit and cut the filler.",
+        "Make the first line earn the scroll — speak to the audience's real need.",
+    ],
+}
+_DEFAULT_PERSONA_LINES = [
+    "Here's my take on the strongest angle for this post.",
+    "Refining the angle so it lands for this platform.",
+]
+
+
+def _roundtable_line(agent_name: str, call_index: int) -> str:
+    """Deterministic scripted line for a persona's nth turn (1-based call_index)."""
+    lines = _ROUNDTABLE_PERSONA_LINES.get(agent_name, _DEFAULT_PERSONA_LINES)
+    return lines[(call_index - 1) % len(lines)]
+
+
+class MockChatClient(BaseChatClient):
+    """Deterministic, offline chat client for one roundtable persona. Honours both the
+    streaming and non-streaming `_inner_get_response` contracts the MAF orchestrator
+    calls; returns a scripted line per invocation (no network, no randomness)."""
+
+    def __init__(self, *, agent_name: str) -> None:
+        super().__init__()
+        self._name = agent_name
+        self._calls = 0
+
+    def _inner_get_response(self, *, messages, stream, options, **kwargs):
+        self._calls += 1
+        line = _roundtable_line(self._name, self._calls)
+        if stream:
+            async def gen():
+                yield ChatResponseUpdate(role="assistant", contents=[Content(type="text", text=line)])
+
+            return ResponseStream(
+                gen(),
+                # Wrap text in a list: a bare str is iterated into one content per character,
+                # which makes Message.text space-separated (see AzureChatClient for the same fix).
+                finalizer=lambda _updates: ChatResponse(messages=[Message("assistant", [line])]),
+            )
+
+        async def go():
+            return ChatResponse(messages=[Message("assistant", [line])])
+
+        return go()
+
+
 # ── Safety ────────────────────────────────────────────────────────────────────
 
 class MockSafety(SafetyService):
@@ -581,6 +652,35 @@ class MockSafety(SafetyService):
 
 
 # ── Store (in-memory stand-in for the two Postgres tables) ─────────────────────
+
+# Sentinel ids that return canned, deterministic brand/user context out of the box, so
+# the roundtable's read side (context.py injecting profile + user skills into personas)
+# is observable with zero setup. A real upsert for the same id overrides the fixture.
+ROUNDTABLE_FIXTURE_BUSINESS_ID = "biz_roundtable_demo"
+ROUNDTABLE_FIXTURE_USER_ID = "user_roundtable_demo"
+
+
+def _fixture_brand_profile() -> dict:
+    return {
+        "id": ROUNDTABLE_FIXTURE_BUSINESS_ID,
+        "must_do": ["Lead with a customer outcome", "Use warm, plain language"],
+        "must_avoid": ["Hype words like 'revolutionary'", "Jargon without context"],
+        "examples": [{"text": "We helped a small roaster double its repeat orders."}],
+        "updated_at": None,
+    }
+
+
+def _fixture_user_skills() -> dict:
+    return UserSkillDoc(
+        user_id=ROUNDTABLE_FIXTURE_USER_ID,
+        rules=[
+            SkillRule(text="Prefer concrete numbers over adjectives", platform=None, kind="positive"),
+            SkillRule(text="Avoid exclamation marks", platform=None, kind="negative"),
+        ],
+        version=1,
+        updated_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    ).model_dump(mode="json")
+
 
 class MockStore(StoreService):
     """An in-memory stand-in for the brand_profiles + workflow_checkpoints tables.
@@ -596,6 +696,8 @@ class MockStore(StoreService):
         await asyncio.sleep(_MOCK_LATENCY)
         if business_id and business_id in self._profiles:
             return dict(self._profiles[business_id])
+        if business_id == ROUNDTABLE_FIXTURE_BUSINESS_ID:
+            return _fixture_brand_profile()
         return empty_profile(business_id)
 
     async def upsert_profile(self, *, business_id: str, profile: dict) -> None:
@@ -606,7 +708,11 @@ class MockStore(StoreService):
     async def get_user_skills(self, *, user_id: str) -> Optional[UserSkillDoc]:
         await asyncio.sleep(_MOCK_LATENCY)
         stored = self._user_skills.get(user_id)
-        return UserSkillDoc(**stored) if stored is not None else None
+        if stored is not None:
+            return UserSkillDoc(**stored)
+        if user_id == ROUNDTABLE_FIXTURE_USER_ID:
+            return UserSkillDoc(**_fixture_user_skills())
+        return None
 
     async def upsert_user_skills(
         self, *, user_id: str, rules: List[SkillRule]

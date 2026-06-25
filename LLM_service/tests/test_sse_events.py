@@ -3,7 +3,7 @@ SSE progress stream + the api surface (replaces test_status_events / test_api).
 
 Covers the §7.2 event envelope bridged from the MAF workflow to SSE
 (`GET /tasks/{id}/events`), the RequestPort resume endpoint (`POST /review`), the
-archivist tagging endpoint (`POST /archive-tags`), and the durability guarantee:
+confirm-learning archivist (`POST /confirm-learning`), and the durability guarantee:
 the workflow's checkpoint persists on the RequestPort pause and a fresh workflow
 instance resumes from it after a simulated process restart.
 
@@ -23,8 +23,10 @@ from LLM_service.core.services import factory, mock, postgres
 from LLM_service.tests.conftest import run_app
 from LLM_service.workflow import HumanVerdict, build_workflow
 from LLM_service.workflow.builder import WORKFLOW_NAME
+from LLM_service.workflow.roundtable import push_utterance
 
-_START = {"topic": "ethiopia harvest", "target_platforms": ["linkedin", "instagram"], "business_id": "biz_sse"}
+_START = {"topic": "ethiopia harvest", "target_platforms": ["linkedin", "instagram"],
+          "business_id": "biz_sse", "content_types": ["text", "brand", "video"]}
 _ENVELOPE_KEYS = {"type", "node", "phase", "platform", "status", "ts"}
 
 
@@ -105,20 +107,18 @@ async def test_events_generator_drains_when_done():
     assert any(e["type"] == "result" and e["status"] == "final" for e in streamed)
 
 
-# ── C. Archive-tags writes the kept rules to the store (get_store) ───────────
+# ── C. Learning: the confirm-learning archivist writes straight to the store ─────────────
 
-async def test_archive_tags_persists_kept_rules_to_profile():
+async def test_confirm_learning_writes_brand_rules_to_profile():
+    """The archivist (behind confirm-learning) distils the conversation and writes brand rules
+    STRAIGHT into the Brand_Voice_Profile — no separate per-rule tagging step."""
     svc = WorkflowService()
     await svc.start({"topic": "harvest", "target_platforms": ["linkedin"], "business_id": "biz_tag"}, task_id="t1")
-    snap = await svc.review("t1", {
+    await svc.review("t1", {
         "linkedin": {"decision": "approve_after_edit", "edited_draft": "Striking microlot statistic upfront."}
     })
-    rules = snap["proposed_rules"]
-    assert rules, "an edit should propose rules"
-
-    tags = [{**r, "keep": r["kind"] == "must_do"} for r in rules]
-    res = await svc.archive_tags("t1", tags)
-    assert res["rules_kept"] >= 1
+    rules = (await svc.confirm_learning("t1", learn=True))["brand_rules"]
+    assert rules, "an edit should distil brand rules"
 
     profile = await factory.get_store().get_profile(business_id="biz_tag")
     assert any(r["rule"] in profile["must_do"] for r in rules if r["kind"] == "must_do")
@@ -157,6 +157,61 @@ async def test_api_start_persists_a_workflow_checkpoint():
     assert checkpoints
 
 
+# ── D2. Roundtable discussion streams over the same SSE channel (Phase 4) ─────
+
+_RT_START = {
+    "topic": "spring single-origin coffee launch",
+    "target_platforms": ["linkedin"],
+    "business_id": mock.ROUNDTABLE_FIXTURE_BUSINESS_ID,
+    "user_id": mock.ROUNDTABLE_FIXTURE_USER_ID,
+}
+
+
+async def test_roundtable_streams_utterances_then_consensus():
+    svc = WorkflowService()
+    await svc.run_roundtable(_RT_START, "linkedin", task_id="rt1", max_rounds=4)
+    events = svc.buffered_events("rt1")
+
+    utterances = [e for e in events if e["type"] == "agent_utterance"]
+    consensus = [e for e in events if e["type"] == "result" and e["status"] == "discussion_consensus"]
+    assert utterances, "expected a stream of agent utterances"
+    assert len(consensus) == 1
+
+    # Ordering: every utterance precedes the single consensus, which is the last event.
+    assert events[-1]["status"] == "discussion_consensus"
+    rounds = [e["round_index"] for e in utterances]
+    assert rounds == sorted(rounds)
+
+    # Envelope completeness + the utterance-specific fields.
+    for e in events:
+        assert _ENVELOPE_KEYS <= set(e)
+        assert isinstance(e["ts"], float)
+    for e in utterances:
+        assert e["platform"] == "linkedin" and e["table_id"] == "linkedin"
+        assert e["speaker"] and e["agent_id"] == e["speaker"] and e["role"] and e["text"]
+    assert consensus[0]["strategy"]["linkedin"] and consensus[0]["converged"] is True
+
+
+async def test_roundtable_user_utterance_appears_in_the_stream():
+    """A queued user 'raise hand' shows up as a user-role agent_utterance in the SSE stream."""
+    await push_utterance(factory.get_store(), task_id="rt2", table_id="linkedin",
+                         text="please mention fair-trade sourcing")
+    svc = WorkflowService()
+    await svc.run_roundtable(_RT_START, "linkedin", task_id="rt2", max_rounds=4)
+
+    user_utts = [e for e in svc.buffered_events("rt2")
+                 if e["type"] == "agent_utterance" and e["role"] == "user"]
+    assert any("fair-trade" in e["text"] for e in user_utts)
+
+
+async def test_roundtable_events_generator_drains_in_order():
+    svc = WorkflowService()
+    await svc.run_roundtable(_RT_START, "linkedin", task_id="rt3", max_rounds=4)
+    streamed = [ev async for ev in svc.events("rt3")]
+    assert streamed and streamed[-1]["status"] == "discussion_consensus"
+    assert any(e["type"] == "agent_utterance" for e in streamed)
+
+
 # ── E. Offline guarantee: under USE_MOCK every service is a mock (no Azure) ───
 
 def test_no_real_backends_selected_in_mock_mode():
@@ -189,8 +244,11 @@ def test_http_sse_round_trip(http_server):
                                       "edited_draft": "Striking microlot statistic upfront."}}
         })
         assert reviewed.status_code == 200 and reviewed.json()["status"] == "completed"
-        proposed = reviewed.json()["proposed_rules"]
-        assert proposed
+
+        # The extra confirmation round: the user opts in → the archivist distils + stores.
+        confirmed = client.post(f"{http_server}/tasks/{task_id}/confirm-learning", json={"learn": True})
+        assert confirmed.status_code == 200 and confirmed.json()["learned"] is True
+        assert confirmed.json()["brand_rules"]  # distilled brand rules, written straight to the store
 
         # SSE: task is done, so the stream replays the buffer and closes.
         events = []
@@ -201,12 +259,9 @@ def test_http_sse_round_trip(http_server):
                     events.append(json.loads(line[6:]))
 
         assert any(e["type"] == "progress" and e["node"] == "reviewer" for e in events)
-        assert any(e["type"] == "result" and e["status"] == "final" and e["node"] == "archivist" for e in events)
+        # The final result now comes from the gate (no in-graph archivist node).
+        assert any(e["type"] == "result" and e["status"] == "final" and e["node"] == "human_gate" for e in events)
         assert all(_ENVELOPE_KEYS <= set(e) for e in events)
-
-        tags = [{**r, "keep": True} for r in proposed]
-        tagged = client.post(f"{http_server}/tasks/{task_id}/archive-tags", json={"tags": tags})
-        assert tagged.status_code == 200 and tagged.json()["rules_kept"] >= 1
 
 
 def test_http_validation_and_not_found(http_server):

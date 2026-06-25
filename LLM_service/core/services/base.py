@@ -177,28 +177,15 @@ class LLMService(ABC):
         final_draft: str,
         existing_must_do: List[str],
         existing_must_avoid: List[str],
+        transcript: Optional[List[dict]] = None,
     ) -> List[dict]:
         """Compare the AI draft with the human's edited final and distil 1-3
         concrete brand-voice rules. Returns a JSON-friendly list of dicts, each
-        {"kind": "must_do"|"must_avoid", "rule": str, "rationale": str}. The
-        archivist reads the existing rules so it does not re-propose duplicates."""
-        ...
-
-    @abstractmethod
-    async def summarize_session(
-        self,
-        *,
-        brief: dict,
-        conversation: List[dict],
-        final_drafts: List[dict],
-    ) -> List[SkillCandidate]:
-        """Read a whole adopted session (the `brief`, the intake `conversation` as a
-        list of {role, content}, and the approved `final_drafts`) and distil 3-6
-        candidate writing rules for the per-`user_id` learning channel. Each candidate
-        infers a `platform` (None = cross-platform), a `suggested_kind`
-        ("positive"|"negative"), and a short `rationale`, so the user can three-way
-        classify them. This is the user-scoped analogue of `distill_rules` (which is
-        brand-scoped and edit-driven)."""
+        {"kind": "must_do"|"must_avoid", "rule": str, "rationale": str}. Reads the
+        existing rules so it does not re-propose duplicates. `transcript` (optional) is the
+        roundtable discussion (turns with speaker/role/text/platform); when present the brand
+        signal comes from the debate too — so a plain `approve` (no edit diff) can still yield
+        brand rules from what the brand-voice persona and the user argued for."""
         ...
 
     @abstractmethod
@@ -213,6 +200,23 @@ class LLMService(ABC):
         the current round wins — it overrides the prior rule outright (no conflict
         report, no second confirmation). Returns the new complete `SkillRule` set the
         store should persist as the user's whole document."""
+        ...
+
+    @abstractmethod
+    async def summarize_preferences(
+        self,
+        *,
+        transcript: List[dict],
+        verdicts: List[dict],
+    ) -> List[dict]:
+        """The single per-user distiller. Distil a user's writing preferences from whatever
+        user signal a run produced — a `transcript` of {speaker, role, text, platform, ...}
+        turns that includes the user's OWN turns (roundtable discussion turns AND/OR their
+        intake turns, reshaped to the same shape) — plus their final `verdicts` (each
+        {platform, decision, edited_draft?, reason?}). Returns a JSON-friendly list of
+        {"skill": str, "evidence": str} (0-3), where `evidence` traces the preference back to
+        the specific interjection or edit. The kept skills are consolidated via
+        `consolidate_skills` and persisted through `StoreService.upsert_user_skills`."""
         ...
 
     @abstractmethod

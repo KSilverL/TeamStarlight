@@ -10,15 +10,19 @@ Integration guide for the content-generation service (`LLM_service/api.py`).
                               POST /tasks (post the brief)
                                       │
                               GET /tasks/{id}/events  ← SSE live progress
-                                      │  (pauses here)
+                                      │  (optional roundtable discussion streams here too)
+                                      │  (pauses at the review gate)
                               POST /tasks/{id}/review  ← approve / reject / edit
                                       │
                               GET /tasks/{id}  ← final outputs
+                                      │
+                              POST /tasks/{id}/confirm-learning  ← opt in to learning (optional)
 ```
 
 1. **Intake** — a short conversation that builds a `CreativeBrief`. Continue turns until `complete: true`, then fetch the brief.
 2. **Workflow** — post the brief to start the run. The service drafts content per platform, pauses for human review, then finalizes.
 3. **Progress** streams over **SSE** (`GET /tasks/{id}/events`). Review resumes over REST.
+4. **Optional extras:** with `ROUNDTABLE_ENABLED` the run opens with a multi-persona discussion you can join ([Roundtable](#roundtable-optional)); after completion, `POST /tasks/{id}/confirm-learning` makes the service learn from the run.
 
 ---
 
@@ -106,13 +110,15 @@ Post a `CreativeBrief` (from intake) or build one directly:
 | `target_platforms` | string[] | ✅ | e.g. `["linkedin", "instagram"]` |
 | `user_intent` | string | recommended | goal / audience |
 | `business_id` | string | recommended | per-brand ID for learned style rules |
-| `user_id` | string | optional | end-user ID; required later to learn/apply per-user rules (`/learn-*`) |
+| `user_id` | string | optional | end-user ID; required to learn/apply per-user rules (via `/confirm-learning`) |
 | `tone_hint` | string | optional | voice hint for users without a brand |
 | `route` | string | optional | from intake; default `direct_generation` |
+| `content_types` | string[] | optional | Which deliverables to produce — any combination of `"text"` (post copy), `"brand"` (animated HTML card; `"html"` accepted as an alias), `"video"` (BrandVideoProps spec). **Omitted → `["text"]`.** Omitting `text` (brand/video only) is a **media-only** run: there is no copy to draft, so the review gate is skipped and the brief goes straight to media generation — the task completes with **no `awaiting_review` step**. Unknown values or an empty list → `400`. |
 | `task_id` | string | optional | supply your own; else auto-generated |
 | `session_id` | string | optional | intake session id; threads its transcript in for per-user learning |
 
-**Response:** task snapshot (see below), `status: "awaiting_review"`.
+**Response:** task snapshot (see below), `status: "awaiting_review"` — **or `"completed"` straight
+away for a media-only run** (no `text`, so no review gate; see the `content_types` row above).
 
 ---
 
@@ -143,17 +149,27 @@ so the gate carries only the text draft):
 
 Platform finalized (after `/review`) — enriched by the media_producer:
 ```json
-{ "type": "result", "node": "archivist", "phase": "archive",
+{ "type": "result", "node": "human_gate", "phase": "review",
   "platform": "instagram", "status": "final", "ts": ...,
   "draft": "...", "decision": "approve_after_edit",
+  "content_types": ["text", "brand", "video"],
   "html_preview": "<!DOCTYPE html>…</html>",
   "video_props": { "brandName": "…", "tagline": "…", "primaryColor": "#…",
                    "secondaryColor": "#…", "accentColor": "#…", "sectionLabel": "…",
                    "stats": [{ "value": "…", "label": "…", "icon": "★" }, …],
                    "headline": "…?", "subtext": "…", "ctaLabel": "…", "contact": "@… · ….com" },
   "needs_human_intervention": false,
-  "proposed_rules": [{ "kind": "must_do", "rule": "...", "rationale": "..." }] }
+  "proposed_rules": [] }
 ```
+
+> `content_types` echoes what the task requested. `html_preview` is present only when `"brand"`
+> was requested, `video_props` only when `"video"` was — otherwise each is `null`. On a media-only
+> run (no `"text"`) `draft` is `""` (there is no copy deliverable; it was only the render basis).
+
+> The `final` event's `node` is `human_gate` for a normal (text) run (the in-graph archivist node
+> was removed — learning moved to the opt-in `POST /tasks/{id}/confirm-learning` step) or
+> `media_producer` for a media-only run (which has no gate). `proposed_rules` is always `[]`;
+> brand-rule distillation happens only if/when you call `/confirm-learning`.
 
 > `needs_human_intervention: true` means the platform hit the retry limit — surface it prominently.
 
@@ -170,13 +186,23 @@ Platform finalized (after `/review`) — enriched by the media_producer:
 
 | What happens | `node` values | `platform` |
 |---|---|---|
-| Service starts generating | `dispatcher`, `scout`, `creator` | `null` |
+| (Roundtable only) discussion | `agent_utterance` per turn + `discussion_consensus` per table | set (= `table_id`) |
+| Service starts generating | `dispatcher`, `scout`, `creator` (roundtable mode skips `dispatcher`/`scout`) | `null` |
 | Per-platform review | `reviewer` | set |
 | Gate — waiting for you | `human_gate` (`interrupted`) + `draft_ready` result per platform | set |
-| After `/review` | `human_gate` or `archivist` + `final` result per platform | set |
+| After `/review` | `human_gate` + `final` result per platform | set |
 | All done | `workflow` (`done`) | `null` |
 
 Rejected platforms re-run — their events repeat for the next round.
+
+> **Media-only runs** (`content_types` without `"text"`) skip the `creator` / `reviewer` /
+> `human_gate` events entirely: after any roundtable discussion you get a `final` result per
+> platform (`node: "media_producer"`) and then `workflow` `done` — no `draft_ready`, no gate.
+
+> **Roundtable events** appear only when the service runs the optional multi-persona discussion
+> stage (`ROUNDTABLE_ENABLED`, off by default). They flow on this **same** stream before the
+> generation events, separable by `table_id` (one table per platform). See
+> [Roundtable (optional)](#roundtable-optional) below.
 
 ---
 
@@ -197,82 +223,48 @@ Resume the paused run. You can address one or more pending platforms at a time; 
 | `decision` | Effect |
 |---|---|
 | `approve` | Platform finalized |
-| `approve_after_edit` | Finalized with your text; service proposes brand rules (see `proposed_rules`) |
+| `approve_after_edit` | Finalized with your text (the edit is recorded for later learning) |
 | `reject` | Platform re-drafts and returns to `awaiting_review` |
 
 **Response:** updated task snapshot. All platforms resolved → `status: "completed"`.
 
+Learning no longer happens automatically on `approve_after_edit`. Once the task is `completed`,
+call **`POST /tasks/{id}/confirm-learning`** (below) to opt in — it distils both brand-voice rules
+and per-user preferences from the run in one step.
+
 ---
 
-### `POST /tasks/{task_id}/archive-tags` — save learned brand rules
+### `POST /tasks/{task_id}/confirm-learning` — opt in to learning from this run
 
-After `approve_after_edit`, the service proposes style rules. Tag which to keep; kept rules are saved to the brand profile and applied on future runs.
+The single, current way to make the service learn. Call it once the task is `completed`. On
+`learn: true` (and the server's `LEARNING_ENABLED`), it distils the whole conversation — the AI
+drafts, your edits/verdicts, and (if the roundtable ran) the discussion transcript — and writes
+**straight to the store**, for **both** channels at once:
+
+- **Brand-voice** (per `business_id`) → `must_do` / `must_avoid` rules merged into the brand
+  profile. Transcript-aware: with a roundtable a plain `approve` (no edit) can still yield rules.
+- **Per-user** (per `user_id`) → learned writing preferences merged into the `user_skills` doc.
+  One distiller learns from whatever user signal the run produced — the user's intake turns
+  and/or roundtable interjections, plus their edits — so a plain (non-roundtable) run learns too.
 
 ```json
-{ "tags": [
-  { "kind": "must_do",    "rule": "Open with a striking statistic", "keep": true },
-  { "kind": "must_avoid", "rule": "Avoid jargon",                   "keep": false }
-] }
+{ "learn": true }
 ```
 
 **Response:**
 ```json
-{ "task_id": "task-...", "business_id": "biz_0012", "rules_kept": 1,
-  "profile": { "id": "biz_0012", "must_do": ["Open with a striking statistic"],
-               "must_avoid": [], "examples": [], "updated_at": null } }
+{ "task_id": "task-...", "learned": true,
+  "brand_rules": [{ "kind": "must_do", "rule": "Open with a striking statistic", "rationale": "..." }],
+  "preference_summary": { "user_id": "u_0007", "business_id": "biz_0012",
+                          "learned_skills": ["Keep a warm, authentic tone"],
+                          "evidence": ["the user edited the opening line"], "source_task_id": "task-..." } }
 ```
 
-Returns `400` if the task has no `business_id`.
-
----
-
-### `POST /tasks/{task_id}/learn-summarize` — propose per-user writing rules
-
-A second, **per-`user_id`** learning channel (separate from the per-brand `/archive-tags`).
-Reads the whole adopted session — the brief, the intake transcript (threaded in via
-`session_id` at `POST /tasks`), and the approved drafts — and distils 3–6 candidate writing
-rules for the user to classify. No body.
-
-**Response:**
-```json
-{ "candidates": [
-  { "id": "cand-1", "text": "Open a linkedin post with a data hook", "platform": "linkedin",
-    "suggested_kind": "positive", "rationale": "mirrors the approved linkedin opening" },
-  { "id": "cand-2", "text": "Keep a warm, authentic tone across platforms", "platform": null,
-    "suggested_kind": "positive", "rationale": "the user adopted this voice" }
-] }
-```
-- `platform: null` = a cross-platform rule (applies to every platform).
-- `suggested_kind` is the inferred classification; the user confirms, flips, or ignores it next.
-
-Returns `400` if the task has no `user_id`.
-
----
-
-### `POST /tasks/{task_id}/learn-commit` — persist the user's verdicts
-
-Three-way classify the candidates. Ignored ones are dropped; kept ones are consolidated with
-the user's prior rules (on conflict **this round overrides**) and saved to the `user_skills`
-store, so the creator folds the user's platform-applicable rules into future drafts.
-
-```json
-{ "decisions": [
-  { "candidate_id": "cand-1", "label": "positive" },
-  { "candidate_id": "cand-2", "label": "negative", "platform": "instagram" },
-  { "candidate_id": "cand-3", "label": "ignore" }
-] }
-```
-- `label` ∈ `positive` | `negative` | `ignore`.
-- `platform` (optional) re-scopes the rule (a truthy value overrides the candidate's platform).
-
-**Response:**
-```json
-{ "skill_doc": { "user_id": "u_0007", "version": 3, "updated_at": "2026-06-16T12:00:00Z",
-  "rules": [{ "text": "Open a linkedin post with a data hook", "platform": "linkedin",
-              "kind": "positive" }] } }
-```
-
-Returns `400` if the task has no `user_id` or a `label` is invalid.
+`learn: false` (or `LEARNING_ENABLED=false` server-side) returns `{ "learned": false,
+"brand_rules": [], "preference_summary": null }` and writes nothing. Returns `409` if the task is
+not yet `completed`. `/confirm-learning` is the single learning path — it writes both channels
+directly (the earlier granular `/archive-tags`, `/learn-summarize`, `/learn-commit` endpoints
+have been removed).
 
 ---
 
@@ -291,6 +283,7 @@ Returned by `POST /tasks`, `POST /tasks/{id}/review`, and this endpoint:
   "outputs": [
     { "platform": "instagram", "draft": "...final copy...", "decision": "approve",
       "comment": "...", "needs_human_intervention": false, "proposed_rules": [],
+      "content_types": ["text", "brand", "video"],
       "html_card": "<!DOCTYPE html>…</html>", "video_props": { "brandName": "…", "...": "…" } }
   ],
   "proposed_rules": [
@@ -302,7 +295,7 @@ Returned by `POST /tasks`, `POST /tasks/{id}/review`, and this endpoint:
 
 - `pending` — drafts waiting for your verdict. Drive your review UI off this list.
 - `outputs` — finalized drafts.
-- `proposed_rules` — rules awaiting `/archive-tags`.
+- `proposed_rules` — the brand rules `/confirm-learning` wrote (snapshot; empty until you confirm).
 
 **`status` values:**
 
@@ -311,6 +304,57 @@ Returned by `POST /tasks`, `POST /tasks/{id}/review`, and this endpoint:
 | `awaiting_review` | Paused at the review gate | `POST /tasks/{id}/review` |
 | `completed` | All platforms finalized | Read `outputs` |
 | `running` | Transient (generating) | Watch SSE |
+
+---
+
+## Roundtable (optional)
+
+When the service runs with `ROUNDTABLE_ENABLED` (off by default), `POST /tasks` first runs a
+**multi-persona discussion stage** — one table per platform, a manager-moderated debate that
+converges on the same creative angle the scout would have produced — before generating drafts.
+Everything else (review gate, finalization, media) is unchanged. The discussion is **live on the
+same `GET /tasks/{id}/events` stream** and the user can join any table.
+
+On a **media-only** run (`content_types` without `"text"`) the discussion is reframed to debate
+how to design the requested HTML card / video (no post copy); the consensus then feeds the
+media-producer directly, with no review gate.
+
+**Two extra SSE event `type`s** (they appear before the normal `progress`/`result` events,
+keyed by `table_id`, which equals the platform):
+
+```
+data: {"type":"agent_utterance","table_id":"linkedin","speaker":"brand_voice","agent_id":"brand_voice",
+       "role":"persona","text":"Lead with the launch stat…","round_index":2,"phase":"discuss","status":"done","ts":...}
+
+data: {"type":"result","status":"discussion_consensus","table_id":"linkedin","node":"roundtable","phase":"discuss",
+       "strategy":{"linkedin":"Open with the 40% stat, then the human story, then a soft CTA."},
+       "rounds_used":4,"converged":true,"turns":9,"ts":...}
+```
+
+- `agent_utterance` — one per discussion turn. `speaker`/`agent_id` is the persona name (or
+  `"user"` for the human seat); `role` ∈ `persona` | `user` | `manager`.
+- `discussion_consensus` — one per table, after its last utterance. `strategy` is the
+  platform→angle map fed downstream to the creator; `converged: false` means the table hit its
+  round cap rather than reaching agreement.
+
+### `POST /tasks/{task_id}/raise-hand` — reserve the next turn on a table
+
+```json
+{ "table_id": "linkedin" }
+```
+The table **waits** for your message at the next round boundary (up to the server's
+`ROUNDTABLE_USER_TURN_TIMEOUT`, default 300 s) instead of converging without you. Then send the
+message with `/say`. **Response:** `{ "task_id": "...", "table_id": "linkedin", "hand_raised": true }`.
+
+### `POST /tasks/{task_id}/say` — send a user utterance into a table
+
+```json
+{ "table_id": "linkedin", "text": "Make it less corporate, more founder-voice.", "interrupt": false }
+```
+Enqueues your words (persisted, so a runner in another process still picks them up at the next
+round boundary) and wakes a table that was waiting on a prior `/raise-hand`. `interrupt: true`
+jumps ahead of any backlog. **Response:** `{ "task_id": "...", "table_id": "linkedin", "queued": true,
+"pending": 1 }`. Returns `400` if `text` or `table_id` is missing.
 
 ---
 
@@ -432,9 +476,9 @@ the message.
 
 | Code | When |
 |---|---|
-| `400` | Missing/invalid fields (no `topic`, empty `target_platforms`, bad `decision`, `approve_after_edit` without `edited_draft`, `/archive-tags` without `business_id`, `/learn-*` without `user_id`, bad learn `label`) |
+| `400` | Missing/invalid fields (no `topic`, empty `target_platforms`, unknown/empty `content_types`, bad `decision`, `approve_after_edit` without `edited_draft`, `/say` or `/raise-hand` without `table_id`/`text`) |
 | `404` | Unknown `task_id` or `session_id` |
-| `409` | Task not awaiting review, `task_id` already exists, or brief not complete |
+| `409` | Task not awaiting review, `task_id` already exists, brief not complete, or `/confirm-learning` before the task is `completed` |
 | `422` | FastAPI request-body validation (malformed JSON / wrong field types); standard FastAPI `detail` payload |
 | `500` | Unexpected server error |
 
@@ -458,19 +502,24 @@ record IntakeReply(String intake_mode, String session_id, String assistant_messa
                   Map<String,Object> brief_partial, boolean complete) {}
 record CreativeBrief(String topic, List<String> target_platforms, String user_intent,
                      String tone_hint, String business_id, String user_id, String route,
+                     List<String> content_types,   // optional: ["text","brand","video"] subset
                      String intake_mode) {}
 
 // Workflow
 record Verdict(String decision, String edited_draft, String reason) {}
 record ReviewRequest(Map<String,Verdict> verdicts) {}
+record ConfirmLearning(boolean learn) {}
 record Tag(String kind, String rule, boolean keep) {}
 record ArchiveTags(List<Tag> tags) {}
 record Decision(String candidate_id, String label, String platform) {}
 record LearnCommit(List<Decision> decisions) {}
+record RaiseHand(String table_id) {}                          // roundtable
+record Say(String table_id, String text, boolean interrupt) {} // roundtable
 record Pending(String request_id, String platform, String draft, String comment,
                boolean needs_human_intervention) {}
 record Output(String platform, String draft, String decision, String comment,
-              boolean needs_human_intervention, List<Map<String,Object>> proposed_rules) {}
+              boolean needs_human_intervention, List<Map<String,Object>> proposed_rules,
+              List<String> content_types) {}
 record TaskSnapshot(String task_id, String status, List<Pending> pending,
                     List<Output> outputs, List<Map<String,Object>> proposed_rules) {}
 ```
@@ -511,9 +560,10 @@ public class NewsroomClient {
     public TaskSnapshot startTask(CreativeBrief b)         throws Exception { return post("/tasks", b, TaskSnapshot.class); }
     public TaskSnapshot review(String id, ReviewRequest r) throws Exception { return post("/tasks/" + id + "/review", r, TaskSnapshot.class); }
     public TaskSnapshot task(String id)                    throws Exception { return get("/tasks/" + id, TaskSnapshot.class); }
-    public Map<String,Object> archiveTags(String id, ArchiveTags t) throws Exception { return post("/tasks/" + id + "/archive-tags", t, Map.class); }
-    public Map<String,Object> learnSummarize(String id)             throws Exception { return post("/tasks/" + id + "/learn-summarize", Map.of(), Map.class); }
-    public Map<String,Object> learnCommit(String id, LearnCommit c) throws Exception { return post("/tasks/" + id + "/learn-commit", c, Map.class); }
+    public Map<String,Object> confirmLearning(String id, boolean learn) throws Exception { return post("/tasks/" + id + "/confirm-learning", new ConfirmLearning(learn), Map.class); }
+    // Roundtable (only when ROUNDTABLE_ENABLED): reserve a turn, then send the message.
+    public Map<String,Object> raiseHand(String id, String table) throws Exception { return post("/tasks/" + id + "/raise-hand", new RaiseHand(table), Map.class); }
+    public Map<String,Object> say(String id, Say s)              throws Exception { return post("/tasks/" + id + "/say", s, Map.class); }
 
     /** Stream SSE events until the task completes. */
     public void streamEvents(String id, Consumer<Map<String,Object>> onEvent) throws Exception {
@@ -569,6 +619,6 @@ t = nr.review(id, new ReviewRequest(verdicts));   // status: "completed"
 
 - Always drive your logic off `status` in the response — it's a state machine.
 - After a disconnect, call `GET /tasks/{id}` to get the latest snapshot; SSE replays from the beginning when you reconnect.
-- Use a stable `business_id` per customer so the service learns their style over time. After `approve_after_edit`, call `/archive-tags` to persist those rules.
+- Use a stable `business_id` (and `user_id`) per customer so the service learns their style over time. After the task is `completed`, call `/confirm-learning` (`{"learn": true}`) to persist what it learned from the run — both brand-voice rules and per-user preferences, in one step.
 - `pending[].needs_human_intervention: true` means the platform exhausted retries — show a special warning rather than a normal review prompt.
 - When a platform is rejected, it re-runs and its SSE events repeat. Key your UI by `task_id + platform + round` if you need to track per-round history.

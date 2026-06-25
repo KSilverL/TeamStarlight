@@ -1,28 +1,38 @@
 package com.example.tsldemo;
 
+import java.util.List;
+
+import jakarta.persistence.CascadeType;
 import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.OneToMany;
+import jakarta.persistence.Table;
 
 @Entity
+@Table
 public class Business {
 	@Id 
+	@GeneratedValue(strategy = GenerationType.AUTO)
 	private int id;
 	private String name;
 	private String inputData;
-	private String username;
+	private String email;
 	private String password;
+	
+	@OneToMany(mappedBy = "user", cascade = CascadeType.ALL, orphanRemoval = true)
+	private List<Session> sessions;
 	
 	public Business() {}
 	
-	public Business(int id, String name, String username, String password, String inputData) {
-		this.setId(id);
+	public Business(String name, String email, String password, String inputData) {
 		this.setName(name);
 		this.setInputData(inputData);
-		this.username = username;
+		this.setEmail(email);
 		this.password = password;
 		
 	}
-
 
 	public int getId() {
 		return id;
@@ -48,13 +58,7 @@ public class Business {
 		this.inputData = inputData;
 	}
 
-	public String getUsername() {
-		return username;
-	}
 
-	public void setUsername(String username) {
-		this.username = username;
-	}
 
 	public String getPassword() {
 		return password;
@@ -66,8 +70,21 @@ public class Business {
 			    "Account created: ID=%d, Name=%s, Username=%s",
 			    this.getId(),
 			    this.getName(),
-			    this.getUsername()
+			    this.getEmail()
 			);
+	}
+
+	public String getEmail() {
+		return email;
+	}
+
+	public void setEmail(String email) {
+		this.email = email;
+	}
+	
+	public void addSession(Session s) {
+		sessions.add(s);
+		s.setUser(this);
 	}
 
 }

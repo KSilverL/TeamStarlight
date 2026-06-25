@@ -1,6 +1,6 @@
 # TeamStarlight API Documentation
 
-This document covers all REST endpoints exposed by the TeamStarlight system. The Next.js frontend service acts as the middleware layer between the React UI and the LangGraph LLM service, exposing a JSON API on `http://localhost:3000/api`. The LLM service pushes status updates to a separate webhook receiver at `http://localhost:9999`.
+This document covers all REST endpoints exposed by the TeamStarlight system. The Next.js frontend service exposes a JSON API on `http://localhost:3000/api` and proxies to the Spring Boot backend, which orchestrates the **MAF (Microsoft Agent Framework)** LLM service. Progress from the LLM service is streamed back over **Server-Sent Events** — the LangGraph-era webhook push to a separate receiver at `http://localhost:9999` has been retired (see [LLM Service Progress (SSE)](#llm-service-progress-sse) below).
 
 ---
 
@@ -12,7 +12,7 @@ This document covers all REST endpoints exposed by the TeamStarlight system. The
   - [Create User](#create-user)
   - [Get User by ID](#get-user-by-id)
   - [Delete User](#delete-user)
-- [LLM Service Webhook](#llm-service-webhook)
+- [LLM Service Progress (SSE)](#llm-service-progress-sse)
 
 ---
 
@@ -248,71 +248,67 @@ Host: localhost:3000
 
 ---
 
-## LLM Service Webhook
+## LLM Service Progress (SSE)
 
-### Content Status Notification
+### Task Event Stream
 
 **Description**  
-This endpoint is **consumed by the LLM service**, not the frontend client. After each platform's content pipeline completes — passing the critic node and writing to the feedback database — the `WebhookStatusNotifier` fires a `POST` to this URL with the task ID and a status payload containing the generated draft and media asset URL. The backend middleware running at `localhost:9999` listens for these events so it can push real-time updates to connected clients without polling the LangGraph graph directly.
+This endpoint is **exposed by the MAF LLM service** and **consumed by the Spring Boot backend**, not the frontend client. It replaces the LangGraph-era status webhook (the old `POST /status` push to a receiver at `:9999`): instead of the LLM service pushing per-platform completions, the backend **subscribes once** to a task's event stream and watches the whole run. The backend relays the events it cares about to the frontend (e.g. over its own SSE/WebSocket channel) so a draft appears in the chat without a full poll. The full LLM-service contract lives in the repo-root [`API.md`](../API.md).
 
 **Endpoint**  
-`/status`
+`/tasks/{task_id}/events`
 
 **Base URL**  
-`http://localhost:9999`
+`http://localhost:8080` *(the MAF LLM service; reached server-to-server by the backend)*
 
 **Method**  
-`POST`
+`GET` *(content type `text/event-stream`)*
 
-**Query Parameters**  
-None
+**Path Parameters**
 
-**Request Body** *(sent by the LLM service)*
+| Parameter | Type   | Required | Description                                              |
+|-----------|--------|----------|----------------------------------------------------------|
+| `task_id` | string | Yes      | The content-generation task to watch (returned by `POST /tasks`) |
 
-| Field     | Type   | Required | Description                                                                 |
-|-----------|--------|----------|-----------------------------------------------------------------------------|
-| `task_id` | string | Yes      | Unique identifier for the content generation task (maps to `thread_id`)     |
-| `status`  | object | Yes      | Payload describing the completed pipeline result for a specific platform    |
+**Event Format**  
+Each line is `data: <json>\n\n`. The stream replays all events so far, continues live, and **closes when the task completes**. Switch on the `type` field — `progress` (the run moved to a new executor) or `result` (content is ready); when the optional roundtable stage runs, the same stream also carries `agent_utterance` (one per discussion turn) and `discussion_consensus` events first. Example `result` events:
 
-The `status` object contains platform-specific content. Example fields:
+| Field          | Type   | Description                                                                 |
+|----------------|--------|-----------------------------------------------------------------------------|
+| `type`         | string | `"progress"` or `"result"` (plus `"agent_utterance"` in roundtable mode)    |
+| `node`         | string | The MAF executor (`dispatcher` / `scout` / `creator` / `reviewer` / `human_gate` / `media_producer` / `workflow`; the in-graph `archivist` was removed). The `final` result is emitted under `human_gate` (text runs) or `media_producer` (media-only runs, which have no gate) |
+| `platform`     | string | The target platform (e.g. `"instagram"`); `null` for non-per-platform steps |
+| `status`       | string | `running` → `done` / `interrupted` / `error`, or `draft_ready` / `final` / `discussion_consensus` on a result |
+| `draft`        | string | The generated post copy                                                     |
+| `content_types`| string[] | (on `final`) what the task requested — any of `text` / `brand` / `video`; gates the two media fields below. The backend chooses this at `POST /tasks` (omit → `["text"]`; brand & video are off unless listed). Omitting `text` is a **media-only** run: no review gate, and `draft` comes back `""` |
+| `html_preview` | string | A complete, self-contained **animated HTML brand card** (only on the `final` result, and only when `"brand"` was requested) — replaces the old DALL-E image |
+| `video_props`  | object | A structured `BrandVideoProps` spec a downstream Remotion render turns into an MP4 (only on the `final` result, and only when `"video"` was requested) |
 
-| Field             | Type   | Description                                    |
-|-------------------|--------|------------------------------------------------|
-| `platform`        | string | The target platform (e.g. `"instagram"`)       |
-| `draft`           | string | The generated post copy                        |
-| `media_asset_url` | string | URL of the generated image from Azure DALL-E 3 |
-
-**Example Request** *(from LLM service → backend)*
+**Example Stream** *(MAF LLM service → backend)*
 
 ```http
-POST /status HTTP/1.1
-Host: localhost:9999
-Content-Type: application/json
-
-{
-  "task_id": "task-abc123",
-  "status": {
-    "platform": "instagram",
-    "draft": "Summer is here ☀️ Discover our new collection. #fashion #summer #style",
-    "media_asset_url": "https://dalle.azure.com/images/generated-abc.png"
-  }
-}
+GET /tasks/task-abc123/events HTTP/1.1
+Host: localhost:8080
+Accept: text/event-stream
 ```
 
-**Example Successful Response** — `200 OK`
+```
+data: {"type":"progress","node":"creator","phase":"create","platform":"instagram","status":"running","ts":1781105228.4}
 
-```json
-{
-  "received": true
-}
+data: {"type":"result","node":"creator","phase":"create","platform":"instagram","status":"draft_ready","draft":"Summer is here ☀️ Discover our new collection. #fashion #summer #style","critic_comment":"approved by red team","needs_human_intervention":false}
+
+data: {"type":"progress","node":"workflow","status":"done","platform":null,"ts":1781105320.1}
 ```
 
-**Example Unsuccessful Response** — `500 Internal Server Error`
+> **Note:** Media is no longer a DALL-E 3 image URL. The post-approval `media_producer` emits an
+> animated, self-contained **HTML brand card** (`html_preview`) plus a structured **video spec**
+> (`video_props`) — both appear only on the `final` result event, after the human approves. See
+> the repo-root [`API.md`](../API.md) for the complete SSE envelope and the standalone media
+> endpoints (`POST /generate-text`, `POST /generate`, `POST /generate-video`).
 
-```json
-{
-  "error": "Failed to process status notification"
-}
-```
-
-> **Note:** The LLM service treats all connection errors and timeouts on this endpoint as non-fatal. If the backend is unreachable the notification is silently dropped (timeout: 2 seconds). This ensures webhook failures never block the content generation pipeline.
+> **Newer LLM-service surface** (also in the repo-root [`API.md`](../API.md)): an **optional
+> roundtable** discussion stage (`ROUNDTABLE_ENABLED`) streams `agent_utterance` + `discussion_consensus`
+> events on this same channel and lets the user join via `POST /tasks/{id}/raise-hand` + `POST /tasks/{id}/say`;
+> and learning is now an explicit opt-in step, `POST /tasks/{id}/confirm-learning`, run after the
+> task completes (it replaces the automatic, in-graph archivist). The backend proxies these through
+> to the frontend the same way it relays the rest of the stream.

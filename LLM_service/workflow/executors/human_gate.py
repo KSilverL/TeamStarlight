@@ -10,19 +10,20 @@ transparency selling point, MIGRATION_PLAN §5.5).
 On resume:
   - approve            → hand off to the media_producer as an ApprovedDraft (it emits
     the FinalDraft, enriched with the animated card + video spec).
-  - approve_after_edit → hand off to the archivist (it distils rules, then hands off to
-    the media_producer with the rules attached).
+  - approve_after_edit → hand off to the media_producer too, carrying the human's edited
+    text as the draft. Brand-voice rule distillation no longer happens here — it moved to
+    the confirmation-gated service step (POST /tasks/{id}/confirm-learning), so learning
+    only runs once the user opts in, and is then transcript-aware.
   - reject             → re-dispatch this platform to the creator for a fresh attempt.
 
-Routing is by message type (MAF delivers ReviewOutcome to the creator, ArchiveJob to the
-archivist, and ApprovedDraft to the media_producer along their respective edges).
+Routing is by message type (MAF delivers ReviewOutcome to the creator and ApprovedDraft to
+the media_producer along their respective edges).
 """
 
 from agent_framework import Executor, WorkflowContext, handler, response_handler
 
 from ..messages import (
     ApprovedDraft,
-    ArchiveJob,
     HumanReviewRequest,
     HumanVerdict,
     ReviewOutcome,
@@ -34,7 +35,7 @@ class HumanGateExecutor(Executor):
     async def gate(
         self,
         outcome: ReviewOutcome,
-        ctx: WorkflowContext[ReviewOutcome | ArchiveJob | ApprovedDraft],
+        ctx: WorkflowContext[ReviewOutcome | ApprovedDraft],
     ) -> None:
         # An un-approved draft only reaches the gate via the circuit-breaker edge,
         # so `not approved` is exactly the "needs human intervention" signal.
@@ -56,7 +57,7 @@ class HumanGateExecutor(Executor):
         self,
         request: HumanReviewRequest,
         verdict: HumanVerdict,
-        ctx: WorkflowContext[ReviewOutcome | ArchiveJob | ApprovedDraft],
+        ctx: WorkflowContext[ReviewOutcome | ApprovedDraft],
     ) -> None:
         if verdict.decision == "reject":
             # Re-draft cycle for this platform. We carry the revision number forward
@@ -78,25 +79,18 @@ class HumanGateExecutor(Executor):
             )
             return
 
-        if verdict.decision == "approve_after_edit" and verdict.edited_draft:
-            # Hand off to the archivist: it distils the edit into rules and emits
-            # the FinalDraft.
-            await ctx.send_message(
-                ArchiveJob(
-                    platform=request.platform,
-                    original_draft=request.draft,
-                    final_draft=verdict.edited_draft,
-                    comment=request.comment,
-                    brief=request.brief,
-                )
-            )
-            return
-
-        # Plain approve: hand off to the media_producer (no distilled rules to carry).
+        # Both approve and approve_after_edit hand off to the media_producer. On an edit the
+        # human's text becomes the draft; the decision label is preserved so callers (and the
+        # confirm-learning step) can tell an edit from a plain approve.
+        draft = (
+            verdict.edited_draft
+            if verdict.decision == "approve_after_edit" and verdict.edited_draft
+            else request.draft
+        )
         await ctx.send_message(
             ApprovedDraft(
                 platform=request.platform,
-                draft=request.draft,
+                draft=draft,
                 decision=verdict.decision,
                 comment=request.comment,
                 needs_human_intervention=request.needs_human_intervention,

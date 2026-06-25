@@ -1,5 +1,11 @@
 # ── Microsoft Agent Framework (MAF) — workflow + executors + RequestPort + checkpoint ──
-agent-framework-core>=1.8.0
+# Pinned (not >=): MAF orchestration is a new/experimental GA surface whose API still
+# shifts between releases (see docs/roundtable_api_notes.md). Bump deliberately, re-running
+# LLM_service/scratch/roundtable_spike.py + the suite after any change.
+agent-framework-core==1.9.0
+# Magentic / GroupChat orchestration (the roundtable stage) lives in a SEPARATE package —
+# NOT bundled with -core. Required once ROUNDTABLE_ENABLED is wired; the spike imports it.
+agent-framework-orchestrations==1.0.0
 httpx>=0.28.1
 typing-extensions>=4.15.0
 pydantic>=2.0.0
@@ -12,9 +18,9 @@ uvicorn[standard]>=0.30.0
 # ── Production backends (optional; lazy-imported, only needed when USE_MOCK_*=false) ──
 # Azure OpenAI / Foundry chat (LLMService) — required when USE_MOCK_LLM=false:
 openai>=1.0.0
-# agent-framework-azure-ai>=1.8.0    # Foundry / Azure OpenAI chat client (optional)
+agent-framework-azure-ai   # Foundry / Azure OpenAI chat client (optional)
 # PostgreSQL (StoreService: brand profiles + checkpoints) — required when USE_MOCK_STORE=false:
-# asyncpg>=0.29.0
+asyncpg>=0.29.0
 # Azure AI Content Safety (SafetyService) — required when USE_MOCK_SAFETY=false:
 # azure-ai-contentsafety>=1.0.0
 # Voice Live API (VoiceService) — STT over a WebSocket; required when USE_MOCK_VOICE=false:
