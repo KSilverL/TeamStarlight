@@ -407,13 +407,14 @@ class IntakeService:
         return session
 
     async def start(
-        self, mode: str, opening_input: Optional[str], user_id: Optional[str] = None
+        self, mode: str, session_id: str, opening_input: Optional[str], user_id: Optional[str] = None
     ) -> dict:
         if mode not in ("voice", "text"):
             raise ApiError(400, "mode must be 'voice' or 'text'")
         session = build_intake(mode)
-        result = await session.start(opening_input, user_id=user_id)
-        self._sessions[result["session_id"]] = session
+        result = await session.start(session_id, opening_input, user_id=user_id)
+        print(result)
+        self._sessions[session_id] = session
         return {"intake_mode": mode, **result}
 
     def transcript(self, session_id: str) -> list:
@@ -576,8 +577,11 @@ class LearnCommitRequest(BaseModel):
 
 class IntakeStartRequest(BaseModel):
     mode: str = Field(..., description="voice | text")
+    session_id: str
     opening_input: Optional[str] = None
     user_id: Optional[str] = Field(None, description="End-user id; tags the session for per-user learning")
+    
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class IntakeTurnRequest(BaseModel):
@@ -690,8 +694,15 @@ async def learn_commit(request: Request, task_id: str, body: LearnCommitRequest)
 
 @intake_router.post("", summary="Open an intake conversation (voice or text)")
 async def intake_start(request: Request, body: IntakeStartRequest) -> dict:
-    return await _intake(request).start(body.mode, body.opening_input, body.user_id)
+    print("RAW BODY:", body.model_dump())
+    print("SESSION ID FIELD:", body.session_id)
 
+    return await _intake(request).start(
+        mode=body.mode,
+        session_id=body.session_id,
+        opening_input=body.opening_input,
+        user_id=body.user_id,
+    )
 
 @intake_router.post("/{session_id}/turn", summary="Send one user turn to an intake session")
 async def intake_turn(request: Request, session_id: str, body: IntakeTurnRequest) -> dict:

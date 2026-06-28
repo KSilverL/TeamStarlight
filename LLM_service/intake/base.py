@@ -188,7 +188,7 @@ class IntakeSession(ABC):
 
     @abstractmethod
     async def start(
-        self, opening_user_input: Optional[str], *, user_id: Optional[str] = None
+        self, session_id: str ,opening_user_input: Optional[str], *, user_id: Optional[str] = None
     ) -> dict:
         """Returns {session_id, assistant_message, brief_partial, complete}. `user_id`
         (optional) tags the session's identity so a downstream task can learn per user."""
@@ -222,13 +222,19 @@ class ConversationalIntake(IntakeSession):
         return state
 
     async def start(
-        self, opening_user_input: Optional[str] = None, *, user_id: Optional[str] = None
+        self, session_id: str ,opening_user_input: Optional[str], *, user_id: Optional[str]
     ) -> dict:
-        session_id = f"intake-{uuid.uuid4().hex[:12]}"
+        # session_id = f"intake-{uuid.uuid4().hex[:12]}"
+        print(session_id)
+        print(opening_user_input)
+        print(user_id)
         state = _SessionState(user_id=user_id)
         self._sessions[session_id] = state
+        print(self._sessions[session_id])
         opening = await self._ingest(session_id, opening_user_input) if opening_user_input else None
         result = await self._conversation.begin(state, opening)
+        print(result)
+        
         return {"session_id": session_id, **result}
 
     def transcript(self, session_id: str) -> List[dict]:
@@ -247,6 +253,11 @@ class ConversationalIntake(IntakeSession):
     async def get_brief(self, session_id: str) -> CreativeBrief:
         state = self._state(session_id)
         return self._conversation.to_brief(state, intake_mode=self.intake_mode)
+
+    @abstractmethod
+    async def _ingest(self, session_id: str, raw: str) -> str:
+        """Transport hook: turn a raw turn (typed text or audio) into user text."""
+        ...
 
     @abstractmethod
     async def _ingest(self, session_id: str, raw: str) -> str:
