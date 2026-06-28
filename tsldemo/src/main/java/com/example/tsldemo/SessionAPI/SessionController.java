@@ -71,9 +71,9 @@ public class SessionController {
 			return service.getSessionsByUser(businessId);
 			
 		} catch(Exception e) {
-//			return List.of();
+			return List.of();
 		}
-		return service.getSessions();
+	
 	}
 	
 	@GetMapping("/sessions")
@@ -104,27 +104,5 @@ public class SessionController {
 		
 	}
 	
-	
-	private String extractUserPrompt(String prompt) {
-		ObjectMapper objMap = new ObjectMapper();
-		Map<String, String> promptJSON = objMap.readValue(prompt, new TypeReference<Map<String,String>>(){});
-		
-		return null;
-	}
-	
-	@PostMapping("/generate-text")
-	public String extractAssisstantResponse(@RequestBody String prompt) {
-		System.out.println(prompt);
-		ObjectMapper objMap = new ObjectMapper();
-		Map<String, Object> promptJSON = objMap.readValue(prompt, new TypeReference<Map<String, Object>>() {});
-		
-		
-		Map<String, Object> response = service.getAgentTextResponse(promptJSON);
-		
-		System.out.println(response.get("assistant_message"));
-		
-		return objMap.writeValueAsString(response);
-		
-	}
 	
 }

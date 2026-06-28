@@ -74,19 +74,6 @@ public class SessionService {
     }
     
     
-    public Map<String, Object> getAgentTextResponse(Map<String, Object> promptJSON) { 	
-    	Map<String, Object> response = restClient.post()
-                .uri(llmServiceBaseUrl +"/generate-text")
-                .contentType(MediaType.APPLICATION_JSON)
-                .body(promptJSON)
-                .retrieve()
-                .body(Map.class);
-    	
-    	System.out.println(response);
-    	
-    	return response;
-    }
-    
 	public void addSession(Session s) {
 		repo.save(s);
 	}
