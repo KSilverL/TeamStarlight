@@ -9,7 +9,7 @@ import FeedbackStats from "./components/FeedbackStats";
 import BrandProfile from "./components/BrandProfile";
 import ContentCalendar from "./components/ContentCalendar";
 
-// ─── Sidebar nav config ───────────────────────────────────────────────────────
+// ── Sidebar nav config ────────────────────────────────────────────────────────
 
 const NAV_ITEMS = [
   {
@@ -151,7 +151,7 @@ const SECTION_TITLES: Record<Section, string> = {
   calendar: "Content Calendar",
 };
 
-// ─── Page ─────────────────────────────────────────────────────────────────────
+// ── Page ──────────────────────────────────────────────────────────────────────
 
 export default function ProfilePage() {
   const [active, setActive] = useState<Section>("approval");
@@ -233,6 +233,20 @@ export default function ProfilePage() {
             </button>
           ))}
         </nav>
+
+        {/* FIX 1: Sign out button at the bottom of the sidebar. */}
+        <div className="p-3 border-t border-[#E8E3DA] flex-shrink-0">
+          <button
+            onClick={() => {
+              localStorage.removeItem("starlight_user");
+              localStorage.removeItem("starlight_token");
+              window.location.href = "/login";
+            }}
+            className="w-full text-xs text-[#9E9893] hover:text-[#FF4800] transition-colors py-2 rounded-lg hover:bg-[#FFF0EB] font-medium"
+          >
+            Sign out
+          </button>
+        </div>
       </aside>
 
       {/* Main content */}

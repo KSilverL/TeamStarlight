@@ -10,6 +10,8 @@ interface SessionSummary {
   createdAt: string;
   status: string;
   targetPlatforms: string[] | null;
+  // First message text — used as a human-readable label in the sidebar.
+  openingInput?: string;
 }
 
 interface DBMessage {
@@ -114,64 +116,15 @@ const CONTENT_TYPES: { id: ContentType; label: string }[] = [
   { id: "brand", label: "Brand Animation" },
 ];
 
+// FIX 1: INITIAL_MESSAGES no longer contains hardcoded EcoHome demo data.
+// Only the welcome message is shown on a fresh/new session.
 const INITIAL_MESSAGES: Message[] = [
   {
     id: "1",
     role: "assistant",
     content:
       "Welcome to Starlight! I'm your AI social media content assistant. Tell me about your business, brand tone, target audience, and what you'd like to promote — I'll generate platform-specific content and walk you through the approval process.",
-    timestamp: new Date(Date.now() - 6 * 60 * 1000),
-  },
-  {
-    id: "2",
-    role: "user",
-    content:
-      "We're EcoHome Solutions — we sell sustainable bamboo home products targeting eco-conscious millennials aged 25–40. Our brand tone is warm, aspirational, and educational. We want to promote our new Bamboo Kitchen Collection across Instagram and LinkedIn.",
-    timestamp: new Date(Date.now() - 5 * 60 * 1000),
-  },
-  {
-    id: "3",
-    role: "assistant",
-    content:
-      "Brand profile captured. Generating a multi-platform content strategy for EcoHome Solutions — Bamboo Kitchen Collection...",
-    variant: "status",
-    timestamp: new Date(Date.now() - 4 * 60 * 1000),
-  },
-  {
-    id: "4",
-    role: "assistant",
-    content: "Here's your Instagram draft. Review and approve or reject:",
-    variant: "draft",
-    platform: "instagram",
-    draft: {
-      text: "🌿 Meet your kitchen's new best friend — the Bamboo Kitchen Collection.\n\nCrafted from 100% organic bamboo, each piece is naturally antimicrobial, carbon-negative in production, and built to last a decade. Because sustainable living shouldn't mean settling for less. 🏡",
-      hashtags: [
-        "#EcoHome",
-        "#BambooKitchen",
-        "#SustainableLiving",
-        "#ZeroWaste",
-        "#GreenHome",
-        "#BambooDesign",
-        "#ConsciousLiving",
-        "#EcoConscious",
-      ],
-      imageDesc:
-        "Flat lay of bamboo cutting boards, utensils, and storage containers on white marble with fresh green herbs",
-    },
-    approval: "pending",
-    timestamp: new Date(Date.now() - 3 * 60 * 1000),
-  },
-  {
-    id: "5",
-    role: "assistant",
-    content: "And here's your LinkedIn draft:",
-    variant: "draft",
-    platform: "linkedin",
-    draft: {
-      text: "The sustainable homewares market is projected to reach $150B by 2030 — and EcoHome Solutions is proud to be part of that shift.\n\nToday we're launching the Bamboo Kitchen Collection: premium products that prove sustainable materials can exceed conventional standards.\n\nBamboo grows 3× faster than hardwood, sequesters carbon during growth, and outlasts plastic by decades. We invite designers, buyers, and conscious consumers to explore what responsible innovation looks like.\n\nThe kitchens we design today reflect the values we leave for tomorrow.",
-    },
-    approval: "pending",
-    timestamp: new Date(Date.now() - 2 * 60 * 1000),
+    timestamp: new Date(),
   },
 ];
 
@@ -195,6 +148,8 @@ export default function ChatPage() {
   const [contentTypes, setContentTypes] = useState<ContentType[]>(["text"]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
+  // FIX 2: Dynamic session title — updated on first message send.
+  const [sessionTitle, setSessionTitle] = useState("New Session");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Conversation history persisted for the lifetime of this page mount so each
@@ -278,6 +233,8 @@ export default function ChatPage() {
         .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }));
       sessionIdRef.current = session.id;
       setActiveSessionId(session.id);
+      // Update header title to reflect the loaded session.
+      setSessionTitle(session.openingInput ? session.openingInput.slice(0, 40) + (session.openingInput.length > 40 ? "…" : "") : `Session · ${formatDate(session.createdAt)}`);
     } catch (err) {
       console.error("Failed to load session:", err);
     } finally {
@@ -369,7 +326,8 @@ export default function ChatPage() {
         role: "assistant",
         content: "Here's your post copy. Review and approve or reject:",
         variant: "text-preview",
-        platform: data.platform as Platform,
+        // FIX 7: Fall back to the locally selected platform if the API doesn't return one.
+        platform: (data.platform as Platform) ?? platform,
         draft: { text: data.text as string },
         approval: "pending",
       });
@@ -459,6 +417,9 @@ export default function ChatPage() {
 
     // Register a new session in the backend on the first message of each chat.
     if (sessionIdRef.current === null) {
+      // FIX 2: Set the session title from the first user message (truncated to 40 chars).
+      setSessionTitle(trimmed.slice(0, 40) + (trimmed.length > 40 ? "…" : ""));
+
       try {
         const token = localStorage.getItem("starlight_token");
         const res = await fetch("/api/sessions", {
@@ -473,8 +434,9 @@ export default function ChatPage() {
         if (res.ok && data.session_id) {
           sessionIdRef.current = data.session_id;
           setActiveSessionId(data.session_id);
+          // FIX 3: Store openingInput so sidebar shows message text instead of date.
           setPastSessions((prev) => [
-            { id: data.session_id, createdAt: new Date().toISOString(), status: "running", targetPlatforms: selectedPlatforms },
+            { id: data.session_id, createdAt: new Date().toISOString(), status: "running", targetPlatforms: selectedPlatforms, openingInput: trimmed },
             ...prev,
           ]);
         }
@@ -531,29 +493,47 @@ export default function ChatPage() {
         </div>
 
         <div className="flex-1 overflow-y-auto p-5 space-y-7">
-          {/* Past Sessions */}
-          {pastSessions.length > 0 && (
-            <div>
-              <h3 className="text-xs font-semibold text-[#9E9893] uppercase tracking-wider mb-3">
+          {/* Past Sessions — FIX 4: always rendered, + New button always visible.
+              Empty state shown when there are no sessions yet. */}
+          <div>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-xs font-semibold text-[#9E9893] uppercase tracking-wider">
                 Past Sessions
               </h3>
+              <button
+                onClick={() => {
+                  setMessages(INITIAL_MESSAGES);
+                  historyRef.current = [];
+                  sessionIdRef.current = null;
+                  setActiveSessionId(null);
+                  setSessionTitle("New Session");
+                }}
+                className="text-xs text-[#FF4800] hover:underline font-medium"
+              >
+                + New
+              </button>
+            </div>
+            {pastSessions.length === 0 ? (
+              <p className="text-xs text-[#BDB6AE] px-1">No past sessions yet.</p>
+            ) : (
               <div className="space-y-1.5">
                 {pastSessions.map((s) => {
                   const isActive = s.id === activeSessionId;
-                  const isLoading = s.id === loadingSessionId;
+                  const isSessionLoading = s.id === loadingSessionId;
                   return (
                     <button
                       key={s.id}
                       onClick={() => loadSession(s)}
-                      disabled={isLoading}
+                      disabled={isSessionLoading}
                       className={`w-full text-left px-3 py-2.5 rounded-lg text-sm transition-colors ${
                         isActive
                           ? "bg-[#FFF0EB] border border-[#FFCBB8] text-[#FF4800]"
                           : "text-[#6B6561] hover:text-[#1B1A17] hover:bg-[#F2EDE4]"
                       } disabled:opacity-50`}
                     >
+                      {/* FIX 5: Show opening message text if available, else fall back to date. */}
                       <p className="font-medium text-xs truncate">
-                        {isLoading ? "Loading…" : formatDate(s.createdAt)}
+                        {isSessionLoading ? "Loading…" : (s.openingInput ? s.openingInput.slice(0, 28) + (s.openingInput.length > 28 ? "…" : "") : formatDate(s.createdAt))}
                       </p>
                       {s.targetPlatforms && s.targetPlatforms.length > 0 && (
                         <p className="text-[10px] text-[#9E9893] mt-0.5 truncate">
@@ -564,8 +544,8 @@ export default function ChatPage() {
                   );
                 })}
               </div>
-            </div>
-          )}
+            )}
+          </div>
 
           {/* Platforms */}
           <div>
@@ -652,6 +632,22 @@ export default function ChatPage() {
             </div>
           </div>
         </div>
+
+        {/* FIX 6: Sign out button — clears auth tokens and session state before redirecting. */}
+        <div className="p-4 border-t border-[#E8E3DA] flex-shrink-0">
+          <button
+            onClick={() => {
+              localStorage.removeItem("starlight_user");
+              localStorage.removeItem("starlight_token");
+              sessionIdRef.current = null;
+              setActiveSessionId(null);
+              window.location.href = "/login";
+            }}
+            className="w-full text-xs text-[#9E9893] hover:text-[#FF4800] transition-colors py-2 rounded-lg hover:bg-[#FFF0EB] font-medium"
+          >
+            Sign out
+          </button>
+        </div>
       </aside>
 
       {/* Chat area */}
@@ -671,8 +667,9 @@ export default function ChatPage() {
               </svg>
             </button>
             <div>
+              {/* FIX 2: Title is now dynamic — set from first user message or loaded session. */}
               <h1 className="font-semibold text-sm text-[#1B1A17]">
-                EcoHome Solutions — Bamboo Kitchen Collection
+                {sessionTitle}
               </h1>
               <p className="text-xs text-[#9E9893] mt-0.5">
                 {selectedPlatforms.length} platform
