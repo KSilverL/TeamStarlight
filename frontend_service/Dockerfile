@@ -3,13 +3,13 @@
 # Shared OS + runtime config. Rebuilt only when the Node version changes.
 # =============================================================================
 FROM node:20-alpine AS base
-ENV NODE_ENV=production
 WORKDIR /app
 
 # =============================================================================
 # Stage 2 – deps
-# Install production + dev dependencies.
-# Rebuilt only when package.json or package-lock.json change.
+# Install ALL dependencies (including devDependencies) so the build stage has
+# TypeScript, Tailwind, PostCSS, etc. NODE_ENV must not be "production" here
+# or npm ci will skip devDependencies.
 # =============================================================================
 FROM base AS deps
 # libc6-compat is required for certain native Node addons on Alpine.
@@ -26,6 +26,8 @@ RUN npm ci
 FROM base AS builder
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
+# Ensure public/ exists — Next.js doesn't require it but the runner COPY expects it.
+RUN mkdir -p public
 
 RUN npm run build
 

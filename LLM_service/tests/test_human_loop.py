@@ -67,6 +67,52 @@ async def test_reject_redispatches_then_can_be_approved(workflow, make_brief):
     assert [o.platform for o in final.get_outputs()] == ["linkedin"]
 
 
+# ── C2. The reject comment drives the rework (not just a blind reroll) ─────────
+
+async def test_reject_comment_drives_rework(workflow, make_brief):
+    """A reject reason isn't merely logged — it's threaded into the creator's re-draft,
+    so the regenerated copy visibly addresses what the human flagged."""
+    result = await workflow.run(make_brief(platforms=("linkedin",)))
+    rid = result.get_request_info_events()[0].request_id
+
+    feedback = "add a concrete customer quote"
+    rejected = await workflow.run(
+        responses={rid: HumanVerdict(decision="reject", reason=feedback)}
+    )
+
+    # The re-drafted copy now waiting at the gate reflects the human's comment.
+    redrafted = rejected.get_request_info_events()[0].data.draft
+    assert feedback in redrafted
+
+
+async def test_reject_threads_comment_and_draft_to_writer(workflow, make_brief, monkeypatch):
+    """The reject reason AND the rejected draft reach the creator's write_copy call,
+    so regeneration reworks the flagged copy instead of starting from a blank slate."""
+    from LLM_service.core.services import factory
+    from LLM_service.core.services.mock import MockLLM
+
+    calls: list[dict] = []
+
+    class Recorder(MockLLM):
+        async def write_copy(self, **kw):
+            calls.append(kw)
+            return await super().write_copy(**kw)
+
+    rec = Recorder()
+    monkeypatch.setattr(factory, "get_llm", lambda: rec)
+
+    result = await workflow.run(make_brief(platforms=("linkedin",)))
+    req = result.get_request_info_events()[0]
+    first_draft = req.data.draft
+
+    await workflow.run(responses={req.request_id: HumanVerdict(decision="reject", reason="too formal")})
+
+    redrafts = [c for c in calls if c.get("attempt", 1) > 1]
+    assert redrafts, "the reject should trigger a re-draft write_copy call"
+    assert redrafts[0]["feedback"] == "too formal"
+    assert redrafts[0]["prior_draft"] == first_draft
+
+
 # ── D. Approve-after-edit → the human's edited text becomes the final draft ────
 
 async def test_approve_after_edit_uses_edited_text(workflow, make_brief):

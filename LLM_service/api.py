@@ -533,13 +533,15 @@ class IntakeService:
         return session
 
     async def start(
-        self, mode: str, opening_input: Optional[str], user_id: Optional[str] = None
+        self, mode: str, session_id: str, opening_input: Optional[str],
+        user_id: Optional[str] = None, target_platforms: Optional[list] = None,
     ) -> dict:
         if mode not in ("voice", "text"):
             raise ApiError(400, "mode must be 'voice' or 'text'")
         session = build_intake(mode)
-        result = await session.start(opening_input, user_id=user_id)
-        self._sessions[result["session_id"]] = session
+        result = await session.start(
+            session_id, opening_input, user_id=user_id, target_platforms=target_platforms)
+        self._sessions[session_id] = session
         return {"intake_mode": mode, **result}
 
     def transcript(self, session_id: str) -> list:
@@ -662,9 +664,13 @@ class StartTaskRequest(BaseModel):
         "'text' (post copy) / 'brand' (animated HTML card; 'html' accepted as an alias) / "
         "'video' (BrandVideoProps spec). "
         "Omitted → ['text'] (brand & video are off unless listed; text is always produced).")
-    task_id: Optional[str] = Field(None, description="Caller-supplied id; auto-generated if omitted")
     session_id: Optional[str] = Field(
-        None, description="Intake session id; its transcript is threaded in for per-user learning")
+        None, description="The conversation id from the intake session (e.g. sess-…). The workflow "
+        "run and every /tasks/{id}/* op key on it, so intake + generation share ONE id. Its intake "
+        "transcript is also threaded in for per-user learning.")
+    task_id: Optional[str] = Field(
+        None, description="Deprecated alias for session_id (back-compat); used only when session_id "
+        "is omitted. Auto-generated if both are absent.")
 
 
 class VerdictPayload(BaseModel):
@@ -707,8 +713,14 @@ class ConfirmLearningRequest(BaseModel):
 
 class IntakeStartRequest(BaseModel):
     mode: str = Field(..., description="voice | text")
+    session_id: str
     opening_input: Optional[str] = None
     user_id: Optional[str] = Field(None, description="End-user id; tags the session for per-user learning")
+    target_platforms: Optional[list[str]] = Field(
+        None, description="Platforms chosen by the backend (e.g. ['linkedin','instagram']). Seeded "
+        "into the brief so intake never asks about platforms — only the topic/goal are inferred.")
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class IntakeTurnRequest(BaseModel):
@@ -769,10 +781,14 @@ async def start_task(request: Request, body: StartTaskRequest) -> dict:
     # Drop unset/None fields so the service's defaults apply (the raw-dict contract:
     # an absent user_intent means "", not None).
     inputs = body.model_dump(exclude_none=True)
+    # One conversation == one session: the backend passes the SAME id it used for the
+    # intake session, so this workflow run (and every /tasks/{id}/* op) keys on it.
+    # `task_id` stays a fallback alias; absent both, the service auto-generates one.
+    conversation_id = body.session_id or body.task_id
     # If the brief came from an intake session, thread that transcript in so per-user
     # learning can later summarize the whole conversation (transport-layer wiring).
-    conversation = _intake(request).transcript(body.session_id) if body.session_id else None
-    return await svc.start(inputs, task_id=body.task_id, conversation=conversation)
+    conversation = _intake(request).transcript(conversation_id) if conversation_id else None
+    return await svc.start(inputs, task_id=conversation_id, conversation=conversation)
 
 
 @tasks_router.get("/{task_id}", summary="Snapshot a task (status, outputs, pending gates)")
@@ -819,8 +835,13 @@ async def say(request: Request, task_id: str, body: SayRequest) -> dict:
 
 @intake_router.post("", summary="Open an intake conversation (voice or text)")
 async def intake_start(request: Request, body: IntakeStartRequest) -> dict:
-    return await _intake(request).start(body.mode, body.opening_input, body.user_id)
-
+    return await _intake(request).start(
+        mode=body.mode,
+        session_id=body.session_id,
+        opening_input=body.opening_input,
+        user_id=body.user_id,
+        target_platforms=body.target_platforms,
+    )
 
 @intake_router.post("/{session_id}/turn", summary="Send one user turn to an intake session")
 async def intake_turn(request: Request, session_id: str, body: IntakeTurnRequest) -> dict:

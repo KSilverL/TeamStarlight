@@ -12,7 +12,6 @@ two entries are guaranteed to behave identically and emit the same brief.
 
 from __future__ import annotations
 
-import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -26,11 +25,13 @@ from .brief_schema import CreativeBrief
 # the Voice Live realtime session — one spec, every transport.
 
 INTAKE_SYSTEM_PROMPT = (
-    "You are the intake host of a social-media newsroom. Through a short, friendly "
-    "conversation, gather a creative brief: the topic, the target platforms, and the "
-    "campaign goal/audience (and, if offered, a tone hint or brand id). Ask for one "
-    "missing thing at a time. If the user is unsure what to post, call scout_trends to "
-    "propose an angle. Call update_brief whenever the user supplies a field."
+    "You are the intake host of a social-media newsroom. The target platforms are ALREADY "
+    "chosen by the backend — never ask about them. From the user's very first message, infer "
+    "as much of the brief as you can in ONE pass: the topic and the campaign goal/audience "
+    "(and, if offered, a tone hint or brand id), and call update_brief with everything you "
+    "extracted. Only ask a short follow-up for a field you genuinely could not infer, one "
+    "thing at a time, and at most a few times. If the user has no idea what to post, call "
+    "scout_trends to propose an angle instead of interrogating them."
 )
 
 BRIEF_TOOL_DEFS: List[dict] = [
@@ -64,13 +65,17 @@ BRIEF_TOOL_DEFS: List[dict] = [
     },
 ]
 
-REQUIRED_FIELDS = ["topic", "target_platforms", "user_intent"]
+# target_platforms is NOT here: the backend supplies it at POST /intake, so intake never
+# asks about platforms. Only the topic + goal are inferred-then-asked.
+REQUIRED_FIELDS = ["topic", "user_intent"]
 _DEFAULT_PLATFORMS = ["linkedin"]
+# Cap on clarifying follow-ups: extract from the opening first; if something's still missing,
+# ask (and keep extracting) at most this many times, then finalize with what we have.
+MAX_INTAKE_FOLLOWUPS = 3
 
 _GREETING = "Hi! I'll help shape your post. "
 _QUESTIONS = {
     "topic": "What's the topic or product you'd like to post about?",
-    "target_platforms": "Which platforms should I write for? (e.g. LinkedIn, Instagram, Twitter)",
     "user_intent": "What's the goal — who's the audience and what should this campaign achieve?",
 }
 
@@ -82,6 +87,7 @@ class _SessionState:
     route: str = "direct_generation"
     used_scout: bool = False
     user_id: Optional[str] = None  # caller-supplied identity; keys per-user learning
+    followups_asked: int = 0  # clarifying questions asked so far (capped at MAX_INTAKE_FOLLOWUPS)
 
 
 class BriefConversation:
@@ -127,6 +133,11 @@ class BriefConversation:
             state.route = "copilot_mode"
             state.used_scout = True
 
+        # We've already asked the maximum number of clarifiers and something is still
+        # missing → stop interrogating and fill the gaps ourselves so the brief completes.
+        if state.followups_asked >= MAX_INTAKE_FOLLOWUPS and self._missing(state.brief_partial):
+            await self._force_complete(state)
+
         return self._respond(state, greeting=greeting)
 
     def _respond(self, state: _SessionState, *, greeting: bool) -> dict:
@@ -136,6 +147,7 @@ class BriefConversation:
             self._finalize_route(state)
             message = f"Great — I've got everything: {self._summary(state.brief_partial)}. Handing this to the newsroom."
         else:
+            state.followups_asked += 1  # we're about to ask one more clarifier
             message = _QUESTIONS[missing[0]]
         if greeting:
             message = _GREETING + message
@@ -145,6 +157,21 @@ class BriefConversation:
             "brief_partial": dict(state.brief_partial),
             "complete": complete,
         }
+
+    async def _force_complete(self, state: _SessionState) -> None:
+        """Last resort once the follow-up cap is hit: fill any still-missing required field
+        ourselves — scout a topic (→ copilot_mode), derive a generic goal — so intake always
+        terminates instead of looping on the user."""
+        bp = state.brief_partial
+        if not bp.get("topic"):
+            bp["topic"] = await scout_topic_ideas(
+                user_intent=bp.get("user_intent", ""),
+                platforms=bp.get("target_platforms") or _DEFAULT_PLATFORMS,
+            )
+            state.route = "copilot_mode"
+            state.used_scout = True
+        if not bp.get("user_intent"):
+            bp["user_intent"] = f"raise awareness of {bp['topic']}"
 
     @staticmethod
     def _finalize_route(state: _SessionState) -> None:
@@ -167,7 +194,7 @@ class BriefConversation:
         bp = state.brief_partial
         return CreativeBrief(
             topic=bp["topic"],
-            target_platforms=bp["target_platforms"],
+            target_platforms=bp.get("target_platforms") or _DEFAULT_PLATFORMS,
             user_intent=bp["user_intent"],
             tone_hint=bp.get("tone_hint"),
             business_id=bp.get("business_id"),
@@ -184,10 +211,13 @@ class IntakeSession(ABC):
 
     @abstractmethod
     async def start(
-        self, opening_user_input: Optional[str], *, user_id: Optional[str] = None
+        self, session_id: str, opening_user_input: Optional[str], *,
+        user_id: Optional[str] = None, target_platforms: Optional[List[str]] = None,
     ) -> dict:
         """Returns {session_id, assistant_message, brief_partial, complete}. `user_id`
-        (optional) tags the session's identity so a downstream task can learn per user."""
+        (optional) tags the session's identity so a downstream task can learn per user.
+        `target_platforms` (backend-supplied) seeds the brief so intake never asks about
+        platforms — the user only ever clarifies the topic/goal."""
         ...
 
     @abstractmethod
@@ -218,10 +248,13 @@ class ConversationalIntake(IntakeSession):
         return state
 
     async def start(
-        self, opening_user_input: Optional[str] = None, *, user_id: Optional[str] = None
+        self, session_id: str, opening_user_input: Optional[str], *,
+        user_id: Optional[str] = None, target_platforms: Optional[List[str]] = None,
     ) -> dict:
-        session_id = f"intake-{uuid.uuid4().hex[:12]}"
         state = _SessionState(user_id=user_id)
+        # Backend-supplied platforms seed the brief up front, so intake never asks for them.
+        if target_platforms:
+            state.brief_partial["target_platforms"] = list(target_platforms)
         self._sessions[session_id] = state
         opening = await self._ingest(session_id, opening_user_input) if opening_user_input else None
         result = await self._conversation.begin(state, opening)
@@ -243,6 +276,11 @@ class ConversationalIntake(IntakeSession):
     async def get_brief(self, session_id: str) -> CreativeBrief:
         state = self._state(session_id)
         return self._conversation.to_brief(state, intake_mode=self.intake_mode)
+
+    @abstractmethod
+    async def _ingest(self, session_id: str, raw: str) -> str:
+        """Transport hook: turn a raw turn (typed text or audio) into user text."""
+        ...
 
     @abstractmethod
     async def _ingest(self, session_id: str, raw: str) -> str:

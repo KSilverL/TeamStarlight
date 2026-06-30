@@ -77,7 +77,7 @@ async def scenario_no_brand() -> None:
 async def scenario_copilot_voice() -> None:
     _h("3 · VAGUE IDEA — copilot_mode VOICE intake → scout → workflow")
     session = build_intake("voice")
-    started = await session.start("Help me think of what to post on LinkedIn to promote our launch")
+    started = await session.start("sess-copilot", "Help me think of what to post on LinkedIn to promote our launch")
     brief = await session.get_brief(started["session_id"])
     print(f"  intake_mode={brief.intake_mode}  route={brief.route}")
     print(f"  scout proposed topic: {brief.topic}")

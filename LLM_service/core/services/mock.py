@@ -394,6 +394,8 @@ class MockLLM(LLMService):
         attempt: int = 1,
         user_skills: str = "",
         history: Optional[List[dict]] = None,
+        feedback: str = "",
+        prior_draft: str = "",
     ) -> str:
         await asyncio.sleep(_MOCK_LATENCY)
         tone = tone_hint or "on-brand"
@@ -427,6 +429,10 @@ class MockLLM(LLMService):
         # no learned rules — the post stays clean.
         if user_skills:
             post += f"\n\n{user_skills}"
+        # On a re-draft, echo the rejection feedback so the offline rework loop is
+        # observable (production reworks the copy against it). Empty on the first pass.
+        if feedback:
+            post += f"\n\nReworked to address: {feedback}"
         return post
 
     async def render_html_card(

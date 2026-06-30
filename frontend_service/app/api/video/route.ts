@@ -6,6 +6,7 @@ const VIDEO_AGENT_URL =
 export async function POST(request: NextRequest) {
   const body = await request.json();
   const brief: string = body.brief ?? "";
+  const history: unknown = body.history ?? undefined;
 
   if (!brief.trim()) {
     return new Response(JSON.stringify({ error: "brief is required" }), {
@@ -18,7 +19,7 @@ export async function POST(request: NextRequest) {
     const upstream = await fetch(`${VIDEO_AGENT_URL}/generate-video`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ brief }),
+      body: JSON.stringify({ brief, ...(history ? { history } : {}) }),
     });
 
     if (!upstream.ok) {

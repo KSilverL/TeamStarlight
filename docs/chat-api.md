@@ -3,7 +3,7 @@
 This document covers all REST endpoints involved in the chat interface workflow across three service layers:
 
 - **Frontend** (Next.js, `http://localhost:3000`) - the user-facing React chat UI
-- **Backend** (Spring Boot, `http://localhost:8080`) - the middleware that manages sessions, orchestrates the LLM service, and persists state
+- **Backend** (Spring Boot, `http://localhost:8081`) - the middleware that manages sessions, orchestrates the LLM service, and persists state
 - **LLM Service** (MAF — Microsoft Agent Framework, `http://localhost:8080`) - the multi-agent "virtual newsroom" content workflow
 
 Every session is owned by an authenticated **Business account** — account creation and login are documented separately in [`auth-api.md`](auth-api.md).
@@ -65,78 +65,66 @@ Frontend receives updated session state
 
 ## A - Session Management
 
+> **Authentication:** all session endpoints require `Authorization: Bearer <token>` (the JWT issued by `POST /login`). Requests without a valid token will return an empty session list or create an unowned session.
+
 ### A1. Create Session
 
 **Description**  
-Creates a new content generation session. The backend assigns a unique `sessionId` (which also becomes the MAF `task_id`), stores the session, and immediately starts the MAF task (D1) asynchronously. The response returns as soon as the session is created - the frontend should then poll `GET /api/sessions/{sessionId}` or listen for server-sent events to track progress.
+Creates a new session by starting an LLM intake conversation. The backend forwards the request to `POST /intake` on the LLM service, persists the resulting session to the database (linked to the authenticated user), and returns the session ID and the LLM's opening message.
 
 **Endpoint**  
 `/api/sessions`
 
 **Base URL**  
-`http://localhost:8080`
+`http://localhost:8081`
 
 **Method**  
 `POST`
 
-**Query Parameters**  
-None
+**Headers**
+
+| Header          | Required | Description                        |
+|-----------------|----------|------------------------------------|
+| `Authorization` | Yes      | `Bearer <token>` from `POST /login` |
 
 **Request Body**
 
-| Field                  | Type            | Required | Description                                                              |
-|------------------------|-----------------|----------|--------------------------------------------------------------------------|
-| `businessDescription`  | string          | Yes      | Description of the business (e.g. "Artisan coffee roastery")            |
-| `brandTone`            | string          | Yes      | Desired brand voice (e.g. "warm, authentic, educational")                |
-| `targetPlatforms`      | string[]        | Yes      | List of platforms. Allowed values: `"x"`, `"instagram"`, `"tiktok"`, `"linkedin"` |
-| `contentTopics`        | string          | Yes      | Topic or campaign to generate content for                                |
-| `contentType`          | string          | Yes      | Type of content. Allowed values: `"text"`, `"image"`, `"video"`, `"mix"` |
-| `notes`                | string          | No       | Additional instructions or constraints for the pipeline                  |
-| `examples`             | string          | No       | Example posts or reference copy to guide tone                            |
-| `userPreferences`      | string          | No       | High-level preferences (e.g. "Avoid overly salesy language")             |
+| Field           | Type   | Required | Description                                                               |
+|-----------------|--------|----------|---------------------------------------------------------------------------|
+| `mode`          | string | Yes      | Intake mode. Currently `"text"` (voice intake via WebSocket is separate)  |
+| `opening_input` | string | No       | The user's opening message (e.g. a brand description or campaign brief)   |
 
 **Example Request**
 
 ```http
 POST /api/sessions HTTP/1.1
-Host: localhost:8080
+Host: localhost:8081
 Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
 
 {
-  "businessDescription": "EcoHome Solutions - we sell sustainable bamboo home products",
-  "brandTone": "warm, aspirational, educational",
-  "targetPlatforms": ["instagram", "linkedin"],
-  "contentTopics": "Bamboo Kitchen Collection launch",
-  "contentType": "mix",
-  "notes": "Emphasise sustainability and durability",
-  "userPreferences": "Prefer storytelling over promotional copy"
+  "mode": "text",
+  "opening_input": "We sell sustainable bamboo home products for eco-conscious households."
 }
 ```
 
-**Example Successful Response** - `201 Created`
+**Example Successful Response** — `200 OK`
 
 ```json
 {
-  "sessionId": "sess-7f3a1b2c",
-  "taskId": "sess-7f3a1b2c",
-  "status": "running",
-  "phase": "phase1",
-  "targetPlatforms": ["instagram", "linkedin"],
-  "contentType": "mix",
-  "createdAt": "2026-06-12T10:00:00Z"
+  "session_id": "a1b2c3d4e5f6...",
+  "assistant_message": "Great! I'd love to help you create content. What platforms are you targeting?",
+  "target_platforms": null
 }
 ```
 
-**Example Unsuccessful Response** - `400 Bad Request`
+`target_platforms` is `null` until the intake conversation has gathered enough information to determine them.
+
+**Example Unsuccessful Response** — `502 Bad Gateway`
 
 ```json
 {
-  "error": "VALIDATION_ERROR",
-  "message": "targetPlatforms must contain at least one valid platform",
-  "details": {
-    "field": "targetPlatforms",
-    "rejectedValue": []
-  }
+  "error": "LLM service unreachable"
 }
 ```
 
@@ -234,62 +222,51 @@ Host: localhost:8080
 ### A3. List Sessions
 
 **Description**  
-Returns a paginated list of all sessions for the current user, ordered by creation date descending. Useful for displaying session history in the sidebar.
+Returns all sessions belonging to the authenticated user, ordered by creation date descending. Used to populate the session history sidebar in the frontend.
 
 **Endpoint**  
 `/api/sessions`
 
 **Base URL**  
-`http://localhost:8080`
+`http://localhost:8081`
 
 **Method**  
 `GET`
 
-**Query Parameters**
+**Headers**
 
-| Parameter | Type    | Required | Default | Description                          |
-|-----------|---------|----------|---------|--------------------------------------|
-| `page`    | integer | No       | `0`     | Zero-indexed page number             |
-| `size`    | integer | No       | `20`    | Number of sessions per page (max 50) |
-| `status`  | string  | No       | -       | Filter by session status             |
+| Header          | Required | Description                         |
+|-----------------|----------|-------------------------------------|
+| `Authorization` | Yes      | `Bearer <token>` from `POST /login` |
+
+**Query Parameters**  
+None
 
 **Example Request**
 
 ```http
-GET /api/sessions?page=0&size=10&status=completed HTTP/1.1
-Host: localhost:8080
+GET /api/sessions HTTP/1.1
+Host: localhost:8081
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
 ```
 
-**Example Successful Response** - `200 OK`
+**Example Successful Response** — `200 OK`
 
 ```json
-{
-  "sessions": [
-    {
-      "sessionId": "sess-7f3a1b2c",
-      "status": "completed",
-      "phase": "done",
-      "targetPlatforms": ["instagram", "linkedin"],
-      "contentTopics": "Bamboo Kitchen Collection launch",
-      "createdAt": "2026-06-12T10:00:00Z",
-      "updatedAt": "2026-06-12T10:15:00Z"
-    }
-  ],
-  "page": 0,
-  "size": 10,
-  "totalElements": 1,
-  "totalPages": 1
-}
+[
+  {
+    "id": "a1b2c3d4e5f6...",
+    "createdAt": "2026-06-23T10:00:00",
+    "updatedAt": null,
+    "status": "running",
+    "phase": null,
+    "targetPlatforms": ["instagram", "linkedin"],
+    "contentTopics": null
+  }
+]
 ```
 
-**Example Unsuccessful Response** - `400 Bad Request`
-
-```json
-{
-  "error": "INVALID_PARAMETER",
-  "message": "size must not exceed 50"
-}
-```
+Returns an empty array `[]` if no sessions exist or the token is missing/invalid.
 
 ---
 

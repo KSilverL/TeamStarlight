@@ -42,12 +42,20 @@ export default function Home() {
         <span className="text-xl font-bold tracking-tight text-[#1B1A17]">
           ✦ Starlight
         </span>
-        <Link
-          href="/chat"
-          className="text-sm font-medium text-[#6B6561] hover:text-[#1B1A17] transition-colors"
-        >
-          Open App →
-        </Link>
+        <div className="flex items-center gap-4">
+          <Link
+            href="/login"
+            className="text-sm font-medium text-[#6B6561] hover:text-[#1B1A17] transition-colors"
+          >
+            Log in
+          </Link>
+          <Link
+            href="/signup"
+            className="text-sm font-semibold bg-[#FF4800] hover:bg-[#E03E00] text-white px-4 py-2 rounded-lg transition-colors"
+          >
+            Sign up
+          </Link>
+        </div>
       </nav>
 
       {/* Hero */}

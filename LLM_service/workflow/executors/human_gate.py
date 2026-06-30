@@ -66,10 +66,13 @@ class HumanGateExecutor(Executor):
             # the human just rejected. A safe draft is approved on its next pass, so
             # this does not affect the circuit breaker (which only loops on reviewer
             # rejections); an unsafe draft simply trips the breaker sooner.
+            # `comment` carries the human's reason and `text` the rejected draft, so the
+            # creator reworks the copy to fix exactly what was flagged (mirrors the
+            # reviewer's retry edge, which also passes its note + the rejected text).
             await ctx.send_message(
                 ReviewOutcome(
                     platform=request.platform,
-                    text="",
+                    text=request.draft,
                     approved=False,
                     retry_count=request.attempt,
                     comment=verdict.reason or "human rejected",

@@ -1,56 +1,86 @@
 services:
 
   # ---------------------------------------------------------------------------
-  # Frontend — Next.js dev server (hot reload via bind mount)
+  # Frontend — Next.js production build
   # ---------------------------------------------------------------------------
   frontend:
     build:
       context: frontend_service
-      dockerfile: Dockerfile.dev
+      dockerfile: Dockerfile
     ports:
       - "3000:3000"
     environment:
-      # Points the /api/brand proxy at the brand-agent service on the
-      # internal Docker network. Override at runtime if needed.
-      - BRAND_AGENT_URL=http://brand-agent:8000
-      - BRAND_VIDEO_AGENT_URL=http://brand-video-agent:8001
+      # # Demo agents (brand card + video)
+      # - BRAND_AGENT_URL=http://brand-agent:8000
+      # - BRAND_VIDEO_AGENT_URL=http://brand-video-agent:8001
+      # Main LLM service (text generation)
+      - TEXT_AGENT_URL=http://backend:8081
+      # Java backend (signup / login)
+      - BACKEND_URL=http://backend:8081
     depends_on:
-      - brand-agent
-      - brand-video-agent
+      # - brand-agent
+      # - brand-video-agent
+      - llm
+      - backend
 
   # ---------------------------------------------------------------------------
-  # Brand Agent — FastAPI LLM service (demo, isolated from LLM_service core)''
-  # Requires ANTHROPIC_API_KEY to be set in the environment or a .env file.
+  # Backend — Spring Boot Java service
   # ---------------------------------------------------------------------------
-  brand-agent:
+  backend:
     build:
-      context: LLM_service/demos/brand_agent
+      context: tsldemo
       dockerfile: Dockerfile
     ports:
-      # Expose on host so you can also hit it directly at http://localhost:8000
-      - "8000:8000"
+      - "8081:8081"
     environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - LLM_SERVICE_BASE_URL=http://llm:8080
+      # Supabase credentials — override here or in a .env file if needed.
+      # Defaults are already baked into application.properties.
+    depends_on:
+      - llm
+
+  # ---------------------------------------------------------------------------
+  # LLM Service — Python FastAPI (MAF virtual-newsroom workflow)
+  # Requires AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY for production.
+  # Runs in mock mode by default (USE_MOCK=true) so it starts without creds.
+  # ---------------------------------------------------------------------------
+  llm:
+    build:
+      context: LLM_service
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - USE_MOCK=true
+      # Uncomment and populate for production:
+      # - USE_MOCK=false
+      # - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+      # - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+      # - DATABASE_URL=${DATABASE_URL}
+
+  # ---------------------------------------------------------------------------
+  # Brand Agent — FastAPI LLM service (demo, isolated from LLM_service core)
+  # Requires ANTHROPIC_API_KEY to be set in the environment or a .env file.
+  # ---------------------------------------------------------------------------
+  # brand-agent:
+  #   build:
+  #     context: LLM_service/demos/brand_agent
+  #     dockerfile: Dockerfile
+  #   ports:
+  #     - "8000:8000"
+  #   environment:
+  #     - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
 
   # ---------------------------------------------------------------------------
   # Brand Video Agent — Remotion render service (demo, isolated from LLM_service core)
   # Heavy image: Node + Python + headless Chromium + ffmpeg. Build takes ~5 min.
   # Requires ANTHROPIC_API_KEY to be set in the environment or a .env file.
   # ---------------------------------------------------------------------------
-  brand-video-agent:
-    build:
-      context: LLM_service/demos/brand_video_agent
-      dockerfile: Dockerfile
-    ports:
-      - "8001:8001"
-    environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-
-  # ---------------------------------------------------------------------------
-  # backend:
-  #   Containerised Backend Service Here
-  # ---------------------------------------------------------------------------
-  # llm:
-    # Containerised LLM Service Here
-  # backend:
-    # Containerised Backend Service Here
+  # brand-video-agent:
+    # build:
+      # context: LLM_service/demos/brand_video_agent
+      # dockerfile: Dockerfile
+    # ports:
+      # - "8001:8001"
+    # environment:
+    #   - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}

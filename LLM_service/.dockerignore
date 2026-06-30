@@ -1,0 +1,8 @@
+demos/
+tests/
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.md
+requirements-dev.txt

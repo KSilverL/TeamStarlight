@@ -13,10 +13,12 @@ public class LoginService {
 		this.businessRepo = businessRepo;
 	}
 	
-	public boolean checkCredentials(String email, String password) {
+	/** Returns the matching Business, or null if credentials are invalid. */
+	public Business checkCredentials(String email, String password) {
 		Business b = businessRepo.findByEmail(email);
-		
-		return b.getEmail().equals(email) && b.getPassword().equals(password);
-		
+		if (b != null && b.getPassword().equals(password)) {
+			return b;
+		}
+		return null;
 	}
 }

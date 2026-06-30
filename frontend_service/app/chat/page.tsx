@@ -4,6 +4,21 @@ import { useState, useRef, useEffect } from "react";
 import Link from "next/link";
 
 type Platform = "x" | "instagram" | "tiktok" | "linkedin";
+
+interface SessionSummary {
+  id: string;
+  createdAt: string;
+  status: string;
+  targetPlatforms: string[] | null;
+}
+
+interface DBMessage {
+  messageId: number;
+  role: "user" | "assistant";
+  variant?: string;
+  content: string;
+  timestamp: string;
+}
 // The three content kinds the backend can actually generate. Multi-select: one
 // "send" can fan out to several of these at once.
 type ContentType = "text" | "video" | "brand";
@@ -182,10 +197,106 @@ export default function ChatPage() {
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Conversation history persisted for the lifetime of this page mount so each
+  // request continues the same thread rather than starting a new LLM session.
+  const historyRef = useRef<{ role: "user" | "assistant"; content: string }[]>([]);
+  // Registered once on the first send; null until then.
+  const sessionIdRef = useRef<string | null>(null);
+
+  /** Fire-and-forget: persist a message to the backend. Non-fatal if it fails. */
+  async function persistMessage(sessionId: string, role: "user" | "assistant", content: string) {
+    const token = localStorage.getItem("starlight_token");
+    try {
+      await fetch(`/api/sessions/${sessionId}/messages`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ role, content }),
+      });
+    } catch {
+      // Non-fatal — message is already visible in the UI
+      console.log("Persistance failure. Request not saved to session.")
+    }
+  }
+  const [pastSessions, setPastSessions] = useState<SessionSummary[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // Load the user's past sessions on mount if they're logged in.
+  useEffect(() => {
+    const token = localStorage.getItem("starlight_token");
+    if (!token) return;
+    fetch("/api/sessions", {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => r.json())
+      .then((data: SessionSummary[]) => {
+        if (Array.isArray(data)) {
+          setPastSessions(data.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  async function loadSession(session: SessionSummary) {
+    if (loadingSessionId) return;
+    setLoadingSessionId(session.id);
+    try {
+      const token = localStorage.getItem("starlight_token");
+      const res = await fetch(`/api/sessions/${session.id}/messages`, {
+        headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      });
+      const dbMessages: DBMessage[] = await res.json();
+
+      // Map DB messages to the chat UI format.
+      const loaded: Message[] = Array.isArray(dbMessages)
+        ? dbMessages.map((m) => ({
+            id: String(m.messageId),
+            role: m.role,
+            content: m.content,
+            timestamp: new Date(m.timestamp),
+          }))
+        : [];
+
+      // Prepend a marker so the user knows they're viewing a past session.
+      const marker: Message = {
+        id: `resume-${session.id}`,
+        role: "assistant",
+        content: `Session resumed from ${formatDate(session.createdAt)}.`,
+        timestamp: new Date(),
+      };
+
+      setMessages(loaded.length > 0 ? loaded : [marker]);
+      historyRef.current = loaded
+        .filter((m) => m.role === "user" || m.role === "assistant")
+        .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }));
+      sessionIdRef.current = session.id;
+      setActiveSessionId(session.id);
+    } catch (err) {
+      console.error("Failed to load session:", err);
+    } finally {
+      setLoadingSessionId(null);
+    }
+  }
+
+  function formatDate(isoString: string) {
+    try {
+      return new Date(isoString).toLocaleDateString([], {
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    } catch {
+      return isoString;
+    }
+  }
 
   function togglePlatform(platform: Platform) {
     setSelectedPlatforms((prev) =>
@@ -240,12 +351,19 @@ export default function ChatPage() {
       const res = await fetch("/api/text", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, platform }),
+        body: JSON.stringify({ prompt, platform, history: historyRef.current }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
         pushMessage({ role: "assistant", content: `Text generation failed: ${data.error ?? "unknown error"}` });
         return;
+      }
+      historyRef.current = [
+        ...historyRef.current,
+        { role: "assistant", content: data.text as string },
+      ];
+      if (sessionIdRef.current) {
+        persistMessage(sessionIdRef.current, "assistant", data.text as string);
       }
       pushMessage({
         role: "assistant",
@@ -270,12 +388,19 @@ export default function ChatPage() {
       const res = await fetch("/api/brand", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
+        body: JSON.stringify({ prompt, history: historyRef.current }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
         pushMessage({ role: "assistant", content: `Brand animation failed: ${data.error ?? "unknown error"}` });
         return;
+      }
+      historyRef.current = [
+        ...historyRef.current,
+        { role: "assistant", content: "[brand animation generated]" },
+      ];
+      if (sessionIdRef.current) {
+        persistMessage(sessionIdRef.current, "assistant", "[brand animation generated]");
       }
       pushMessage({
         role: "assistant",
@@ -295,12 +420,19 @@ export default function ChatPage() {
       const res = await fetch("/api/video", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ brief: prompt }),
+        body: JSON.stringify({ brief: prompt, history: historyRef.current }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
         pushMessage({ role: "assistant", content: `Video spec failed: ${data.error ?? "unknown error"}` });
         return;
+      }
+      historyRef.current = [
+        ...historyRef.current,
+        { role: "assistant", content: "[brand video spec generated]" },
+      ];
+      if (sessionIdRef.current) {
+        persistMessage(sessionIdRef.current, "assistant", "[brand video spec generated]");
       }
       pushMessage({
         role: "assistant",
@@ -319,9 +451,41 @@ export default function ChatPage() {
     if (!trimmed || isLoading || contentTypes.length === 0) return;
 
     pushMessage({ role: "user", content: trimmed });
+    historyRef.current = [...historyRef.current, { role: "user", content: trimmed }];
     setInput("");
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
+    }
+
+    // Register a new session in the backend on the first message of each chat.
+    if (sessionIdRef.current === null) {
+      try {
+        const token = localStorage.getItem("starlight_token");
+        const res = await fetch("/api/sessions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({ opening_input: trimmed }),
+        });
+        const data = await res.json();
+        if (res.ok && data.session_id) {
+          sessionIdRef.current = data.session_id;
+          setActiveSessionId(data.session_id);
+          setPastSessions((prev) => [
+            { id: data.session_id, createdAt: new Date().toISOString(), status: "running", targetPlatforms: selectedPlatforms },
+            ...prev,
+          ]);
+        }
+      } catch (err) {
+        console.error("Session registration failed:", err);
+      }
+    }
+
+    // Persist the user message now that we have a session ID.
+    if (sessionIdRef.current) {
+      persistMessage(sessionIdRef.current, "user", trimmed);
     }
 
     // Fan out to every selected content type at once.
@@ -367,6 +531,42 @@ export default function ChatPage() {
         </div>
 
         <div className="flex-1 overflow-y-auto p-5 space-y-7">
+          {/* Past Sessions */}
+          {pastSessions.length > 0 && (
+            <div>
+              <h3 className="text-xs font-semibold text-[#9E9893] uppercase tracking-wider mb-3">
+                Past Sessions
+              </h3>
+              <div className="space-y-1.5">
+                {pastSessions.map((s) => {
+                  const isActive = s.id === activeSessionId;
+                  const isLoading = s.id === loadingSessionId;
+                  return (
+                    <button
+                      key={s.id}
+                      onClick={() => loadSession(s)}
+                      disabled={isLoading}
+                      className={`w-full text-left px-3 py-2.5 rounded-lg text-sm transition-colors ${
+                        isActive
+                          ? "bg-[#FFF0EB] border border-[#FFCBB8] text-[#FF4800]"
+                          : "text-[#6B6561] hover:text-[#1B1A17] hover:bg-[#F2EDE4]"
+                      } disabled:opacity-50`}
+                    >
+                      <p className="font-medium text-xs truncate">
+                        {isLoading ? "Loading…" : formatDate(s.createdAt)}
+                      </p>
+                      {s.targetPlatforms && s.targetPlatforms.length > 0 && (
+                        <p className="text-[10px] text-[#9E9893] mt-0.5 truncate">
+                          {s.targetPlatforms.join(", ")}
+                        </p>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           {/* Platforms */}
           <div>
             <h3 className="text-xs font-semibold text-[#9E9893] uppercase tracking-wider mb-3">
