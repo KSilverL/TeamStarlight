@@ -69,6 +69,10 @@ interface Message {
   videoJobId?: string;
   approval?: ApprovalStatus;
   timestamp: Date;
+  // Workflow-specific fields — set when the message originates from the MAF pipeline.
+  workflowTaskId?: string;
+  needsHumanIntervention?: boolean;
+  videoProps?: VideoProps;
 }
 
 const PLATFORMS: {
@@ -177,6 +181,16 @@ const INITIAL_MESSAGES: Message[] = [
 
 const platformMap = Object.fromEntries(PLATFORMS.map((p) => [p.id, p]));
 
+// Human-readable labels for each MAF executor shown as live status messages.
+const NODE_LABELS: Record<string, string> = {
+  dispatcher: "Validating brief…",
+  scout: "Scouting content strategy…",
+  creator: "Writing platform copy…",
+  reviewer: "Running safety & brand review…",
+  archivist: "Learning from your edits…",
+  media_producer: "Generating brand assets…",
+};
+
 // Monotonic message ids — several generators append concurrently when multiple
 // content types are selected, so Date.now() alone would collide.
 let _msgSeq = 0;
@@ -202,6 +216,8 @@ export default function ChatPage() {
   const historyRef = useRef<{ role: "user" | "assistant"; content: string }[]>([]);
   // Registered once on the first send; null until then.
   const sessionIdRef = useRef<string | null>(null);
+  // Active EventSource for the MAF workflow SSE stream; replaced on each new workflow run.
+  const workflowEsRef = useRef<EventSource | null>(null);
 
   /** Fire-and-forget: persist a message to the backend. Non-fatal if it fails. */
   async function persistMessage(sessionId: string, role: "user" | "assistant", content: string) {
@@ -314,12 +330,24 @@ export default function ChatPage() {
 
   function handleApproval(messageId: string, approval: ApprovalStatus) {
     const msg = messages.find((m) => m.id === messageId);
-    const platformLabel =
-      platformMap[msg?.platform ?? ""]?.label ?? "platform";
+    const platformLabel = platformMap[msg?.platform ?? ""]?.label ?? "platform";
 
     setMessages((prev) =>
       prev.map((m) => (m.id === messageId ? { ...m, approval } : m))
     );
+
+    // For workflow drafts, submit the verdict to the human gate so the MAF
+    // pipeline can continue (media_producer runs after approval, creator re-drafts after reject).
+    if (msg?.workflowTaskId && msg.platform) {
+      const decision = approval === "approved" ? "approve" : "reject";
+      fetch(`/api/tasks/${msg.workflowTaskId}/review`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ verdicts: { [msg.platform]: { decision } } }),
+      }).catch(() => {
+        // Non-fatal: the SSE stream will surface an error event if the review fails.
+      });
+    }
 
     setTimeout(() => {
       setMessages((prev) => [
@@ -344,38 +372,141 @@ export default function ChatPage() {
 
   // ── Per-content-type generators (each appends its own status + result) ──────
 
-  async function genText(prompt: string) {
-    pushMessage({ role: "assistant", content: "Generating post copy…", variant: "status" });
-    const platform = (selectedPlatforms[0] ?? "linkedin") as Platform;
+  async function genWorkflow(prompt: string) {
+    pushMessage({ role: "assistant", content: "Starting the virtual newsroom…", variant: "status" });
+
+    // Close any previous SSE stream before opening a new one.
+    if (workflowEsRef.current) {
+      workflowEsRef.current.close();
+      workflowEsRef.current = null;
+    }
+
+    // 1. Start the MAF workflow task.
+    let taskId: string;
     try {
-      const res = await fetch("/api/text", {
+      const res = await fetch("/api/tasks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, platform, history: historyRef.current }),
+        body: JSON.stringify({
+          topic: prompt,
+          target_platforms: selectedPlatforms,
+          user_intent: prompt,
+        }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
-        pushMessage({ role: "assistant", content: `Text generation failed: ${data.error ?? "unknown error"}` });
+        pushMessage({ role: "assistant", content: `Workflow failed to start: ${data.error ?? "unknown error"}` });
         return;
       }
-      historyRef.current = [
-        ...historyRef.current,
-        { role: "assistant", content: data.text as string },
-      ];
-      if (sessionIdRef.current) {
-        persistMessage(sessionIdRef.current, "assistant", data.text as string);
-      }
-      pushMessage({
-        role: "assistant",
-        content: "Here's your post copy. Review and approve or reject:",
-        variant: "text-preview",
-        platform: data.platform as Platform,
-        draft: { text: data.text as string },
-        approval: "pending",
-      });
+      taskId = data.task_id as string;
     } catch {
-      pushMessage({ role: "assistant", content: "Could not reach the text backend." });
+      pushMessage({ role: "assistant", content: "Could not reach the workflow backend." });
+      return;
     }
+
+    // 2. Open the SSE stream and handle events as they arrive.
+    // genWorkflow() returns here so handleSend() isn't blocked — events fire asynchronously.
+    const es = new EventSource(`/api/tasks/${taskId}/events`);
+    workflowEsRef.current = es;
+    const seenNodes = new Set<string>();
+
+    es.onmessage = (e) => {
+      let event: Record<string, unknown>;
+      try { event = JSON.parse(e.data as string); } catch { return; }
+
+      const type = event.type as string;
+      const node = event.node as string;
+      const status = event.status as string;
+      const platform = event.platform as string | undefined;
+
+      if (type === "progress") {
+        // Show each executor once per platform to avoid duplicate status lines.
+        if (status === "running") {
+          const key = `${node}-${platform ?? ""}`;
+          if (!seenNodes.has(key)) {
+            seenNodes.add(key);
+            const label = NODE_LABELS[node];
+            if (label) {
+              pushMessage({
+                role: "assistant",
+                content: platform ? `[${platform}] ${label}` : label,
+                variant: "status",
+              });
+            }
+          }
+        }
+        if (node === "workflow" && status === "done") {
+          es.close();
+          workflowEsRef.current = null;
+        }
+      }
+
+      // draft_ready: the human gate has paused.
+      // If the user wants a text draft, show the DraftCard for manual approval.
+      // If they only want brand/video assets, auto-approve so media_producer runs
+      // immediately — they never asked to review the underlying text copy.
+      if (type === "result" && status === "draft_ready") {
+        if (contentTypes.includes("text")) {
+          pushMessage({
+            role: "assistant",
+            content: `Here's your ${platform} draft — approve or request changes:`,
+            variant: "text-preview",
+            platform: platform as Platform,
+            draft: { text: event.draft as string },
+            workflowTaskId: taskId,
+            needsHumanIntervention: (event.needs_human_intervention as boolean) ?? false,
+            approval: "pending",
+          });
+          if (sessionIdRef.current) {
+            persistMessage(sessionIdRef.current, "assistant", event.draft as string);
+          }
+        } else {
+          // Auto-approve: submit verdict immediately so media_producer can run.
+          fetch(`/api/tasks/${taskId}/review`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ verdicts: { [platform as string]: { decision: "approve" } } }),
+          }).catch(() => {});
+        }
+      }
+
+      // final: approved draft + media assets from media_producer.
+      if (type === "result" && status === "final") {
+        historyRef.current = [
+          ...historyRef.current,
+          { role: "assistant", content: event.draft as string },
+        ];
+        if (sessionIdRef.current) {
+          persistMessage(sessionIdRef.current, "assistant", event.draft as string);
+        }
+        // Only render the brand animation card when the user selected "Brand Animation".
+        if (event.html_preview && contentTypes.includes("brand")) {
+          pushMessage({
+            role: "assistant",
+            content: `Brand animation — ${platform}:`,
+            variant: "html-preview",
+            html: event.html_preview as string,
+            approval: "approved",
+          });
+        }
+        // Only render the video spec card when the user selected "Video".
+        if (event.video_props && contentTypes.includes("video")) {
+          pushMessage({
+            role: "assistant",
+            content: `Brand video spec — ${platform}:`,
+            videoProps: event.video_props as VideoProps,
+            approval: "approved",
+          });
+        }
+      }
+    };
+
+    es.onerror = () => {
+      if (workflowEsRef.current === es) {
+        es.close();
+        workflowEsRef.current = null;
+      }
+    };
   }
 
   async function genBrand(prompt: string) {
@@ -488,11 +619,11 @@ export default function ChatPage() {
       persistMessage(sessionIdRef.current, "user", trimmed);
     }
 
-    // Fan out to every selected content type at once.
+    // Single workflow call — the MAF pipeline generates text drafts, brand
+    // animations, and video specs in one pass. genWorkflow() gates which output
+    // cards are shown based on the current contentTypes selection.
     const jobs: Promise<void>[] = [];
-    if (contentTypes.includes("text")) jobs.push(genText(trimmed));
-    if (contentTypes.includes("brand")) jobs.push(genBrand(trimmed));
-    if (contentTypes.includes("video")) jobs.push(genVideo(trimmed));
+    jobs.push(genWorkflow(trimmed));
 
     setIsLoading(true);
     try {
@@ -699,6 +830,24 @@ export default function ChatPage() {
         {/* Messages */}
         <div className="flex-1 overflow-y-auto px-6 py-6 space-y-5">
           {messages.map((msg) => {
+            // Workflow final event: video spec delivered directly (no job polling needed).
+            if (msg.videoProps) {
+              return (
+                <div key={msg.id} className="w-full max-w-sm">
+                  <p className="text-sm text-[#6B6561] mb-2">{msg.content}</p>
+                  <div className="bg-white border border-[#E8E3DA] rounded-2xl overflow-hidden shadow-sm">
+                    <div className="flex items-center px-4 py-2.5 bg-[#1B1A17] text-white">
+                      <span className="text-sm font-semibold">✦ Brand Video Spec</span>
+                    </div>
+                    <div className="bg-[#F8F5EE] p-3">
+                      <VideoSpec props={msg.videoProps} />
+                    </div>
+                    <p className="text-xs text-[#9E9893] px-4 pb-3">{formatTime(msg.timestamp)}</p>
+                  </div>
+                </div>
+              );
+            }
+
             if (
               (msg.variant === "video-pending" || msg.variant === "video-preview") &&
               msg.videoJobId
@@ -1131,6 +1280,11 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
 
         {/* Content */}
         <div className="p-4 space-y-3">
+          {message.needsHumanIntervention && (
+            <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-xs text-amber-700">
+              The AI reviewer flagged this draft after multiple attempts — your direct input is needed.
+            </div>
+          )}
           {draft.imageDesc && (
             <div className="bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-2 text-xs text-[#6B6561]">
               <span className="text-[#9E9893]">Image prompt: </span>
