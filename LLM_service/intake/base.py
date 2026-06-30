@@ -230,10 +230,8 @@ class ConversationalIntake(IntakeSession):
         print(user_id)
         state = _SessionState(user_id=user_id)
         self._sessions[session_id] = state
-        print(self._sessions[session_id])
         opening = await self._ingest(session_id, opening_user_input) if opening_user_input else None
         result = await self._conversation.begin(state, opening)
-        print(result)
         
         return {"session_id": session_id, **result}
 
