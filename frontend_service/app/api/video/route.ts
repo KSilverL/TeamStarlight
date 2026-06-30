@@ -1,7 +1,7 @@
 import { NextRequest } from "next/server";
 
 const VIDEO_AGENT_URL =
-  process.env.BRAND_VIDEO_AGENT_URL ?? "http://localhost:8001";
+  process.env.BRAND_VIDEO_AGENT_URL ?? "http://localhost:8081";
 
 export async function POST(request: NextRequest) {
   const body = await request.json();

@@ -12,7 +12,7 @@ services:
     environment:
       # # Demo agents (brand card + video)
       # - BRAND_AGENT_URL=http://brand-agent:8000
-      # - BRAND_VIDEO_AGENT_URL=http://brand-video-agent:8001
+      - BRAND_VIDEO_AGENT_URL=http://backend:8081
       # Main LLM service (text generation)
       - TEXT_AGENT_URL=http://backend:8081
       # Java backend (signup / login)
