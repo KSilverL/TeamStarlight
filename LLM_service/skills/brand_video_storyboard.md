@@ -25,6 +25,16 @@ enumerates them via the `type` discriminator. Never invent a new slide type.
   Use when the brief has concrete numbers or proof points worth dwelling on.
 - **`collage`** — 1-4 images arranged on geometric shapes, with an optional header.
   Use for visual storytelling (product, team, lifestyle) rather than numbers.
+- **`pie_chart`** — 2-6 proportional segments, optionally with a short stat callout.
+  Use for "how the whole breaks down" stories (budget split, market share).
+- **`line_chart`** — 1-2 trend lines drawn across 2-8 x-axis points (e.g. years).
+  Use for "this changed over time" stories. Two series invites comparison.
+- **`bar_chart`** — 2-6 bars compared side by side. Use for ranking or comparing a
+  handful of discrete things at a single point in time (not a trend).
+- **`node_diagram`** — 3-6 short concept labels shown as a connected chain. Use to
+  show how one idea leads to another (cause → effect, theme → theme).
+- **`comparison_table`** — 1-4 columns × 2-5 rows, revealed one row at a time. Use
+  when there are several named things being compared on the same few attributes.
 - **`outro`** — brand name, call-to-action button, optional contact handle.
   Always the last slide.
 
@@ -32,8 +42,10 @@ enumerates them via the `type` discriminator. Never invent a new slide type.
 
 - Start with `hook` (it's the reason someone keeps watching).
 - End with `outro` (it's the only slide with a CTA).
-- Put `collage`/`counter_stat` slides in the middle, in whatever order best builds
-  the argument — lead with the more visually striking one if both are present.
+- Put every other slide type in the middle, in whatever order best builds the
+  argument — lead with the most visually striking one, and don't feel obligated to
+  use every type in one storyboard. Most storyboards should use 1-3 of the
+  data/visual middle slide types, not all of them at once.
 
 ## Image fields are search keywords, never URLs
 
@@ -42,6 +54,21 @@ enumerates them via the `type` discriminator. Never invent a new slide type.
 description longer than a few words. A later step resolves these to real cut-out
 images; you only choose what to search for. Omit `imageQuery`/leave it null for a
 text-only hook slide if no image fits.
+
+## Chart/data fields are illustrative, not looked up
+
+There is no live data source behind `pie_chart`, `line_chart`, `bar_chart`,
+`node_diagram`, or `comparison_table` — you invent plausible, on-brief numbers and
+labels yourself, the same way you already invent `counter_stat.stats`. Keep them
+consistent with any real figures mentioned in the brief; don't contradict them.
+
+- `line_chart.series[].values` must have exactly one number per `xLabels` entry, in
+  the same order (e.g. 5 `xLabels` years → 5 `values` per series). This is enforced
+  server-side; a mismatched length is rejected.
+- `comparison_table.rows[].values` must have exactly one value per `columns` entry,
+  in the same order. Also enforced server-side.
+- `node_diagram.nodes` reads left-to-right (or top-to-bottom on 9:16) as a sequence,
+  not a free-form graph — order them in the sequence you want shown.
 
 ## Colour palette rules
 

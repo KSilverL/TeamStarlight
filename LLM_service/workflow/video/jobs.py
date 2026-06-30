@@ -21,6 +21,7 @@ from ...core.config import Settings, get_settings
 from ...core.services import factory
 from ...core.video_schema import StoryboardSpec
 from .assets import resolve_storyboard_assets
+from .music import resolve_storyboard_music
 from .render import RenderError, render_storyboard
 
 
@@ -33,6 +34,10 @@ async def _run_job(job_id: str, storyboard: StoryboardSpec, settings: Settings) 
     job_dir = _job_dir(settings, job_id)
     try:
         renderable = await resolve_storyboard_assets(storyboard, job_dir=job_dir)
+        total_seconds = sum(s.durationFrames for s in renderable.slides) / renderable.fps
+        renderable.musicLocalPath = await resolve_storyboard_music(
+            job_dir=job_dir, duration_seconds=total_seconds,
+        )
         output_path = await render_storyboard(renderable, job_dir=job_dir, settings=settings)
         await store.update_video_job(job_id=job_id, status="done", output_path=str(output_path), error=None)
     except RenderError as exc:

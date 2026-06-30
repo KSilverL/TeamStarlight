@@ -14,10 +14,15 @@ import pytest
 from pydantic import ValidationError
 
 from LLM_service.core.video_schema import (
+    BarChartSlideSpec,
     CollageSlideSpec,
+    ComparisonTableSlideSpec,
     CounterStatSlideSpec,
     HookSlideSpec,
+    LineChartSlideSpec,
+    NodeDiagramSlideSpec,
     OutroSlideSpec,
+    PieChartSlideSpec,
     RenderableStoryboard,
     SLIDE_TYPES,
     StoryboardSpec,
@@ -32,6 +37,11 @@ def test_slide_type_registry_matches_implemented_models():
         CounterStatSlideSpec.model_fields["type"].default,
         CollageSlideSpec.model_fields["type"].default,
         OutroSlideSpec.model_fields["type"].default,
+        PieChartSlideSpec.model_fields["type"].default,
+        LineChartSlideSpec.model_fields["type"].default,
+        BarChartSlideSpec.model_fields["type"].default,
+        NodeDiagramSlideSpec.model_fields["type"].default,
+        ComparisonTableSlideSpec.model_fields["type"].default,
     }
     assert discriminators == SLIDE_TYPES
 
@@ -96,6 +106,74 @@ def test_renderable_storyboard_requires_concrete_durations():
         )
 
 
+def test_line_chart_rejects_mismatched_series_length():
+    with pytest.raises(ValidationError):
+        LineChartSlideSpec(
+            xLabels=["2021", "2022", "2023"],
+            series=[{"label": "Dublin 6", "values": [100, 110]}],  # 2 values, 3 labels
+        )
+
+
+def test_line_chart_accepts_matched_series_length():
+    slide = LineChartSlideSpec(
+        xLabels=["2021", "2022", "2023"],
+        series=[{"label": "Dublin 6", "values": [100, 110, 130]}],
+    )
+    assert slide.type == "line_chart"
+
+
+def test_comparison_table_rejects_mismatched_row_length():
+    with pytest.raises(ValidationError):
+        ComparisonTableSlideSpec(
+            columns=["Price", "Beds"],
+            rows=[
+                {"label": "123 Main St", "values": ["€450k"]},  # 1 value, 2 columns
+                {"label": "456 Oak Ave", "values": ["€520k", "3"]},
+            ],
+        )
+
+
+def test_comparison_table_accepts_matched_row_length():
+    slide = ComparisonTableSlideSpec(
+        columns=["Price", "Beds"],
+        rows=[
+            {"label": "123 Main St", "values": ["€450k", "2"]},
+            {"label": "456 Oak Ave", "values": ["€520k", "3"]},
+        ],
+    )
+    assert slide.type == "comparison_table"
+
+
+def test_storyboard_spec_accepts_phase_2_chart_slides():
+    storyboard = StoryboardSpec(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        platform="linkedin",
+        slides=[
+            {"type": "hook", "headline": "Dublin Property Trends"},
+            {"type": "pie_chart", "slices": [{"label": "Houses", "value": 60}, {"label": "Apartments", "value": 40}]},
+            {"type": "line_chart", "xLabels": ["2023", "2024", "2025"], "series": [{"label": "Avg Price", "values": [400, 430, 460]}]},
+            {"type": "bar_chart", "bars": [{"label": "Q1", "value": 12}, {"label": "Q2", "value": 18}]},
+            {"type": "node_diagram", "nodes": ["Search", "Compare", "Decide"]},
+            {"type": "comparison_table", "columns": ["Price"], "rows": [{"label": "A", "values": ["€1"]}, {"label": "B", "values": ["€2"]}]},
+            {"type": "outro", "brandName": "X", "ctaLabel": "Go"},
+        ],
+    )
+    assert [s.type for s in storyboard.slides][1:6] == [
+        "pie_chart", "line_chart", "bar_chart", "node_diagram", "comparison_table",
+    ]
+
+
+@pytest.mark.parametrize("slide_type,expected_default", [
+    ("pie_chart", 150),
+    ("line_chart", 180),
+    ("bar_chart", 150),
+    ("node_diagram", 120),
+    ("comparison_table", 180),
+])
+def test_clamp_duration_has_defaults_for_phase_2_types(slide_type, expected_default):
+    assert clamp_duration(slide_type, None) == expected_default
+
+
 def test_renderable_storyboard_round_trips_a_full_storyboard():
     renderable = RenderableStoryboard(
         brandName="NOVAPULSE", primaryColor="#0d1117", secondaryColor="#2d4ed8", accentColor="#f5c84c",
@@ -111,3 +189,14 @@ def test_renderable_storyboard_round_trips_a_full_storyboard():
     )
     assert [s.type for s in renderable.slides] == ["hook", "collage", "counter_stat", "outro"]
     assert renderable.model_dump()["slides"][1]["resolvedImages"][0]["localPath"] is None
+    assert renderable.musicLocalPath is None
+
+
+def test_renderable_storyboard_accepts_resolved_music_path():
+    renderable = RenderableStoryboard(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        width=1080, height=1920,
+        slides=[{"type": "outro", "brandName": "X", "ctaLabel": "Go", "durationFrames": 90}],
+        musicLocalPath="music.mp3",
+    )
+    assert renderable.musicLocalPath == "music.mp3"

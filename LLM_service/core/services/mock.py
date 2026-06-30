@@ -26,6 +26,7 @@ from .base import (
     BackgroundRemovalService,
     ImageSearchService,
     LLMService,
+    MusicGenerationService,
     SafetyResult,
     SafetyService,
     StoreService,
@@ -703,3 +704,14 @@ class MockBackgroundRemoval(BackgroundRemovalService):
     async def remove_background(self, *, image_bytes: bytes) -> bytes:
         await asyncio.sleep(_MOCK_LATENCY)
         return image_bytes
+
+
+class MockMusicGeneration(MusicGenerationService):
+    """Offline stand-in for Soundraw: returns a small deterministic placeholder
+    "track" (not a real decodable mp3 — never inspected, only written to disk and
+    handed to Remotion), so the music-resolution pipeline and its tests never need
+    real credentials or network access."""
+
+    async def generate(self, *, mood: str, genre: str, duration_seconds: float, energy: str) -> bytes:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return f"MOCK_TRACK mood={mood} genre={genre} energy={energy} duration={duration_seconds}".encode()

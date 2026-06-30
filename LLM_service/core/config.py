@@ -111,6 +111,7 @@ class Settings:
     use_mock_voice: Optional[bool] = None
     use_mock_image_search: Optional[bool] = None
     use_mock_background_removal: Optional[bool] = None
+    use_mock_music_generation: Optional[bool] = None
 
     # ── Azure OpenAI / Foundry (chat + structured output + copywriting) ────────
     azure_openai_endpoint: Optional[str] = None
@@ -144,6 +145,9 @@ class Settings:
     pexels_api_key: Optional[str] = None
     removebg_api_key: Optional[str] = None
 
+    # ── Soundraw (background music generation) ──────────────────────────────────
+    soundraw_api_key: Optional[str] = None
+
     # ── Video render pipeline (local Remotion CLI) ──────────────────────────────
     # Path to the video_renderer/ Node project (repo-root sibling of LLM_service/).
     video_renderer_dir: Optional[str] = None
@@ -172,6 +176,9 @@ class Settings:
 
     def mock_background_removal(self) -> bool:
         return self.use_mock if self.use_mock_background_removal is None else self.use_mock_background_removal
+
+    def mock_music_generation(self) -> bool:
+        return self.use_mock if self.use_mock_music_generation is None else self.use_mock_music_generation
 
     def notify_via_webhook(self) -> bool:
         """Whether status events are POSTed to the backend webhook. Defaults to
@@ -204,6 +211,10 @@ class Settings:
         return bool(self.removebg_api_key)
 
     @property
+    def has_soundraw(self) -> bool:
+        return bool(self.soundraw_api_key)
+
+    @property
     def resolved_video_renderer_dir(self) -> Path:
         """Absolute path to the video_renderer/ Node project. VIDEO_RENDERER_DIR
         overrides; otherwise defaults to the repo-root sibling of LLM_service/ (this
@@ -231,7 +242,8 @@ class Settings:
             f"[llm={tag(self.mock_llm())} safety={tag(self.mock_safety())} "
             f"store={tag(self.mock_store())} voice={tag(self.mock_voice())} "
             f"image_search={tag(self.mock_image_search())} "
-            f"background_removal={tag(self.mock_background_removal())}]"
+            f"background_removal={tag(self.mock_background_removal())} "
+            f"music_generation={tag(self.mock_music_generation())}]"
         )
 
 
@@ -245,6 +257,7 @@ def _load() -> Settings:
         use_mock_voice=_env_bool("USE_MOCK_VOICE"),
         use_mock_image_search=_env_bool("USE_MOCK_IMAGE_SEARCH"),
         use_mock_background_removal=_env_bool("USE_MOCK_BACKGROUND_REMOVAL"),
+        use_mock_music_generation=_env_bool("USE_MOCK_MUSIC_GENERATION"),
         azure_openai_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
         azure_openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
@@ -265,6 +278,7 @@ def _load() -> Settings:
         azure_voicelive_api_key=os.getenv("AZURE_VOICELIVE_API_KEY"),
         pexels_api_key=os.getenv("PEXELS_API_KEY"),
         removebg_api_key=os.getenv("REMOVEBG_API_KEY"),
+        soundraw_api_key=os.getenv("SOUNDRAW_API_KEY"),
         video_renderer_dir=os.getenv("VIDEO_RENDERER_DIR"),
         video_jobs_dir=os.getenv("VIDEO_JOBS_DIR", ".video_jobs"),
         webhook_url=os.getenv("WEBHOOK_URL", "http://localhost:9999/status"),

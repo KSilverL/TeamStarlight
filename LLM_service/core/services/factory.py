@@ -23,6 +23,7 @@ from .base import (
     BackgroundRemovalService,
     ImageSearchService,
     LLMService,
+    MusicGenerationService,
     SafetyService,
     StoreService,
     VoiceService,
@@ -35,6 +36,7 @@ __all__ = [
     "get_voice",
     "get_image_search",
     "get_background_removal",
+    "get_music_generation",
     "get_checkpoint_storage",
     "reset_services",
 ]
@@ -128,6 +130,16 @@ def get_background_removal() -> BackgroundRemovalService:
         _require(s.has_removebg, "Remove.bg", "REMOVEBG_API_KEY", "USE_MOCK_BACKGROUND_REMOVAL=true")
         return media_assets.RemoveBgService(s)
     return _cached("background_removal", build)
+
+
+def get_music_generation() -> MusicGenerationService:
+    def build() -> MusicGenerationService:
+        s = get_settings()
+        if s.mock_music_generation():
+            return mock.MockMusicGeneration()
+        _require(s.has_soundraw, "Soundraw", "SOUNDRAW_API_KEY", "USE_MOCK_MUSIC_GENERATION=true")
+        return media_assets.SoundrawMusic(s)
+    return _cached("music_generation", build)
 
 
 def get_checkpoint_storage() -> CheckpointStorage:

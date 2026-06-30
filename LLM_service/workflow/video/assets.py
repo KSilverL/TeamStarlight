@@ -19,10 +19,15 @@ from typing import Dict, List, Optional, Tuple
 from ...core.services import factory
 from ...core.video_schema import (
     RenderableStoryboard,
+    RenderBarChartSlide,
     RenderCollageSlide,
+    RenderComparisonTableSlide,
     RenderCounterStatSlide,
     RenderHookSlide,
+    RenderLineChartSlide,
+    RenderNodeDiagramSlide,
     RenderOutroSlide,
+    RenderPieChartSlide,
     ResolvedImage,
     StoryboardSpec,
     aspect_for_platform,
@@ -136,6 +141,29 @@ async def resolve_storyboard_assets(storyboard: StoryboardSpec, *, job_dir: Path
             render_slides.append(RenderOutroSlide(
                 brandName=slide.brandName, ctaLabel=slide.ctaLabel,
                 contact=slide.contact, durationFrames=duration,
+            ))
+        elif slide.type == "pie_chart":
+            render_slides.append(RenderPieChartSlide(
+                headline=slide.headline, slices=slide.slices,
+                calloutText=slide.calloutText, durationFrames=duration,
+            ))
+        elif slide.type == "line_chart":
+            render_slides.append(RenderLineChartSlide(
+                headline=slide.headline, xLabels=slide.xLabels,
+                series=slide.series, durationFrames=duration,
+            ))
+        elif slide.type == "bar_chart":
+            render_slides.append(RenderBarChartSlide(
+                headline=slide.headline, bars=slide.bars, durationFrames=duration,
+            ))
+        elif slide.type == "node_diagram":
+            render_slides.append(RenderNodeDiagramSlide(
+                headline=slide.headline, nodes=slide.nodes, durationFrames=duration,
+            ))
+        elif slide.type == "comparison_table":
+            render_slides.append(RenderComparisonTableSlide(
+                headline=slide.headline, columns=slide.columns,
+                rows=slide.rows, durationFrames=duration,
             ))
 
     return RenderableStoryboard(

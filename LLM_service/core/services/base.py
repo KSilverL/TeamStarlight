@@ -351,3 +351,16 @@ class BackgroundRemovalService(ABC):
         """Return PNG bytes with the background removed. Raises on a hard failure
         (rate limit, bad image, network) — callers fall back to the original image."""
         ...
+
+
+# ── Background music (Soundraw) ───────────────────────────────────────────────
+
+class MusicGenerationService(ABC):
+    """Background music generation, sized to a render's exact duration."""
+
+    @abstractmethod
+    async def generate(self, *, mood: str, genre: str, duration_seconds: float, energy: str) -> bytes:
+        """Return audio bytes (mp3) for a track matching the requested duration.
+        Raises on a hard failure (rate limit, bad params, network) — callers fall
+        back to a silent render."""
+        ...
