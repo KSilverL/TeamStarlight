@@ -22,15 +22,22 @@ from __future__ import annotations
 import json
 from typing import List, Optional
 
+from pydantic import ValidationError
+
 from ..config import Settings
-from ..media_schema import BrandVideoProps
 from ..skill_schema import SkillCandidate, SkillRule
+from ..video_schema import StoryboardSpec
 from .base import (
     LLMService,
     SafetyResult,
     SafetyService,
     VoiceService,
 )
+
+# Discriminated-union storyboard JSON is meaningfully harder for the model to nail
+# on the first try than the old fixed shape — bounded retry, re-prompting with the
+# validation error, before failing loudly.
+_VIDEO_STORYBOARD_MAX_ATTEMPTS = 3
 
 
 def _strip_fences(text: str) -> str:
@@ -191,34 +198,51 @@ class AzureLLM(LLMService):
         )
         return _strip_fences(raw)
 
-    async def generate_video_props(
+    async def generate_video_storyboard(
         self,
         *,
         topic: str,
         draft: str,
         tone_hint: Optional[str],
+        platform: str,
         skill: str = "",
         history: Optional[List[dict]] = None,
     ) -> dict:
-        schema = json.dumps(BrandVideoProps.model_json_schema())
+        schema = json.dumps(StoryboardSpec.model_json_schema())
         style_guide = f"\n\n{skill}" if skill else ""
         system = (
             "You are a brand strategist and creative director for short-form social "
-            "video. Given a brand topic and the approved post copy, return ONLY valid "
-            "JSON (no markdown fences, no prose) matching this JSON Schema — exactly 3 "
-            f"stats:\n{schema}" + style_guide
+            "video. Given a brand topic, the approved post copy, and the target "
+            "platform, compose a storyboard — an ordered list of 2-8 slides chosen "
+            "from the registry described by this JSON Schema (you may only use the "
+            "slide types it defines; image fields are search keywords, never URLs). "
+            "Return ONLY valid JSON (no markdown fences, no prose) matching the schema "
+            f"exactly:\n{schema}" + style_guide
         )
         user = (
             f"Brand topic: {topic}\n"
             f"Approved post copy:\n{draft}\n"
-            f"Tone: {tone_hint or 'brand voice'}"
+            f"Tone: {tone_hint or 'brand voice'}\n"
+            f"Target platform: {platform}"
         )
-        raw = await self._complete(
-            [{"role": "system", "content": system}, *(history or []),
-             {"role": "user", "content": user}]
-        )
-        data = json.loads(_strip_fences(raw))
-        return BrandVideoProps(**data).model_dump()
+        messages = [{"role": "system", "content": system}, *(history or []),
+                    {"role": "user", "content": user}]
+        last_error: Exception = ValueError("generate_video_storyboard: no attempts made")
+        for _ in range(_VIDEO_STORYBOARD_MAX_ATTEMPTS):
+            raw = await self._complete(messages)
+            try:
+                data = json.loads(_strip_fences(raw))
+                return StoryboardSpec(**data).model_dump()
+            except (json.JSONDecodeError, ValidationError) as exc:
+                last_error = exc
+                messages = messages + [
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content": (
+                        f"Your previous JSON was invalid: {exc}. Return corrected JSON "
+                        "only, matching the schema exactly."
+                    )},
+                ]
+        raise last_error
 
     async def distill_rules(
         self,

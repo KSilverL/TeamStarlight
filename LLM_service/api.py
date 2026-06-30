@@ -38,20 +38,23 @@ import asyncio
 import json
 import os
 import uuid
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Body, FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .core.config import load_dotenv
 from .core.events import DONE, INTERRUPTED, RUNNING, progress_event, result_event
 from .core.services import factory
 from .core.skill_schema import SkillCandidate, SkillDecision
+from .core.video_schema import StoryboardSpec
 from .intake import IntakeSession, build_intake
 from .skills import load_skill
 from .workflow import Brief, HumanVerdict, build_workflow
 from .workflow.builder import WORKFLOW_NAME
+from .workflow.video.jobs import get_render_job, start_render_job
 
 # Sentinel pushed to SSE subscribers when a task finishes, so the stream closes.
 _STREAM_DONE = object()
@@ -184,7 +187,7 @@ class WorkflowService:
                 "draft": draft.draft,
                 "decision": draft.decision,
                 "html_preview": draft.html_card,  # the LLM-rendered animated brand card
-                "video_props": draft.video_props.model_dump() if draft.video_props else None,
+                "video_storyboard": draft.video_storyboard.model_dump() if draft.video_storyboard else None,
                 "needs_human_intervention": draft.needs_human_intervention,
                 "proposed_rules": [r.model_dump() for r in draft.proposed_rules],
             })]
@@ -361,6 +364,13 @@ class WorkflowService:
     async def get(self, task_id: str) -> dict:
         return self._snapshot(self._require(task_id))
 
+    def get_final_draft(self, task_id: str, platform: str) -> Optional[dict]:
+        """The FinalDraft dict (including `video_storyboard`) media_producer already
+        produced for one platform of a task, or None if that platform hasn't reached
+        the workflow's output node yet. Used by VideoService.start so the render
+        trigger only needs {task_id, platform} — never a full storyboard round-trip."""
+        return self._require(task_id).outputs.get(platform)
+
     def buffered_events(self, task_id: str) -> list[dict]:
         """Non-blocking snapshot of the §7.2 event log so far (the SSE replay
         buffer). Unlike `events()`, this never waits for future events."""
@@ -440,16 +450,15 @@ class IntakeService:
 
 class MediaService:
     """Async wrapper over the post-approval media generators, exposed as standalone
-    endpoints for the backend's "Brand Animation" + "Brand Video" content types.
+    endpoints for the backend's "Brand Animation" content type (one-shot, outside the
+    full workflow). Video storyboard generation has no standalone path — it is always
+    tied to an approved per-platform draft (media_producer's role); see VideoService
+    for the actual render trigger, which reads the storyboard the workflow already
+    produced rather than generating one from a free-text brief.
 
-    Both reach the LLM through `factory.get_llm()`, so they honour the same Azure ↔ mock
-    toggle as the workflow. The animated HTML card is synchronous; the video returns a
-    structured `BrandVideoProps` spec (this service does not render an MP4 — that stays
-    external), tracked under a job id so the backend's poll-then-show flow works unchanged.
+    Reaches the LLM through `factory.get_llm()`, so it honours the same Azure ↔ mock
+    toggle as the workflow.
     """
-
-    def __init__(self) -> None:
-        self._video_jobs: dict[str, dict] = {}
 
     async def generate_text(
         self, prompt: str, platform: str = "linkedin", history: Optional[list] = None
@@ -477,26 +486,42 @@ class MediaService:
         )
         return {"html": html}
 
-    async def start_video(self, brief: str, history: Optional[list] = None) -> dict:
-        if not brief.strip():
-            raise ApiError(400, "'brief' is required")
-        prior = _normalize_history(history)
-        job_id = uuid.uuid4().hex
-        try:
-            props = await factory.get_llm().generate_video_props(
-                topic=brief, draft=brief, tone_hint=None, skill=load_skill("brand_video"),
-                history=prior,
-            )
-            self._video_jobs[job_id] = {"status": "done", "props": props, "error": None}
-        except Exception as exc:  # surface generation failures to the backend poll
-            self._video_jobs[job_id] = {"status": "error", "props": None, "error": str(exc)}
-        return {"job_id": job_id, "status": self._video_jobs[job_id]["status"]}
+class VideoService:
+    """Async wrapper over the video render pipeline (workflow/video/). Reads the
+    storyboard media_producer already attached to a finished platform's FinalDraft
+    (via WorkflowService.get_final_draft) and triggers an explicit, separately
+    polled render job — never re-generates a storyboard from a raw brief, and never
+    blocks the request on the render itself (45+ seconds locally)."""
 
-    def video_job(self, job_id: str) -> dict:
-        job = self._video_jobs.get(job_id)
+    def __init__(self, *, workflow: WorkflowService) -> None:
+        self._workflow = workflow
+
+    async def start(self, task_id: str, platform: str) -> dict:
+        draft = self._workflow.get_final_draft(task_id, platform)
+        if draft is None:
+            raise ApiError(404, f"no finished draft for platform '{platform}' on task {task_id}")
+        storyboard = draft.get("video_storyboard")
+        if not storyboard:
+            raise ApiError(409, f"platform '{platform}' has no video storyboard yet")
+        doc = await start_render_job(
+            task_id=task_id, platform=platform, storyboard=StoryboardSpec(**storyboard),
+        )
+        return {"job_id": doc["id"], "status": doc["status"]}
+
+    async def get(self, job_id: str) -> dict:
+        job = await get_render_job(job_id=job_id)
         if job is None:
             raise ApiError(404, f"unknown video job: {job_id}")
-        return {"job_id": job_id, **job}
+        return job
+
+    async def download_path(self, job_id: str) -> Path:
+        job = await self.get(job_id)
+        if job["status"] != "done" or not job.get("output_path"):
+            raise ApiError(409, f"video job {job_id} is not done yet (status={job['status']})")
+        path = Path(job["output_path"])
+        if not path.is_file():
+            raise ApiError(404, f"rendered file for job {job_id} is missing on disk")
+        return path
 
 
 def _verdict_from_payload(payload: dict) -> HumanVerdict:
@@ -606,9 +631,8 @@ class GenerateHtmlRequest(BaseModel):
     history: Optional[list] = _HISTORY_FIELD
 
 
-class GenerateVideoRequest(BaseModel):
-    brief: str = Field(..., description="Brand brief for the BrandVideoProps spec")
-    history: Optional[list] = _HISTORY_FIELD
+class RenderVideoRequest(BaseModel):
+    platform: str = Field(..., description="Which finished platform draft's storyboard to render")
 
 
 # ── Dependencies: pull the per-app service singletons off app.state ───────────
@@ -625,11 +649,16 @@ def _media(request: Request) -> MediaService:
     return request.app.state.media
 
 
+def _video(request: Request) -> VideoService:
+    return request.app.state.video
+
+
 # ── Routers ───────────────────────────────────────────────────────────────────
 
 tasks_router = APIRouter(prefix="/tasks", tags=["tasks"])
 intake_router = APIRouter(prefix="/intake", tags=["intake"])
 media_router = APIRouter(tags=["media"])
+video_jobs_router = APIRouter(prefix="/video-jobs", tags=["video"])
 
 
 @tasks_router.post("", summary="Start a workflow run from a brief")
@@ -688,6 +717,14 @@ async def learn_commit(request: Request, task_id: str, body: LearnCommitRequest)
     return await _workflow(request).learn_commit(task_id, decisions)
 
 
+@tasks_router.post(
+    "/{task_id}/render-video",
+    summary="Render the MP4 for one platform's already-produced video storyboard",
+)
+async def render_video(request: Request, task_id: str, body: RenderVideoRequest) -> dict:
+    return await _video(request).start(task_id, body.platform)
+
+
 @intake_router.post("", summary="Open an intake conversation (voice or text)")
 async def intake_start(request: Request, body: IntakeStartRequest) -> dict:
     return await _intake(request).start(body.mode, body.opening_input, body.user_id)
@@ -738,14 +775,15 @@ async def generate_html(request: Request, body: GenerateHtmlRequest) -> dict:
     return await _media(request).generate_html(body.prompt, body.history)
 
 
-@media_router.post("/generate-video", summary="Start a BrandVideoProps spec job")
-async def generate_video(request: Request, body: GenerateVideoRequest) -> dict:
-    return await _media(request).start_video(body.brief, body.history)
+@video_jobs_router.get("/{job_id}", summary="Poll a video render job")
+async def get_video_job(request: Request, job_id: str) -> dict:
+    return await _video(request).get(job_id)
 
 
-@media_router.get("/jobs/{job_id}", summary="Poll a video-spec job")
-async def video_job(request: Request, job_id: str) -> dict:
-    return _media(request).video_job(job_id)
+@video_jobs_router.get("/{job_id}/download", summary="Download the finished MP4")
+async def download_video_job(request: Request, job_id: str) -> FileResponse:
+    path = await _video(request).download_path(job_id)
+    return FileResponse(path, media_type="video/mp4", filename=f"{job_id}.mp4")
 
 
 # ── App factory ────────────────────────────────────────────────────────────────
@@ -755,6 +793,7 @@ def create_app(
     service: Optional[WorkflowService] = None,
     intake: Optional[IntakeService] = None,
     media: Optional[MediaService] = None,
+    video: Optional[VideoService] = None,
 ) -> FastAPI:
     """Build the FastAPI app. Tests inject custom service instances; production uses
     fresh defaults wired to the toggle-resolved factory backends."""
@@ -767,6 +806,7 @@ def create_app(
     app.state.workflow = service or WorkflowService()
     app.state.intake = intake or IntakeService()
     app.state.media = media or MediaService()
+    app.state.video = video or VideoService(workflow=app.state.workflow)
 
     @app.exception_handler(ApiError)
     async def _api_error_handler(_request: Request, exc: ApiError) -> JSONResponse:
@@ -779,6 +819,7 @@ def create_app(
     app.include_router(tasks_router)
     app.include_router(intake_router)
     app.include_router(media_router)
+    app.include_router(video_jobs_router)
     return app
 
 

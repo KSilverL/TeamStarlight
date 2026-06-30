@@ -26,7 +26,7 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
-from ..core.media_schema import BrandVideoProps
+from ..core.video_schema import StoryboardSpec
 
 # Reject this many times before the circuit breaker forces a human decision.
 MAX_RETRIES = 3
@@ -162,5 +162,5 @@ class FinalDraft(BaseModel):
     comment: str
     needs_human_intervention: bool = False
     proposed_rules: List[BrandRule] = Field(default_factory=list)
-    html_card: Optional[str] = None                 # self-contained animated HTML
-    video_props: Optional[BrandVideoProps] = None   # structured 3-scene video spec
+    html_card: Optional[str] = None                       # self-contained animated HTML
+    video_storyboard: Optional[StoryboardSpec] = None     # dynamic, composable video storyboard

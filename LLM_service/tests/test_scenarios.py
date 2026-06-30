@@ -82,12 +82,12 @@ async def test_scenario_vague_idea_copilot_voice():
     svc = WorkflowService()
     snapshot = await svc.start(brief.model_dump(), task_id="copilot-1")
     assert snapshot["status"] == "awaiting_review"
-    # approving each platform produces the animated card + video spec on the final event
+    # approving each platform produces the animated card + video storyboard on the final event
     await svc.review("copilot-1", {p: {"decision": "approve"} for p in brief.target_platforms})
     finals = [e for e in svc.buffered_events("copilot-1")
               if e["type"] == "result" and e["status"] == "final"]
     assert finals and finals[0]["html_preview"].startswith("<!DOCTYPE html>")
-    assert finals[0]["video_props"] and len(finals[0]["video_props"]["stats"]) == 3
+    assert finals[0]["video_storyboard"] and 2 <= len(finals[0]["video_storyboard"]["slides"]) <= 8
 
 
 # ── 4. Brand training — the self-evolving profile ─────────────────────────────

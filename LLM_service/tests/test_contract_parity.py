@@ -108,33 +108,31 @@ async def test_render_html_card_parity():
         assert isinstance(out, str) and out.startswith("<!DOCTYPE html>")
 
 
-_VIDEO_KEYS = {
-    "brandName", "tagline", "primaryColor", "secondaryColor", "accentColor",
-    "sectionLabel", "stats", "headline", "subtext", "ctaLabel", "contact",
-}
+_STORYBOARD_KEYS = {"brandName", "primaryColor", "secondaryColor", "accentColor", "platform", "slides"}
 
 
-async def test_generate_video_props_parity():
-    kw = dict(topic="coffee launch", draft="Our new single-origin is here.", tone_hint="warm")
-    m = await mock.MockLLM().generate_video_props(**kw)
+async def test_generate_video_storyboard_parity():
+    kw = dict(topic="coffee launch", draft="Our new single-origin is here.", tone_hint="warm",
+              platform="instagram_reels")
+    m = await mock.MockLLM().generate_video_storyboard(**kw)
     canned = json.dumps({
-        "brandName": "COFFEE", "tagline": "Roasted with care",
-        "primaryColor": "#0d0d1a", "secondaryColor": "#5b8def", "accentColor": "#f0a500",
-        "sectionLabel": "Why Choose Us",
-        "stats": [
-            {"value": "10K+", "label": "Cups poured", "icon": "★"},
-            {"value": "99%", "label": "Happy clients", "icon": "◆"},
-            {"value": "24/7", "label": "Freshly roasted", "icon": "●"},
+        "brandName": "COFFEE", "primaryColor": "#0d0d1a", "secondaryColor": "#5b8def",
+        "accentColor": "#f0a500", "platform": "instagram_reels",
+        "slides": [
+            {"type": "hook", "headline": "Ready to sip?", "imageQuery": "coffee cup", "shape": "circle"},
+            {"type": "counter_stat", "sectionLabel": "Why Choose Us", "stats": [
+                {"value": "10K+", "label": "Cups poured", "icon": "★"},
+                {"value": "99%", "label": "Happy clients", "icon": "◆"},
+            ]},
+            {"type": "outro", "brandName": "COFFEE", "ctaLabel": "Order Now", "contact": "@coffee · coffee.com"},
         ],
-        "headline": "Ready to sip?", "subtext": "Taste the difference today.",
-        "ctaLabel": "Order Now", "contact": "@coffee · coffee.com",
     })
-    a = await azure_llm(canned).generate_video_props(**kw)
+    a = await azure_llm(canned).generate_video_storyboard(**kw)
     for out in (m, a):
-        assert isinstance(out, dict) and set(out) >= _VIDEO_KEYS
-        assert isinstance(out["stats"], list) and len(out["stats"]) == 3
-        for stat in out["stats"]:
-            assert set(stat) == {"value", "label", "icon"}
+        assert isinstance(out, dict) and set(out) >= _STORYBOARD_KEYS
+        assert isinstance(out["slides"], list) and 2 <= len(out["slides"]) <= 8
+        for slide in out["slides"]:
+            assert "type" in slide
 
 
 async def test_distill_rules_parity():

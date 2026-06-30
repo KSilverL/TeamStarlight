@@ -164,11 +164,12 @@ async def main() -> None:
         for rule in getattr(final, "proposed_rules", []):
             print(f"  ↪ proposed brand rule [{rule.kind}]: {rule.rule}")
         card = getattr(final, "html_card", None)
-        props = getattr(final, "video_props", None)
+        storyboard = getattr(final, "video_storyboard", None)
         if card:
             print(f"  ✓ animated HTML card produced ({len(card)} chars)")
-        if props:
-            print(f"  ✓ video spec produced: {props.brandName} — {props.tagline}")
+        if storyboard:
+            slide_types = " → ".join(s.type for s in storyboard.slides)
+            print(f"  ✓ video storyboard produced: {storyboard.brandName} — {slide_types}")
     print()
 
 

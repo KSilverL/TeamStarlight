@@ -20,9 +20,11 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from ...skills import parse_char_limit
-from ..media_schema import BrandVideoProps, StatItem
 from ..skill_schema import SkillCandidate, SkillRule, UserSkillDoc
+from ..video_schema import StoryboardSpec
 from .base import (
+    BackgroundRemovalService,
+    ImageSearchService,
     LLMService,
     SafetyResult,
     SafetyService,
@@ -313,26 +315,29 @@ body{{background:#000;display:flex;justify-content:center;align-items:center;min
 </div></body></html>"""
 
 
-def _mock_video_props(topic: str, draft: str, tone_hint: Optional[str]) -> dict:
-    """A deterministic BrandVideoProps-shaped dict (exactly 3 stats)."""
+def _mock_storyboard(topic: str, draft: str, tone_hint: Optional[str], platform: str) -> dict:
+    """A deterministic 4-slide StoryboardSpec-shaped dict — one of each Phase 1 slide
+    type, in a typical order (hook -> collage -> counter_stat -> outro), so
+    contract-parity / shape tests have something stable to assert on."""
     primary, secondary, accent = _MEDIA_PALETTE
+    brand = _brand_name(topic)
     tagline = (tone_hint or "Crafted with intent").strip()[:48] or "Crafted with intent"
-    return BrandVideoProps(
-        brandName=_brand_name(topic),
-        tagline=tagline,
+    return StoryboardSpec(
+        brandName=brand,
         primaryColor=primary,
         secondaryColor=secondary,
         accentColor=accent,
-        sectionLabel="Why It Matters",
-        stats=[
-            StatItem(value="100%", label="On brand", icon="★"),
-            StatItem(value="3", label="Platforms", icon="◆"),
-            StatItem(value="24/7", label="Always on", icon="●"),
+        platform=platform,
+        slides=[
+            {"type": "hook", "headline": tagline, "imageQuery": topic, "shape": "circle"},
+            {"type": "collage", "headline": "Why It Matters", "imageQueries": [topic, "team", "product"]},
+            {"type": "counter_stat", "sectionLabel": "By The Numbers", "stats": [
+                {"value": "100%", "label": "On brand", "icon": "★"},
+                {"value": "3", "label": "Platforms", "icon": "◆"},
+                {"value": "24/7", "label": "Always on", "icon": "●"},
+            ]},
+            {"type": "outro", "brandName": brand, "ctaLabel": "Learn More", "contact": "@brand · brand.com"},
         ],
-        headline="Ready to dive in?",
-        subtext="Join us and see what the buzz is about.",
-        ctaLabel="Learn More",
-        contact="@brand · brand.com",
     ).model_dump()
 
 
@@ -434,17 +439,18 @@ class MockLLM(LLMService):
         # topic/draft (production folds the prior turns into the prompt).
         return _mock_html_card(topic, draft, tone_hint)
 
-    async def generate_video_props(
+    async def generate_video_storyboard(
         self,
         *,
         topic: str,
         draft: str,
         tone_hint: Optional[str],
+        platform: str,
         skill: str = "",
         history: Optional[List[dict]] = None,
     ) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
-        return _mock_video_props(topic, draft, tone_hint)
+        return _mock_storyboard(topic, draft, tone_hint, platform)
 
     async def distill_rules(
         self,
@@ -591,6 +597,7 @@ class MockStore(StoreService):
         self._profiles: Dict[str, dict] = {}
         self._checkpoints: Dict[str, dict] = {}
         self._user_skills: Dict[str, dict] = {}
+        self._video_jobs: Dict[str, dict] = {}
 
     async def get_profile(self, *, business_id: Optional[str]) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
@@ -632,6 +639,31 @@ class MockStore(StoreService):
         stored = self._checkpoints.get(task_id)
         return dict(stored) if stored is not None else None
 
+    async def create_video_job(self, *, job_id: str, task_id: str, platform: str, storyboard: dict) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        now = datetime.now(timezone.utc).isoformat()
+        doc = {
+            "id": job_id, "task_id": task_id, "platform": platform, "status": "pending",
+            "storyboard": storyboard, "output_path": None, "error": None,
+            "created_at": now, "updated_at": now,
+        }
+        self._video_jobs[job_id] = doc
+        return dict(doc)
+
+    async def update_video_job(self, *, job_id: str, **fields) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        doc = self._video_jobs.get(job_id)
+        if doc is None:
+            raise KeyError(f"unknown video job: {job_id}")
+        doc.update(fields)
+        doc["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return dict(doc)
+
+    async def get_video_job(self, *, job_id: str) -> Optional[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        stored = self._video_jobs.get(job_id)
+        return dict(stored) if stored is not None else None
+
 
 # ── Voice ──────────────────────────────────────────────────────────────────────
 
@@ -642,3 +674,32 @@ class MockVoice(VoiceService):
         # so a faithful transcript is the verbatim text. This makes a voice intake
         # produce a CreativeBrief identical to the same words typed (§4.4).
         return {"session_id": session_id, "transcript": user_audio.strip()}
+
+
+# ── Image search / background removal (offline stand-ins for Pexels / Remove.bg) ──
+
+class MockImageSearch(ImageSearchService):
+    """Deterministic, offline stand-in for Pexels: returns one placeholder image
+    candidate per query (no network), so the asset-resolution pipeline and its
+    tests never need real credentials."""
+
+    async def search(self, *, query: str, per_page: int = 1) -> List[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return [
+            {
+                "url": f"https://mock.pexels.local/{i}/{query.replace(' ', '-')}.jpg",
+                "photographer": "Mock Photographer",
+                "width": 1080,
+                "height": 1080,
+            }
+            for i in range(max(per_page, 0))
+        ]
+
+
+class MockBackgroundRemoval(BackgroundRemovalService):
+    """Offline stand-in for Remove.bg: returns the input bytes unchanged (no real
+    cutout), so callers exercise the same code path without a network call."""
+
+    async def remove_background(self, *, image_bytes: bytes) -> bytes:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return image_bytes

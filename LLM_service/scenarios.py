@@ -87,7 +87,7 @@ async def scenario_copilot_voice() -> None:
               if e["type"] == "result" and e["status"] == "final"]
     card_ok = bool(finals and (finals[0].get("html_preview") or "").startswith("<!DOCTYPE html>"))
     print(f"  ✓ animated HTML card produced: {card_ok}")
-    print(f"  ✓ video spec produced: {bool(finals and finals[0].get('video_props'))}")
+    print(f"  ✓ video storyboard produced: {bool(finals and finals[0].get('video_storyboard'))}")
 
 
 async def scenario_brand_training() -> None:
