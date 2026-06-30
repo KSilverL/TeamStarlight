@@ -1,5 +1,6 @@
 package com.example.tsldemo.AgentAPI;
 
+import java.util.HashMap;
 import java.util.Map;
 
 import org.springframework.beans.factory.annotation.Value;
@@ -30,4 +31,18 @@ public class AgentService {
     	
     	return response;
     }
+	
+	public Map<String, Object> getAgentVideoResponse(Map<String, Object> promptJSON) { 	
+    	Map<String, Object> response = restClient.post()
+                .uri(llmServiceBaseUrl +"/generate-video")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(promptJSON)
+                .retrieve()
+                .body(Map.class);
+    	
+    	System.out.println(response);
+    	
+    	return response;
+    }
+	
 }

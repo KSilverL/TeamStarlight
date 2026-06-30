@@ -19,18 +19,30 @@ public class AgentController {
 	private AgentService service;
 	
 	@PostMapping("/generate-text")
-	public String extractAssisstantResponse(@RequestBody String prompt) {
-		System.out.println(prompt);
+	public String extractAssistantTextResponse(@RequestBody String prompt) {
 		ObjectMapper objMap = new ObjectMapper();
+		
 		Map<String, Object> promptJSON = objMap.readValue(prompt, new TypeReference<Map<String, Object>>() {});
 		
-		
 		Map<String, Object> response = service.getAgentTextResponse(promptJSON);
-		
-		System.out.println(response.get("assistant_message"));
 		
 		return objMap.writeValueAsString(response);
 		
 	}
 	
+
+	@PostMapping("/generate-video") 
+	public String extractAssistantVideoResponse(@RequestBody String prompt) {
+		System.out.println(prompt);
+		
+		ObjectMapper objMap = new ObjectMapper();
+		Map<String, Object> promptJSON = objMap.readValue(prompt, new TypeReference<Map<String, Object>>() {});
+		
+		Map<String, Object> videoResponse = service.getAgentVideoResponse(promptJSON);
+		
+		return objMap.writeValueAsString(videoResponse);
+		
+	}
+	
 }
+
