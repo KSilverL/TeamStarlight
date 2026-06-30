@@ -76,11 +76,6 @@ public class SessionController {
 	
 	}
 	
-	@GetMapping("/sessions")
-	public List<Session> getAllSessions() {
-		return service.getSessions();
-	}
-	
 	
 	private static class MessageRequest {
 		public String role;
@@ -93,6 +88,7 @@ public class SessionController {
 			request.role != null ? request.role : "user",
 			request.content != null ? request.content : ""
 		);
+		
 		service.updateSession(id, msg);
 		return msg;
 	}
