@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import uuid
 from pathlib import Path
 
 if __name__ == "__main__":
@@ -102,8 +103,12 @@ async def _intake_brief(mode: str) -> dict:
     """Drive a text or mock-voice intake conversation to a CreativeBrief, then attach the
     brand/user ids (intake doesn't ask for those)."""
     session = build_intake(mode)
-    opening = await _ask(f"  You (open the {mode} chat)", "help me think of what to post on linkedin to promote our launch")
-    res = await session.start(opening)
+    # The CLI plays "the backend": it owns the platform picker, so it supplies target_platforms
+    # (intake never asks for them) and mints the session id that intake + the workflow share.
+    picked = await _ask("  Target platforms (comma-sep)", "linkedin, instagram")
+    platforms = [p.strip() for p in picked.split(",") if p.strip()] or ["linkedin"]
+    opening = await _ask(f"  You (open the {mode} chat)", "help me think of what to post to promote our launch")
+    res = await session.start(f"sess-{uuid.uuid4().hex[:12]}", opening, target_platforms=platforms)
     sid = res["session_id"]
     print(f"  Assistant: {res.get('assistant_message', '')}")
     while not res.get("complete"):
@@ -176,7 +181,8 @@ async def _run_gate(svc, task_id: str, snapshot: dict) -> dict:
                 edited = await _ask("  New draft text")
                 verdicts[platform] = {"decision": "approve_after_edit", "edited_draft": edited}
             elif choice.startswith("r"):
-                verdicts[platform] = {"decision": "reject", "reason": await _ask("  Reason", "not strong enough")}
+                comment = await _ask("  What's wrong / what to change (drives the rework)", "not strong enough")
+                verdicts[platform] = {"decision": "reject", "reason": comment}
             else:
                 verdicts[platform] = {"decision": "approve"}
         print("\n  … resuming the newsroom …")
@@ -276,6 +282,25 @@ async def _run_once() -> None:
     await _confirm_learning(svc, task_id, inputs)
 
 
+def _cheat_sheet() -> None:
+    """Which inputs trigger which flow. Each run drives ONE config; loop ('Run another?')
+    to cover the rest — together these reach every path through the system."""
+    _section("FLOW CHEAT-SHEET — inputs that exercise each path")
+    rows = [
+        ("Standard (scout)",     "Roundtable = n"),
+        ("Roundtable debate",    "Roundtable = Y  · raise a hand at any round to join the table"),
+        ("Reject → rework",      "At the gate press r + type a comment → next draft shows 'Reworked to address: …'"),
+        ("Approve-after-edit",   "At the gate press e + type your final copy"),
+        ("Circuit breaker",      "Topic contains 'unsafe' → 3 reviewer rejects → gate flagged ⚠"),
+        ("Media-only (no gate)", "Content types WITHOUT 'text', e.g. 'brand, video'"),
+        ("No-brand path",        "Brand id = blank (steers on tone only, never reads the store)"),
+        ("Text / voice intake",  "Brief step → choose 2 or 3 (vs 1 = manual)"),
+        ("Learning + read-back", "Set Brand id + User id, then 'Learn this conversation?' = Y"),
+    ]
+    for name, how in rows:
+        print(f"  • {name:<21} {how}")
+
+
 def _force_mock() -> None:
     """Pin every service to its mock so the harness exercises all features offline,
     deterministically — even if .env points at real (and rate-limited) backends."""
@@ -296,6 +321,7 @@ async def main() -> None:
     _section(get_settings().mode_banner())
     print("\n  Interactive harness — drive every feature by hand (mock by default).")
     print("  Seats at the table: platform_editor · brand_voice · user_advocate · audience_advocate · you")
+    _cheat_sheet()
 
     while True:
         try:

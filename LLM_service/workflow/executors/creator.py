@@ -44,7 +44,14 @@ def _user_skill_block(doc: UserSkillDoc, platform: str) -> str:
     return "\n".join(sections)
 
 
-async def _draft_one(brief: Brief, platform: str, strategy: str, attempt: int) -> Draft:
+async def _draft_one(
+    brief: Brief,
+    platform: str,
+    strategy: str,
+    attempt: int,
+    feedback: str = "",
+    prior_draft: str = "",
+) -> Draft:
     # Dynamic layer: read the brand profile ONLY for a branded user. No-brand users
     # (business_id is None) never touch the store — they steer on brief.tone_hint.
     must_do: list[str] = []
@@ -76,6 +83,8 @@ async def _draft_one(brief: Brief, platform: str, strategy: str, attempt: int) -
         skill=load_skill(platform),  # static layer: the platform style guide
         attempt=attempt,
         user_skills=user_skills,     # per-user layer: this user's learned rules
+        feedback=feedback,           # rework layer: why the prior draft was rejected
+        prior_draft=prior_draft,     # rework layer: the rejected copy to fix
     )
     return Draft(platform=platform, text=text, attempt=attempt, brief=brief, strategy=strategy)
 
@@ -97,8 +106,15 @@ class CreatorExecutor(Executor):
     async def redraft(self, outcome: ReviewOutcome, ctx: WorkflowContext[Draft]) -> None:
         """Re-draft a single rejected platform (from the reviewer's retry edge or a
         human reject). `retry_count` carries how many rejections happened before this
-        attempt, so the next attempt number is retry_count + 1."""
+        attempt, so the next attempt number is retry_count + 1. `comment` carries the
+        rejection reason (the human's gate comment or the reviewer's note) and `text`
+        the rejected draft, so the rework fixes what was flagged rather than rerolling."""
         draft = await _draft_one(
-            outcome.brief, outcome.platform, outcome.strategy, attempt=outcome.retry_count + 1
+            outcome.brief,
+            outcome.platform,
+            outcome.strategy,
+            attempt=outcome.retry_count + 1,
+            feedback=outcome.comment,
+            prior_draft=outcome.text,
         )
         await ctx.send_message(draft)

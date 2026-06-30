@@ -5,9 +5,9 @@ Integration guide for the content-generation service (`LLM_service/api.py`).
 ## How it works (30-second overview)
 
 ```
-  POST /intake  ─► turns ─► GET /intake/{sid}/brief
-                                      │
-                              POST /tasks (post the brief)
+  POST /intake (session_id + target_platforms) ─► [turns?] ─► GET /intake/{sid}/brief
+                                      │  ── reuse the SAME session_id ──┐
+                              POST /tasks (post the brief)  ◄───────────┘
                                       │
                               GET /tasks/{id}/events  ← SSE live progress
                                       │  (optional roundtable discussion streams here too)
@@ -19,8 +19,12 @@ Integration guide for the content-generation service (`LLM_service/api.py`).
                               POST /tasks/{id}/confirm-learning  ← opt in to learning (optional)
 ```
 
-1. **Intake** — a short conversation that builds a `CreativeBrief`. Continue turns until `complete: true`, then fetch the brief.
-2. **Workflow** — post the brief to start the run. The service drafts content per platform, pauses for human review, then finalizes.
+1. **Intake** — the service **analyses the opening message** and builds the `CreativeBrief` in
+   one pass. Platforms come from the backend (`target_platforms`, never asked); only a genuinely
+   missing topic/goal triggers a short follow-up (capped at 3). A self-contained opening returns
+   `complete: true` on the **first** call — no `/turn` needed. Then fetch the brief.
+2. **Workflow** — post the brief to start the run, **reusing the intake `session_id`** (one
+   conversation = one id). The service drafts content per platform, pauses for human review, then finalizes.
 3. **Progress** streams over **SSE** (`GET /tasks/{id}/events`). Review resumes over REST.
 4. **Optional extras:** with `ROUNDTABLE_ENABLED` the run opens with a multi-persona discussion you can join ([Roundtable](#roundtable-optional)); after completion, `POST /tasks/{id}/confirm-learning` makes the service learn from the run.
 
@@ -50,23 +54,36 @@ Built on **FastAPI** (ASGI, served by uvicorn). The Python LLM service is consum
 ### `POST /intake` — start a session
 
 ```json
-{ "mode": "text", "opening_input": "Post about our autumn cold brew launch" }
+{ "mode": "text", "session_id": "sess-1a2b3c4d5e6f",
+  "target_platforms": ["linkedin", "instagram"],
+  "opening_input": "Post about our autumn cold brew launch to drive newsletter signups" }
 ```
 
 | Field | Type | Required |
 |---|---|---|
 | `mode` | `"text"` or `"voice"` | ✅ |
-| `opening_input` | string | optional |
+| `session_id` | string | ✅ — the conversation id you reuse at `POST /tasks` (one conversation = one session) |
+| `target_platforms` | string[] | recommended — the platforms the user already picked in the UI. **Seeded into the brief so intake never asks about platforms.** |
+| `opening_input` | string | optional (but recommended — it's what the LLM analyses) |
 | `user_id` | string | optional — tags the session for per-user learning |
+
+**Intake is analyse-first, not an interrogation.** From `opening_input` the LLM extracts as much
+of the brief as it can in **one pass** (topic + goal; platforms come from `target_platforms`). If
+the opening already carries everything, the session returns `complete: true` immediately — **zero
+follow-up questions**. Only a genuinely missing field triggers a short clarifier, and at most
+**3** of them; after that the service fills any gap itself (scouts a topic, derives a goal) so
+intake always terminates. A self-contained opening therefore needs no `/turn` calls at all.
 
 **Response:**
 ```json
 {
   "intake_mode": "text",
-  "session_id": "intake-1a2b3c4d5e6f",
-  "assistant_message": "Which platforms should I write for?",
-  "brief_partial": { "topic": "our autumn cold brew launch" },
-  "complete": false
+  "session_id": "sess-1a2b3c4d5e6f",
+  "assistant_message": "Great — I've got everything: '…' for linkedin, instagram — to …. Handing this to the newsroom.",
+  "brief_partial": { "topic": "our autumn cold brew launch",
+                     "target_platforms": ["linkedin", "instagram"],
+                     "user_intent": "drive newsletter signups" },
+  "complete": true
 }
 ```
 
@@ -114,8 +131,12 @@ Post a `CreativeBrief` (from intake) or build one directly:
 | `tone_hint` | string | optional | voice hint for users without a brand |
 | `route` | string | optional | from intake; default `direct_generation` |
 | `content_types` | string[] | optional | Which deliverables to produce — any combination of `"text"` (post copy), `"brand"` (animated HTML card; `"html"` accepted as an alias), `"video"` (BrandVideoProps spec). **Omitted → `["text"]`.** Omitting `text` (brand/video only) is a **media-only** run: there is no copy to draft, so the review gate is skipped and the brief goes straight to media generation — the task completes with **no `awaiting_review` step**. Unknown values or an empty list → `400`. |
-| `task_id` | string | optional | supply your own; else auto-generated |
-| `session_id` | string | optional | intake session id; threads its transcript in for per-user learning |
+| `session_id` | string | recommended | The conversation id from the intake session (e.g. `sess-…`). **Pass the same id you used for `POST /intake`** — the run and every `/tasks/{id}/*` op key on it, so intake + generation are **one session** with one id. Its intake transcript is also threaded in for per-user learning. |
+| `task_id` | string | optional | Deprecated alias for `session_id` (back-compat); used only when `session_id` is omitted. Auto-generated (`task-…`) if both are absent. |
+
+> **One conversation = one session.** Intake and generation no longer use separate ids — the
+> backend supplies a `session_id` at `POST /intake` and reuses it at `POST /tasks`, so the
+> `{task_id}` path param on every `/tasks/{id}/*` endpoint below **is that same `session_id`**.
 
 **Response:** task snapshot (see below), `status: "awaiting_review"` — **or `"completed"` straight
 away for a media-only run** (no `text`, so no review gate; see the `content_types` row above).
@@ -220,11 +241,15 @@ Resume the paused run. You can address one or more pending platforms at a time; 
 }
 ```
 
-| `decision` | Effect |
-|---|---|
-| `approve` | Platform finalized |
-| `approve_after_edit` | Finalized with your text (the edit is recorded for later learning) |
-| `reject` | Platform re-drafts and returns to `awaiting_review` |
+| `decision` | Effect | Relevant field |
+|---|---|---|
+| `approve` | Platform finalized | — |
+| `approve_after_edit` | Finalized with your text (the edit is recorded for later learning) | `edited_draft` (required) |
+| `reject` | Platform **reworks against your `reason`** and returns to `awaiting_review` | `reason` (optional, but steers the rework) |
+
+On `reject`, the `reason` is not just logged — it is threaded into the re-draft (together with the
+rejected copy), so the regenerated post reworks to address that specific feedback rather than
+blindly rerolling. Send a concrete `reason` ("too formal, add a customer stat") to steer the rework.
 
 **Response:** updated task snapshot. All platforms resolved → `status: "completed"`.
 
@@ -274,7 +299,7 @@ Returned by `POST /tasks`, `POST /tasks/{id}/review`, and this endpoint:
 
 ```json
 {
-  "task_id": "task-1a2b3c4d5e6f",
+  "task_id": "sess-1a2b3c4d5e6f",
   "status": "awaiting_review",
   "pending": [
     { "request_id": "...", "platform": "linkedin", "draft": "...",
@@ -506,7 +531,7 @@ record CreativeBrief(String topic, List<String> target_platforms, String user_in
                      String intake_mode) {}
 
 // Workflow
-record Verdict(String decision, String edited_draft, String reason) {}
+record Verdict(String decision, String edited_draft, String reason) {}  // reason: reject feedback — steers the rework
 record ReviewRequest(Map<String,Verdict> verdicts) {}
 record ConfirmLearning(boolean learn) {}
 record Tag(String kind, String rule, boolean keep) {}
@@ -610,6 +635,9 @@ new Thread(() -> {
 // 4. Approve all pending platforms
 Map<String, Verdict> verdicts = new HashMap<>();
 t.pending().forEach(p -> verdicts.put(p.platform(), new Verdict("approve", null, null)));
+// To reject with feedback instead → new Verdict("reject", null, "too formal, add a customer stat")
+//   the reason is threaded into the re-draft, so the platform reworks to fix that point and
+//   returns to "awaiting_review" (review it again); edit → new Verdict("approve_after_edit", "...your copy...", null)
 t = nr.review(id, new ReviewRequest(verdicts));   // status: "completed"
 
 // t.outputs() now holds the finalized drafts
@@ -621,4 +649,4 @@ t = nr.review(id, new ReviewRequest(verdicts));   // status: "completed"
 - After a disconnect, call `GET /tasks/{id}` to get the latest snapshot; SSE replays from the beginning when you reconnect.
 - Use a stable `business_id` (and `user_id`) per customer so the service learns their style over time. After the task is `completed`, call `/confirm-learning` (`{"learn": true}`) to persist what it learned from the run — both brand-voice rules and per-user preferences, in one step.
 - `pending[].needs_human_intervention: true` means the platform exhausted retries — show a special warning rather than a normal review prompt.
-- When a platform is rejected, it re-runs and its SSE events repeat. Key your UI by `task_id + platform + round` if you need to track per-round history.
+- When a platform is rejected, it re-runs and its SSE events repeat — and the `reason` you send is **threaded into the re-draft** (together with the rejected copy), so a concrete reason ("too formal, add a customer stat") makes the next draft fix that specific point instead of rerolling blindly. Collect a short rejection comment in your review UI and pass it as `reason`. Key your UI by `task_id + platform + round` if you need to track per-round history.

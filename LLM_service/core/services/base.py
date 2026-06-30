@@ -107,6 +107,8 @@ class LLMService(ABC):
         attempt: int = 1,
         user_skills: str = "",
         history: Optional[List[dict]] = None,
+        feedback: str = "",
+        prior_draft: str = "",
     ) -> str:
         """Return ready-to-publish, platform-native post copy (a real post the user
         can copy-paste — hook, body, CTA, hashtags/emojis — not an outline),
@@ -119,7 +121,12 @@ class LLMService(ABC):
         angle/hook on attempt > 1 rather than repeating the rejected copy. `user_skills`
         is a pre-rendered MUST DO / MUST AVOID block of the current user's learned rules
         (the per-`user_id` channel), injected alongside the static `skill`; empty for
-        users with no learned rules. `history` is the prior conversation as a list of
+        users with no learned rules. `feedback` is the specific reason the prior draft
+        was rejected (the human's gate comment, or the reviewer's safety/brand note) and
+        `prior_draft` is the rejected copy itself — both populated only on a re-draft
+        (attempt > 1): an impl MUST address that feedback head-on and rework the prior
+        draft rather than rerolling blindly, so the regenerated copy visibly fixes what
+        was flagged. `history` is the prior conversation as a list of
         {role, content} messages, supplied by the caller (the backend looks it up by
         conversation id and assembles the payload — this service stays stateless): an
         impl folds it in as prior turns so a follow-up like "make it punchier" continues

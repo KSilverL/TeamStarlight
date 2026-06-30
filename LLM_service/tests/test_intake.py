@@ -29,9 +29,10 @@ _MULTI_TURNS = ["LinkedIn and Instagram", "drive signups from local coffee lover
 _COPILOT = "Help me think of what to post on LinkedIn to promote our launch"
 
 
-async def _drive(session, opening, turns):
-    """Run a scripted conversation; return (CreativeBrief, [assistant_messages])."""
-    result = await session.start(opening)
+async def _drive(session, opening, turns, session_id="sess-test"):
+    """Run a scripted conversation; return (CreativeBrief, [assistant_messages]).
+    `session_id` is backend-supplied now (one conversation == one session)."""
+    result = await session.start(session_id, opening)
     sid = result["session_id"]
     messages = [result["assistant_message"]]
     for turn in turns:
@@ -88,20 +89,58 @@ def test_both_entries_share_one_engine_and_assets():
 
 async def test_multi_turn_fills_brief_incrementally():
     session = TextIntake()
-    started = await session.start(_MULTI_OPEN)
+    # Platforms are backend-supplied now: intake seeds them and never asks. Only the goal,
+    # which the sparse opening didn't state, needs a single clarifying follow-up.
+    started = await session.start("sess-multi", _MULTI_OPEN, target_platforms=["linkedin", "instagram"])
     sid = started["session_id"]
     assert started["complete"] is False
-    assert started["brief_partial"].get("topic")            # topic captured from opening
-    assert "target_platforms" not in started["brief_partial"]  # still to ask
-
-    after_platforms = await session.send_user_turn(sid, _MULTI_TURNS[0])
-    assert after_platforms["brief_partial"]["target_platforms"] == ["linkedin", "instagram"]
-    assert after_platforms["complete"] is False
+    assert started["brief_partial"].get("topic")                                   # topic from opening
+    assert started["brief_partial"]["target_platforms"] == ["linkedin", "instagram"]  # seeded, not asked
+    assert "user_intent" not in started["brief_partial"]                           # the one thing to clarify
 
     done = await session.send_user_turn(sid, _MULTI_TURNS[1])
     assert done["complete"] is True
     brief = await session.get_brief(sid)
+    assert brief.target_platforms == ["linkedin", "instagram"]
     assert brief.user_intent == "drive signups from local coffee lovers"
+
+
+async def test_rich_opening_completes_with_zero_followups():
+    """The whole point of the simplification: a self-contained opening + backend platforms
+    finishes in one pass — no questions asked, even though the opening never named a platform."""
+    session = TextIntake()
+    started = await session.start(
+        "sess-rich",
+        "Post about our Ethiopia harvest to drive newsletter signups",  # topic + goal, no platform
+        target_platforms=["linkedin", "instagram"],
+    )
+    assert started["complete"] is True                       # zero follow-ups
+    brief = await session.get_brief(started["session_id"])
+    assert brief.topic and brief.user_intent
+    assert brief.target_platforms == ["linkedin", "instagram"]  # came from the backend, never asked
+
+
+async def test_followups_are_capped_then_force_completed():
+    """A user who never supplies the goal is not interrogated forever: after MAX_INTAKE_FOLLOWUPS
+    clarifiers the engine fills the gaps itself (scout topic / default goal) and completes."""
+    from LLM_service.intake.base import MAX_INTAKE_FOLLOWUPS
+
+    session = TextIntake()
+    started = await session.start("sess-cap", None, target_platforms=["linkedin"])
+    assert started["complete"] is False
+    sid = started["session_id"]
+
+    # Answer every clarifier with whitespace (no usable signal); the cap must still terminate.
+    result = started
+    for _ in range(MAX_INTAKE_FOLLOWUPS + 1):
+        if result["complete"]:
+            break
+        result = await session.send_user_turn(sid, "   ")
+    assert result["complete"] is True
+
+    brief = await session.get_brief(sid)
+    assert brief.topic and brief.user_intent                 # gaps filled by the force-complete
+    assert brief.route == "copilot_mode"                     # topic came from the scout fallback
 
 
 # ── copilot_mode: scout proposes a topic when the user is unsure ──────────────
@@ -130,7 +169,7 @@ async def test_brief_feeds_workflow_unchanged():
 
 async def test_get_brief_before_complete_raises():
     session = TextIntake()
-    started = await session.start(_MULTI_OPEN)  # incomplete (no platforms/intent yet)
+    started = await session.start("sess-incomplete", _MULTI_OPEN)  # incomplete (no platforms/intent yet)
     with pytest.raises(ValueError):
         await session.get_brief(started["session_id"])
 
@@ -144,8 +183,8 @@ def test_build_intake_rejects_unknown_mode():
 
 async def test_intake_service_text_and_voice_match():
     svc = IntakeService()
-    text = await svc.start("text", _ONE_SHOT)
-    voice = await svc.start("voice", _ONE_SHOT)
+    text = await svc.start("text", "sess-text", _ONE_SHOT)
+    voice = await svc.start("voice", "sess-voice", _ONE_SHOT)
     assert text["complete"] and voice["complete"]
     tb = await svc.get_brief(text["session_id"])
     vb = await svc.get_brief(voice["session_id"])
@@ -157,7 +196,7 @@ async def test_intake_service_unknown_session_and_bad_mode():
     from LLM_service.api import ApiError
     svc = IntakeService()
     with pytest.raises(ApiError) as bad_mode:
-        await svc.start("hologram", None)
+        await svc.start("hologram", "sess-bad", None)
     assert bad_mode.value.status == 400
     with pytest.raises(ApiError) as missing:
         await svc.turn("nope", "hi")
@@ -175,9 +214,13 @@ def http_server():
 def test_http_intake_then_start_workflow(http_server):
     with httpx.Client(timeout=10) as client:
         # multi-turn text intake over HTTP
-        started = client.post(f"{http_server}/intake", json={"mode": "text", "opening_input": _MULTI_OPEN})
+        started = client.post(
+            f"{http_server}/intake",
+            json={"mode": "text", "session_id": "sess-http", "opening_input": _MULTI_OPEN},
+        )
         assert started.status_code == 200 and started.json()["complete"] is False
         sid = started.json()["session_id"]
+        assert sid == "sess-http"  # backend-supplied id is echoed back, not regenerated
 
         client.post(f"{http_server}/intake/{sid}/turn", json={"user_input": _MULTI_TURNS[0]})
         done = client.post(f"{http_server}/intake/{sid}/turn", json={"user_input": _MULTI_TURNS[1]})
@@ -187,12 +230,16 @@ def test_http_intake_then_start_workflow(http_server):
         assert brief["intake_mode"] == "text"
         assert set(brief) >= {"topic", "target_platforms", "user_intent", "route", "intake_mode"}
 
-        # the brief starts a workflow unchanged
-        task = client.post(f"{http_server}/tasks", json=brief)
+        # the brief starts a workflow unchanged — reusing the SAME session id, so intake
+        # and generation are one session: the task keys on the intake session_id.
+        task = client.post(f"{http_server}/tasks", json={**brief, "session_id": sid})
         assert task.status_code == 200 and task.json()["status"] == "awaiting_review"
+        assert task.json()["task_id"] == sid
 
         # validation
-        assert client.post(f"{http_server}/intake", json={"mode": "smoke-signals"}).status_code == 400
+        assert client.post(
+            f"{http_server}/intake", json={"mode": "smoke-signals", "session_id": "sess-x"}
+        ).status_code == 400
         assert client.get(f"{http_server}/intake/nope/brief").status_code == 404
 
 
@@ -203,7 +250,9 @@ def test_voice_websocket_bridges_a_turn():
 
     app = create_app()
     client = TestClient(app)
-    started = client.post("/intake", json={"mode": "voice", "opening_input": _MULTI_OPEN})
+    started = client.post(
+        "/intake", json={"mode": "voice", "session_id": "sess-ws", "opening_input": _MULTI_OPEN}
+    )
     sid = started.json()["session_id"]
 
     with client.websocket_connect(f"/intake/{sid}/voice") as ws:

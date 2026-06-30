@@ -76,7 +76,7 @@ async def test_scenario_no_brand_user_skips_store(make_brief, monkeypatch):
 
 async def test_scenario_vague_idea_copilot_voice():
     session = build_intake("voice")
-    started = await session.start("Help me think of what to post on LinkedIn to promote our launch")
+    started = await session.start("sess-copilot", "Help me think of what to post on LinkedIn to promote our launch")
     assert started["complete"] is True                    # scout fills the topic in one turn
 
     brief = await session.get_brief(started["session_id"])

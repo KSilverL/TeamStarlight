@@ -148,17 +148,19 @@ def test_http_confirm_learning_round_trip():
         with httpx.Client(timeout=10) as client:
             # 1) Open an intake session — its transcript threads into the task.
             sid = client.post(f"{base_url}/intake", json={
-                "mode": "text", "user_id": "u_http",
+                "mode": "text", "session_id": "sess-learn", "user_id": "u_http",
                 "opening_input": "Post about ethiopia harvest on linkedin; always mention fair-trade sourcing",
             }).json()["session_id"]
 
-            # 2) Start a task with the user + intake session id.
+            # 2) Start a task reusing the SAME session id — one conversation, one session,
+            # so the task keys on the intake session_id (task_id == sid).
             started = client.post(f"{base_url}/tasks", json={
                 "topic": "ethiopia harvest", "target_platforms": ["linkedin"],
                 "user_id": "u_http", "session_id": sid,
             })
             assert started.status_code == 200
             task_id = started.json()["task_id"]
+            assert task_id == sid
             assert started.json()["status"] == "awaiting_review"
 
             # 3) Approve, then confirm learning from the adopted session.

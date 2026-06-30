@@ -144,12 +144,24 @@ class AzureLLM(LLMService):
         attempt: int = 1,
         user_skills: str = "",
         history: Optional[List[dict]] = None,
+        feedback: str = "",
+        prior_draft: str = "",
     ) -> str:
-        revision = (
-            f" This is revision #{attempt}; a previous version was rejected — take a "
-            "clearly different angle and hook, do not repeat the rejected copy."
-            if attempt > 1 else ""
-        )
+        # On a re-draft, steer with the specific reason the prior version was rejected
+        # (the human's gate comment / the reviewer's note) rather than a generic "vary
+        # the angle" nudge, so the rework directly fixes what was flagged.
+        if attempt > 1:
+            revision = f" This is revision #{attempt}; a previous version was rejected."
+            if feedback:
+                revision += (
+                    f" The reviewer's exact feedback was: \"{feedback}\". Rework the copy "
+                    "to fix this specific point head-on — do not ignore it or merely "
+                    "reshuffle the hook."
+                )
+            else:
+                revision += " Take a clearly different angle and hook, do not repeat the rejected copy."
+        else:
+            revision = ""
         style_guide = f"\n\nFollow this platform style guide exactly:\n{skill}" if skill else ""
         learned = f"\n\nThis user's learned writing rules:\n{user_skills}" if user_skills else ""
         system = (
@@ -161,9 +173,14 @@ class AzureLLM(LLMService):
             f"Must do: {must_do or 'n/a'}. Must avoid: {must_avoid or 'n/a'}. "
             f"Tone: {tone_hint or 'brand voice'}.{revision}{style_guide}{learned}"
         )
+        # Show the rejected draft so the model reworks the real copy, not a blank slate.
+        rejected = (
+            f"\n\nThe rejected draft was:\n{prior_draft}\nRevise it to fix the feedback above."
+            if prior_draft else ""
+        )
         user = (
             f"Topic: {topic}\nStrategy: {strategy}\nGoal: {user_intent}\n"
-            f"Positive examples: {examples or 'n/a'}"
+            f"Positive examples: {examples or 'n/a'}{rejected}"
         )
         # Prior turns (assembled by the caller from the conversation store) go between
         # the system prompt and the current request, so a follow-up continues the thread.
