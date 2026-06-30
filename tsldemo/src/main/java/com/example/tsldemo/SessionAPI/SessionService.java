@@ -11,8 +11,10 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.client.RestClient;
 
+import com.example.tsldemo.ApiDTOS;
 import com.example.tsldemo.Business;
 import com.example.tsldemo.Message;
 import com.example.tsldemo.Session;
@@ -39,6 +41,7 @@ public class SessionService {
     
     //TODO: clean function
     public IntakeRespDTO createSession(IntakeReqDTO intakeDTO, int businessId) {
+    	System.out.println("in create session");
     	Session session = new Session();
         String sessionId = session.getId();
         
@@ -74,6 +77,16 @@ public class SessionService {
     }
     
     
+    public ApiDTOS.IntakeTurnResponse getIntakeTurn(String prompt, String sessionId) {
+    	return restClient.post()
+                .uri(llmServiceBaseUrl + "/intake/" + sessionId + "/turn")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new ApiDTOS.IntakeTurnRequest(prompt))
+                .retrieve()
+                .body(ApiDTOS.IntakeTurnResponse.class);
+    	
+    }
+    
 	public void addSession(Session s) {
 		repo.save(s);
 	}
@@ -90,12 +103,11 @@ public class SessionService {
 		return repo.findById(id);
 	}
 
-	public String updateSession(String id, Message msg) {
+	public void updateSession(String id, Message msg) {
 		Session s = repo.getReferenceById(id);
 		s.addMessage(msg);
 		repo.save(s);
 		
-		return null;
 	}
 	
 }
