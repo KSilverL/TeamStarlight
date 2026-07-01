@@ -17,9 +17,9 @@ import com.example.tsldemo.auth.JwtUtil;
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.ObjectMapper;
 
+import com.example.tsldemo.ApiDTOS.IntakeRequest;
 import com.example.tsldemo.Message;
 import com.example.tsldemo.Session;
-import com.example.tsldemo.DTOs.Request.IntakeReqDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.IntakeRespDTO;
 import com.example.tsldemo.DTOs.ResponseToFrontEnd.FrontIntakeRespDTO;
 
@@ -53,7 +53,7 @@ public class SessionController {
 	// Must call this first to create a session before any other
 	@PostMapping("/api/sessions")
 	public IntakeRespDTO addSession(
-			@RequestBody IntakeReqDTO intakeDTO,
+			@RequestBody IntakeRequest intakeDTO,
 			@RequestHeader(value = "Authorization", required = false) String authHeader) {
 		
 		int businessId = jwtUtil.extractBusinessId(authHeader);

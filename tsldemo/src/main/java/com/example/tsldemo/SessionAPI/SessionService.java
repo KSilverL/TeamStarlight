@@ -15,10 +15,10 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.client.RestClient;
 
 import com.example.tsldemo.ApiDTOS;
+import com.example.tsldemo.ApiDTOS.IntakeRequest;
 import com.example.tsldemo.Business;
 import com.example.tsldemo.Message;
 import com.example.tsldemo.Session;
-import com.example.tsldemo.DTOs.Request.IntakeReqDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.IntakeRespDTO;
 import com.example.tsldemo.SignInAPI.BusinessRepository;
 
@@ -40,27 +40,24 @@ public class SessionService {
     }
     
     //TODO: clean function
-    public IntakeRespDTO createSession(IntakeReqDTO intakeDTO, int businessId) {
+    public IntakeRespDTO createSession(IntakeRequest intakeDTO, int businessId) {
     	System.out.println("in create session");
     	Session session = new Session();
         String sessionId = session.getId();
+        intakeDTO.sessionId = sessionId;
         
         repo.save(session);
         
-        Map<String, Object> body = new HashMap<>();
-        body.put("session_id", sessionId);
-        body.put("opening_user_input", intakeDTO.openingInput());
-        body.put("mode", "text"); 
       
         //TODO: Fix IntakeReqDTO
         IntakeRespDTO intakeResp = restClient.post()
                 .uri(llmServiceBaseUrl + "/intake")
                 .contentType(MediaType.APPLICATION_JSON)
-                .body(body)
+                .body(intakeDTO)
                 .retrieve()
                 .body(IntakeRespDTO.class);
                 
-        Message userPrompt = new Message("user", intakeDTO.openingInput());
+        Message userPrompt = new Message("user", intakeDTO.openingInput);
         Message openingMessage = new Message("assistant",intakeResp.assistantMessage());
         
         session.addMessage(userPrompt);
