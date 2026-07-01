@@ -137,7 +137,6 @@ class Settings:
     azure_openai_api_key: Optional[str] = None
     azure_openai_api_version: str = "2024-02-01"
     azure_chat_deployment: str = "gpt-4o"
-    foundry_project_endpoint: Optional[str] = None
 
     # ── Azure AI Content Safety (reviewer) ─────────────────────────────────────
     azure_content_safety_endpoint: Optional[str] = None
@@ -201,11 +200,10 @@ class Settings:
     # Per-user learning write-back from the roundtable (transcript + interjections + verdict).
     # LEARNING_ENABLED=false still READS stored skills but writes none (regression/isolation).
     learning_enabled: bool = True
-    preference_summary_model: Optional[str] = None  # cheap tier for the prod summary call
-
-    # ── Backend status webhook (legacy transport; SSE replaces it in M2) ───────
-    webhook_url: str = "http://localhost:9999/status"
-    webhook_enabled: Optional[bool] = None
+    # Cheap tier for the prod per-user preference summary call. Defaults to the same
+    # rate-limit-friendly deployment as the roundtable personas (ROUNDTABLE_PERSONA_MODEL);
+    # PREFERENCE_SUMMARY_MODEL overrides it. None → fall back to the main chat deployment.
+    preference_summary_model: Optional[str] = None
 
     # ── Per-service resolution: override > global > default ─────────────────────
     def mock_llm(self) -> bool:
@@ -219,11 +217,6 @@ class Settings:
 
     def mock_voice(self) -> bool:
         return self.use_mock if self.use_mock_voice is None else self.use_mock_voice
-
-    def notify_via_webhook(self) -> bool:
-        """Whether status events are POSTed to the backend webhook. Defaults to
-        production-only; WEBHOOK_ENABLED overrides (e.g. to test the receiver)."""
-        return (not self.use_mock) if self.webhook_enabled is None else self.webhook_enabled
 
     # ── Credential presence checks (used by production impls / factory) ─────────
     @property
@@ -267,7 +260,6 @@ def _load() -> Settings:
         azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
         azure_openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
         azure_chat_deployment=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4o"),
-        foundry_project_endpoint=os.getenv("FOUNDRY_PROJECT_ENDPOINT"),
         azure_content_safety_endpoint=os.getenv("AZURE_CONTENTSAFETY_ENDPOINT")
         or os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT"),
         azure_content_safety_key=os.getenv("AZURE_CONTENTSAFETY_KEY")
@@ -298,9 +290,11 @@ def _load() -> Settings:
         roundtable_persona_api_key=os.getenv("AZURE_PERSONA_API_KEY"),
         roundtable_user_turn_timeout=_env_float("ROUNDTABLE_USER_TURN_TIMEOUT", 300.0),
         learning_enabled=True if learning is None else learning,
-        preference_summary_model=os.getenv("PREFERENCE_SUMMARY_MODEL"),
-        webhook_url=os.getenv("WEBHOOK_URL", "http://localhost:9999/status"),
-        webhook_enabled=_env_bool("WEBHOOK_ENABLED"),
+        # The per-user summary call reuses the cheap persona deployment by default
+        # (ROUNDTABLE_PERSONA_MODEL); PREFERENCE_SUMMARY_MODEL overrides if set.
+        preference_summary_model=(
+            os.getenv("PREFERENCE_SUMMARY_MODEL") or os.getenv("ROUNDTABLE_PERSONA_MODEL")
+        ),
     )
 
 

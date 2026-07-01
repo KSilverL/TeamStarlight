@@ -19,6 +19,8 @@ user_skills table.
 
 from __future__ import annotations
 
+import time
+
 import httpx
 
 from LLM_service.api import WorkflowService, create_app
@@ -161,7 +163,12 @@ def test_http_confirm_learning_round_trip():
             assert started.status_code == 200
             task_id = started.json()["task_id"]
             assert task_id == sid
-            assert started.json()["status"] == "awaiting_review"
+            # POST /tasks is non-blocking — it returns `running` and drives in the background.
+            assert started.json()["status"] == "running"
+            for _ in range(200):
+                if client.get(f"{base_url}/tasks/{task_id}").json()["status"] == "awaiting_review":
+                    break
+                time.sleep(0.02)
 
             # 3) Approve, then confirm learning from the adopted session.
             client.post(f"{base_url}/tasks/{task_id}/review",

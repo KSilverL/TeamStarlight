@@ -73,11 +73,13 @@ class AzureLLM(LLMService):
             )
         return self._client
 
-    async def _complete(self, messages: List[dict]) -> str:
-        """Single seam through which all chat traffic flows (overridable in tests)."""
+    async def _complete(self, messages: List[dict], *, model: Optional[str] = None) -> str:
+        """Single seam through which all chat traffic flows (overridable in tests).
+        `model` overrides the deployment for one call (e.g. the cheap summary tier);
+        None → the main chat deployment."""
         client = self._ensure_client()
         resp = await client.chat.completions.create(
-            model=self._settings.azure_chat_deployment,
+            model=model or self._settings.azure_chat_deployment,
             messages=messages,
         )
         return resp.choices[0].message.content or ""
@@ -326,11 +328,14 @@ class AzureLLM(LLMService):
             "Read the transcript of the user's own turns (roundtable discussion turns and/or "
             "their intake turns) and their final verdicts/edits, then list 0-3 concrete "
             "preferences. Each must trace to a specific user turn or edit. Reply with ONLY a "
-            'JSON array of {"skill": str, "evidence": str}. Uses the cheap summary tier.'
+            'JSON array of {"skill": str, "evidence": str}.'
         )
         user = json.dumps({"transcript": transcript, "verdicts": verdicts})
+        # Runs on the cheap summary tier (PREFERENCE_SUMMARY_MODEL / ROUNDTABLE_PERSONA_MODEL),
+        # falling back to the main deployment when neither is set.
         raw = await self._complete(
-            [{"role": "system", "content": system}, {"role": "user", "content": user}]
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model=self._settings.preference_summary_model,
         )
         items = json.loads(_strip_fences(raw))
         out: List[dict] = []
@@ -339,6 +344,43 @@ class AzureLLM(LLMService):
             if skill:
                 out.append({"skill": skill, "evidence": item.get("evidence", "")})
         return out[:3]
+
+    async def summarize_handoff(
+        self,
+        *,
+        transcript: List[dict],
+        verdicts: List[dict],
+    ) -> dict:
+        system = (
+            "You write a short handoff recap of a finished content-strategy session so the NEXT "
+            "session can continue the thread. From the transcript (the user's turns and the "
+            "discussion) and the final verdicts/edits, capture only what should carry forward. "
+            "Reply with ONLY a JSON object: "
+            '{"topic": str|null, "prior_strategy_summary": str|null, '
+            '"approved_directions": [str], "rejected_directions": [str], "user_notes": [str]}. '
+            "Keep each list to at most 5 short items; do not invent anything not in the input."
+        )
+        user = json.dumps({"transcript": transcript, "verdicts": verdicts})
+        raw = await self._complete(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        )
+        data = json.loads(_strip_fences(raw))
+
+        def _str_or_none(value):
+            return value if isinstance(value, str) and value.strip() else None
+
+        def _str_list(value):
+            return [v for v in value if isinstance(v, str) and v.strip()][:5] if isinstance(value, list) else []
+
+        # Shape strictly to the PriorSessionContext content keys (no parent_session_id — the caller
+        # attaches it), so the consumer can splat this straight into the model.
+        return {
+            "topic": _str_or_none(data.get("topic")),
+            "prior_strategy_summary": _str_or_none(data.get("prior_strategy_summary")),
+            "approved_directions": _str_list(data.get("approved_directions")),
+            "rejected_directions": _str_list(data.get("rejected_directions")),
+            "user_notes": _str_list(data.get("user_notes")),
+        }
 
     async def _complete_with_tools(self, messages: List[dict], tools: List[dict]) -> dict:
         """Function-calling completion. Returns {"content": str, "tool_calls":

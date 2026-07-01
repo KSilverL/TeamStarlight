@@ -8,7 +8,7 @@ Integration guide for the content-generation service (`LLM_service/api.py`).
   POST /intake (session_id + target_platforms) ─► [turns?] ─► GET /intake/{sid}/brief
                                       │  ── reuse the SAME session_id ──┐
                               POST /tasks (post the brief)  ◄───────────┘
-                                      │
+                                      │  → returns status:"running" (non-blocking; drives in background)
                               GET /tasks/{id}/events  ← SSE live progress
                                       │  (optional roundtable discussion streams here too)
                                       │  (pauses at the review gate)
@@ -24,8 +24,12 @@ Integration guide for the content-generation service (`LLM_service/api.py`).
    missing topic/goal triggers a short follow-up (capped at 3). A self-contained opening returns
    `complete: true` on the **first** call — no `/turn` needed. Then fetch the brief.
 2. **Workflow** — post the brief to start the run, **reusing the intake `session_id`** (one
-   conversation = one id). The service drafts content per platform, pauses for human review, then finalizes.
-3. **Progress** streams over **SSE** (`GET /tasks/{id}/events`). Review resumes over REST.
+   conversation = one id). `POST /tasks` is **non-blocking**: it returns immediately with
+   `status: "running"` and drives the run in the background, so you watch progress live over SSE
+   (a roundtable + drafting can take minutes). The service drafts content per platform, pauses for
+   human review, then finalizes.
+3. **Progress** streams over **SSE** (`GET /tasks/{id}/events`) — open it right after `POST /tasks`
+   to catch the gate. Review resumes over REST (`POST /review`, synchronous).
 4. **Optional extras:** with `ROUNDTABLE_ENABLED` the run opens with a multi-persona discussion you can join ([Roundtable](#roundtable-optional)); after completion, `POST /tasks/{id}/confirm-learning` makes the service learn from the run.
 
 ---
@@ -66,6 +70,18 @@ Built on **FastAPI** (ASGI, served by uvicorn). The Python LLM service is consum
 | `target_platforms` | string[] | recommended — the platforms the user already picked in the UI. **Seeded into the brief so intake never asks about platforms.** |
 | `opening_input` | string | optional (but recommended — it's what the LLM analyses) |
 | `user_id` | string | optional — tags the session for per-user learning |
+| `prior_context` | object | optional — the recap of an **earlier** session this one continues (a `PriorSessionContext` from [`POST /summarize-handoff`](#post-summarize-handoff--distil-a-finished-session-into-a-prior-context-recap)). Its **presence** means "continue that thread"; omit it (or pass `null`) for a fresh conversation. |
+
+**Continuing a prior conversation.** Pass `prior_context` to seed a new session with what an earlier
+one settled on (the last topic, the directions approved/ruled out, the user's explicit steers). The
+service folds it into the intake prompt so the same analyse-first pass resolves the new brief against
+it — a sparse "let's keep going" opening can complete without re-asking. It must carry a
+`parent_session_id`; a malformed object → `400`, and an **all-empty** recap (only `parent_session_id`,
+no distilled content) degrades back to the fresh path unchanged. The recap rides onto the resulting
+`CreativeBrief` as `prior_context` (for debug / SSE); it never blocks completion. **Durable
+preferences** (brand voice / per-user rules) are a *separate* channel — they come from
+[`POST /tasks/{id}/confirm-learning`](#post-taskstask_idconfirm-learning--opt-in-to-learning-from-this-run),
+not from `prior_context`.
 
 **Intake is analyse-first, not an interrogation.** From `opening_input` the LLM extracts as much
 of the brief as it can in **one pass** (topic + goal; platforms come from `target_platforms`). If
@@ -106,12 +122,55 @@ Call once `complete: true`. Returns the `CreativeBrief` to post to `/tasks`.
   "user_intent": "drive signups from local coffee lovers",
   "tone_hint": null,
   "business_id": null,
+  "user_id": null,
   "route": "direct_generation",
-  "intake_mode": "text"
+  "intake_mode": "text",
+  "prior_context": null
 }
 ```
 
+`user_id` and `prior_context` are always present (both `null` unless supplied at `/intake`).
 Returns `409` if the brief is not complete yet.
+
+### `POST /summarize-handoff` — distil a finished session into a prior-context recap
+
+Turn a **finished** conversation into a `PriorSessionContext` you can pass as `prior_context` on the
+**next** session's `POST /intake` — threading one conversation into the next while the service stays
+stateless. The forward-looking sibling of `/confirm-learning`: that writes *durable* rules; this
+returns *one session's* continuation seed (not persisted).
+
+```json
+{ "session_id": "sess-prev-1a2b3c",
+  "transcript": [ { "role": "user", "text": "please keep it warm and local" } ],
+  "verdicts": [ { "platform": "linkedin", "decision": "approve_after_edit",
+                  "edited_draft": "Lead with the seasonal angle." } ] }
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `session_id` | string | ✅ | the **parent** session to summarize; becomes `parent_session_id` |
+| `transcript` | object[] | optional | prior turns (`[{role\|speaker, text, platform?}]`) assembled by the backend |
+| `verdicts` | object[] | optional | the user's gate verdicts (`[{platform, decision, edited_draft?, reason?}]`) |
+
+The service is stateless — the backend assembles `transcript` + `verdicts`. (Dev convenience: if both
+are omitted and `session_id` is still a live task in the LLM-service process, that run's transcript +
+intake turns + verdicts are used.)
+
+**Response** — a `PriorSessionContext`:
+```json
+{
+  "parent_session_id": "sess-prev-1a2b3c",
+  "topic": null,
+  "prior_strategy_summary": "linkedin: Lead with the seasonal angle.",
+  "approved_directions": ["linkedin: Lead with the seasonal angle."],
+  "rejected_directions": [],
+  "user_notes": ["please keep it warm and local"]
+}
+```
+
+> **Session threading is the backend's job.** Record `parent_session_id` (or a thread id) on the new
+> `Session`; the LLM service only consumes the recap. An empty input yields an all-empty recap, which
+> the next `POST /intake` degrades back to the fresh path.
 
 ---
 
@@ -138,8 +197,14 @@ Post a `CreativeBrief` (from intake) or build one directly:
 > backend supplies a `session_id` at `POST /intake` and reuses it at `POST /tasks`, so the
 > `{task_id}` path param on every `/tasks/{id}/*` endpoint below **is that same `session_id`**.
 
-**Response:** task snapshot (see below), `status: "awaiting_review"` — **or `"completed"` straight
-away for a media-only run** (no `text`, so no review gate; see the `content_types` row above).
+**Response:** task snapshot (see below) with **`status: "running"`** and empty `pending`/`outputs`.
+`POST /tasks` is **non-blocking** — it starts the run in the background and returns immediately, so
+the roundtable discussion + drafting stream over SSE in real time instead of arriving all at once
+when a blocking call returns. **Watch `GET /tasks/{id}/events`** (or poll `GET /tasks/{id}`) for the
+run to reach `awaiting_review` (the review gate) — or `completed` for a **media-only** run (no
+`text`, so no gate; see the `content_types` row above). If a run fails, the task becomes
+`status: "error"` (with an `error` message) and the SSE stream closes on a terminal
+`{ "node": "workflow", "status": "error" }` event — it never hangs.
 
 ---
 
@@ -156,7 +221,7 @@ Each line: `data: <json>\n\n`. Switch on `type`:
 ```
 - `status`: `running` → `done` | `interrupted` (waiting for your review) | `error`
 - `platform`: set for per-platform steps, else `null`
-- A terminal `{ "node": "workflow", "status": "done" }` means the task is finished.
+- A terminal `{ "node": "workflow", "status": "done" }` means the task finished; `{ "node": "workflow", "status": "error" }` means it failed (the task is now `status: "error"`). Either one closes the stream.
 
 **`result`** — content is ready (two shapes):
 
@@ -326,9 +391,14 @@ Returned by `POST /tasks`, `POST /tasks/{id}/review`, and this endpoint:
 
 | `status` | Meaning | Next step |
 |---|---|---|
+| `running` | Generating in the background — the initial `POST /tasks` (and `/roundtable[s]`) response, until the run hits the gate or finishes | Watch SSE / poll `GET /tasks/{id}` |
 | `awaiting_review` | Paused at the review gate | `POST /tasks/{id}/review` |
 | `completed` | All platforms finalized | Read `outputs` |
-| `running` | Transient (generating) | Watch SSE |
+| `error` | The run failed (an executor raised) | Inspect the snapshot's `error` string; the SSE stream has already closed on a `workflow`/`error` event |
+
+> When `status` is `error`, the snapshot carries an extra `"error": "<message>"` field. This only
+> happens for an unexpected server-side failure mid-run; ordinary validation problems are the `4xx`
+> responses in [Error codes](#error-codes).
 
 ---
 
@@ -380,6 +450,43 @@ Enqueues your words (persisted, so a runner in another process still picks them 
 round boundary) and wakes a table that was waiting on a prior `/raise-hand`. `interrupt: true`
 jumps ahead of any backlog. **Response:** `{ "task_id": "...", "table_id": "linkedin", "queued": true,
 "pending": 1 }`. Returns `400` if `text` or `table_id` is missing.
+
+> **Each platform's hand is independent, and the check is passive.** Raise-hand / say are keyed by
+> `(task_id, table_id)`, so raising a hand on `linkedin` never affects `instagram`. Before every
+> round the moderator simply **checks that table's queue** — it never prompts you "do you want to
+> speak?"; you drive it entirely from the backend by calling `/raise-hand` + `/say` when you want in.
+> This works the same in the inline (`POST /tasks` with `ROUNDTABLE_ENABLED`) path, where the tables
+> run concurrently.
+
+### Standalone discussion runs — `POST /roundtable` / `POST /roundtables`
+
+Run **only** the discussion stage (no drafting/review/media), e.g. to show or debug the debate, or
+to get a strategy for the backend to use however it likes. Unlike the inline `ROUNDTABLE_ENABLED`
+stage in `POST /tasks`, these **do not chain into generation** — they stop at the consensus.
+
+- `POST /roundtable` — one table for a **single** `platform` (defaults to the first target platform).
+- `POST /roundtables` — **fan out** one table per `target_platforms`, concurrently.
+
+```json
+// POST /roundtable
+{ "topic": "spring single-origin harvest", "target_platforms": ["linkedin"],
+  "business_id": "biz_0012", "user_id": "u_0007", "max_rounds": 8 }
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `topic` | string | ✅ | what to debate |
+| `target_platforms` | string[] | ✅ | the platform(s) to debate |
+| `platform` | string | optional | `/roundtable` only — the single table to run; defaults to the first target platform (`/roundtables` ignores it) |
+| `business_id` / `user_id` | string | optional | seed the brand-voice / user-advocate personas |
+| `user_intent` / `tone_hint` | string | optional | brief context |
+| `max_rounds` | int | optional | per-table round cap (default `ROUNDTABLE_MAX_ROUNDS`) |
+| `task_id` | string | optional | the event-channel id; auto-generated (`rt-…`) if absent |
+
+Both are **non-blocking**: the response is `{ "task_id": "...", "status": "running", "platform"? }`.
+Watch `GET /tasks/{task_id}/events` for the `agent_utterance` turns + the `discussion_consensus`
+result(s) (separable by `table_id`), or read the finished consensus off `GET /tasks/{task_id}`
+(`outputs`). Raise-hand / say work here too, keyed by `(task_id, platform)`.
 
 ---
 
@@ -443,7 +550,7 @@ poll-then-show shape the frontend already uses for the animated card).
 { "brief": "Launch announcement for our new cold brew", "history": [] }
 ```
 ```json
-// response (202)
+// response (200)
 { "job_id": "a1b2c3d4e5f6...", "status": "done" }
 ```
 
@@ -501,11 +608,11 @@ the message.
 
 | Code | When |
 |---|---|
-| `400` | Missing/invalid fields (no `topic`, empty `target_platforms`, unknown/empty `content_types`, bad `decision`, `approve_after_edit` without `edited_draft`, `/say` or `/raise-hand` without `table_id`/`text`) |
+| `400` | Missing/invalid fields (no `topic`, empty `target_platforms`, unknown/empty `content_types`, bad `decision`, `approve_after_edit` without `edited_draft`, `/say` or `/raise-hand` without `table_id`/`text`, `/roundtable` with no resolvable `platform`) |
 | `404` | Unknown `task_id` or `session_id` |
 | `409` | Task not awaiting review, `task_id` already exists, brief not complete, or `/confirm-learning` before the task is `completed` |
 | `422` | FastAPI request-body validation (malformed JSON / wrong field types); standard FastAPI `detail` payload |
-| `500` | Unexpected server error |
+| `500` | Unexpected error on a **synchronous** call (e.g. `POST /review`). A failure during a **background** run (`POST /tasks` / `/roundtable[s]`, which already returned `running`) is **not** a `500` — the task goes `status: "error"` (with an `error` message) and the SSE stream closes on a `workflow`/`error` event. |
 
 `WS /intake/{sid}/voice` is now a real WebSocket endpoint (FastAPI native): send one
 `{"user_input": "..."}` JSON frame per turn and receive the assistant turn back; an unknown
@@ -519,34 +626,37 @@ JDK 11+ `java.net.http.HttpClient` + Jackson.
 
 ### DTOs
 
+> Configure the `ObjectMapper` with `FAIL_ON_UNKNOWN_PROPERTIES = false` (see the client below) so
+> these records stay forward-compatible: the service may include fields a record omits (e.g.
+> `prior_context` on the brief).
+
 ```java
 // Intake
-record IntakeStart(String mode, String opening_input, String user_id) {}
+record IntakeStart(String mode, String session_id, List<String> target_platforms,
+                   String opening_input, String user_id) {}   // session_id required; prior_context omitted for brevity
 record IntakeTurn(String user_input) {}
 record IntakeReply(String intake_mode, String session_id, String assistant_message,
                   Map<String,Object> brief_partial, boolean complete) {}
 record CreativeBrief(String topic, List<String> target_platforms, String user_intent,
                      String tone_hint, String business_id, String user_id, String route,
                      List<String> content_types,   // optional: ["text","brand","video"] subset
-                     String intake_mode) {}
+                     String intake_mode) {}         // response also carries prior_context (nullable)
 
 // Workflow
 record Verdict(String decision, String edited_draft, String reason) {}  // reason: reject feedback — steers the rework
 record ReviewRequest(Map<String,Verdict> verdicts) {}
 record ConfirmLearning(boolean learn) {}
-record Tag(String kind, String rule, boolean keep) {}
-record ArchiveTags(List<Tag> tags) {}
-record Decision(String candidate_id, String label, String platform) {}
-record LearnCommit(List<Decision> decisions) {}
 record RaiseHand(String table_id) {}                          // roundtable
 record Say(String table_id, String text, boolean interrupt) {} // roundtable
 record Pending(String request_id, String platform, String draft, String comment,
                boolean needs_human_intervention) {}
 record Output(String platform, String draft, String decision, String comment,
               boolean needs_human_intervention, List<Map<String,Object>> proposed_rules,
-              List<String> content_types) {}
+              List<String> content_types,
+              String html_card, Map<String,Object> video_props) {}  // media present only if requested
 record TaskSnapshot(String task_id, String status, List<Pending> pending,
-                    List<Output> outputs, List<Map<String,Object>> proposed_rules) {}
+                    List<Output> outputs, List<Map<String,Object>> proposed_rules,
+                    String error) {}   // error: present only when status == "error"
 ```
 
 ### Client
@@ -554,7 +664,9 @@ record TaskSnapshot(String task_id, String status, List<Pending> pending,
 ```java
 public class NewsroomClient {
     private final HttpClient http = HttpClient.newHttpClient();
-    private final ObjectMapper json = new ObjectMapper();
+    // Tolerate fields the DTOs don't list — the service is the source of truth and may add more.
+    private final ObjectMapper json = new ObjectMapper()
+        .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
     private final String base;
 
     public NewsroomClient(String base) { this.base = base; }
@@ -581,8 +693,14 @@ public class NewsroomClient {
     public IntakeReply  intakeTurn(String sid, String t) throws Exception { return post("/intake/" + sid + "/turn", new IntakeTurn(t), IntakeReply.class); }
     public CreativeBrief brief(String sid)               throws Exception { return get("/intake/" + sid + "/brief", CreativeBrief.class); }
 
-    // Workflow
-    public TaskSnapshot startTask(CreativeBrief b)         throws Exception { return post("/tasks", b, TaskSnapshot.class); }
+    // Workflow. Reuse the intake session_id at POST /tasks (one conversation = one session):
+    // merge it onto the brief so the run keys on it and the intake transcript threads in.
+    public TaskSnapshot startTask(CreativeBrief b, String sessionId) throws Exception {
+        @SuppressWarnings("unchecked")
+        Map<String,Object> body = json.convertValue(b, Map.class);
+        body.put("session_id", sessionId);
+        return post("/tasks", body, TaskSnapshot.class);
+    }
     public TaskSnapshot review(String id, ReviewRequest r) throws Exception { return post("/tasks/" + id + "/review", r, TaskSnapshot.class); }
     public TaskSnapshot task(String id)                    throws Exception { return get("/tasks/" + id, TaskSnapshot.class); }
     public Map<String,Object> confirmLearning(String id, boolean learn) throws Exception { return post("/tasks/" + id + "/confirm-learning", new ConfirmLearning(learn), Map.class); }
@@ -608,18 +726,20 @@ public class NewsroomClient {
 ```java
 NewsroomClient nr = new NewsroomClient("http://localhost:8080");
 
-// 1. Intake — collect a brief
-IntakeReply r = nr.startIntake(new IntakeStart("text", "Post about our cold brew launch"));
-String sid = r.session_id();
+// 1. Intake — collect a brief. The backend owns the session id and reuses it end to end.
+String sid = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 12);
+IntakeReply r = nr.startIntake(new IntakeStart(
+    "text", sid, List.of("linkedin", "instagram"), "Post about our cold brew launch", null));
 while (!r.complete())
     r = nr.intakeTurn(sid, getUserInput());   // ask the user and send their reply
 CreativeBrief cb = nr.brief(sid);
 
-// 2. Start the workflow
-TaskSnapshot t = nr.startTask(cb);            // status: "awaiting_review"
-String id = t.task_id();
+// 2. Start the workflow — reuse the SAME sid (one conversation = one session). Non-blocking:
+//    returns immediately with status "running" and drives in the background.
+TaskSnapshot t = nr.startTask(cb, sid);       // status: "running", pending is still empty
+String id = t.task_id();                        // == sid
 
-// 3. Watch progress on a background thread (optional)
+// 3. Watch progress live over SSE (open it right after startTask to catch the gate)
 new Thread(() -> {
     try {
         nr.streamEvents(id, ev -> {
@@ -632,13 +752,17 @@ new Thread(() -> {
     } catch (Exception ignored) {}
 }).start();
 
-// 4. Approve all pending platforms
+// 4. Wait for the review gate (poll, or trigger off the SSE human_gate/interrupted event)
+while ("running".equals(t.status())) { Thread.sleep(200); t = nr.task(id); }
+// now t.status() is "awaiting_review" (text run), "completed" (media-only), or "error"
+
+// 5. Approve all pending platforms
 Map<String, Verdict> verdicts = new HashMap<>();
 t.pending().forEach(p -> verdicts.put(p.platform(), new Verdict("approve", null, null)));
 // To reject with feedback instead → new Verdict("reject", null, "too formal, add a customer stat")
 //   the reason is threaded into the re-draft, so the platform reworks to fix that point and
 //   returns to "awaiting_review" (review it again); edit → new Verdict("approve_after_edit", "...your copy...", null)
-t = nr.review(id, new ReviewRequest(verdicts));   // status: "completed"
+t = nr.review(id, new ReviewRequest(verdicts));   // status: "completed" (this call is synchronous)
 
 // t.outputs() now holds the finalized drafts
 ```
@@ -646,6 +770,7 @@ t = nr.review(id, new ReviewRequest(verdicts));   // status: "completed"
 ### Tips
 
 - Always drive your logic off `status` in the response — it's a state machine.
+- `POST /tasks` (and `POST /roundtable[s]`) return `status: "running"` **immediately** with an empty `pending` — the run drives in the background. Don't act on that first response; open the SSE stream (or poll `GET /tasks/{id}`) and proceed when `status` becomes `awaiting_review` / `completed`. A mid-run failure surfaces as `status: "error"` (never a hang).
 - After a disconnect, call `GET /tasks/{id}` to get the latest snapshot; SSE replays from the beginning when you reconnect.
 - Use a stable `business_id` (and `user_id`) per customer so the service learns their style over time. After the task is `completed`, call `/confirm-learning` (`{"learn": true}`) to persist what it learned from the run — both brand-voice rules and per-user preferences, in one step.
 - `pending[].needs_human_intervention: true` means the platform exhausted retries — show a special warning rather than a normal review prompt.
