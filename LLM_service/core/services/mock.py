@@ -706,12 +706,38 @@ class MockBackgroundRemoval(BackgroundRemovalService):
         return image_bytes
 
 
+def _silent_mp3(duration_seconds: float) -> bytes:
+    """Build a real (silent) MPEG-1 Layer III file covering `duration_seconds`.
+
+    Remotion's renderer runs `ffprobe` on every audio asset before rendering
+    (to read channel count/duration), so a decodable file is required even in
+    mock mode — a placeholder string fails that probe and aborts the render.
+    Each frame is a valid header (MPEG1/L3, 44.1kHz, mono, 32kbps) followed by
+    zeroed side-info/main-data bytes, which decodes as silence.
+    """
+    sample_rate = 44100
+    bitrate_bps = 32000
+    samples_per_frame = 1152
+    frame_size = (144 * bitrate_bps) // sample_rate  # 104 bytes, no padding
+
+    header = bytes((0xFF, 0xFB, 0x10, 0xC0))
+    frame = header + bytes(frame_size - len(header))
+
+    frame_count = max(2, -(-int(duration_seconds * sample_rate) // samples_per_frame))
+    return frame * frame_count
+
+
 class MockMusicGeneration(MusicGenerationService):
-    """Offline stand-in for Soundraw: returns a small deterministic placeholder
-    "track" (not a real decodable mp3 — never inspected, only written to disk and
-    handed to Remotion), so the music-resolution pipeline and its tests never need
-    real credentials or network access."""
+    """Offline stand-in for Soundraw: returns a real (silent) MP3 sized to
+    `duration_seconds`, so the music-resolution pipeline — including Remotion's
+    ffprobe inspection of the file — works end to end without real credentials
+    or network access.
+
+    TODO: circle back and wire up a real SOUNDRAW_API_KEY (see SoundrawMusic in
+    media_assets.py) once its request/response contract is verified against a
+    live account — this mock only proves the pipeline plumbing, not real audio.
+    """
 
     async def generate(self, *, mood: str, genre: str, duration_seconds: float, energy: str) -> bytes:
         await asyncio.sleep(_MOCK_LATENCY)
-        return f"MOCK_TRACK mood={mood} genre={genre} energy={energy} duration={duration_seconds}".encode()
+        return _silent_mp3(duration_seconds)

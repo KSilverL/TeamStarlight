@@ -52,20 +52,16 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - USE_MOCK=true
-      # Uncomment and populate for production:
-      # - USE_MOCK=false
-      # - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
-      # - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
-      # - DATABASE_URL=${DATABASE_URL}
-      # Video storyboard pipeline (Pexels + Remove.bg) — stays on mock (placeholder
-      # images, no network) until real keys are provided:
-      # - USE_MOCK_IMAGE_SEARCH=false
-      # - USE_MOCK_BACKGROUND_REMOVAL=false
-      # - PEXELS_API_KEY=${PEXELS_API_KEY}
-      # - REMOVEBG_API_KEY=${REMOVEBG_API_KEY}
-      # Background music (Soundraw) — same opt-in pattern:
-      # - USE_MOCK_MUSIC_GENERATION=false
+      - USE_MOCK=false
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+      - DATABASE_URL=${DATABASE_URL}
+      - USE_MOCK_IMAGE_SEARCH=false
+      - USE_MOCK_BACKGROUND_REMOVAL=false
+      - PEXELS_API_KEY=${PEXELS_API_KEY}
+      - REMOVEBG_API_KEY=${REMOVEBG_API_KEY}
+      - USE_MOCK_MUSIC_GENERATION=true
+      - USE_MOCK_SAFETY=true
       # - SOUNDRAW_API_KEY=${SOUNDRAW_API_KEY}
 
   # ---------------------------------------------------------------------------
