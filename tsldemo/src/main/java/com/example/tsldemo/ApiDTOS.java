@@ -25,32 +25,37 @@ public class ApiDTOS {
     }
 	
 	public static class IntakeResponse {
-		    @JsonProperty("intake_mode")
-			public String intakeMode;
+		@JsonProperty("intake_mode")
+		public String intakeMode;
 
-		    @JsonProperty("session_id")
-			public String sessionId;
+		@JsonProperty("session_id")
+		public String sessionId;
 
-		    @JsonProperty("assistant_message")
-		    public String assistantMessage;
+		@JsonProperty("assistant_message")
+		public String assistantMessage;
 
-		    @JsonProperty("brief_partial")
-		    public BriefPartial brief_partial;
+		@JsonProperty("brief_partial")
+		public BriefPartial brief_partial;
 
-		    @JsonProperty("complete")
-		    public Boolean complete;
+		@JsonProperty("complete")
+		public Boolean complete;
 
-		    // ERROR HANDLING
-		    @JsonProperty("detail")
-		    public List<Detail> detail;
+		// ERROR HANDLING
+		@JsonProperty("detail")
+		public List<Detail> detail;
 	}
 	
 	public record IntakeTurnRequest(String user_input) {}
 	
 	public record IntakeTurnResponse(
-	        String reply,
-	        String nextPhase,
-	        boolean completed
-	    ) {}
+		String sessionId,
+			
+		@JsonProperty("assistant_message")
+	    String assistantMessage,
+		    
+	    BriefPartial brief_partial,
+	    Boolean complete
+		    
+	) {}
 	
 }
