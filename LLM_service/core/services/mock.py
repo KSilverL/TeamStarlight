@@ -549,6 +549,40 @@ class MockLLM(LLMService):
                 })
         return out[:3]
 
+    async def summarize_handoff(
+        self,
+        *,
+        transcript: List[dict],
+        verdicts: List[dict],
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        approved: List[str] = []
+        rejected: List[str] = []
+        notes: List[str] = []
+        # Verdicts → which directions were adopted vs ruled out (the strongest continuation signal).
+        for v in verdicts or []:
+            platform = v.get("platform") or "this platform"
+            decision = v.get("decision")
+            if decision in ("approve", "approve_after_edit"):
+                label = (v.get("edited_draft") or "").strip()
+                approved.append(f"{platform}: {label}" if label else f"the {platform} direction")
+            elif decision == "reject":
+                reason = (v.get("reason") or "").strip()
+                rejected.append(f"{platform}: {reason}" if reason else f"the {platform} direction")
+        # The user's own turns are explicit steers worth carrying forward verbatim.
+        for turn in transcript or []:
+            is_user = turn.get("role") == "user" or turn.get("speaker") == "user"
+            text = (turn.get("text") or turn.get("content") or "").strip()
+            if is_user and text:
+                notes.append(text)
+        return {
+            "topic": None,  # the new intake / backend supplies the next topic; this recaps directions
+            "prior_strategy_summary": ("; ".join(approved) if approved else None),
+            "approved_directions": _unique(approved)[:5],
+            "rejected_directions": _unique(rejected)[:5],
+            "user_notes": _unique(notes)[:5],
+        }
+
     async def fill_brief(
         self,
         *,

@@ -227,6 +227,25 @@ class LLMService(ABC):
         ...
 
     @abstractmethod
+    async def summarize_handoff(
+        self,
+        *,
+        transcript: List[dict],
+        verdicts: List[dict],
+    ) -> dict:
+        """Distil a "handoff" recap of a finished conversation so a NEXT session can carry it as
+        prior context (PriorSessionContext) — the forward-looking sibling of the learning
+        distillers (which produce durable rules; this produces one session's continuation seed).
+        Reads the same signal: a `transcript` of {speaker, role, text, platform, ...} turns (the
+        roundtable discussion and/or the user's intake turns) plus the final `verdicts` (each
+        {platform, decision, edited_draft?, reason?}). Returns a JSON-friendly dict with EXACTLY
+        the PriorSessionContext content keys — `topic`, `prior_strategy_summary` (both str|None),
+        `approved_directions`, `rejected_directions`, `user_notes` (str lists) — and NO others
+        (the caller attaches `parent_session_id`). An empty conversation yields the all-empty
+        shape, which the caller degrades to "no prior context"."""
+        ...
+
+    @abstractmethod
     async def fill_brief(
         self,
         *,

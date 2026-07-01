@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 
+from LLM_service.core.config import reset_settings
 from LLM_service.core.services import factory
 from LLM_service.core.services.mock import (
     ROUNDTABLE_FIXTURE_BUSINESS_ID,
@@ -314,3 +315,59 @@ async def test_multi_platform_streams_over_sse():
     events = svc.buffered_events("rt-multi")
     assert {e["table_id"] for e in events if e["type"] == "agent_utterance"} == {"linkedin", "instagram"}
     assert {e["table_id"] for e in events if e.get("status") == "discussion_consensus"} == {"linkedin", "instagram"}
+
+
+# ── Backend raise-hand is checked per round in the INLINE (start) path, per-platform ──
+
+async def test_inline_start_roundtable_checks_backend_raise_hand_per_platform(monkeypatch):
+    """The backend-called path (WorkflowService.start with ROUNDTABLE_ENABLED) checks the
+    raise-hand queue before each round WITHOUT any interactive prompt hook — the tables run
+    concurrently and each platform's raised hand is independent. Here the backend has queued a
+    turn for linkedin only; that table folds it in, instagram (no hand) never gets a user turn."""
+    monkeypatch.setenv("ROUNDTABLE_ENABLED", "true")
+    reset_settings()
+    factory.reset_services()
+
+    from LLM_service.api import WorkflowService
+    from LLM_service.workflow.roundtable import push_utterance
+
+    task_id = "rt-inline-hand"
+    # The backend "raised a hand + said" for linkedin only, before the run (deterministic under the
+    # zero-latency mock). Keyed by (task_id, table_id), so instagram's table is unaffected.
+    await push_utterance(factory.get_store(), task_id=task_id, table_id="linkedin",
+                         text="please mention fair-trade sourcing")
+
+    svc = WorkflowService()
+    await svc.start({
+        "topic": "spring single-origin coffee launch",
+        "target_platforms": ["linkedin", "instagram"],
+        "business_id": ROUNDTABLE_FIXTURE_BUSINESS_ID, "user_id": ROUNDTABLE_FIXTURE_USER_ID,
+    }, task_id=task_id)
+
+    user_utts = [e for e in svc.buffered_events(task_id)
+                 if e["type"] == "agent_utterance" and e["role"] == "user"]
+    # linkedin folded in the backend's utterance; instagram (no raised hand) has no user turn.
+    assert any(e["table_id"] == "linkedin" and "fair-trade" in e["text"] for e in user_utts)
+    assert not any(e["table_id"] == "instagram" for e in user_utts)
+
+
+# ── Each platform drafts from its OWN strategy, fanned out in parallel ─────────
+
+async def test_each_platform_drafts_from_its_own_strategy():
+    """The creator's fan-out drafts every platform concurrently from that platform's OWN strategy
+    (not a shared one): a per-platform CreativeStrategy carries distinct strategies, and each draft
+    at the gate reports its own platform's strategy."""
+    from LLM_service.workflow import build_workflow
+    from LLM_service.workflow.messages import CreativeStrategy
+
+    brief = _brief(platforms=["linkedin", "instagram"], business_id=None, user_id=None)
+    strategy = CreativeStrategy(brief=brief, strategies={
+        "linkedin": "LEAD WITH A DATA HOOK",
+        "instagram": "LEAD WITH A VISUAL STORY",
+    })
+    # roundtable_entry starts at the creator with the per-platform strategy (Phase 6 shape).
+    result = await build_workflow(roundtable_entry=True).run(strategy)
+
+    reqs = {e.data.platform: e.data for e in result.get_request_info_events()}
+    assert reqs["linkedin"].strategy == "LEAD WITH A DATA HOOK"
+    assert reqs["instagram"].strategy == "LEAD WITH A VISUAL STORY"

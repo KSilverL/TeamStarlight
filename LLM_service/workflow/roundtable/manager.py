@@ -32,6 +32,19 @@ from .queue import has_pending
 BeforeRound = Callable[[str, int], Awaitable[None]]
 
 
+async def _user_has_floor(*, user_name, task_id, table_id, store) -> bool:
+    """Shared "does the user hold the floor this round" check for both managers: a user seat must
+    be wired (name + task + table), and the user has either raised a hand (the table then waits for
+    them) or already queued a message (route straight to them). Pure read of the gate + the queue."""
+    if not (user_name and task_id and table_id):
+        return False
+    if hand_raised(task_id, table_id):
+        return True
+    if store and await has_pending(store, task_id=task_id, table_id=table_id):
+        return True
+    return False
+
+
 def _item(answer, reason: str = "deterministic roundtable manager") -> MagenticProgressLedgerItem:
     return MagenticProgressLedgerItem(reason=reason, answer=answer)
 
@@ -95,13 +108,9 @@ class MockRoundtableManager(MagenticManagerBase):
     async def _user_pending(self) -> bool:
         """Yield the mic to the user when they've raised a hand (reserved a turn) OR already
         have a message queued. The raised-hand case makes the table wait for them to type."""
-        if not (self._user and self._task_id and self._table_id):
-            return False
-        if hand_raised(self._task_id, self._table_id):
-            return True
-        if self._store and await has_pending(self._store, task_id=self._task_id, table_id=self._table_id):
-            return True
-        return False
+        return await _user_has_floor(
+            user_name=self._user, task_id=self._task_id, table_id=self._table_id, store=self._store
+        )
 
     async def create_progress_ledger(self, magentic_context: MagenticContext) -> MagenticProgressLedger:
         r = magentic_context.round_count
@@ -205,13 +214,9 @@ class InteractiveMagenticManager(StandardMagenticManager):
 
     async def _user_pending(self) -> bool:
         """The user has the floor iff a seat is wired and they raised a hand or queued a message."""
-        if not (self._user and self._task_id):
-            return False
-        if hand_raised(self._task_id, self._platform):
-            return True
-        if self._store and await has_pending(self._store, task_id=self._task_id, table_id=self._platform):
-            return True
-        return False
+        return await _user_has_floor(
+            user_name=self._user, task_id=self._task_id, table_id=self._platform, store=self._store
+        )
 
     async def create_progress_ledger(self, magentic_context: MagenticContext) -> MagenticProgressLedger:
         if self._before_round is not None:

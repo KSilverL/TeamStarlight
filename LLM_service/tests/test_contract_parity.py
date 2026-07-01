@@ -36,7 +36,7 @@ def azure_llm(reply: str) -> azure.AzureLLM:
     """An AzureLLM whose single chat seam returns a canned reply."""
     llm = azure.AzureLLM(get_settings())
 
-    async def _complete(messages):
+    async def _complete(messages, *, model=None):
         return reply
 
     llm._complete = _complete  # type: ignore[assignment]
@@ -208,6 +208,45 @@ async def test_summarize_preferences_parity():
             assert isinstance(item["evidence"], str)
     # the mock traces the preference back to the user's interjection
     assert any("fair-trade" in i["evidence"] for i in m)
+
+
+_HANDOFF_KEYS = {
+    "topic", "prior_strategy_summary", "approved_directions", "rejected_directions", "user_notes",
+}
+
+
+async def test_summarize_handoff_parity():
+    transcript = [
+        {"speaker": "user", "role": "user", "text": "keep it warm and local", "platform": "linkedin"},
+        {"speaker": "platform_editor", "role": "persona", "text": "open with a hook", "platform": "linkedin"},
+    ]
+    verdicts = [
+        {"platform": "linkedin", "decision": "approve_after_edit", "edited_draft": "Lead with the seasonal angle."},
+        {"platform": "instagram", "decision": "reject", "reason": "too salesy"},
+    ]
+    m = await mock.MockLLM().summarize_handoff(transcript=transcript, verdicts=verdicts)
+    a = await azure_llm(json.dumps({
+        "topic": "autumn cold brew",
+        "prior_strategy_summary": "lead with the seasonal angle",
+        "approved_directions": ["seasonal angle"],
+        "rejected_directions": ["salesy framing"],
+        "user_notes": ["keep it warm and local"],
+    })).summarize_handoff(transcript=transcript, verdicts=verdicts)
+    for out in (m, a):
+        # EXACTLY the PriorSessionContext content keys (the caller attaches parent_session_id).
+        assert set(out.keys()) == _HANDOFF_KEYS
+        assert out["topic"] is None or isinstance(out["topic"], str)
+        assert out["prior_strategy_summary"] is None or isinstance(out["prior_strategy_summary"], str)
+        for key in ("approved_directions", "rejected_directions", "user_notes"):
+            assert isinstance(out[key], list) and all(isinstance(x, str) for x in out[key])
+    # The mock carries the user's steer + the approve/reject split forward.
+    assert any("warm and local" in n for n in m["user_notes"])
+    assert m["approved_directions"] and m["rejected_directions"]
+
+    # An empty conversation distils to the all-empty recap (which the caller degrades to "no prior").
+    empty = await mock.MockLLM().summarize_handoff(transcript=[], verdicts=[])
+    assert set(empty.keys()) == _HANDOFF_KEYS
+    assert empty["topic"] is None and empty["approved_directions"] == [] and empty["user_notes"] == []
 
 
 _SKILL_RULE_KEYS = {"text", "platform", "kind"}

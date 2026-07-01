@@ -11,6 +11,7 @@ and that the brief feeds the M1/M2 workflow with zero changes. Fully mocked/offl
 from __future__ import annotations
 
 import json
+import time
 
 import httpx
 import pytest
@@ -18,8 +19,12 @@ import pytest
 from LLM_service.api import IntakeService, WorkflowService, create_app
 from LLM_service.core.services import factory
 from LLM_service.tests.conftest import run_app
-from LLM_service.intake import CreativeBrief, build_intake
-from LLM_service.intake.base import BriefConversation, ConversationalIntake
+from LLM_service.intake import CreativeBrief, PriorSessionContext, build_intake
+from LLM_service.intake.base import (
+    BriefConversation,
+    ConversationalIntake,
+    _render_prior_context,
+)
 from LLM_service.intake.text_intake import TextIntake
 from LLM_service.intake.voice_intake import MockVoiceIntake
 
@@ -143,6 +148,87 @@ async def test_followups_are_capped_then_force_completed():
     assert brief.route == "copilot_mode"                     # topic came from the scout fallback
 
 
+# ── Prior-session context: continuing an earlier conversation ─────────────────
+
+_PRIOR = PriorSessionContext(
+    parent_session_id="sess-prev",
+    topic="autumn cold brew launch",
+    approved_directions=["lead with the seasonal angle"],
+    rejected_directions=["heavy discount framing"],
+    user_notes=["keep it warm and local"],
+)
+
+
+async def test_prior_context_none_leaves_behaviour_unchanged():
+    """Case 1: no prior context → the analyse-first path is byte-identical, and the brief carries
+    prior_context=None (the fresh conversation)."""
+    base_brief, base_msgs = await _drive(TextIntake(), _ONE_SHOT, [])
+    # Passing prior_context=None must change nothing.
+    session = TextIntake()
+    started = await session.start("sess-fresh", _ONE_SHOT, prior_context=None)
+    assert started["complete"] is True                       # still zero follow-ups
+    brief = await session.get_brief(started["session_id"])
+    assert brief.prior_context is None
+    assert started["assistant_message"] == base_msgs[0]      # same dialogue
+
+
+async def test_prior_context_folds_into_prompt_and_rides_onto_brief(monkeypatch):
+    """Case 2: a non-empty recap folds a 前情提要 block into the fill_brief system prompt (so the
+    LLM resolves against it), the conversation still completes, and the recap rides onto the brief."""
+    llm = factory.get_llm()  # cached singleton the intake engine will call
+    captured: dict = {}
+    original = llm.fill_brief
+
+    async def spy(**kwargs):
+        captured["system_prompt"] = kwargs["system_prompt"]
+        return await original(**kwargs)
+
+    monkeypatch.setattr(llm, "fill_brief", spy)
+
+    session = TextIntake()
+    started = await session.start(
+        "sess-cont", _ONE_SHOT, target_platforms=["linkedin"], prior_context=_PRIOR)
+    assert started["complete"] is True
+
+    # The recap was folded into the prompt the LLM saw.
+    assert "前情提要" in captured["system_prompt"]
+    assert "autumn cold brew launch" in captured["system_prompt"]
+    assert "lead with the seasonal angle" in captured["system_prompt"]
+
+    # And it rides onto the resulting brief (debug / SSE), without ever being a required field.
+    brief = await session.get_brief(started["session_id"])
+    assert brief.prior_context is not None
+    assert brief.prior_context.parent_session_id == "sess-prev"
+    assert brief.prior_context.topic == "autumn cold brew launch"
+
+
+def test_render_prior_context_empty_is_blank_nonempty_has_block():
+    """The renderer is the Phase-5 degrade point: an empty recap produces no block (prompt
+    unchanged); a recap with signal produces the 前情提要 section."""
+    assert _render_prior_context(PriorSessionContext(parent_session_id="sess-prev")) == ""
+    block = _render_prior_context(_PRIOR)
+    assert block.startswith("\n") and "前情提要" in block
+    assert "keep it warm and local" in block
+
+
+async def test_prior_context_malformed_400_and_empty_degrades():
+    """Case 3: a malformed recap (missing parent_session_id) → HTTP 400 at the service layer; an
+    all-empty recap (only parent_session_id) degrades to the fresh path (no error, prior_context None)."""
+    from LLM_service.api import ApiError
+
+    svc = IntakeService()
+    with pytest.raises(ApiError) as bad:
+        await svc.start("text", "sess-bad", _ONE_SHOT, prior_context={"topic": "no parent id"})
+    assert bad.value.status == 400
+
+    # Empty recap → degrade: the session opens normally and the brief carries no prior context.
+    started = await svc.start(
+        "text", "sess-empty", _ONE_SHOT, prior_context={"parent_session_id": "sess-prev"})
+    assert started["complete"] is True
+    brief = await svc.get_brief("sess-empty")
+    assert brief["prior_context"] is None
+
+
 # ── copilot_mode: scout proposes a topic when the user is unsure ──────────────
 
 async def test_copilot_mode_invokes_scout_tool():
@@ -233,14 +319,53 @@ def test_http_intake_then_start_workflow(http_server):
         # the brief starts a workflow unchanged — reusing the SAME session id, so intake
         # and generation are one session: the task keys on the intake session_id.
         task = client.post(f"{http_server}/tasks", json={**brief, "session_id": sid})
-        assert task.status_code == 200 and task.json()["status"] == "awaiting_review"
+        # POST /tasks is non-blocking now — returns `running`, drives in the background.
+        assert task.status_code == 200 and task.json()["status"] == "running"
         assert task.json()["task_id"] == sid
+        for _ in range(200):
+            if client.get(f"{http_server}/tasks/{sid}").json()["status"] == "awaiting_review":
+                break
+            time.sleep(0.02)
+        assert client.get(f"{http_server}/tasks/{sid}").json()["status"] == "awaiting_review"
 
         # validation
         assert client.post(
             f"{http_server}/intake", json={"mode": "smoke-signals", "session_id": "sess-x"}
         ).status_code == 400
         assert client.get(f"{http_server}/intake/nope/brief").status_code == 404
+
+
+def test_http_summarize_handoff_then_continue_intake(http_server):
+    """End-to-end: distil a finished session into a prior-context recap, then seed the NEXT
+    intake with it — one conversation threaded into the next (the service stays stateless)."""
+    with httpx.Client(timeout=10) as client:
+        # 1) Backend assembles a prior session's signal and asks for a handoff recap.
+        handoff = client.post(f"{http_server}/summarize-handoff", json={
+            "session_id": "sess-prev",
+            "transcript": [{"role": "user", "text": "keep it warm and local"}],
+            "verdicts": [{"platform": "linkedin", "decision": "approve_after_edit",
+                          "edited_draft": "Lead with the seasonal angle."}],
+        })
+        assert handoff.status_code == 200
+        prior = handoff.json()
+        assert prior["parent_session_id"] == "sess-prev"
+        assert prior["approved_directions"] and "warm and local" in prior["user_notes"][0]
+
+        # 2) The recap seeds a NEW intake session; it completes and rides onto the brief.
+        started = client.post(f"{http_server}/intake", json={
+            "mode": "text", "session_id": "sess-next",
+            "target_platforms": ["linkedin"],
+            "opening_input": _ONE_SHOT, "prior_context": prior,
+        })
+        assert started.status_code == 200 and started.json()["complete"] is True
+        brief = client.get(f"{http_server}/intake/sess-next/brief").json()
+        assert brief["prior_context"]["parent_session_id"] == "sess-prev"
+
+        # 3) Validation: a malformed recap (no parent_session_id) → 400; session_id is required.
+        assert client.post(f"{http_server}/intake", json={
+            "mode": "text", "session_id": "sess-x", "prior_context": {"topic": "no parent"},
+        }).status_code == 400
+        assert client.post(f"{http_server}/summarize-handoff", json={"session_id": ""}).status_code == 400
 
 
 def test_voice_websocket_bridges_a_turn():

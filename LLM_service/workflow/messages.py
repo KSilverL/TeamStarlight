@@ -128,17 +128,6 @@ class HumanVerdict(BaseModel):
     reason: Optional[str] = None
 
 
-class ArchiveJob(BaseModel):
-    """human_gate → archivist (on approve_after_edit): the AI draft vs the human's
-    final text, so the archivist can distil what the human changed into rules."""
-
-    platform: str
-    original_draft: str   # the AI draft the reviewer approved
-    final_draft: str      # the human's edited version
-    comment: str
-    brief: Brief
-
-
 class BrandRule(BaseModel):
     """One candidate brand-voice rule distilled from an edit. `kind` decides which
     list it joins in the Brand_Voice_Profile when the user keeps it."""

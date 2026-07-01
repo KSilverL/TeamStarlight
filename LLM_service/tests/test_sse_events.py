@@ -14,6 +14,7 @@ in-process test HTTP server on localhost.
 from __future__ import annotations
 
 import json
+import time
 
 import httpx
 import pytest
@@ -212,6 +213,77 @@ async def test_roundtable_events_generator_drains_in_order():
     assert any(e["type"] == "agent_utterance" for e in streamed)
 
 
+# ── D3. A run that raises never hangs SSE subscribers (error path) ────────────
+
+class _BoomWorkflow:
+    """A workflow whose event stream raises immediately, standing in for an executor
+    that blows up mid-run — so the error-handling path is exercised without a real fault."""
+
+    def run(self, message=None, *, stream=False, **kwargs):
+        async def gen():
+            raise RuntimeError("boom in the newsroom")
+            yield  # unreachable; makes gen an async generator
+
+        return gen()
+
+
+async def test_run_error_marks_task_and_closes_subscribers():
+    svc = WorkflowService(workflow_factory=lambda **kw: _BoomWorkflow())
+    with pytest.raises(RuntimeError):
+        await svc.start({"topic": "x", "target_platforms": ["linkedin"]}, task_id="boom")
+
+    snap = await svc.get("boom")
+    assert snap["status"] == "error" and "boom" in snap["error"]
+
+    # The SSE generator drains (a terminal workflow-error event) instead of blocking forever.
+    streamed = [ev async for ev in svc.events("boom")]
+    assert any(e["node"] == "workflow" and e["status"] == "error" for e in streamed)
+
+
+# ── D4. Standalone roundtable routes (single + fan-out) ───────────────────────
+
+def _await_completed(client, base_url, task_id):
+    for _ in range(200):
+        snap = client.get(f"{base_url}/tasks/{task_id}").json()
+        if snap["status"] in ("completed", "error"):
+            return snap
+        time.sleep(0.02)
+    return client.get(f"{base_url}/tasks/{task_id}").json()
+
+
+def test_http_roundtable_single_and_fanout(http_server):
+    with httpx.Client(timeout=10) as client:
+        # Single table: POST /roundtable returns immediately (running), converges over SSE.
+        started = client.post(f"{http_server}/roundtable", json={
+            "topic": "spring single-origin harvest", "target_platforms": ["linkedin"],
+            "max_rounds": 4,
+        })
+        assert started.status_code == 200
+        body = started.json()
+        assert body["status"] == "running" and body["platform"] == "linkedin"
+        snap = _await_completed(client, http_server, body["task_id"])
+        assert snap["status"] == "completed"
+        assert [o["platform"] for o in snap["outputs"]] == ["linkedin"]
+
+        # Fan-out: POST /roundtables runs one table per target platform.
+        fan = client.post(f"{http_server}/roundtables", json={
+            "topic": "spring single-origin harvest",
+            "target_platforms": ["linkedin", "instagram"], "max_rounds": 4,
+        })
+        assert fan.status_code == 200 and fan.json()["status"] == "running"
+        snap2 = _await_completed(client, http_server, fan.json()["task_id"])
+        assert snap2["status"] == "completed"
+        assert {o["platform"] for o in snap2["outputs"]} == {"linkedin", "instagram"}
+
+        # A discussion streamed at least one utterance over the shared SSE channel.
+        events = []
+        with client.stream("GET", f"{http_server}/tasks/{fan.json()['task_id']}/events") as stream:
+            for line in stream.iter_lines():
+                if line.startswith("data: "):
+                    events.append(json.loads(line[6:]))
+        assert any(e["type"] == "agent_utterance" for e in events)
+
+
 # ── E. Offline guarantee: under USE_MOCK every service is a mock (no Azure) ───
 
 def test_no_real_backends_selected_in_mock_mode():
@@ -237,7 +309,16 @@ def test_http_sse_round_trip(http_server):
         })
         assert started.status_code == 200
         task_id = started.json()["task_id"]
-        assert started.json()["status"] == "awaiting_review"
+        # POST /tasks is non-blocking now: it returns a `running` snapshot and drives in the
+        # background so progress streams live. Poll until the gate before resuming.
+        assert started.json()["status"] == "running"
+        snap = started.json()
+        for _ in range(200):
+            snap = client.get(f"{http_server}/tasks/{task_id}").json()
+            if snap["status"] == "awaiting_review":
+                break
+            time.sleep(0.02)
+        assert snap["status"] == "awaiting_review"
 
         reviewed = client.post(f"{http_server}/tasks/{task_id}/review", json={
             "verdicts": {"linkedin": {"decision": "approve_after_edit",
