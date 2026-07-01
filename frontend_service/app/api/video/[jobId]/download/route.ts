@@ -1,8 +1,9 @@
 import { NextRequest } from "next/server";
 
-const VIDEO_AGENT_URL =
-  process.env.BRAND_VIDEO_AGENT_URL ?? "http://localhost:8001";
+const LLM_URL = process.env.LLM_SERVICE_URL ?? "http://localhost:8080";
 
+// Streams the finished MP4 through Next.js so the browser never needs to reach
+// the LLM service's internal (e.g. Docker-network) hostname directly.
 export async function GET(
   _request: NextRequest,
   { params }: { params: Promise<{ jobId: string }> }
@@ -10,7 +11,7 @@ export async function GET(
   const { jobId } = await params;
 
   try {
-    const upstream = await fetch(`${VIDEO_AGENT_URL}/download/${jobId}`);
+    const upstream = await fetch(`${LLM_URL}/video-jobs/${jobId}/download`);
 
     if (!upstream.ok) {
       return new Response("Video not available", { status: upstream.status });
@@ -25,7 +26,7 @@ export async function GET(
     });
   } catch (err) {
     const message =
-      err instanceof Error ? err.message : "Video agent unreachable";
+      err instanceof Error ? err.message : "LLM service unreachable";
     return new Response(message, { status: 502 });
   }
 }

@@ -9,3 +9,12 @@ AGENTS.md
 CLAUDE.md
 demos/
 sample_videos/
+
+# Per-job video render working directory (resolved images + rendered MP4s).
+LLM_service/.video_jobs/
+
+# video_renderer/ Node project — has its own .gitignore, but in case a render is
+# run from the repo root instead of the project directory:
+video_renderer/node_modules/
+video_renderer/out/
+video_renderer/.remotion/

@@ -36,43 +36,64 @@ interface VideoStat {
   icon: string;
 }
 
-// The structured brand-video spec the backend generates (BrandVideoProps). This
-// service produces the spec, not a rendered MP4 — the card renders the spec itself.
-interface VideoProps {
+// The dynamic storyboard the backend composes (core.video_schema.StoryboardSpec):
+// an ordered list of typed slides picked from a fixed registry, not a fixed scene
+// count. This service produces the storyboard (+ resolves it into an MP4 on
+// request via /api/video) — the agent decides which slides/order/length fit the
+// brief, never a hardcoded template.
+interface HookSlide {
+  type: "hook";
+  headline: string;
+  subtext?: string | null;
+  imageQuery?: string | null;
+  shape: "circle" | "blob" | "hex";
+  durationFrames?: number | null;
+}
+interface CounterStatSlide {
+  type: "counter_stat";
+  sectionLabel?: string | null;
+  stats: VideoStat[];
+  durationFrames?: number | null;
+}
+interface CollageSlide {
+  type: "collage";
+  headline?: string | null;
+  imageQueries: string[];
+  layout: "grid" | "scatter" | "stack";
+  durationFrames?: number | null;
+}
+interface OutroSlide {
+  type: "outro";
   brandName: string;
-  tagline: string;
+  ctaLabel: string;
+  contact?: string | null;
+  durationFrames?: number | null;
+}
+type VideoSlide = HookSlide | CounterStatSlide | CollageSlide | OutroSlide;
+
+interface VideoStoryboard {
+  brandName: string;
   primaryColor: string;
   secondaryColor: string;
   accentColor: string;
-  sectionLabel: string;
-  stats: VideoStat[];
-  headline: string;
-  subtext: string;
-  ctaLabel: string;
-  contact: string;
+  platform: string;
+  slides: VideoSlide[];
 }
 
 interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
-  variant?:
-    | "status"
-    | "draft"
-    | "text-preview"
-    | "html-preview"
-    | "video-pending"
-    | "video-preview";
+  variant?: "status" | "draft" | "text-preview" | "html-preview";
   platform?: Platform;
   draft?: DraftContent;
   html?: string;
-  videoJobId?: string;
   approval?: ApprovalStatus;
   timestamp: Date;
   // Workflow-specific fields — set when the message originates from the MAF pipeline.
   workflowTaskId?: string;
   needsHumanIntervention?: boolean;
-  videoProps?: VideoProps;
+  videoStoryboard?: VideoStoryboard;
 }
 
 const PLATFORMS: {
@@ -489,12 +510,16 @@ export default function ChatPage() {
             approval: "approved",
           });
         }
-        // Only render the video spec card when the user selected "Video".
-        if (event.video_props && contentTypes.includes("video")) {
+        // Only render the storyboard card when the user selected "Video". The
+        // storyboard is data only at this point — rendering the MP4 is a separate,
+        // explicitly-triggered job (see VideoStoryboardCard's "Render Video" button).
+        if (event.video_storyboard && contentTypes.includes("video")) {
           pushMessage({
             role: "assistant",
-            content: `Brand video spec — ${platform}:`,
-            videoProps: event.video_props as VideoProps,
+            content: `Brand video storyboard — ${platform}:`,
+            videoStoryboard: event.video_storyboard as VideoStoryboard,
+            platform: platform as Platform,
+            workflowTaskId: taskId,
             approval: "approved",
           });
         }
@@ -542,38 +567,6 @@ export default function ChatPage() {
       });
     } catch {
       pushMessage({ role: "assistant", content: "Could not reach the brand backend." });
-    }
-  }
-
-  async function genVideo(prompt: string) {
-    pushMessage({ role: "assistant", content: "Generating your brand video spec…", variant: "status" });
-    try {
-      const res = await fetch("/api/video", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ brief: prompt, history: historyRef.current }),
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        pushMessage({ role: "assistant", content: `Video spec failed: ${data.error ?? "unknown error"}` });
-        return;
-      }
-      historyRef.current = [
-        ...historyRef.current,
-        { role: "assistant", content: "[brand video spec generated]" },
-      ];
-      if (sessionIdRef.current) {
-        persistMessage(sessionIdRef.current, "assistant", "[brand video spec generated]");
-      }
-      pushMessage({
-        role: "assistant",
-        content: "Here's your brand video spec:",
-        variant: "video-pending",
-        videoJobId: data.jobId as string,
-        approval: "pending",
-      });
-    } catch {
-      pushMessage({ role: "assistant", content: "Could not reach the video backend." });
     }
   }
 
@@ -830,36 +823,12 @@ export default function ChatPage() {
         {/* Messages */}
         <div className="flex-1 overflow-y-auto px-6 py-6 space-y-5">
           {messages.map((msg) => {
-            // Workflow final event: video spec delivered directly (no job polling needed).
-            if (msg.videoProps) {
+            // Workflow final event: storyboard delivered directly (no job polling
+            // needed for this part) — actually rendering the MP4 is a separate,
+            // explicitly-triggered job the card kicks off on demand.
+            if (msg.videoStoryboard) {
               return (
-                <div key={msg.id} className="w-full max-w-sm">
-                  <p className="text-sm text-[#6B6561] mb-2">{msg.content}</p>
-                  <div className="bg-white border border-[#E8E3DA] rounded-2xl overflow-hidden shadow-sm">
-                    <div className="flex items-center px-4 py-2.5 bg-[#1B1A17] text-white">
-                      <span className="text-sm font-semibold">✦ Brand Video Spec</span>
-                    </div>
-                    <div className="bg-[#F8F5EE] p-3">
-                      <VideoSpec props={msg.videoProps} />
-                    </div>
-                    <p className="text-xs text-[#9E9893] px-4 pb-3">{formatTime(msg.timestamp)}</p>
-                  </div>
-                </div>
-              );
-            }
-
-            if (
-              (msg.variant === "video-pending" || msg.variant === "video-preview") &&
-              msg.videoJobId
-            ) {
-              return (
-                <BrandVideoCard
-                  key={msg.id}
-                  message={msg}
-                  onApprove={() => handleApproval(msg.id, "approved")}
-                  onReject={() => handleApproval(msg.id, "rejected")}
-                  formatTime={formatTime}
-                />
+                <VideoStoryboardCard key={msg.id} message={msg} formatTime={formatTime} />
               );
             }
 
@@ -973,54 +942,93 @@ interface DraftCardProps {
   formatTime: (d: Date) => string;
 }
 
-// ── Brand Video Card ──────────────────────────────────────────────────────────
+// ── Brand Video Storyboard Card ───────────────────────────────────────────────
 
-interface BrandVideoCardProps {
+interface VideoStoryboardCardProps {
   message: Message;
-  onApprove: () => void;
-  onReject: () => void;
   formatTime: (d: Date) => string;
 }
 
+const SLIDE_ICON: Record<VideoSlide["type"], string> = {
+  hook: "🎬",
+  counter_stat: "📊",
+  collage: "🖼️",
+  outro: "🏁",
+};
+
+function slideSummary(slide: VideoSlide): string {
+  switch (slide.type) {
+    case "hook":
+      return slide.headline;
+    case "counter_stat":
+      return `${slide.stats.length} stat${slide.stats.length === 1 ? "" : "s"}`;
+    case "collage":
+      return `${slide.imageQueries.length} image${slide.imageQueries.length === 1 ? "" : "s"}`;
+    case "outro":
+      return slide.ctaLabel;
+  }
+}
+
 /**
- * Renders a brand video card that polls /api/video/[jobId] until the spec is ready,
- * then shows the structured BrandVideoProps spec (palette + scenes + CTA). The
- * backend produces the spec — not a rendered MP4 — so the card visualises the spec
- * a downstream Remotion render would consume. Polling state is local to each card.
+ * Shows the dynamically-composed storyboard the agent picked (palette + ordered
+ * slide list) immediately — no polling needed, it's already in hand from the
+ * result/final SSE event. Rendering the actual MP4 is a separate, explicitly
+ * triggered job: clicking "Render Video" posts {taskId, platform} to /api/video,
+ * polls /api/video/[jobId] until done, then swaps the preview for a real
+ * <video> player sourced from the finished download.
  */
-function BrandVideoCard({
-  message,
-  onApprove,
-  onReject,
-  formatTime,
-}: BrandVideoCardProps) {
-  const [renderStatus, setRenderStatus] = useState<"pending" | "done" | "error">(
-    message.variant === "video-preview" ? "done" : "pending"
-  );
+function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) {
+  const storyboard = message.videoStoryboard!;
+  const [renderState, setRenderState] = useState<"idle" | "pending" | "done" | "error">("idle");
+  const [jobId, setJobId] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
-  const [renderError, setRenderError] = useState<string | null>(null);
-  const [props, setProps] = useState<VideoProps | null>(null);
-  const approval = message.approval;
+  const [error, setError] = useState<string | null>(null);
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+
+  async function startRender() {
+    if (!message.workflowTaskId || !message.platform) return;
+    setRenderState("pending");
+    setError(null);
+    setElapsed(0);
+    try {
+      const res = await fetch("/api/video", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ taskId: message.workflowTaskId, platform: message.platform }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setRenderState("error");
+        setError(data.error ?? "Could not start the render.");
+        return;
+      }
+      setJobId(data.jobId as string);
+    } catch {
+      setRenderState("error");
+      setError("Could not reach the video backend.");
+    }
+  }
 
   useEffect(() => {
-    if (renderStatus !== "pending" || !message.videoJobId) return;
+    if (renderState !== "pending" || !jobId) return;
 
-    // Poll job status every 1.5 s (spec generation is fast — a single LLM call)
+    // Render is a local Remotion CLI subprocess (asset fetch + headless Chromium) —
+    // tens of seconds, so poll every 3s rather than the storyboard's near-instant cadence.
     const poll = setInterval(async () => {
       try {
-        const res = await fetch(`/api/video/${message.videoJobId}`);
+        const res = await fetch(`/api/video/${jobId}`);
         const data = await res.json();
         if (data.status === "done") {
-          setProps(data.props ?? null);
-          setRenderStatus("done");
+          setDownloadUrl(data.downloadUrl as string);
+          setRenderState("done");
         } else if (data.status === "error") {
-          setRenderStatus("error");
-          setRenderError(data.error ?? "Spec generation failed.");
+          setRenderState("error");
+          setError(data.error ?? "Render failed.");
         }
       } catch {
         // transient network error — keep polling
       }
-    }, 1500);
+    }, 3000);
 
     const tick = setInterval(() => setElapsed((s) => s + 1), 1000);
 
@@ -1028,64 +1036,45 @@ function BrandVideoCard({
       clearInterval(poll);
       clearInterval(tick);
     };
-  }, [renderStatus, message.videoJobId]);
+  }, [renderState, jobId]);
 
   return (
     <div className="w-full max-w-sm">
       <p className="text-sm text-[#6B6561] mb-2">{message.content}</p>
       <div className="bg-white border border-[#E8E3DA] rounded-2xl overflow-hidden shadow-sm">
-        {/* Header */}
-        <div className="flex items-center justify-between px-4 py-2.5 bg-[#1B1A17] text-white">
-          <span className="text-sm font-semibold">✦ Brand Video Spec</span>
-          {approval === "approved" && (
-            <span className="text-xs bg-green-500 text-white px-2 py-0.5 rounded-full font-medium">
-              Approved
-            </span>
-          )}
-          {approval === "rejected" && (
-            <span className="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full font-medium">
-              Rejected
-            </span>
-          )}
+        <div className="flex items-center px-4 py-2.5 bg-[#1B1A17] text-white">
+          <span className="text-sm font-semibold">✦ Brand Video Storyboard</span>
         </div>
 
-        {/* Body — pending spinner, error, or the structured spec */}
         <div className="bg-[#F8F5EE] p-3">
-          {renderStatus === "pending" && (
-            <div className="flex flex-col items-center justify-center gap-3 text-[#9E9893] py-12">
-              <svg className="animate-spin" width={36} height={36} viewBox="0 0 24 24" fill="none">
+          {renderState === "done" && downloadUrl ? (
+            <video src={downloadUrl} controls autoPlay className="w-full rounded-lg bg-black" />
+          ) : (
+            <StoryboardPreview storyboard={storyboard} />
+          )}
+
+          {renderState === "pending" && (
+            <div className="flex flex-col items-center justify-center gap-2 text-[#9E9893] py-4">
+              <svg className="animate-spin" width={28} height={28} viewBox="0 0 24 24" fill="none">
                 <circle cx="12" cy="12" r="10" stroke="#E8E3DA" strokeWidth="3" />
                 <path d="M12 2a10 10 0 0 1 10 10" stroke="#FF4800" strokeWidth="3" strokeLinecap="round" />
               </svg>
-              <p className="text-xs font-medium text-center">Generating video spec…</p>
-              <p className="text-xs text-center">{elapsed}s elapsed</p>
+              <p className="text-xs font-medium text-center">Rendering video… {elapsed}s elapsed</p>
             </div>
           )}
 
-          {renderStatus === "error" && (
-            <div className="flex flex-col items-center justify-center gap-2 text-center px-4 py-12">
-              <p className="text-sm font-medium text-red-500">Spec generation failed</p>
-              <p className="text-xs text-[#9E9893]">{renderError}</p>
-            </div>
+          {renderState === "error" && (
+            <p className="text-xs text-red-500 text-center mt-3">{error}</p>
           )}
-
-          {renderStatus === "done" && props && <VideoSpec props={props} />}
         </div>
 
-        {/* Actions */}
-        {renderStatus === "done" && approval === "pending" && (
-          <div className="flex gap-2 px-4 pt-1 pb-4">
+        {(renderState === "idle" || renderState === "error") && (
+          <div className="px-4 pt-1 pb-4">
             <button
-              onClick={onApprove}
-              className="flex-1 bg-green-600 hover:bg-green-500 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+              onClick={startRender}
+              className="w-full bg-[#FF4800] hover:bg-[#E03E00] text-white text-sm font-medium py-2 rounded-lg transition-colors"
             >
-              Approve
-            </button>
-            <button
-              onClick={onReject}
-              className="flex-1 bg-[#F2EDE4] hover:bg-[#E8E3DA] text-[#1B1A17] text-sm font-medium py-2 rounded-lg transition-colors border border-[#E8E3DA]"
-            >
-              Reject
+              {renderState === "error" ? "Retry Render" : "Render Video"}
             </button>
           </div>
         )}
@@ -1099,24 +1088,22 @@ function BrandVideoCard({
 }
 
 /**
- * Visualises a BrandVideoProps spec: a poster-style hero in the brand palette,
- * the three Scene-2 stats, and the Scene-3 CTA — i.e. the data a Remotion render
- * turns into the 3-scene video.
+ * Visualises a StoryboardSpec: a poster-style hero in the brand palette, then the
+ * ordered list of slides the agent chose — i.e. the data a Remotion render turns
+ * into the actual video, before any image queries are resolved.
  */
-function VideoSpec({ props }: { props: VideoProps }) {
+function StoryboardPreview({ storyboard }: { storyboard: VideoStoryboard }) {
   return (
     <div className="flex flex-col gap-3">
-      {/* Hero / Scene 1 — brand identity in the generated palette */}
       <div
         className="rounded-lg p-4 text-center"
-        style={{ background: props.primaryColor, color: "#fff" }}
+        style={{ background: storyboard.primaryColor, color: "#fff" }}
       >
-        <div className="text-lg font-bold tracking-wide" style={{ color: props.secondaryColor }}>
-          {props.brandName}
+        <div className="text-lg font-bold tracking-wide" style={{ color: storyboard.secondaryColor }}>
+          {storyboard.brandName}
         </div>
-        <div className="text-xs mt-1 opacity-90">{props.tagline}</div>
         <div className="flex justify-center gap-1.5 mt-3">
-          {[props.primaryColor, props.secondaryColor, props.accentColor].map((c, i) => (
+          {[storyboard.primaryColor, storyboard.secondaryColor, storyboard.accentColor].map((c, i) => (
             <span
               key={i}
               className="w-5 h-5 rounded-full border border-white/30"
@@ -1127,36 +1114,21 @@ function VideoSpec({ props }: { props: VideoProps }) {
         </div>
       </div>
 
-      {/* Scene 2 — three stats */}
-      <div>
-        <div className="text-[11px] font-semibold text-[#9E9893] uppercase tracking-wider mb-1.5">
-          {props.sectionLabel}
-        </div>
-        <div className="grid grid-cols-3 gap-2">
-          {props.stats.map((s, i) => (
-            <div
-              key={i}
-              className="bg-white border border-[#E8E3DA] rounded-lg p-2 text-center"
-            >
-              <div className="text-base" style={{ color: props.accentColor }}>{s.icon}</div>
-              <div className="text-sm font-bold text-[#1B1A17]">{s.value}</div>
-              <div className="text-[10px] text-[#6B6561] leading-tight">{s.label}</div>
+      <div className="flex flex-col gap-1.5">
+        {storyboard.slides.map((slide, i) => (
+          <div
+            key={i}
+            className="flex items-center gap-2 bg-white border border-[#E8E3DA] rounded-lg px-3 py-2"
+          >
+            <span className="text-base">{SLIDE_ICON[slide.type]}</span>
+            <div className="flex-1 min-w-0">
+              <div className="text-[10px] font-semibold text-[#9E9893] uppercase tracking-wider">
+                {slide.type.replace("_", " ")}
+              </div>
+              <div className="text-xs text-[#1B1A17] truncate">{slideSummary(slide)}</div>
             </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Scene 3 — CTA */}
-      <div className="bg-white border border-[#E8E3DA] rounded-lg p-3 text-center">
-        <div className="text-sm font-semibold text-[#1B1A17]">{props.headline}</div>
-        <div className="text-xs text-[#6B6561] mt-1">{props.subtext}</div>
-        <div
-          className="inline-block text-xs font-semibold text-white px-3 py-1.5 rounded-full mt-2"
-          style={{ background: `linear-gradient(90deg, ${props.secondaryColor}, ${props.accentColor})` }}
-        >
-          {props.ctaLabel}
-        </div>
-        <div className="text-[10px] text-[#9E9893] mt-2">{props.contact}</div>
+          </div>
+        ))}
       </div>
     </div>
   );
