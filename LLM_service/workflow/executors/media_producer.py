@@ -50,11 +50,12 @@ class MediaProducerExecutor(Executor):
         await ctx.yield_output(
             FinalDraft(
                 platform=approved.platform,
-                draft=approved.draft,
+                draft=approved.draft if text_requested else "",  # media-only: no text deliverable
                 decision=approved.decision,
                 comment=approved.comment,
                 needs_human_intervention=approved.needs_human_intervention,
                 proposed_rules=approved.proposed_rules,
+                content_types=list(approved.brief.content_types or []),
                 html_card=html_card,
                 video_storyboard=StoryboardSpec(**storyboard),
             )

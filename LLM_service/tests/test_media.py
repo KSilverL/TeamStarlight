@@ -62,6 +62,24 @@ async def test_approved_final_draft_carries_html_card_and_video_storyboard(workf
     assert {s.type for s in out.video_storyboard.slides} <= SLIDE_TYPES
 
 
+async def test_content_types_gate_which_media_is_produced(workflow, make_brief):
+    """brand/video are opt-in: with the default (text only) the media_producer makes neither,
+    and a partial selection produces exactly the requested artifact (text is always present)."""
+    # Default brief → text only → no card, no video spec, but the copy is still produced.
+    res = await workflow.run(make_brief(platforms=("linkedin",)))
+    rid = res.get_request_info_events()[0].request_id
+    out = (await workflow.run(responses={rid: HumanVerdict(decision="approve")})).get_outputs()[0]
+    assert out.html_card is None and out.video_props is None
+    assert out.draft  # the post copy is always produced (the spine)
+
+    # Ask for video only → video spec present, HTML card absent.
+    res = await workflow.run(make_brief(platforms=("linkedin",), content_types=["text", "video"]))
+    rid = res.get_request_info_events()[0].request_id
+    out = (await workflow.run(responses={rid: HumanVerdict(decision="approve")})).get_outputs()[0]
+    assert out.html_card is None
+    assert out.video_props is not None and len(out.video_props.stats) == 3
+
+
 # ── C. Multi-turn: caller-supplied conversation history threads into generation ──
 # The Python service is stateless; the backend assembles prior {role, content} turns
 # (looked up by conversation id) and posts them, so a follow-up continues the thread.
@@ -111,7 +129,8 @@ async def test_media_service_generate_text_accepts_history():
 
 
 async def test_approve_after_edit_also_produces_media_and_keeps_rules(workflow, make_brief):
-    result = await workflow.run(make_brief(platforms=("linkedin",), business_id="biz_media"))
+    result = await workflow.run(make_brief(
+        platforms=("linkedin",), business_id="biz_media", content_types=["text", "brand", "video"]))
     rid = result.get_request_info_events()[0].request_id
 
     out = (await workflow.run(responses={
@@ -124,3 +143,48 @@ async def test_approve_after_edit_also_produces_media_and_keeps_rules(workflow, 
     assert out.video_storyboard is not None and len(out.video_storyboard.slides) >= 2
     # the archivist's distilled rules survive the media_producer hand-off
     assert all(r.kind in ("must_do", "must_avoid") for r in out.proposed_rules)
+
+
+# ── D. Media-only (Case 4): no "text" → skip create/review/gate, run straight to media ────
+
+async def test_media_only_skips_the_gate_and_blanks_the_text(make_brief):
+    """Requesting brand+video but NOT text completes WITHOUT a review gate (no copy to
+    approve), produces the requested artifacts, and surfaces no text deliverable."""
+    from LLM_service.api import WorkflowService
+
+    svc = WorkflowService()
+    snap = await svc.start(
+        make_brief(platforms=("linkedin", "instagram"), content_types=["brand", "video"]).model_dump(),
+        task_id="media-only-1",
+    )
+    # No gate: the task is done immediately (not awaiting_review).
+    assert snap["status"] == "completed"
+    assert snap["pending"] == []
+    assert {o["platform"] for o in snap["outputs"]} == {"linkedin", "instagram"}
+    for o in snap["outputs"]:
+        assert o["draft"] == ""                       # text was not requested
+        assert o["content_types"] == ["brand", "video"]
+        assert o["html_card"].startswith("<!DOCTYPE html>")
+        assert o["video_props"] and len(o["video_props"]["stats"]) == 3
+
+    # The SSE stream carried a `final` per platform and never a text `draft_ready` gate.
+    events = svc.buffered_events("media-only-1")
+    assert not any(e.get("status") == "draft_ready" for e in events)
+    assert not any(e.get("node") in ("creator", "reviewer", "human_gate", "dispatcher", "scout")
+                   for e in events)
+    finals = [e for e in events if e["type"] == "result" and e["status"] == "final"]
+    assert {e["platform"] for e in finals} == {"linkedin", "instagram"}
+
+
+async def test_media_only_video_only_produces_just_the_video_spec(make_brief):
+    from LLM_service.api import WorkflowService
+
+    svc = WorkflowService()
+    snap = await svc.start(
+        make_brief(platforms=("linkedin",), content_types=["video"]).model_dump(),
+        task_id="media-only-2",
+    )
+    assert snap["status"] == "completed"
+    out = snap["outputs"][0]
+    assert out["draft"] == "" and out["html_card"] is None
+    assert out["video_props"] and len(out["video_props"]["stats"]) == 3

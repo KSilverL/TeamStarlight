@@ -14,11 +14,20 @@ from __future__ import annotations
 import json
 
 import pytest
+from agent_framework import ChatResponse, ChatResponseUpdate, Message
 
-from LLM_service.core.config import get_settings
-from LLM_service.core.services import azure, mock, postgres
-from LLM_service.core.services.base import SafetyResult, SafetyService, VoiceService
+from LLM_service.core.config import get_settings, reset_settings
+from LLM_service.core.services import azure, factory, mock, postgres
+from LLM_service.core.services.base import (
+    SafetyResult,
+    SafetyService,
+    VoiceService,
+    empty_profile,
+)
 from LLM_service.core.skill_schema import SkillCandidate, SkillRule, UserSkillDoc
+from LLM_service.workflow import Brief
+from LLM_service.workflow.roundtable import PersonaContext, build_roundtable
+from LLM_service.workflow.roundtable.personas import ROSTER
 
 
 # ── Fakes / seam overrides (no network) ───────────────────────────────────────
@@ -27,7 +36,7 @@ def azure_llm(reply: str) -> azure.AzureLLM:
     """An AzureLLM whose single chat seam returns a canned reply."""
     llm = azure.AzureLLM(get_settings())
 
-    async def _complete(messages):
+    async def _complete(messages, *, model=None):
         return reply
 
     llm._complete = _complete  # type: ignore[assignment]
@@ -73,7 +82,7 @@ async def test_dispatch_parity():
     for out in (m, a):
         assert set(out.keys()) == {"route", "topic", "target_platforms", "user_intent"}
         assert isinstance(out["target_platforms"], list)
-        assert out["route"] in {"copilot_mode", "direct_generation", "brand_training"}
+        assert out["route"] in {"copilot_mode", "direct_generation"}
 
 
 async def test_plan_strategy_parity():
@@ -176,29 +185,66 @@ async def test_fill_brief_parity():
         assert isinstance(out["wants_scout"], bool)
 
 
-_CANDIDATE_KEYS = {"id", "text", "platform", "suggested_kind", "rationale"}
-
-
-async def test_summarize_session_parity():
-    kw = dict(
-        brief={"topic": "coffee launch", "target_platforms": ["linkedin", "x"], "tone_hint": "warm"},
-        conversation=[{"role": "user", "content": "post about our coffee launch"}],
-        final_drafts=[{"platform": "linkedin", "draft": "Our single-origin is here."},
-                      {"platform": "x", "draft": "Coffee launch — today. 🧵"}],
-    )
-    m = await mock.MockLLM().summarize_session(**kw)
+async def test_summarize_preferences_parity():
+    transcript = [
+        {"speaker": "user", "role": "user", "text": "please mention fair-trade sourcing",
+         "platform": "linkedin", "round_index": 1},
+        {"speaker": "platform_editor", "role": "persona", "text": "open with a hook",
+         "platform": "linkedin", "round_index": 2},
+    ]
+    verdicts = [{"platform": "linkedin", "decision": "approve_after_edit", "edited_draft": "crisp punchy line"}]
+    m = await mock.MockLLM().summarize_preferences(transcript=transcript, verdicts=verdicts)
     a = await azure_llm(json.dumps([
-        {"text": "Open with a data hook", "platform": "linkedin", "suggested_kind": "positive", "rationale": "added"},
-        {"text": "Keep it warm", "platform": None, "suggested_kind": "positive", "rationale": "tone"},
-        {"text": "Avoid hype words", "platform": None, "suggested_kind": "negative", "rationale": "trimmed"},
-    ])).summarize_session(**kw)
+        {"skill": "Mention fair-trade sourcing", "evidence": "the user asked for it"},
+        {"skill": "Be crisp and punchy", "evidence": "the user's edit"},
+    ])).summarize_preferences(transcript=transcript, verdicts=verdicts)
     for out in (m, a):
-        assert isinstance(out, list) and 1 <= len(out) <= 6
-        for cand in out:
-            assert isinstance(cand, SkillCandidate)
-            assert set(cand.model_dump().keys()) == _CANDIDATE_KEYS
-            assert cand.suggested_kind in ("positive", "negative")
-            assert cand.id and cand.text
+        assert isinstance(out, list) and 0 <= len(out) <= 3
+        for item in out:
+            assert set(item.keys()) == {"skill", "evidence"}
+            assert isinstance(item["skill"], str) and item["skill"]
+            assert isinstance(item["evidence"], str)
+    # the mock traces the preference back to the user's interjection
+    assert any("fair-trade" in i["evidence"] for i in m)
+
+
+_HANDOFF_KEYS = {
+    "topic", "prior_strategy_summary", "approved_directions", "rejected_directions", "user_notes",
+}
+
+
+async def test_summarize_handoff_parity():
+    transcript = [
+        {"speaker": "user", "role": "user", "text": "keep it warm and local", "platform": "linkedin"},
+        {"speaker": "platform_editor", "role": "persona", "text": "open with a hook", "platform": "linkedin"},
+    ]
+    verdicts = [
+        {"platform": "linkedin", "decision": "approve_after_edit", "edited_draft": "Lead with the seasonal angle."},
+        {"platform": "instagram", "decision": "reject", "reason": "too salesy"},
+    ]
+    m = await mock.MockLLM().summarize_handoff(transcript=transcript, verdicts=verdicts)
+    a = await azure_llm(json.dumps({
+        "topic": "autumn cold brew",
+        "prior_strategy_summary": "lead with the seasonal angle",
+        "approved_directions": ["seasonal angle"],
+        "rejected_directions": ["salesy framing"],
+        "user_notes": ["keep it warm and local"],
+    })).summarize_handoff(transcript=transcript, verdicts=verdicts)
+    for out in (m, a):
+        # EXACTLY the PriorSessionContext content keys (the caller attaches parent_session_id).
+        assert set(out.keys()) == _HANDOFF_KEYS
+        assert out["topic"] is None or isinstance(out["topic"], str)
+        assert out["prior_strategy_summary"] is None or isinstance(out["prior_strategy_summary"], str)
+        for key in ("approved_directions", "rejected_directions", "user_notes"):
+            assert isinstance(out[key], list) and all(isinstance(x, str) for x in out[key])
+    # The mock carries the user's steer + the approve/reject split forward.
+    assert any("warm and local" in n for n in m["user_notes"])
+    assert m["approved_directions"] and m["rejected_directions"]
+
+    # An empty conversation distils to the all-empty recap (which the caller degrades to "no prior").
+    empty = await mock.MockLLM().summarize_handoff(transcript=[], verdicts=[])
+    assert set(empty.keys()) == _HANDOFF_KEYS
+    assert empty["topic"] is None and empty["approved_directions"] == [] and empty["user_notes"] == []
 
 
 _SKILL_RULE_KEYS = {"text", "platform", "kind"}
@@ -303,6 +349,91 @@ async def test_checkpoint_roundtrip_parity():
         await store.save_checkpoint(task_id="t1", data={"state": "paused"})
         loaded = await store.load_checkpoint(task_id="t1")
         assert loaded is not None and loaded.get("state") == "paused"
+
+
+# ── Roundtable chat client + build parity (Phase 2) ───────────────────────────
+
+def azure_chat_client(reply: str) -> azure.AzureChatClient:
+    """An AzureChatClient whose single completion seam returns a canned reply."""
+    client = azure.AzureChatClient(get_settings(), agent_name="platform_editor")
+
+    async def _complete(messages):
+        return reply
+
+    client._complete = _complete  # type: ignore[assignment]
+    return client
+
+
+async def _drive_non_stream(client) -> ChatResponse:
+    return await client._inner_get_response(
+        messages=[Message("user", "your angle?")], stream=False, options={}
+    )
+
+
+async def _drive_stream(client):
+    stream = client._inner_get_response(
+        messages=[Message("user", "your angle?")], stream=True, options={}
+    )
+    return [u async for u in stream]
+
+
+async def test_roundtable_chat_client_parity():
+    """MockChatClient and AzureChatClient shape responses identically (non-stream returns a
+    ChatResponse with text; stream yields ChatResponseUpdate(s)) — Azure's network is stubbed."""
+    clients = [mock.MockChatClient(agent_name="platform_editor"), azure_chat_client("an azure line")]
+    for client in clients:
+        resp = await _drive_non_stream(client)
+        assert isinstance(resp, ChatResponse)
+        assert isinstance(resp.text, str) and resp.text
+
+        updates = await _drive_stream(client)
+        assert updates and all(isinstance(u, ChatResponseUpdate) for u in updates)
+        assert "".join(u.text or "" for u in updates)
+
+
+def test_get_chat_client_toggle(monkeypatch):
+    """The factory returns a MockChatClient in mock mode and an AzureChatClient in
+    production mode (with creds), mirroring the other service getters."""
+    assert isinstance(factory.get_chat_client(agent_name="brand_voice"), mock.MockChatClient)
+
+    monkeypatch.setenv("USE_MOCK_LLM", "false")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com/openai/v1")
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
+    reset_settings()
+    factory.reset_services()
+    assert isinstance(factory.get_chat_client(agent_name="brand_voice"), azure.AzureChatClient)
+
+
+def _context() -> PersonaContext:
+    return PersonaContext(brand_profile=empty_profile(None), user_skills=None)
+
+
+def _brief() -> Brief:
+    return Brief(topic="coffee launch", target_platforms=["linkedin"], user_intent="signups")
+
+
+def test_roundtable_build_shape_parity(monkeypatch):
+    """A table assembles to the same structural shape (same roster, one workflow) whether the
+    backend is mock (deterministic manager) or production (LLM manager_agent) — built offline,
+    not run, so no network."""
+    mock_build = build_roundtable("linkedin", _brief(), context=_context(), max_rounds=4)
+
+    monkeypatch.setenv("USE_MOCK_LLM", "false")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com/openai/v1")
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
+    reset_settings()
+    factory.reset_services()
+    azure_build = build_roundtable("linkedin", _brief(), context=_context(), max_rounds=4)
+
+    for build in (mock_build, azure_build):
+        assert build.names == ROSTER
+        assert len(build.personas) == len(ROSTER)
+        assert build.roles == {n: n for n in ROSTER}
+        assert build.workflow is not None
+        assert build.max_rounds == 4
+    # The production personas are Azure-backed; the mock ones are offline.
+    assert isinstance(mock_build.personas[0].agent.client, mock.MockChatClient)
+    assert isinstance(azure_build.personas[0].agent.client, azure.AzureChatClient)
 
 
 # ── Voice parity ──────────────────────────────────────────────────────────────

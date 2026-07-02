@@ -2,10 +2,11 @@ package com.example.tsldemo;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
 import java.time.LocalDateTime;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
-
+import java.util.UUID;
 import jakarta.persistence.*;
 
 @Entity
@@ -36,13 +37,17 @@ public class Session {
 	private Business user;
 
 	// id comes from the LLM service so both systems share the same session identifier
-	public Session(String id) {
-		this.id = id;
+	public Session() {
+		this.id = createSessionID();
 		this.status = "running";
 		this.createdAt = LocalDateTime.now().toString();
 	}
 
-	public Session() {}
+	private String createSessionID() {
+		return "intake-"+ UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+		
+	}
+	
 
 //	@JsonProperty("userId")
 //	public int getUserId() {

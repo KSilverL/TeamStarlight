@@ -1,8 +1,12 @@
 package com.example.tsldemo.SessionAPI;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
@@ -32,28 +36,44 @@ public class SessionService {
     public SessionService(RestClient restClient) {
         this.restClient = restClient;
     }
-
-	public IntakeRespDTO createSession(IntakeReqDTO intakeDTO, int businessId) {
+    
+    //TODO: clean function
+    public IntakeRespDTO createSession(IntakeReqDTO intakeDTO, int businessId) {
+    	Session session = new Session();
+        String sessionId = session.getId();
+        
+        repo.save(session);
+        
+        Map<String, Object> body = new HashMap<>();
+        body.put("session_id", sessionId);
+        body.put("opening_user_input", intakeDTO.openingInput());
+        body.put("mode", "text"); 
+      
+        //TODO: Fix IntakeReqDTO
         IntakeRespDTO intakeResp = restClient.post()
                 .uri(llmServiceBaseUrl + "/intake")
-				.contentType(MediaType.APPLICATION_JSON)
-				.body(intakeDTO)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(body)
                 .retrieve()
                 .body(IntakeRespDTO.class);
+                
+        Message userPrompt = new Message("user", intakeDTO.openingInput());
+        Message openingMessage = new Message("assistant",intakeResp.assistantMessage());
+        
+        session.addMessage(userPrompt);
+        session.addMessage(openingMessage);
 
-		Session session = new Session(intakeResp.sessionId());
-
-		if (businessId > 0) {
-			Business business = businessRepo.findById(businessId).orElse(null);
-			if (business != null) {
-				session.setUser(business);
-			}
-		}
-
-		repo.save(session);
-		return intakeResp;
+        if (businessId > 0) {
+            Business business = businessRepo.findById(businessId).orElse(null);
+            if (business != null) {
+                session.setUser(business);
+            }
+        }
+        
+        return intakeResp;
     }
-
+    
+    
 	public void addSession(Session s) {
 		repo.save(s);
 	}

@@ -36,7 +36,13 @@ public class JwtUtil {
     }
 
     /** Returns the businessId encoded in the token, or -1 if invalid/expired. */
-    public int extractBusinessId(String token) {
+    public int extractBusinessId(String authHeader) {
+    	if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            return -1;
+        }
+
+        String token = authHeader.substring(7);
+
         try {
             String subject = Jwts.parser()
                     .verifyWith(key)
@@ -44,9 +50,14 @@ public class JwtUtil {
                     .parseSignedClaims(token)
                     .getPayload()
                     .getSubject();
+
             return Integer.parseInt(subject);
+
         } catch (Exception e) {
             return -1;
         }
     }
+    
+
+  
 }

@@ -17,6 +17,7 @@ shaping logic without a database.
 from __future__ import annotations
 
 import json
+import ssl as _ssl
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -25,6 +26,28 @@ from agent_framework import CheckpointStorage, WorkflowCheckpoint
 from ..config import Settings
 from ..skill_schema import SkillRule, UserSkillDoc
 from .base import StoreService, empty_profile
+
+
+def _connect_kwargs(settings: Settings) -> dict:
+    """Extra `asyncpg.create_pool` kwargs derived from `settings.postgres_sslmode`.
+
+    Translates a libpq-style sslmode into asyncpg's `ssl` argument so the same DSN
+    works against Supabase (SSL optional) and Azure Cosmos DB for PostgreSQL (SSL
+    mandatory). Unset → `{}` (the DSN's own `?sslmode=` governs, if any)."""
+    mode = (settings.postgres_sslmode or "").strip().lower()
+    if not mode or mode in ("allow", "prefer"):
+        return {}  # let the driver / DSN negotiate
+    if mode == "disable":
+        return {"ssl": False}
+    ctx = _ssl.create_default_context()
+    if mode == "require":
+        # Encrypt without validating the cert chain (matches libpq sslmode=require).
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+    elif mode == "verify-ca":
+        ctx.check_hostname = False
+    # verify-full → keep the default (hostname + chain verification).
+    return {"ssl": ctx}
 
 
 def _profiles_ddl(table: str) -> str:
@@ -77,7 +100,7 @@ class PostgresStore(StoreService):
             import asyncpg  # lazy import
 
             s = self._settings
-            self._pool_obj = await asyncpg.create_pool(dsn=s.postgres_dsn)
+            self._pool_obj = await asyncpg.create_pool(dsn=s.postgres_dsn, **_connect_kwargs(s))
             async with self._pool_obj.acquire() as conn:
                 await conn.execute(_profiles_ddl(s.postgres_profiles_table))
                 await conn.execute(_user_skills_ddl(s.postgres_user_skills_table))
@@ -200,14 +223,22 @@ class PostgresCheckpointStorage(CheckpointStorage):
         if self._pool_obj is None:
             import asyncpg  # lazy import
 
-            self._pool_obj = await asyncpg.create_pool(dsn=self._settings.postgres_dsn)
+            self._pool_obj = await asyncpg.create_pool(
+                dsn=self._settings.postgres_dsn, **_connect_kwargs(self._settings)
+            )
             async with self._pool_obj.acquire() as conn:
                 await conn.execute(_checkpoints_ddl(self._table))
         return self._pool_obj
 
     async def save(self, checkpoint: "WorkflowCheckpoint") -> str:
+        # `to_dict()` is a SHALLOW conversion: nested values stay live framework objects
+        # (e.g. WorkflowMessage, our pydantic messages), which `json.dumps` cannot encode.
+        # Mirror MAF's own FileCheckpointStorage: run the checkpoint encoder first — it
+        # pickles non-JSON-native values to base64 strings — then JSON-serialize the result.
+        from agent_framework._workflows._checkpoint_encoding import encode_checkpoint_value
+
         pool = await self._pool()
-        doc = json.dumps(checkpoint.to_dict())
+        doc = json.dumps(encode_checkpoint_value(checkpoint.to_dict()))
         async with pool.acquire() as conn:
             await conn.execute(
                 f"INSERT INTO {self._table} (id, workflow_name, doc) VALUES ($1, $2, $3::jsonb) "
@@ -219,11 +250,19 @@ class PostgresCheckpointStorage(CheckpointStorage):
             )
         return checkpoint.checkpoint_id
 
+    @staticmethod
+    def _from_doc(doc: str) -> "WorkflowCheckpoint":
+        """Reverse `save`'s encoding: JSON-decode, then run the checkpoint decoder
+        (un-pickles the base64-encoded framework/pydantic values) before rebuilding."""
+        from agent_framework._workflows._checkpoint_encoding import decode_checkpoint_value
+
+        return WorkflowCheckpoint.from_dict(decode_checkpoint_value(json.loads(doc)))
+
     async def load(self, checkpoint_id: str) -> "WorkflowCheckpoint":
         pool = await self._pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(f"SELECT doc FROM {self._table} WHERE id = $1", checkpoint_id)
-        return WorkflowCheckpoint.from_dict(json.loads(row["doc"]))
+        return self._from_doc(row["doc"])
 
     async def list_checkpoints(self, *, workflow_name: str) -> List["WorkflowCheckpoint"]:
         pool = await self._pool()
@@ -232,7 +271,7 @@ class PostgresCheckpointStorage(CheckpointStorage):
                 f"SELECT doc FROM {self._table} WHERE workflow_name = $1 ORDER BY seq ASC",
                 workflow_name,
             )
-        return [WorkflowCheckpoint.from_dict(json.loads(r["doc"])) for r in rows]
+        return [self._from_doc(r["doc"]) for r in rows]
 
     async def list_checkpoint_ids(self, *, workflow_name: str) -> List[str]:
         return [c.checkpoint_id for c in await self.list_checkpoints(workflow_name=workflow_name)]
