@@ -18,8 +18,16 @@ from typing import Any, Callable, Dict, Optional
 from agent_framework import CheckpointStorage, InMemoryCheckpointStorage
 
 from ..config import get_settings
-from . import azure, mock, postgres
-from .base import LLMService, SafetyService, StoreService, VoiceService
+from . import azure, media_assets, mock, postgres
+from .base import (
+    BackgroundRemovalService,
+    ImageSearchService,
+    LLMService,
+    MusicGenerationService,
+    SafetyService,
+    StoreService,
+    VoiceService,
+)
 
 __all__ = [
     "get_llm",
@@ -27,6 +35,9 @@ __all__ = [
     "get_store",
     "get_voice",
     "get_chat_client",
+    "get_image_search",
+    "get_background_removal",
+    "get_music_generation",
     "get_checkpoint_storage",
     "reset_services",
 ]
@@ -140,6 +151,34 @@ def get_chat_client(
         s, agent_name=agent_name, model=mdl, endpoint=ep, api_key=key,
         max_tokens=max_tokens, reasoning_effort=reasoning_effort, verbosity=verbosity,
     )
+def get_image_search() -> ImageSearchService:
+    def build() -> ImageSearchService:
+        s = get_settings()
+        if s.mock_image_search():
+            return mock.MockImageSearch()
+        _require(s.has_pexels, "Pexels", "PEXELS_API_KEY", "USE_MOCK_IMAGE_SEARCH=true")
+        return media_assets.PexelsImageSearch(s)
+    return _cached("image_search", build)
+
+
+def get_background_removal() -> BackgroundRemovalService:
+    def build() -> BackgroundRemovalService:
+        s = get_settings()
+        if s.mock_background_removal():
+            return mock.MockBackgroundRemoval()
+        _require(s.has_removebg, "Remove.bg", "REMOVEBG_API_KEY", "USE_MOCK_BACKGROUND_REMOVAL=true")
+        return media_assets.RemoveBgService(s)
+    return _cached("background_removal", build)
+
+
+def get_music_generation() -> MusicGenerationService:
+    def build() -> MusicGenerationService:
+        s = get_settings()
+        if s.mock_music_generation():
+            return mock.MockMusicGeneration()
+        _require(s.has_soundraw, "Soundraw", "SOUNDRAW_API_KEY", "USE_MOCK_MUSIC_GENERATION=true")
+        return media_assets.SoundrawMusic(s)
+    return _cached("music_generation", build)
 
 
 def get_checkpoint_storage() -> CheckpointStorage:

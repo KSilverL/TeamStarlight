@@ -75,6 +75,18 @@ def _checkpoints_ddl(table: str) -> str:
     )
 
 
+def _video_jobs_ddl(table: str) -> str:
+    # Same whole-document-in-JSONB shape as brand_profiles/user_skills; the job_id
+    # is the primary key. task_id/platform/status are pulled out as plain columns
+    # too (not just inside `doc`) so a future "list jobs for a task" query doesn't
+    # need a JSONB index — Phase 1 doesn't need that query, but the columns are free.
+    return (
+        f"CREATE TABLE IF NOT EXISTS {table} ("
+        f"id TEXT PRIMARY KEY, task_id TEXT, platform TEXT, status TEXT, "
+        f"doc JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+    )
+
+
 class PostgresStore(StoreService):
     """brand_profiles + the StoreService checkpoint KV, on PostgreSQL."""
 
@@ -93,6 +105,7 @@ class PostgresStore(StoreService):
                 await conn.execute(_profiles_ddl(s.postgres_profiles_table))
                 await conn.execute(_user_skills_ddl(s.postgres_user_skills_table))
                 await conn.execute(_checkpoints_ddl(s.postgres_checkpoints_table))
+                await conn.execute(_video_jobs_ddl(s.postgres_video_jobs_table))
         return self._pool_obj
 
     async def _read(self, table: str, key: str) -> Optional[dict]:
@@ -150,6 +163,46 @@ class PostgresStore(StoreService):
 
     async def load_checkpoint(self, *, task_id: str) -> Optional[dict]:
         return await self._read(self._settings.postgres_checkpoints_table, task_id)
+
+    async def create_video_job(self, *, job_id: str, task_id: str, platform: str, storyboard: dict) -> dict:
+        now = datetime.now(timezone.utc).isoformat()
+        doc = {
+            "id": job_id, "task_id": task_id, "platform": platform, "status": "pending",
+            "storyboard": storyboard, "output_path": None, "error": None,
+            "created_at": now, "updated_at": now,
+        }
+        pool = await self._pool()
+        table = self._settings.postgres_video_jobs_table
+        async with pool.acquire() as conn:
+            await conn.execute(
+                f"INSERT INTO {table} (id, task_id, platform, status, doc) "
+                f"VALUES ($1, $2, $3, $4, $5::jsonb)",
+                job_id, task_id, platform, "pending", json.dumps(doc),
+            )
+        return doc
+
+    async def update_video_job(self, *, job_id: str, **fields) -> dict:
+        pool = await self._pool()
+        table = self._settings.postgres_video_jobs_table
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(f"SELECT doc FROM {table} WHERE id = $1", job_id)
+            if row is None:
+                raise KeyError(f"unknown video job: {job_id}")
+            doc = json.loads(row["doc"])
+            doc.update(fields)
+            doc["updated_at"] = datetime.now(timezone.utc).isoformat()
+            await conn.execute(
+                f"UPDATE {table} SET doc = $2::jsonb, status = $3, updated_at = now() WHERE id = $1",
+                job_id, json.dumps(doc), doc.get("status", "pending"),
+            )
+        return doc
+
+    async def get_video_job(self, *, job_id: str) -> Optional[dict]:
+        pool = await self._pool()
+        table = self._settings.postgres_video_jobs_table
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(f"SELECT doc FROM {table} WHERE id = $1", job_id)
+        return json.loads(row["doc"]) if row else None
 
 
 class PostgresCheckpointStorage(CheckpointStorage):

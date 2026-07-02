@@ -26,7 +26,7 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
-from ..core.media_schema import BrandVideoProps
+from ..core.video_schema import StoryboardSpec
 
 # Reject this many times before the circuit breaker forces a human decision.
 MAX_RETRIES = 3
@@ -167,5 +167,5 @@ class FinalDraft(BaseModel):
     # Echoes the brief's requested deliverables; `html_card` / `video_props` are populated
     # only when "brand" / "video" are in `content_types` (else None).
     content_types: List[str] = Field(default_factory=lambda: list(DEFAULT_CONTENT_TYPES))
-    html_card: Optional[str] = None                 # self-contained animated HTML ("brand")
-    video_props: Optional[BrandVideoProps] = None   # structured 3-scene video spec ("video")
+    html_card: Optional[str] = None                       # self-contained animated HTML
+    video_storyboard: Optional[StoryboardSpec] = None     # dynamic, composable video storyboard

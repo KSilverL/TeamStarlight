@@ -30,6 +30,8 @@ __all__ = [
     "SafetyService",
     "StoreService",
     "VoiceService",
+    "ImageSearchService",
+    "BackgroundRemovalService",
     "empty_profile",
 ]
 
@@ -156,23 +158,27 @@ class LLMService(ABC):
         ...
 
     @abstractmethod
-    async def generate_video_props(
+    async def generate_video_storyboard(
         self,
         *,
         topic: str,
         draft: str,
         tone_hint: Optional[str],
+        platform: str,
         skill: str = "",
         history: Optional[List[dict]] = None,
     ) -> dict:
-        """Generate the structured spec for a 3-scene brand video (the "生成视频" idea,
-        ported from demos/brand_video_agent) as a JSON-friendly dict matching
-        core.media_schema.BrandVideoProps (brand identity / three stats / CTA + a 3-colour
-        palette). The LLM produces DATA only — no visual code; the actual Remotion render
-        is external to this service. `skill` is the static spec (skills/brand_video.md).
-        Every impl MUST return exactly 3 `stats`. `history` (optional) is the prior
-        {role, content} conversation the caller assembled, folded in as context for a
-        follow-up; None/empty = single-turn."""
+        """Generate a dynamic, composable storyboard for a short-form brand video as a
+        JSON-friendly dict matching core.video_schema.StoryboardSpec — an ordered list
+        of typed `slides` picked from the slide registry (hook / counter_stat / collage
+        / outro), not a fixed scene count. The LLM produces DATA only — no visual code,
+        and image fields are search keywords, never URLs; the actual Remotion render is
+        external to this service. `platform` lets the prompt reason about length/format
+        context, but the final aspect ratio is derived deterministically downstream
+        (core.video_schema.aspect_for_platform), never trusted from the LLM. `skill` is
+        the static spec (skills/brand_video_storyboard.md). `history` (optional) is the
+        prior {role, content} conversation the caller assembled, folded in as context
+        for a follow-up; None/empty = single-turn."""
         ...
 
     @abstractmethod
@@ -320,6 +326,23 @@ class StoreService(ABC):
         """Return the most recent checkpoint for a task, or None."""
         ...
 
+    @abstractmethod
+    async def create_video_job(self, *, job_id: str, task_id: str, platform: str, storyboard: dict) -> dict:
+        """Create a `pending` video-render job row. Returns the stored document
+        (id, task_id, platform, status, storyboard, output_path, error, timestamps)."""
+        ...
+
+    @abstractmethod
+    async def update_video_job(self, *, job_id: str, **fields) -> dict:
+        """Merge `fields` (e.g. status, output_path, error) into an existing video job
+        and return the updated document."""
+        ...
+
+    @abstractmethod
+    async def get_video_job(self, *, job_id: str) -> Optional[dict]:
+        """Return the video job document, or None if `job_id` is unknown."""
+        ...
+
 
 # ── Voice (Voice Live bridge) ─────────────────────────────────────────────────
 
@@ -331,4 +354,43 @@ class VoiceService(ABC):
     @abstractmethod
     async def transcribe_turn(self, *, session_id: str, user_audio: str) -> dict:
         """Turn a user audio turn into text. Contract keys: session_id, transcript."""
+        ...
+
+
+# ── Image search (Pexels) ──────────────────────────────────────────────────────
+
+class ImageSearchService(ABC):
+    """Stock-photo search for collage/hook slide image queries. Callers must treat
+    an empty result as a soft-fail (skip the image), never raise on a plain miss."""
+
+    @abstractmethod
+    async def search(self, *, query: str, per_page: int = 1) -> List[dict]:
+        """Return up to `per_page` candidate images for `query`, each a dict with at
+        least {url, photographer, width, height}. Empty list on no match."""
+        ...
+
+
+# ── Background removal (Remove.bg) ───────────────────────────────────────────────
+
+class BackgroundRemovalService(ABC):
+    """Cut-out photography: strips the background from a downloaded stock image so
+    it composites cleanly over a geometric shape."""
+
+    @abstractmethod
+    async def remove_background(self, *, image_bytes: bytes) -> bytes:
+        """Return PNG bytes with the background removed. Raises on a hard failure
+        (rate limit, bad image, network) — callers fall back to the original image."""
+        ...
+
+
+# ── Background music (Soundraw) ───────────────────────────────────────────────
+
+class MusicGenerationService(ABC):
+    """Background music generation, sized to a render's exact duration."""
+
+    @abstractmethod
+    async def generate(self, *, mood: str, genre: str, duration_seconds: float, energy: str) -> bytes:
+        """Return audio bytes (mp3) for a track matching the requested duration.
+        Raises on a hard failure (rate limit, bad params, network) — callers fall
+        back to a silent render."""
         ...

@@ -20,6 +20,7 @@ public class Message {
 	@JsonProperty
 	private String variant;
 	@JsonProperty
+	@Column(columnDefinition = "TEXT")
 	private String content;
 	@JsonProperty
 	private String timestamp;

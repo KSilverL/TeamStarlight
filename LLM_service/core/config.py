@@ -131,6 +131,9 @@ class Settings:
     use_mock_safety: Optional[bool] = None
     use_mock_store: Optional[bool] = None
     use_mock_voice: Optional[bool] = None
+    use_mock_image_search: Optional[bool] = None
+    use_mock_background_removal: Optional[bool] = None
+    use_mock_music_generation: Optional[bool] = None
 
     # ── Azure OpenAI / Foundry (chat + structured output + copywriting) ────────
     azure_openai_endpoint: Optional[str] = None
@@ -155,6 +158,7 @@ class Settings:
     # Azure Cosmos DB for PostgreSQL *requires* SSL, so set POSTGRES_SSLMODE=require
     # there. Honoured by PostgresStore._pool / PostgresCheckpointStorage._pool.
     postgres_sslmode: Optional[str] = None
+    postgres_video_jobs_table: str = "video_jobs"
 
     # ── Voice Live API (voice intake) ──────────────────────────────────────────
     azure_voicelive_endpoint: Optional[str] = None
@@ -204,6 +208,22 @@ class Settings:
     # rate-limit-friendly deployment as the roundtable personas (ROUNDTABLE_PERSONA_MODEL);
     # PREFERENCE_SUMMARY_MODEL overrides it. None → fall back to the main chat deployment.
     preference_summary_model: Optional[str] = None
+    # ── Pexels (stock photo search) + Remove.bg (cut-out backgrounds) ──────────
+    pexels_api_key: Optional[str] = None
+    removebg_api_key: Optional[str] = None
+
+    # ── Soundraw (background music generation) ──────────────────────────────────
+    soundraw_api_key: Optional[str] = None
+
+    # ── Video render pipeline (local Remotion CLI) ──────────────────────────────
+    # Path to the video_renderer/ Node project (repo-root sibling of LLM_service/).
+    video_renderer_dir: Optional[str] = None
+    # Per-job working directory: resolved images + the final MP4. Not git-tracked.
+    video_jobs_dir: str = ".video_jobs"
+
+    # ── Backend status webhook (legacy transport; SSE replaces it in M2) ───────
+    webhook_url: str = "http://localhost:9999/status"
+    webhook_enabled: Optional[bool] = None
 
     # ── Per-service resolution: override > global > default ─────────────────────
     def mock_llm(self) -> bool:
@@ -217,6 +237,20 @@ class Settings:
 
     def mock_voice(self) -> bool:
         return self.use_mock if self.use_mock_voice is None else self.use_mock_voice
+
+    def mock_image_search(self) -> bool:
+        return self.use_mock if self.use_mock_image_search is None else self.use_mock_image_search
+
+    def mock_background_removal(self) -> bool:
+        return self.use_mock if self.use_mock_background_removal is None else self.use_mock_background_removal
+
+    def mock_music_generation(self) -> bool:
+        return self.use_mock if self.use_mock_music_generation is None else self.use_mock_music_generation
+
+    def notify_via_webhook(self) -> bool:
+        """Whether status events are POSTed to the backend webhook. Defaults to
+        production-only; WEBHOOK_ENABLED overrides (e.g. to test the receiver)."""
+        return (not self.use_mock) if self.webhook_enabled is None else self.webhook_enabled
 
     # ── Credential presence checks (used by production impls / factory) ─────────
     @property
@@ -235,6 +269,36 @@ class Settings:
     def has_voice(self) -> bool:
         return bool(self.azure_voicelive_endpoint)
 
+    @property
+    def has_pexels(self) -> bool:
+        return bool(self.pexels_api_key)
+
+    @property
+    def has_removebg(self) -> bool:
+        return bool(self.removebg_api_key)
+
+    @property
+    def has_soundraw(self) -> bool:
+        return bool(self.soundraw_api_key)
+
+    @property
+    def resolved_video_renderer_dir(self) -> Path:
+        """Absolute path to the video_renderer/ Node project. VIDEO_RENDERER_DIR
+        overrides; otherwise defaults to the repo-root sibling of LLM_service/ (this
+        file is core/config.py, so parent.parent.parent is the repo root)."""
+        if self.video_renderer_dir:
+            return Path(self.video_renderer_dir)
+        return Path(__file__).resolve().parent.parent.parent / "video_renderer"
+
+    @property
+    def resolved_video_jobs_dir(self) -> Path:
+        """Absolute path to the per-job working directory (resolved images + the
+        final MP4). Relative `video_jobs_dir` values resolve under LLM_service/."""
+        path = Path(self.video_jobs_dir)
+        if path.is_absolute():
+            return path
+        return Path(__file__).resolve().parent.parent / path
+
     def mode_banner(self) -> str:
         """Human-readable one-liner describing the resolved mode of each service."""
         def tag(is_mock: bool) -> str:
@@ -243,7 +307,10 @@ class Settings:
         return (
             f"MODE: {overall}  "
             f"[llm={tag(self.mock_llm())} safety={tag(self.mock_safety())} "
-            f"store={tag(self.mock_store())} voice={tag(self.mock_voice())}]"
+            f"store={tag(self.mock_store())} voice={tag(self.mock_voice())} "
+            f"image_search={tag(self.mock_image_search())} "
+            f"background_removal={tag(self.mock_background_removal())} "
+            f"music_generation={tag(self.mock_music_generation())}]"
         )
 
 
@@ -256,6 +323,9 @@ def _load() -> Settings:
         use_mock_safety=_env_bool("USE_MOCK_SAFETY"),
         use_mock_store=_env_bool("USE_MOCK_STORE"),
         use_mock_voice=_env_bool("USE_MOCK_VOICE"),
+        use_mock_image_search=_env_bool("USE_MOCK_IMAGE_SEARCH"),
+        use_mock_background_removal=_env_bool("USE_MOCK_BACKGROUND_REMOVAL"),
+        use_mock_music_generation=_env_bool("USE_MOCK_MUSIC_GENERATION"),
         azure_openai_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
         azure_openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
@@ -269,6 +339,7 @@ def _load() -> Settings:
         postgres_user_skills_table=os.getenv("POSTGRES_USER_SKILLS_TABLE", "user_skills"),
         postgres_checkpoints_table=os.getenv("POSTGRES_CHECKPOINTS_TABLE", "workflow_checkpoints"),
         postgres_sslmode=os.getenv("POSTGRES_SSLMODE"),
+        postgres_video_jobs_table=os.getenv("POSTGRES_VIDEO_JOBS_TABLE", "video_jobs"),
         azure_voicelive_endpoint=os.getenv("AZURE_VOICELIVE_ENDPOINT"),
         azure_voicelive_model=os.getenv("AZURE_VOICELIVE_MODEL", "gpt-realtime"),
         azure_voicelive_api_version=os.getenv("AZURE_VOICELIVE_API_VERSION", "2026-04-10"),
@@ -295,6 +366,13 @@ def _load() -> Settings:
         preference_summary_model=(
             os.getenv("PREFERENCE_SUMMARY_MODEL") or os.getenv("ROUNDTABLE_PERSONA_MODEL")
         ),
+        pexels_api_key=os.getenv("PEXELS_API_KEY"),
+        removebg_api_key=os.getenv("REMOVEBG_API_KEY"),
+        soundraw_api_key=os.getenv("SOUNDRAW_API_KEY"),
+        video_renderer_dir=os.getenv("VIDEO_RENDERER_DIR"),
+        video_jobs_dir=os.getenv("VIDEO_JOBS_DIR", ".video_jobs"),
+        webhook_url=os.getenv("WEBHOOK_URL", "http://localhost:9999/status"),
+        webhook_enabled=_env_bool("WEBHOOK_ENABLED"),
     )
 
 

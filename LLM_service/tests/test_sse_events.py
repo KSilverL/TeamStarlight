@@ -82,10 +82,10 @@ async def test_review_approves_all_and_completes():
 
     finals = [e for e in svc.buffered_events("t1") if e["type"] == "result" and e["status"] == "final"]
     assert {e["platform"] for e in finals} == {"linkedin", "instagram"}
-    # the media_producer enriched each final with the animated card + video spec
+    # the media_producer enriched each final with the animated card + video storyboard
     for e in finals:
         assert e["html_preview"].startswith("<!DOCTYPE html>")
-        assert e["video_props"] and len(e["video_props"]["stats"]) == 3
+        assert e["video_storyboard"] and 2 <= len(e["video_storyboard"]["slides"]) <= 8
 
 
 async def test_partial_review_keeps_other_platform_pending():
@@ -368,18 +368,72 @@ def test_http_media_endpoints(http_server):
         assert html_res.status_code == 200
         assert html_res.json()["html"].startswith("<!DOCTYPE html>")
 
-        # Brand video → a job that resolves to a structured spec (no MP4).
-        started = client.post(f"{http_server}/generate-video", json={"brief": "Luna Skincare — minimalist"})
-        assert started.status_code == 200
-        job_id = started.json()["job_id"]
-        job = client.get(f"{http_server}/jobs/{job_id}").json()
-        assert job["status"] == "done"
-        assert len(job["props"]["stats"]) == 3
-
-        # Validation + unknown job.
+        # Validation.
         assert client.post(f"{http_server}/generate", json={"prompt": ""}).status_code == 400
         assert client.post(f"{http_server}/generate-text", json={"prompt": ""}).status_code == 400
+
+        # The old standalone "generate-video"/"jobs/{id}" routes are retired — video
+        # storyboard generation is now workflow-only (media_producer's role); see
+        # test_http_video_render_trigger for the real render-video/video-jobs flow.
+        assert client.post(f"{http_server}/generate-video", json={"brief": "x"}).status_code == 404
         assert client.get(f"{http_server}/jobs/nope").status_code == 404
+
+
+def test_http_video_render_trigger(http_server, monkeypatch):
+    """The render-video endpoint reads the storyboard media_producer already
+    attached to a finished platform draft (never a free-text brief) and kicks off
+    a separately-tracked, polled job. `render_storyboard` (the actual `npx remotion
+    render` subprocess) is faked here so this stays in the suite's fast/offline
+    style — it doesn't depend on Node/headless Chromium being installed wherever
+    pytest runs. The real subprocess is exercised directly in
+    workflow/video/render.py's own usage (verified manually end-to-end)."""
+    import LLM_service.workflow.video.jobs as jobs_module
+
+    async def _fake_render_storyboard(renderable, *, job_dir, settings, timeout_s=240.0):
+        job_dir.mkdir(parents=True, exist_ok=True)
+        output_path = job_dir / "output.mp4"
+        output_path.write_bytes(b"fake-mp4-bytes")
+        return output_path
+
+    monkeypatch.setattr(jobs_module, "render_storyboard", _fake_render_storyboard)
+
+    with httpx.Client(timeout=10) as client:
+        started = client.post(f"{http_server}/tasks", json={
+            "topic": "harvest", "target_platforms": ["linkedin"], "business_id": "biz_render",
+        })
+        task_id = started.json()["task_id"]
+        client.post(f"{http_server}/tasks/{task_id}/review",
+                    json={"verdicts": {"linkedin": {"decision": "approve"}}})
+
+        # Unknown task / unfinished platform both fail before any job is created.
+        missing_task = client.post(f"{http_server}/tasks/nope/render-video", json={"platform": "linkedin"})
+        assert missing_task.status_code == 404
+        wrong_platform = client.post(f"{http_server}/tasks/{task_id}/render-video",
+                                      json={"platform": "tiktok"})
+        assert wrong_platform.status_code == 404
+
+        triggered = client.post(f"{http_server}/tasks/{task_id}/render-video",
+                                 json={"platform": "linkedin"})
+        assert triggered.status_code == 200
+        job_id = triggered.json()["job_id"]
+        assert triggered.json()["status"] == "pending"
+
+        # The render runs as a detached background task; poll briefly for it to
+        # finish (the faked render above is near-instant, so this settles fast).
+        job = None
+        for _ in range(50):
+            job = client.get(f"{http_server}/video-jobs/{job_id}").json()
+            if job["status"] != "pending":
+                break
+            time.sleep(0.05)
+        assert job is not None and job["status"] == "done", job
+
+        download = client.get(f"{http_server}/video-jobs/{job_id}/download")
+        assert download.status_code == 200
+        assert download.content == b"fake-mp4-bytes"
+
+        assert client.get(f"{http_server}/video-jobs/nope").status_code == 404
+        assert client.get(f"{http_server}/video-jobs/nope/download").status_code == 404
 
 
 def test_http_media_accepts_conversation_history(http_server):

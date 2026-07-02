@@ -1,0 +1,24 @@
+{
+  "name": "video_renderer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Remotion render service for the dynamic storyboard-driven brand video pipeline. Invoked as a CLI subprocess by LLM_service/workflow/video/render.py.",
+  "scripts": {
+    "render": "remotion render src/index.tsx StoryboardVideo",
+    "studio": "remotion studio src/index.tsx",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.484",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "recharts": "^3.9.1",
+    "remotion": "4.0.484"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "typescript": "^5.6.0"
+  }
+}
