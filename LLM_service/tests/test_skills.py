@@ -3,8 +3,9 @@ Platform skills — the creator's static injection layer (M4).
 
 Verifies the creator's static layer has real content to read: the skill files load,
 the declared character limit is enforced by the copywriter, and a platform without a
-skill degrades gracefully. (The animated HTML card / video spec produced post-approval
-from skills/brand_animation.md + skills/brand_video.md are covered in test_media.py.)
+skill degrades gracefully. (The animated HTML card / video storyboard produced
+post-approval from skills/brand_animation.md + skills/brand_video_storyboard.md are
+covered in test_media.py.)
 """
 
 from __future__ import annotations
@@ -64,5 +65,5 @@ async def test_write_copy_without_skill_is_unbounded():
 def test_brand_media_skills_load_with_real_content():
     animation = load_skill("brand_animation")
     assert animation and "<!DOCTYPE html>" in animation   # the HTML card spec
-    video = load_skill("brand_video")
-    assert video and "stats" in video                     # the video-props spec
+    video = load_skill("brand_video_storyboard")
+    assert video and "slide" in video                     # the storyboard registry spec

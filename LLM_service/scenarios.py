@@ -26,8 +26,10 @@ from pathlib import Path
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import os
+
 from LLM_service.api import WorkflowService
-from LLM_service.core.config import get_settings
+from LLM_service.core.config import get_settings, reset_settings
 from LLM_service.core.services import factory
 from LLM_service.intake import build_intake
 from LLM_service.workflow import Brief, HumanVerdict, build_workflow
@@ -75,43 +77,74 @@ async def scenario_no_brand() -> None:
 async def scenario_copilot_voice() -> None:
     _h("3 · VAGUE IDEA — copilot_mode VOICE intake → scout → workflow")
     session = build_intake("voice")
-    started = await session.start("Help me think of what to post on LinkedIn to promote our launch")
+    started = await session.start("sess-copilot", "Help me think of what to post on LinkedIn to promote our launch")
     brief = await session.get_brief(started["session_id"])
     print(f"  intake_mode={brief.intake_mode}  route={brief.route}")
     print(f"  scout proposed topic: {brief.topic}")
     svc = WorkflowService()
-    await svc.start(brief.model_dump(), task_id="showcase-copilot")
+    # Ask for all three deliverables so the showcase exercises the media_producer.
+    await svc.start({**brief.model_dump(), "content_types": ["text", "brand", "video"]},
+                    task_id="showcase-copilot")
     # Approve every platform → the media_producer renders the animated card + video spec.
     await svc.review("showcase-copilot", {p: {"decision": "approve"} for p in brief.target_platforms})
     finals = [e for e in svc.buffered_events("showcase-copilot")
               if e["type"] == "result" and e["status"] == "final"]
     card_ok = bool(finals and (finals[0].get("html_preview") or "").startswith("<!DOCTYPE html>"))
     print(f"  ✓ animated HTML card produced: {card_ok}")
-    print(f"  ✓ video spec produced: {bool(finals and finals[0].get('video_props'))}")
+    print(f"  ✓ video storyboard produced: {bool(finals and finals[0].get('video_storyboard'))}")
 
 
 async def scenario_brand_training() -> None:
-    _h("4 · BRAND TRAINING — self-evolving profile")
+    _h("4 · BRAND TRAINING — self-evolving profile (confirmation-gated)")
     biz = "biz_training_showcase"
-    wf = build_workflow()
-    result = await wf.run(Brief(
-        topic="our roastery's origin story", target_platforms=["linkedin"],
-        user_intent="build brand affinity", business_id=biz, route="brand_training"))
-    rid = result.get_request_info_events()[0].request_id
-    edited = "Lead with a striking single-origin statistic that earns the scroll."
-    out = (await wf.run(responses={rid: HumanVerdict(decision="approve_after_edit", edited_draft=edited)})).get_outputs()[0]
-    rules = [r for r in out.proposed_rules if r.kind == "must_do"]
-    print(f"  archivist distilled: {rules[0].rule if rules else '(none)'}")
+    svc = WorkflowService()
+    await svc.start({
+        "topic": "our roastery's origin story", "target_platforms": ["linkedin"],
+        "user_intent": "build brand affinity", "business_id": biz, "route": "direct_generation",
+    }, task_id="showcase-training")
+    await svc.review("showcase-training", {"linkedin": {
+        "decision": "approve_after_edit",
+        "edited_draft": "Lead with a striking single-origin statistic that earns the scroll.",
+    }})
+    # The extra round: the user confirms this conversation should be learned → the archivist
+    # distils it and writes the brand rules straight to the profile (no separate tagging step).
+    res = await svc.confirm_learning("showcase-training", learn=True)
+    rules = [r for r in res["brand_rules"] if r["kind"] == "must_do"]
+    print(f"  archivist distilled + stored (after confirm): {rules[0]['rule'] if rules else '(none)'}")
     if rules:
-        store = factory.get_store()
-        profile = await store.get_profile(business_id=biz)
-        profile["must_do"].append(rules[0].rule)
-        await store.upsert_profile(business_id=biz, profile=profile)
         nxt = await build_workflow().run(Brief(
             topic="our spring lineup", target_platforms=["linkedin"],
-            user_intent="drive signups", business_id=biz, route="brand_training"))
+            user_intent="drive signups", business_id=biz, route="direct_generation"))
         draft2 = nxt.get_request_info_events()[0].data.draft
-        print(f"  ✓ next run applies the kept rule: {rules[0].rule in draft2}")
+        print(f"  ✓ next run applies the kept rule: {any(r['rule'] in draft2 for r in rules)}")
+
+
+async def scenario_roundtable() -> None:
+    _h("5 · ROUNDTABLE — multi-persona discussion drops in for scout")
+    os.environ["ROUNDTABLE_ENABLED"] = "true"
+    reset_settings()
+    factory.reset_services()
+    try:
+        svc = WorkflowService()
+        await svc.start({
+            "topic": "our 2026 single-origin harvest", "target_platforms": ["linkedin"],
+            "business_id": "biz_roundtable_demo", "user_id": "user_roundtable_demo",
+            "content_types": ["text", "brand", "video"],
+        }, task_id="showcase-roundtable")
+        evs = svc.buffered_events("showcase-roundtable")
+        utts = [e for e in evs if e["type"] == "agent_utterance"]
+        print(f"  discussion turns: {len(utts)} (seats: {sorted({e['speaker'] for e in utts})})")
+        print(f"  ✓ scout bypassed: {not any(e.get('node') == 'scout' for e in evs)}")
+        await svc.review("showcase-roundtable", {"linkedin": {"decision": "approve"}})
+        finals = [e for e in svc.buffered_events("showcase-roundtable")
+                  if e["type"] == "result" and e["status"] == "final"]
+        print(f"  ✓ roundtable → draft → gate → final: {bool(finals)}")
+        card_ok = bool(finals and (finals[0].get("html_preview") or "").startswith("<!DOCTYPE html>"))
+        print(f"  ✓ animated HTML card produced: {card_ok}")
+    finally:
+        os.environ.pop("ROUNDTABLE_ENABLED", None)
+        reset_settings()
+        factory.reset_services()
 
 
 async def scenario_circuit_breaker() -> None:
@@ -129,8 +162,9 @@ async def main() -> None:
     await scenario_no_brand()
     await scenario_copilot_voice()
     await scenario_brand_training()
+    await scenario_roundtable()
     await scenario_circuit_breaker()
-    print("\n  All four scenarios + circuit breaker + HTML preview demonstrated.\n")
+    print("\n  All scenarios + roundtable + circuit breaker + HTML preview demonstrated.\n")
 
 
 if __name__ == "__main__":

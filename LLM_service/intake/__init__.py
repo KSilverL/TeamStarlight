@@ -17,12 +17,13 @@ from __future__ import annotations
 
 from ..core.config import get_settings
 from .base import BriefConversation, IntakeSession
-from .brief_schema import CreativeBrief
+from .brief_schema import CreativeBrief, PriorSessionContext
 from .text_intake import TextIntake
 from .voice_intake import MockVoiceIntake, VoiceIntake
 
 __all__ = [
     "CreativeBrief",
+    "PriorSessionContext",
     "IntakeSession",
     "BriefConversation",
     "TextIntake",

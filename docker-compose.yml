@@ -10,16 +10,15 @@ services:
     ports:
       - "3000:3000"
     environment:
-      # # Demo agents (brand card + video)
+      # # Demo agent (brand card)
       # - BRAND_AGENT_URL=http://brand-agent:8000
-      # - BRAND_VIDEO_AGENT_URL=http://brand-video-agent:8001
-      # Main LLM service (text generation)
+      # Main LLM service (text generation + MAF workflow /tasks + video render jobs)
       - TEXT_AGENT_URL=http://llm:8080
+      - LLM_SERVICE_URL=http://llm:8080
       # Java backend (signup / login)
       - BACKEND_URL=http://backend:8081
     depends_on:
       # - brand-agent
-      # - brand-video-agent
       - llm
       - backend
 
@@ -46,17 +45,25 @@ services:
   # ---------------------------------------------------------------------------
   llm:
     build:
-      context: LLM_service
-      dockerfile: Dockerfile
+      # Context is the repo root, not LLM_service/ — the image also bundles the
+      # sibling video_renderer/ Node project (local Remotion CLI render subprocess).
+      context: .
+      dockerfile: LLM_service/Dockerfile
     ports:
       - "8080:8080"
     environment:
-      - USE_MOCK=true
-      # Uncomment and populate for production:
-      # - USE_MOCK=false
-      # - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
-      # - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
-      # - DATABASE_URL=${DATABASE_URL}
+      - USE_MOCK=false
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+      - AZURE_OPENAI_CHAT_DEPLOYMENT=${AZURE_OPENAI_CHAT_DEPLOYMENT}
+      - DATABASE_URL=${DATABASE_URL}
+      - USE_MOCK_IMAGE_SEARCH=false
+      - USE_MOCK_BACKGROUND_REMOVAL=false
+      - PEXELS_API_KEY=${PEXELS_API_KEY}
+      - REMOVEBG_API_KEY=${REMOVEBG_API_KEY}
+      - USE_MOCK_MUSIC_GENERATION=true
+      - USE_MOCK_SAFETY=true
+      # - SOUNDRAW_API_KEY=${SOUNDRAW_API_KEY}
 
   # ---------------------------------------------------------------------------
   # Brand Agent — FastAPI LLM service (demo, isolated from LLM_service core)
@@ -70,17 +77,3 @@ services:
   #     - "8000:8000"
   #   environment:
   #     - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-
-  # ---------------------------------------------------------------------------
-  # Brand Video Agent — Remotion render service (demo, isolated from LLM_service core)
-  # Heavy image: Node + Python + headless Chromium + ffmpeg. Build takes ~5 min.
-  # Requires ANTHROPIC_API_KEY to be set in the environment or a .env file.
-  # ---------------------------------------------------------------------------
-  # brand-video-agent:
-    # build:
-      # context: LLM_service/demos/brand_video_agent
-      # dockerfile: Dockerfile
-    # ports:
-      # - "8001:8001"
-    # environment:
-    #   - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}

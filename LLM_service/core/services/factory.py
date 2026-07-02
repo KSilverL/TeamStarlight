@@ -13,19 +13,31 @@ without credentials, rather than silently falling back to mock.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 from agent_framework import CheckpointStorage, InMemoryCheckpointStorage
 
 from ..config import get_settings
-from . import azure, mock, postgres
-from .base import LLMService, SafetyService, StoreService, VoiceService
+from . import azure, media_assets, mock, postgres
+from .base import (
+    BackgroundRemovalService,
+    ImageSearchService,
+    LLMService,
+    MusicGenerationService,
+    SafetyService,
+    StoreService,
+    VoiceService,
+)
 
 __all__ = [
     "get_llm",
     "get_safety",
     "get_store",
     "get_voice",
+    "get_chat_client",
+    "get_image_search",
+    "get_background_removal",
+    "get_music_generation",
     "get_checkpoint_storage",
     "reset_services",
 ]
@@ -99,6 +111,74 @@ def get_voice() -> VoiceService:
                  "AZURE_VOICELIVE_ENDPOINT", "USE_MOCK_VOICE=true")
         return azure.AzureVoice(s)
     return _cached("voice", build)
+
+
+def get_chat_client(
+    *,
+    agent_name: str,
+    model: Optional[str] = None,
+    endpoint: Optional[str] = None,
+    api_key: Optional[str] = None,
+    max_tokens: Optional[int] = None,
+    reasoning_effort: Optional[str] = None,
+    verbosity: Optional[str] = None,
+):
+    """Return a fresh MAF chat client for one roundtable seat, resolved by the LLM toggle.
+    Unlike the other getters this is NOT cached: the mock client is stateful (per-persona
+    scripted turns) and each seat needs its own instance, so a singleton would cross-wire
+    the discussion.
+
+    Mock = deterministic offline client. Production: the personas default to the
+    rate-limit-friendlier persona resource (AZURE_PERSONA_ENDPOINT/_API_KEY +
+    ROUNDTABLE_PERSONA_MODEL), falling back to the main Azure OpenAI resource when those are
+    unset; the builder passes the main endpoint/key + ROUNDTABLE_MANAGER_MODEL explicitly for
+    the manager so it stays on the main (gpt-5.4) deployment. `max_tokens` caps a single turn
+    (personas pass the ROUNDTABLE_PERSONA_MAX_TOKENS budget to keep turns short; the manager
+    leaves it None so it has room for the final strategy). `reasoning_effort` (e.g. "minimal" for
+    persona seats) keeps a reasoning model from spending the whole `max_tokens` budget on hidden
+    reasoning — the manager omits it (None) to keep full reasoning for the strategy ledger.
+    `verbosity` ("low" for persona seats) keeps a turn to one short spoken point, not an essay."""
+    s = get_settings()
+    if s.mock_llm():
+        return mock.MockChatClient(agent_name=agent_name)
+    ep = endpoint or s.roundtable_persona_endpoint or s.azure_openai_endpoint
+    key = api_key or s.roundtable_persona_api_key or s.azure_openai_api_key
+    mdl = model or s.roundtable_persona_model or s.azure_chat_deployment
+    _require(bool(ep and key), "Azure OpenAI chat client",
+             "AZURE_OPENAI_ENDPOINT/_API_KEY (or AZURE_PERSONA_ENDPOINT/_API_KEY for personas)",
+             "USE_MOCK_LLM=true")
+    return azure.AzureChatClient(
+        s, agent_name=agent_name, model=mdl, endpoint=ep, api_key=key,
+        max_tokens=max_tokens, reasoning_effort=reasoning_effort, verbosity=verbosity,
+    )
+def get_image_search() -> ImageSearchService:
+    def build() -> ImageSearchService:
+        s = get_settings()
+        if s.mock_image_search():
+            return mock.MockImageSearch()
+        _require(s.has_pexels, "Pexels", "PEXELS_API_KEY", "USE_MOCK_IMAGE_SEARCH=true")
+        return media_assets.PexelsImageSearch(s)
+    return _cached("image_search", build)
+
+
+def get_background_removal() -> BackgroundRemovalService:
+    def build() -> BackgroundRemovalService:
+        s = get_settings()
+        if s.mock_background_removal():
+            return mock.MockBackgroundRemoval()
+        _require(s.has_removebg, "Remove.bg", "REMOVEBG_API_KEY", "USE_MOCK_BACKGROUND_REMOVAL=true")
+        return media_assets.RemoveBgService(s)
+    return _cached("background_removal", build)
+
+
+def get_music_generation() -> MusicGenerationService:
+    def build() -> MusicGenerationService:
+        s = get_settings()
+        if s.mock_music_generation():
+            return mock.MockMusicGeneration()
+        _require(s.has_soundraw, "Soundraw", "SOUNDRAW_API_KEY", "USE_MOCK_MUSIC_GENERATION=true")
+        return media_assets.SoundrawMusic(s)
+    return _cached("music_generation", build)
 
 
 def get_checkpoint_storage() -> CheckpointStorage:
