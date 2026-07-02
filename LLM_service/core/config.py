@@ -140,6 +140,7 @@ class Settings:
     azure_openai_api_key: Optional[str] = None
     azure_openai_api_version: str = "2024-02-01"
     azure_chat_deployment: str = "gpt-4o"
+    foundry_project_endpoint: Optional[str] = None
 
     # ── Azure AI Content Safety (reviewer) ─────────────────────────────────────
     azure_content_safety_endpoint: Optional[str] = None
@@ -330,6 +331,7 @@ def _load() -> Settings:
         azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
         azure_openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
         azure_chat_deployment=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4o"),
+        foundry_project_endpoint=os.getenv("FOUNDRY_PROJECT_ENDPOINT"),
         azure_content_safety_endpoint=os.getenv("AZURE_CONTENTSAFETY_ENDPOINT")
         or os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT"),
         azure_content_safety_key=os.getenv("AZURE_CONTENTSAFETY_KEY")
