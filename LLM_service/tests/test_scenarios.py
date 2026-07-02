@@ -163,7 +163,7 @@ async def test_scenario_roundtable_end_to_end(monkeypatch):
     assert {e["platform"] for e in finals} == {"linkedin", "instagram"}
     for e in finals:
         assert e["html_preview"].startswith("<!DOCTYPE html>")
-        assert e["video_props"] and len(e["video_props"]["stats"]) == 3
+        assert e["video_storyboard"] and len(e["video_storyboard"]["slides"]) >= 2
 
 
 async def test_scenario_roundtable_media_only_skips_text_and_gate(monkeypatch):
@@ -194,7 +194,7 @@ async def test_scenario_roundtable_media_only_skips_text_and_gate(monkeypatch):
     out = snap["outputs"][0]
     assert out["draft"] == "" and out["content_types"] == ["brand", "video"]
     assert out["html_card"].startswith("<!DOCTYPE html>")
-    assert out["video_props"] and len(out["video_props"]["stats"]) == 3
+    assert out["video_storyboard"] and len(out["video_storyboard"]["slides"]) >= 2
 
 
 async def test_scenario_roundtable_disabled_uses_scout(monkeypatch):

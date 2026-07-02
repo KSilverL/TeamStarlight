@@ -35,28 +35,43 @@ class MediaProducerExecutor(Executor):
         llm = factory.get_llm()
         topic = approved.brief.topic
         tone_hint = approved.brief.tone_hint
-        # Both artifacts are independent — produce them concurrently.
-        html_card, storyboard = await asyncio.gather(
-            llm.render_html_card(
-                topic=topic, draft=approved.draft, tone_hint=tone_hint,
+        # brand/video are opt-in per the brief's content_types — only render what was asked for,
+        # so a text-only run produces no HTML card / video spec. The two artifacts are
+        # independent, so produce whichever are requested concurrently. `approved.draft` is the
+        # rendering basis (the approved copy on the text flow, or the topic/discussion basis on a
+        # media-only run); the text DELIVERABLE is blank unless "text" was requested.
+        content_types = approved.brief.content_types or []
+        basis = approved.draft
+
+        async def _card():
+            if "brand" not in content_types:
+                return None
+            return await llm.render_html_card(
+                topic=topic, draft=basis, tone_hint=tone_hint,
                 skill=load_skill("brand_animation"),
-            ),
-            llm.generate_video_storyboard(
-                topic=topic, draft=approved.draft, tone_hint=tone_hint,
+            )
+
+        async def _storyboard():
+            if "video" not in content_types:
+                return None
+            raw = await llm.generate_video_storyboard(
+                topic=topic, draft=basis, tone_hint=tone_hint,
                 platform=approved.platform,
                 skill=load_skill("brand_video_storyboard"),
-            ),
-        )
+            )
+            return StoryboardSpec(**raw)
+
+        html_card, storyboard = await asyncio.gather(_card(), _storyboard())
         await ctx.yield_output(
             FinalDraft(
                 platform=approved.platform,
-                draft=approved.draft,  # media-only: no text deliverable if text_requested else ""
+                draft=basis if "text" in content_types else "",  # no text deliverable on media-only
                 decision=approved.decision,
                 comment=approved.comment,
                 needs_human_intervention=approved.needs_human_intervention,
                 proposed_rules=approved.proposed_rules,
-                content_types=list(approved.brief.content_types or []),
+                content_types=list(content_types),
                 html_card=html_card,
-                video_storyboard=StoryboardSpec(**storyboard),
+                video_storyboard=storyboard,
             )
         )

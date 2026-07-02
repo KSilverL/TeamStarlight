@@ -387,6 +387,7 @@ def test_http_video_render_trigger(http_server, monkeypatch):
     style — it doesn't depend on Node/headless Chromium being installed wherever
     pytest runs. The real subprocess is exercised directly in
     workflow/video/render.py's own usage (verified manually end-to-end)."""
+    import LLM_service.workflow.video.assets as assets_module
     import LLM_service.workflow.video.jobs as jobs_module
 
     async def _fake_render_storyboard(renderable, *, job_dir, settings, timeout_s=240.0):
@@ -395,11 +396,19 @@ def test_http_video_render_trigger(http_server, monkeypatch):
         output_path.write_bytes(b"fake-mp4-bytes")
         return output_path
 
+    # The mock image search yields placeholder `mock.pexels.local` URLs; without faking the
+    # download the render job spends ~5s on real (failing) HTTP fetches before it settles,
+    # overrunning the poll below. Fake it to keep this fully offline (like render_storyboard).
+    async def _no_download(url):
+        return None
+
     monkeypatch.setattr(jobs_module, "render_storyboard", _fake_render_storyboard)
+    monkeypatch.setattr(assets_module, "_download", _no_download)
 
     with httpx.Client(timeout=10) as client:
         started = client.post(f"{http_server}/tasks", json={
             "topic": "harvest", "target_platforms": ["linkedin"], "business_id": "biz_render",
+            "content_types": ["text", "video"],  # a storyboard must exist for render-video to trigger
         })
         task_id = started.json()["task_id"]
         client.post(f"{http_server}/tasks/{task_id}/review",

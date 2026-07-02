@@ -323,50 +323,13 @@ async def main() -> None:
     print("  Seats at the table: platform_editor · brand_voice · user_advocate · audience_advocate · you")
     _cheat_sheet()
 
-    print("\n  THE NEWSROOM — agents that hand work to one another:")
-    for executor_id in ("dispatcher", "scout", "creator", "reviewer", "human_gate",
-                        "archivist", "media_producer"):
-        name, role = _agent(executor_id)
-        print(f"    • {name} — {role}")
-
-    workflow = build_workflow()
-    brief = Brief(
-        topic="new harvest season beans from Ethiopia",
-        target_platforms=["linkedin", "instagram"],
-        user_intent="Highlight the limited-time launch and the farmers' story",
-        business_id="biz_demo_0001",
-        tone_hint="warm, authentic, educational",
-        route="direct_generation",
-    )
-    print(f"\n  Brief     : {brief.topic}")
-    print(f"  Platforms : {', '.join(brief.target_platforms)}")
-
-    _section("LIVE — dispatcher → scout → creator → reviewer → gate")
-    outputs: dict[str, object] = {}
-    requests, produced = await _stream_segment(workflow, message=brief)
-    outputs.update(produced)
-
-    # Resume the RequestPort until the workflow idles with no pending requests.
-    while requests:
-        responses = await _resolve_pending(requests)
-        _section("LIVE — resuming the newsroom")
-        requests, produced = await _stream_segment(workflow, responses=responses)
-        outputs.update(produced)
-
-    _section("WORKFLOW COMPLETE — final, ready-to-publish posts")
-    for platform, final in outputs.items():
-        print(f"\n  ── {platform} ({final.decision}) ──")
-        print(_draft_box(final.draft))
-        for rule in getattr(final, "proposed_rules", []):
-            print(f"  ↪ proposed brand rule [{rule.kind}]: {rule.rule}")
-        card = getattr(final, "html_card", None)
-        storyboard = getattr(final, "video_storyboard", None)
-        if card:
-            print(f"  ✓ animated HTML card produced ({len(card)} chars)")
-        if storyboard:
-            slide_types = " → ".join(s.type for s in storyboard.slides)
-            print(f"  ✓ video storyboard produced: {storyboard.brandName} — {slide_types}")
-    print()
+    # Each run drives ONE config through the same WorkflowService the HTTP API uses; loop so you
+    # can cover the rest of the cheat-sheet paths without restarting the harness.
+    while True:
+        await _run_once()
+        if not await _yn("\n  Run another?", default=False):
+            break
+    print("\n  bye.")
 
 
 if __name__ == "__main__":
