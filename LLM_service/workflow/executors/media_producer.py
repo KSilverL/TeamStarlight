@@ -50,7 +50,7 @@ class MediaProducerExecutor(Executor):
         await ctx.yield_output(
             FinalDraft(
                 platform=approved.platform,
-                draft=approved.draft if text_requested else "",  # media-only: no text deliverable
+                draft=approved.draft,  # media-only: no text deliverable if text_requested else ""
                 decision=approved.decision,
                 comment=approved.comment,
                 needs_human_intervention=approved.needs_human_intervention,

@@ -412,6 +412,7 @@ export default function ChatPage() {
           topic: prompt,
           target_platforms: selectedPlatforms,
           user_intent: prompt,
+          content_types: contentTypes,
         }),
       });
       const data = await res.json();
@@ -430,10 +431,21 @@ export default function ChatPage() {
     const es = new EventSource(`/api/tasks/${taskId}/events`);
     workflowEsRef.current = es;
     const seenNodes = new Set<string>();
+    // GET /tasks/{id}/events replays its full buffer on every (re)connect, including after
+    // the browser's automatic EventSource reconnect on a dropped connection. Each event
+    // carries a stable per-task `seq`; skip anything at or below the last one we've already
+    // acted on so a replay can't re-fire side effects (e.g. double-submitting /review).
+    let lastSeq = -1;
 
     es.onmessage = (e) => {
       let event: Record<string, unknown>;
       try { event = JSON.parse(e.data as string); } catch { return; }
+
+      const seq = event.seq as number | undefined;
+      if (typeof seq === "number") {
+        if (seq <= lastSeq) return;
+        lastSeq = seq;
+      }
 
       const type = event.type as string;
       const node = event.node as string;
