@@ -60,7 +60,7 @@ from .workflow.roundtable.gate import raise_hand as _raise_user_hand
 from .workflow.roundtable.queue import push_utterance
 from .workflow.roundtable.runner import run_table, run_tables
 from .workflow.video.jobs import get_render_job, start_render_job
-from .core.skill_schema import SkillCandidate, SkillDecision
+from .core.skill_schema import SkillCandidate
 from .core.video_schema import StoryboardSpec
 
 # Sentinel pushed to SSE subscribers when a task finishes, so the stream closes.
@@ -188,6 +188,9 @@ class _Task:
         self.event_listener = None                    # optional sync hook: live-stream each event (CLI)
         self.runner: Optional[asyncio.Task] = None    # background drive task (HTTP non-blocking path)
         self.error: Optional[str] = None              # set if the run raised; surfaced in the snapshot
+        self.lock = asyncio.Lock()                    # serializes resumes: two concurrent /review calls
+        # (e.g. auto-approving two platforms' drafts back-to-back) must not both drive the same
+        # underlying `workflow` at once — that races on `task.pending` and can 409 a legitimate call.
         self.status = "running"
         self.done = False
 
@@ -212,6 +215,11 @@ class WorkflowService:
     # ── Event translation (MAF event → §7.2 envelope) + publish ───────────────
 
     def _publish(self, task: _Task, event: dict) -> None:
+        # A stable, monotonic per-task index baked into the stored event, so a client that
+        # reconnects (GET /tasks/{id}/events replays the full buffer — see `events()`) can tell
+        # a replayed event from a new one and avoid re-firing event-driven side effects
+        # (e.g. auto-approving a human-gate draft a second time, which 409s).
+        event["seq"] = len(task.events)
         task.events.append(event)
         for q in task.subscribers:
             q.put_nowait(event)
@@ -266,8 +274,11 @@ class WorkflowService:
     # ── Drive one run segment (start or resume) until the next pause / end ─────
 
     async def _drive(self, task: _Task, *, message=None, responses=None) -> dict:
-        answered = set(responses.keys()) if responses else set()
-        new_pending: dict[str, dict] = {}
+        # Answered gates stop being pending the moment we resume with their response — before
+        # the stream even starts, not after it drains (see below for why "after" is wrong).
+        if responses:
+            for req_id in responses:
+                task.pending.pop(req_id, None)
         stream = (
             task.workflow.run(message, stream=True)
             if message is not None
@@ -276,7 +287,14 @@ class WorkflowService:
         async for ev in stream:
             if ev.type == "request_info":
                 d = ev.data
-                new_pending[ev.request_id] = {
+                # Written straight into `task.pending` (not a local buffer merged in after the
+                # loop): a multi-platform run keeps streaming (e.g. platform B still drafting)
+                # after platform A's `request_info` pauses it, and `_publish` below fires A's
+                # `draft_ready` SSE event immediately. A client that auto-approves on receipt
+                # must see A as pending right away, or a same-task `review()` call landing
+                # before this loop finishes for every platform wrongly 409s ("not awaiting
+                # review") even though the client just did exactly what the event told it to.
+                task.pending[ev.request_id] = {
                     "request_id": ev.request_id,
                     "platform": d.platform,
                     "draft": d.draft,
@@ -287,10 +305,6 @@ class WorkflowService:
                 self._record_output(task, ev.data)
             for out in self._translate(ev):
                 self._publish(task, out)
-
-        # Keep unanswered gates pending; drop the ones we just answered; add new ones.
-        task.pending = {k: v for k, v in task.pending.items() if k not in answered}
-        task.pending.update(new_pending)
 
         if task.pending:
             task.status = "awaiting_review"
@@ -393,60 +407,75 @@ class WorkflowService:
         self, task: _Task, brief: Brief, *, roundtable: bool, text_requested: bool, before_round,
     ) -> dict:
         """The heavy segment of a start: (optional) roundtable discussion, then drive the MAF
-        workflow to its first pause/end. Shared by the inline and background start paths."""
-        if roundtable:
-            results = await run_tables(
-                brief, platforms=brief.target_platforms, task_id=task.task_id,
-                on_event=lambda ev: self._publish(task, ev),
-                before_round=before_round,
-            )
-            # Keep the full discussion transcript so the per-user learning loop can distil
-            # preferences from the user's interjections after the gate (§6.5 write side).
-            task.roundtable_transcript = [
-                t.model_dump() for r in results for t in r.consensus.transcript
-            ]
-            # Merge the N single-platform consensuses into ONE CreativeStrategy. With text it is
-            # the scout drop-in (→ creator); media-only it is the render brief (→ media_entry).
-            strategy = CreativeStrategy(
-                brief=brief,
-                strategies={
-                    r.consensus.platform: r.consensus.strategy.strategies.get(r.consensus.platform, "")
-                    for r in results
-                },
-            )
-            return await self._drive(task, message=strategy)
+        workflow to its first pause/end. Shared by the inline and background start paths.
 
-        if not text_requested:
-            # Media-only without a roundtable: synthesize a (topic-based) strategy and run straight
-            # to the media_producer — no discussion, no copy, no human gate.
-            strategy = CreativeStrategy(
-                brief=brief, strategies={p: "" for p in brief.target_platforms})
-            return await self._drive(task, message=strategy)
+        Holds `task.lock` for the whole segment — the same lock `review()` takes before it
+        resumes — so a client can never call `task.workflow.run()` a second time (via a
+        same-task `review()`) while this first run is still mid-stream for a slower platform.
+        A platform that pauses early still surfaces in `task.pending` immediately (see
+        `_drive`) so a racing `review()` call queues on the lock instead of 409ing; once it
+        acquires the lock the whole segment (including any still-running sibling platform) has
+        already finished, and the workflow is safe to resume again."""
+        async with task.lock:
+            if roundtable:
+                results = await run_tables(
+                    brief, platforms=brief.target_platforms, task_id=task.task_id,
+                    on_event=lambda ev: self._publish(task, ev),
+                    before_round=before_round,
+                )
+                # Keep the full discussion transcript so the per-user learning loop can distil
+                # preferences from the user's interjections after the gate (§6.5 write side).
+                task.roundtable_transcript = [
+                    t.model_dump() for r in results for t in r.consensus.transcript
+                ]
+                # Merge the N single-platform consensuses into ONE CreativeStrategy. With text it
+                # is the scout drop-in (→ creator); media-only it is the render brief (→ media_entry).
+                strategy = CreativeStrategy(
+                    brief=brief,
+                    strategies={
+                        r.consensus.platform: r.consensus.strategy.strategies.get(r.consensus.platform, "")
+                        for r in results
+                    },
+                )
+                return await self._drive(task, message=strategy)
 
-        return await self._drive(task, message=brief)
+            if not text_requested:
+                # Media-only without a roundtable: synthesize a (topic-based) strategy and run
+                # straight to the media_producer — no discussion, no copy, no human gate.
+                strategy = CreativeStrategy(
+                    brief=brief, strategies={p: "" for p in brief.target_platforms})
+                return await self._drive(task, message=strategy)
+
+            return await self._drive(task, message=brief)
 
     async def review(self, task_id: str, verdicts: dict) -> dict:
         task = self._require(task_id)
-        if not task.pending:
-            raise ApiError(409, "task is not awaiting review")
         if not isinstance(verdicts, dict) or not verdicts:
             raise ApiError(400, "'verdicts' must be a non-empty object keyed by platform")
 
-        responses: dict[str, HumanVerdict] = {}
-        for req_id, data in task.pending.items():
-            verdict = verdicts.get(data["platform"])
-            if verdict is None:
-                continue  # leave un-addressed platforms pending
-            responses[req_id] = _verdict_from_payload(verdict)
-            # Record the AI draft the human reviewed + the verdict, so confirm-learning can
-            # distil brand rules (AI-vs-final diff) and trace a learned preference to the edit.
-            task.original_drafts[data["platform"]] = data["draft"]
-            task.last_verdicts.append({"platform": data["platform"], **verdict})
-        if not responses:
-            raise ApiError(400, "no verdict matched a pending platform")
-        # Learning no longer runs automatically — it waits for POST /tasks/{id}/confirm-learning.
-        # Guard the resume too: an executor failure (e.g. media render) must not hang subscribers.
-        return await self._run_guarded(task, self._drive(task, responses=responses), reraise=True)
+        # Serialize resumes on this task: two platforms' drafts can both auto-approve within
+        # milliseconds of each other (see `task.lock`), and concurrently driving the same
+        # `task.workflow` races on `task.pending` — the loser can see a stale/emptied view and
+        # wrongly 409, or corrupt the bookkeeping for the platform it never touched.
+        async with task.lock:
+            if not task.pending:
+                raise ApiError(409, "task is not awaiting review")
+
+            responses: dict[str, HumanVerdict] = {}
+            for req_id, data in task.pending.items():
+                verdict = verdicts.get(data["platform"])
+                if verdict is None:
+                    continue  # leave un-addressed platforms pending
+                responses[req_id] = _verdict_from_payload(verdict)
+                # Record the AI draft the human reviewed + the verdict, so confirm-learning can
+                # distil brand rules (AI-vs-final diff) and trace a learned preference to the edit.
+                task.original_drafts[data["platform"]] = data["draft"]
+                task.last_verdicts.append({"platform": data["platform"], **verdict})
+            if not responses:
+                raise ApiError(400, "no verdict matched a pending platform")
+            # Learning no longer runs automatically — it waits for POST /tasks/{id}/confirm-learning.
+            # Guard the resume too: an executor failure (e.g. media render) must not hang subscribers.
+            return await self._run_guarded(task, self._drive(task, responses=responses), reraise=True)
 
     async def confirm_learning(self, task_id: str, learn: bool) -> dict:
         """One extra round: the user confirms whether THIS conversation should be learned.
@@ -609,7 +638,10 @@ class WorkflowService:
 
     async def events(self, task_id: str):
         """Async generator of §7.2 events for SSE: replays the buffer, then follows
-        live until the task completes."""
+        live until the task completes. Yields `None` (a heartbeat) every 15s of
+        inactivity so the route can keep the connection alive — an idle proxy/browser
+        timeout would otherwise force a reconnect, which replays the whole buffer and
+        can re-trigger a client's already-handled side effects."""
         task = self._require(task_id)
         q: asyncio.Queue = asyncio.Queue()
         task.subscribers.append(q)
@@ -621,7 +653,11 @@ class WorkflowService:
             if task.done:
                 return
             while True:
-                ev = await q.get()
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield None
+                    continue
                 if ev is _STREAM_DONE:
                     return
                 if id(ev) in seen:
@@ -988,7 +1024,10 @@ async def task_events(request: Request, task_id: str) -> StreamingResponse:
 
     async def event_stream():
         async for ev in svc.events(task_id):
-            yield f"data: {json.dumps(ev, default=str)}\n\n"
+            # `None` is a heartbeat (see `events()`): an SSE comment line, ignored by
+            # EventSource but enough to keep an idle proxy/browser from timing out the
+            # connection and forcing a reconnect (which replays the whole buffer).
+            yield ": keep-alive\n\n" if ev is None else f"data: {json.dumps(ev, default=str)}\n\n"
 
     return StreamingResponse(
         event_stream(),
