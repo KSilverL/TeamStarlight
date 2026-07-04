@@ -1,4 +1,4 @@
-"""The workflow executors: dispatcher, scout, creator, reviewer, human_gate,
+"""The workflow executors: dispatcher, strategist, creator, reviewer, human_gate,
 media_producer.
 
 Each is a thin MAF Executor that reads its input message, reaches its backend via
@@ -16,11 +16,11 @@ from .human_gate import HumanGateExecutor
 from .media_entry import MediaEntryExecutor
 from .media_producer import MediaProducerExecutor
 from .reviewer import ReviewerExecutor
-from .scout import ScoutExecutor
+from .strategist import StrategistExecutor
 
 __all__ = [
     "DispatcherExecutor",
-    "ScoutExecutor",
+    "StrategistExecutor",
     "CreatorExecutor",
     "ReviewerExecutor",
     "HumanGateExecutor",

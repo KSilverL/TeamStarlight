@@ -48,7 +48,7 @@ from .base import (
 # rejected on every attempt — exactly what the circuit-breaker test needs.
 UNSAFE_MARKER = "unsafe"
 
-# Platform-differentiated strategy angle (scout). Keyed case-insensitively.
+# Platform-differentiated strategy angle (strategist). Keyed case-insensitively.
 _PLATFORM_FOCUS: Dict[str, str] = {
     "linkedin": "business analysis and credibility",
     "twitter": "emotional resonance and brevity",
@@ -210,7 +210,7 @@ def _compose_post(
 
 # Platform tokens the mock intake recognises in free text (intake function-calling).
 _PLATFORM_TOKENS = ("linkedin", "instagram", "twitter", "tiktok", "facebook", "youtube")
-# Phrases that signal copilot_mode — "help me decide what to post" → scout tool.
+# Phrases that signal copilot_mode — "help me decide what to post" → suggest_topic tool.
 _COPILOT_TRIGGERS = (
     "help me think", "what should i post", "give me ideas", "not sure",
     "brainstorm", "ideas for", "no idea", "suggest", "help me decide",
@@ -602,11 +602,11 @@ class MockLLM(LLMService):
     ) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
         updates = _free_extract(user_text)
-        wants_scout = any(trigger in user_text.lower() for trigger in _COPILOT_TRIGGERS)
+        wants_topic_idea = any(trigger in user_text.lower() for trigger in _COPILOT_TRIGGERS)
         # If the assistant just asked for a specific field, a direct answer slots in —
-        # except a "give me ideas" turn must NOT become the topic (scout proposes it).
+        # except a "give me ideas" turn must NOT become the topic (suggest_topic proposes it).
         if pending_field and not updates.get(pending_field):
-            if wants_scout and pending_field == "topic":
+            if wants_topic_idea and pending_field == "topic":
                 pass
             elif pending_field == "target_platforms":
                 platforms = _parse_platforms(user_text)
@@ -614,7 +614,7 @@ class MockLLM(LLMService):
                     updates["target_platforms"] = platforms
             elif user_text.strip():
                 updates[pending_field] = user_text.strip()
-        return {"brief_updates": updates, "wants_scout": wants_scout}
+        return {"brief_updates": updates, "wants_topic_idea": wants_topic_idea}
 
 
 # ── Chat client (roundtable personas) ──────────────────────────────────────────

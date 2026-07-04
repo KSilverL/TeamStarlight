@@ -2,7 +2,7 @@
 Azure-backed production implementations (LLM / Safety / Voice).
 
 All three are wired to real backends (M4): `AzureLLM` → Azure OpenAI / Foundry chat
-(the dispatcher/scout/creator prompt-building lives here so executors stay
+(the dispatcher/strategist/creator prompt-building lives here so executors stay
 logic-free); `AzureSafety` → Azure AI Content Safety `analyze_text`; `AzureVoice` →
 the Voice Live API WebSocket (STT for one spoken turn). The factory refuses to hand
 any of these out unless the matching credentials are set.
@@ -129,7 +129,7 @@ class AzureLLM(LLMService):
         self, *, topic: str, platform: str, user_intent: str
     ) -> str:
         system = (
-            f"You are a hotspot scout. Produce a short {platform} content *strategy* "
+            f"You are a content strategist. Produce a short {platform} content *strategy* "
             "(the angle, not the copy)."
         )
         user = f"Topic: {topic}\nGoal: {user_intent}"
@@ -442,13 +442,13 @@ class AzureLLM(LLMService):
                     {"role": "user", "content": user_text}]
         result = await self._complete_with_tools(messages, tools)
         updates: dict = {}
-        wants_scout = False
+        wants_topic_idea = False
         for call in result["tool_calls"]:
             if call["name"] == "update_brief":
                 updates.update({k: v for k, v in call["arguments"].items() if v})
-            elif call["name"] == "scout_trends":
-                wants_scout = True
-        return {"brief_updates": updates, "wants_scout": wants_scout}
+            elif call["name"] == "suggest_topic":
+                wants_topic_idea = True
+        return {"brief_updates": updates, "wants_topic_idea": wants_topic_idea}
 
 
 # ── Chat client (roundtable personas + manager) ───────────────────────────────

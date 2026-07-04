@@ -87,7 +87,7 @@ not from `prior_context`.
 of the brief as it can in **one pass** (topic + goal; platforms come from `target_platforms`). If
 the opening already carries everything, the session returns `complete: true` immediately — **zero
 follow-up questions**. Only a genuinely missing field triggers a short clarifier, and at most
-**3** of them; after that the service fills any gap itself (scouts a topic, derives a goal) so
+**3** of them; after that the service fills any gap itself (suggests a topic, derives a goal) so
 intake always terminates. A self-contained opening therefore needs no `/turn` calls at all.
 
 **Response:**
@@ -273,7 +273,7 @@ Platform finalized (after `/review`) — enriched by the media_producer:
 | What happens | `node` values | `platform` |
 |---|---|---|
 | (Roundtable only) discussion | `agent_utterance` per turn + `discussion_consensus` per table | set (= `table_id`) |
-| Service starts generating | `dispatcher`, `scout`, `creator` (roundtable mode skips `dispatcher`/`scout`) | `null` |
+| Service starts generating | `dispatcher`, `strategist`, `creator` (roundtable mode skips `dispatcher`/`strategist`) | `null` |
 | Per-platform review | `reviewer` | set |
 | Gate — waiting for you | `human_gate` (`interrupted`) + `draft_ready` result per platform | set |
 | After `/review` | `human_gate` + `final` result per platform | set |
@@ -406,7 +406,7 @@ Returned by `POST /tasks`, `POST /tasks/{id}/review`, and this endpoint:
 
 When the service runs with `ROUNDTABLE_ENABLED` (off by default), `POST /tasks` first runs a
 **multi-persona discussion stage** — one table per platform, a manager-moderated debate that
-converges on the same creative angle the scout would have produced — before generating drafts.
+converges on the same creative angle the strategist would have produced — before generating drafts.
 Everything else (review gate, finalization, media) is unchanged. The discussion is **live on the
 same `GET /tasks/{id}/events` stream** and the user can join any table.
 

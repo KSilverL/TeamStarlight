@@ -6,7 +6,7 @@ RequestPort pause persists the in-flight message + request payload to the
 CheckpointStorage). Each edge in the graph is keyed by message type:
 
     Brief            ──▶ dispatcher        (workflow input)
-    DispatchPlan     ──▶ scout
+    DispatchPlan     ──▶ strategist
     CreativeStrategy ──▶ creator
     Draft            ──▶ reviewer
     ReviewOutcome    ──▶ creator (retry) | human_gate   (switch-case edge)
@@ -59,7 +59,7 @@ class Brief(BaseModel):
 
 
 class DispatchPlan(BaseModel):
-    """dispatcher → scout: the validated brief plus the confirmed route."""
+    """dispatcher → strategist: the validated brief plus the confirmed route."""
 
     brief: Brief
     route: str
@@ -69,7 +69,7 @@ class DispatchPlan(BaseModel):
 
 
 class CreativeStrategy(BaseModel):
-    """scout → creator: a per-platform strategy angle (not copy)."""
+    """strategist → creator: a per-platform strategy angle (not copy)."""
 
     brief: Brief
     strategies: dict[str, str]  # platform -> strategy text

@@ -4,7 +4,7 @@ The four end-to-end user scenarios (M4 acceptance).
 Each is a complete run-through of one kind of user, fully mocked/offline:
   1. Branded user      — learned brand rules are injected into the copy.
   2. No-brand user     — steers on tone_hint ONLY, never reads the store.
-  3. Vague idea        — copilot_mode voice intake → scout proposes a topic → workflow.
+  3. Vague idea        — copilot_mode voice intake → a topic is suggested → workflow.
   4. Brand training    — the self-evolving profile: edit → distil → keep → next run reflects.
 
 Together they exercise: voice/text dual entry, the circuit-breaker transparency flag,
@@ -77,11 +77,11 @@ async def test_scenario_no_brand_user_skips_store(make_brief, monkeypatch):
 async def test_scenario_vague_idea_copilot_voice():
     session = build_intake("voice")
     started = await session.start("sess-copilot", "Help me think of what to post on LinkedIn to promote our launch")
-    assert started["complete"] is True                    # scout fills the topic in one turn
+    assert started["complete"] is True                    # suggest_topic fills the topic in one turn
 
     brief = await session.get_brief(started["session_id"])
     assert brief.intake_mode == "voice"
-    assert brief.route == "copilot_mode" and brief.topic  # scout proposed a topic
+    assert brief.route == "copilot_mode" and brief.topic  # a topic was suggested
 
     # the brief feeds the workflow unchanged (asking for all three deliverables here)
     svc = WorkflowService()
@@ -124,11 +124,11 @@ async def test_scenario_brand_training_self_evolves(make_brief):
     assert any(r["rule"] in draft2 for r in must_do)
 
 
-# ── 5. Roundtable drops in for scout (Phase 6, end-to-end) ────────────────────
+# ── 5. Roundtable drops in for strategist (Phase 6, end-to-end) ───────────────
 
 async def test_scenario_roundtable_end_to_end(monkeypatch):
     """ROUNDTABLE_ENABLED=true: brief → multi-persona discussion (per platform) → drafts →
-    review → final + media. The discussion replaces scout; the creator and downstream are
+    review → final + media. The discussion replaces the strategist; the creator and downstream are
     unchanged."""
     monkeypatch.setenv("ROUNDTABLE_ENABLED", "true")
     reset_settings()
@@ -148,11 +148,11 @@ async def test_scenario_roundtable_end_to_end(monkeypatch):
     assert {p["platform"] for p in snap["pending"]} == {"linkedin", "instagram"}
 
     events = svc.buffered_events("rt-e2e")
-    # The discussion ran (per-table) and bypassed scout/dispatcher, then went to the creator.
+    # The discussion ran (per-table) and bypassed strategist/dispatcher, then went to the creator.
     assert {e["table_id"] for e in events if e.get("status") == "discussion_consensus"} == {"linkedin", "instagram"}
     assert any(e["type"] == "agent_utterance" for e in events)
     assert any(e.get("node") == "creator" for e in events)
-    assert not any(e.get("node") in ("dispatcher", "scout") for e in events)
+    assert not any(e.get("node") in ("dispatcher", "strategist") for e in events)
 
     final = await svc.review("rt-e2e", {
         "linkedin": {"decision": "approve"},
@@ -189,7 +189,7 @@ async def test_scenario_roundtable_media_only_skips_text_and_gate(monkeypatch):
 
     events = svc.buffered_events("rt-media-only")
     assert any(e["type"] == "agent_utterance" for e in events)        # the table still discussed
-    assert not any(e.get("node") in ("creator", "reviewer", "human_gate", "scout", "dispatcher")
+    assert not any(e.get("node") in ("creator", "reviewer", "human_gate", "strategist", "dispatcher")
                    for e in events)                                   # create/review/gate skipped
     out = snap["outputs"][0]
     assert out["draft"] == "" and out["content_types"] == ["brand", "video"]
@@ -197,9 +197,9 @@ async def test_scenario_roundtable_media_only_skips_text_and_gate(monkeypatch):
     assert out["video_storyboard"] and len(out["video_storyboard"]["slides"]) >= 2
 
 
-async def test_scenario_roundtable_disabled_uses_scout(monkeypatch):
+async def test_scenario_roundtable_disabled_uses_strategist(monkeypatch):
     """Regression guard: with the flag OFF the front of the pipeline is the original
-    dispatcher → scout (no discussion events), unchanged from before Phase 6."""
+    dispatcher → strategist (no discussion events), unchanged from before Phase 6."""
     monkeypatch.setenv("ROUNDTABLE_ENABLED", "false")
     reset_settings()
 
@@ -210,7 +210,7 @@ async def test_scenario_roundtable_disabled_uses_scout(monkeypatch):
     )
     events = svc.buffered_events("rt-off")
     nodes = {e.get("node") for e in events}
-    assert "scout" in nodes and "dispatcher" in nodes
+    assert "strategist" in nodes and "dispatcher" in nodes
     assert not any(e["type"] == "agent_utterance" for e in events)
 
 

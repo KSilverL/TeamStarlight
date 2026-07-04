@@ -27,7 +27,7 @@ Backend (Spring Boot) ──────────────────► 
 Frontend receives updated session state
 ```
 
-**Workflow phases** — the MAF newsroom runs `dispatcher → scout → creator` (fan-out) `→ reviewer → human-gate → archivist → media_producer`:
+**Workflow phases** — the MAF newsroom runs `dispatcher → strategist → creator` (fan-out) `→ reviewer → human-gate → archivist → media_producer`:
 
 1. **Phase 1 — Planning:** the backend confirms the brief and may present a campaign outline for approval before starting generation (the backend's own planning step — the MAF service does not gate on an outline).
 2. **Phase 2 — Content Creation:** the MAF workflow drafts one native post per platform (creator fan-out), screens each through the reviewer, then pauses at the **review gate** for the per-platform approve / edit / reject verdict.
@@ -796,7 +796,7 @@ These endpoints are called **by the Spring Boot backend only** and are not inten
 ### D1. Start a Task
 
 **Description**  
-Starts a new MAF newsroom run from a `CreativeBrief`. The backend calls this once the brief is confirmed (A1/B1). The service runs dispatcher → scout → creator (one draft per platform) → reviewer, then pauses at the human-review gate with `status: "awaiting_review"`. The backend watches progress over SSE (E1) and submits the verdict via D2.
+Starts a new MAF newsroom run from a `CreativeBrief`. The backend calls this once the brief is confirmed (A1/B1). The service runs dispatcher → strategist → creator (one draft per platform) → reviewer, then pauses at the human-review gate with `status: "awaiting_review"`. The backend watches progress over SSE (E1) and submits the verdict via D2.
 
 **Endpoint**  
 `/tasks`
@@ -1038,7 +1038,7 @@ The backend learns of per-platform progress by **subscribing to the task's SSE s
 **Event Format**  
 Each line is `data: <json>\n\n`. Switch on `type`:
 
-- **`progress`** — the run moved to a new MAF executor (`dispatcher` / `scout` / `creator` / `reviewer` / `human_gate` / `archivist` / `media_producer` / `workflow`). `status` flows `running` → `done` | `interrupted` (waiting for review) | `error`; a terminal `{ "node": "workflow", "status": "done" }` ends the task.
+- **`progress`** — the run moved to a new MAF executor (`dispatcher` / `strategist` / `creator` / `reviewer` / `human_gate` / `archivist` / `media_producer` / `workflow`). `status` flows `running` → `done` | `interrupted` (waiting for review) | `error`; a terminal `{ "node": "workflow", "status": "done" }` ends the task.
 - **`result`** — content is ready. At the gate, a `draft_ready` result carries the text `draft` + `critic_comment` (the reviewer's note). After `/review`, a `final` result is enriched by the `media_producer` with `html_preview` (the animated HTML brand card) + `video_props` (the video spec).
 
 **Example Stream** *(MAF LLM service → backend)*

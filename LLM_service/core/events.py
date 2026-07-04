@@ -32,7 +32,7 @@ ERROR = "error"              # executor raised an exception
 # ── executor id → newsroom phase ──────────────────────────────────────────────
 NODE_PHASE: dict[str, str] = {
     "dispatcher": "dispatch",   # 总编导
-    "scout": "scout",           # 热点星探
+    "strategist": "strategist", # 内容策略师
     "creator": "create",        # 人格创作者 (per-platform fan-out)
     "reviewer": "review",       # 红队审核员
     "human_gate": "review",     # RequestPort 人工审批
