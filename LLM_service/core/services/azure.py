@@ -126,12 +126,21 @@ class AzureLLM(LLMService):
         }
 
     async def plan_strategy(
-        self, *, topic: str, platform: str, user_intent: str
+        self, *, topic: str, platform: str, user_intent: str, trends: str = ""
     ) -> str:
         system = (
             f"You are a content strategist. Produce a short {platform} content *strategy* "
             "(the angle, not the copy)."
         )
+        if trends:
+            # Same fusion-with-rejection-permission framing as the roundtable's trend_scout
+            # seat — a forced trend is worse than none.
+            system += (
+                "\n\nBelow are current, broad cultural/industry trends. If ONE of them has a "
+                "genuine, creative connection to the topic, fuse it into the angle; prefer an "
+                "unexpected but honest link over an on-the-nose one. If none genuinely fits, "
+                "use none — a forced trend is worse than none.\n\n" + trends
+            )
         user = f"Topic: {topic}\nGoal: {user_intent}"
         return await self._complete(
             [{"role": "system", "content": system}, {"role": "user", "content": user}]

@@ -24,7 +24,8 @@ from LLM_service.core.services.factory import reset_services
 from LLM_service.workflow import Brief, build_workflow
 from LLM_service.workflow.roundtable import reset_gates
 
-_TOGGLE_VARS = ("USE_MOCK", "USE_MOCK_LLM", "USE_MOCK_SAFETY", "USE_MOCK_STORE", "USE_MOCK_VOICE")
+_TOGGLE_VARS = ("USE_MOCK", "USE_MOCK_LLM", "USE_MOCK_SAFETY", "USE_MOCK_STORE", "USE_MOCK_VOICE",
+                "TREND_SCOUT_ENABLED")
 _CRED_VARS = (
     "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_CHAT_DEPLOYMENT",
     "AZURE_CONTENTSAFETY_ENDPOINT", "AZURE_CONTENTSAFETY_KEY",
