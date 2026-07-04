@@ -599,7 +599,7 @@ This endpoint is called **by the Spring Boot backend only** in response to B1. I
 ### C1. Generate Platform Content
 
 **Description**  
-Generates a single platform-specific post draft from a user prompt. Unlike the newsroom workflow used in the main chat interface (which runs the full dispatcher → scout → creator fan-out → reviewer → human-gate run via `POST /tasks`), this is one of the MAF service's **standalone, one-shot media generators** — it does **not** go through the workflow or human gate, so there is no `task_id`. It is the same `POST /generate-text` endpoint the frontend's "Text" content button uses. The LLM service applies the platform's house-style skill (`skills/<platform>.md`) so the copy follows each platform's conventions:
+Generates a single platform-specific post draft from a user prompt. Unlike the newsroom workflow used in the main chat interface (which runs the full dispatcher → strategist → creator fan-out → reviewer → human-gate run via `POST /tasks`), this is one of the MAF service's **standalone, one-shot media generators** — it does **not** go through the workflow or human gate, so there is no `task_id`. It is the same `POST /generate-text` endpoint the frontend's "Text" content button uses. The LLM service applies the platform's house-style skill (`skills/<platform>.md`) so the copy follows each platform's conventions:
 
 - **Instagram**: visual, emoji-heavy, CTA with "link in bio"
 - **LinkedIn**: formal, thought-leadership framing, no hashtags

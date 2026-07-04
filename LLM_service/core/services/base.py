@@ -60,7 +60,7 @@ def empty_profile(business_id: Optional[str]) -> dict:
 
 class LLMService(ABC):
     """Chat, structured output, and platform copywriting. One service backs the
-    dispatcher (structured route), the scout (platform strategy), and the creator
+    dispatcher (structured route), the strategist (platform strategy), and the creator
     (per-platform draft)."""
 
     @abstractmethod
@@ -265,9 +265,9 @@ class LLMService(ABC):
         """One intake turn (function-calling): given the shared system prompt + tool
         definitions, the conversation so far, and the user's latest turn, decide which
         CreativeBrief fields the user just supplied. Returns:
-            {"brief_updates": dict, "wants_scout": bool}
+            {"brief_updates": dict, "wants_topic_idea": bool}
         `brief_updates` is the `update_brief` tool-call result (fields → values);
-        `wants_scout` flags the `scout_trends` tool call (copilot_mode — the user
+        `wants_topic_idea` flags the `suggest_topic` tool call (copilot_mode — the user
         asked for ideas). `pending_field` is the field the assistant just asked about,
         so a direct answer slots in even without an explicit cue. This single primitive
         is shared verbatim by the text and voice entry points — only the transport

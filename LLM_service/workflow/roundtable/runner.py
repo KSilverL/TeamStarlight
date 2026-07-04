@@ -1,7 +1,7 @@
 """
 Roundtable runner (§6 / §1 stage-chaining). `run_table` drives ONE table's Magentic workflow,
 collects the transcript from the event stream, and emits a `RoundtableConsensus` whose
-`.strategy` is the existing `CreativeStrategy` — the scout drop-in. `run_tables` (Phase 5)
+`.strategy` is the existing `CreativeStrategy` — the strategist drop-in. `run_tables` (Phase 5)
 fans that out: one table per target platform, run concurrently, summarised into a
 `list[RoundtableConsensus]`.
 

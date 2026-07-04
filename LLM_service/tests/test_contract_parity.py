@@ -180,9 +180,9 @@ async def test_fill_brief_parity():
     a = await az.fill_brief(**kw)
 
     for out in (m, a):
-        assert set(out.keys()) == {"brief_updates", "wants_scout"}
+        assert set(out.keys()) == {"brief_updates", "wants_topic_idea"}
         assert isinstance(out["brief_updates"], dict)
-        assert isinstance(out["wants_scout"], bool)
+        assert isinstance(out["wants_topic_idea"], bool)
 
 
 async def test_summarize_preferences_parity():

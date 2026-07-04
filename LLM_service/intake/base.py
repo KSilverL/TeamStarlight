@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from ..core.services import factory
-from ..workflow.executors.scout import scout_topic_ideas
+from ..workflow.executors.strategist import suggest_topic
 from .brief_schema import CreativeBrief, PriorSessionContext
 
 # ── The shared conversational assets (system prompt + function definitions) ───
@@ -31,7 +31,7 @@ INTAKE_SYSTEM_PROMPT = (
     "(and, if offered, a tone hint or brand id), and call update_brief with everything you "
     "extracted. Only ask a short follow-up for a field you genuinely could not infer, one "
     "thing at a time, and at most a few times. If the user has no idea what to post, call "
-    "scout_trends to propose an angle instead of interrogating them."
+    "suggest_topic to propose an angle instead of interrogating them."
 )
 
 def _render_prior_context(prior: PriorSessionContext) -> str:
@@ -79,7 +79,7 @@ BRIEF_TOOL_DEFS: List[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "scout_trends",
+            "name": "suggest_topic",
             "description": "Call when the user is unsure what to post and wants topic ideas.",
             "parameters": {
                 "type": "object",
@@ -109,7 +109,7 @@ class _SessionState:
     brief_partial: dict = field(default_factory=dict)
     messages: List[dict] = field(default_factory=list)  # [{role, content}]
     route: str = "direct_generation"
-    used_scout: bool = False
+    used_topic_idea: bool = False
     user_id: Optional[str] = None  # caller-supplied identity; keys per-user learning
     followups_asked: int = 0  # clarifying questions asked so far (capped at MAX_INTAKE_FOLLOWUPS)
     # The prior-session recap (backend-supplied) this conversation continues; None = fresh. An
@@ -158,14 +158,14 @@ class BriefConversation:
             if value:
                 state.brief_partial[key] = value
 
-        # copilot_mode: the user asked for ideas and has no topic → scout proposes one.
-        if result.get("wants_scout") and not state.brief_partial.get("topic"):
-            state.brief_partial["topic"] = await scout_topic_ideas(
+        # copilot_mode: the user asked for ideas and has no topic → suggest one.
+        if result.get("wants_topic_idea") and not state.brief_partial.get("topic"):
+            state.brief_partial["topic"] = await suggest_topic(
                 user_intent=state.brief_partial.get("user_intent", ""),
                 platforms=state.brief_partial.get("target_platforms") or _DEFAULT_PLATFORMS,
             )
             state.route = "copilot_mode"
-            state.used_scout = True
+            state.used_topic_idea = True
 
         # We've already asked the maximum number of clarifiers and something is still
         # missing → stop interrogating and fill the gaps ourselves so the brief completes.
@@ -194,16 +194,16 @@ class BriefConversation:
 
     async def _force_complete(self, state: _SessionState) -> None:
         """Last resort once the follow-up cap is hit: fill any still-missing required field
-        ourselves — scout a topic (→ copilot_mode), derive a generic goal — so intake always
+        ourselves — suggest a topic (→ copilot_mode), derive a generic goal — so intake always
         terminates instead of looping on the user."""
         bp = state.brief_partial
         if not bp.get("topic"):
-            bp["topic"] = await scout_topic_ideas(
+            bp["topic"] = await suggest_topic(
                 user_intent=bp.get("user_intent", ""),
                 platforms=bp.get("target_platforms") or _DEFAULT_PLATFORMS,
             )
             state.route = "copilot_mode"
-            state.used_scout = True
+            state.used_topic_idea = True
         if not bp.get("user_intent"):
             bp["user_intent"] = f"raise awareness of {bp['topic']}"
 
@@ -212,8 +212,8 @@ class BriefConversation:
         # The user is here to generate content; whether to *learn* from this
         # conversation is decided at the END (POST /tasks/{id}/confirm-learning),
         # not at intake. So intake only ever produces direct_generation (or
-        # copilot_mode when the scout proposed the topic) — never brand_training.
-        state.route = "copilot_mode" if state.used_scout else "direct_generation"
+        # copilot_mode when a topic was suggested) — never brand_training.
+        state.route = "copilot_mode" if state.used_topic_idea else "direct_generation"
 
     @staticmethod
     def _summary(brief_partial: dict) -> str:
@@ -223,7 +223,7 @@ class BriefConversation:
     def to_brief(self, state: _SessionState, *, intake_mode: str) -> CreativeBrief:
         if self._missing(state.brief_partial):
             raise ValueError("brief is not complete yet")
-        if state.route == "direct_generation" and not state.used_scout:
+        if state.route == "direct_generation" and not state.used_topic_idea:
             self._finalize_route(state)
         bp = state.brief_partial
         return CreativeBrief(

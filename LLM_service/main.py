@@ -8,7 +8,7 @@ Unlike scenarios.py (a fixed, non-interactive showcase), this lets you drive EVE
 by hand and watch it happen, all through the same `WorkflowService` the HTTP API uses:
 
   • build the brief manually, or via a text / (mock) voice intake conversation
-  • toggle the ROUNDTABLE stage on/off  (scout  ↔  multi-persona discussion). When it is on,
+  • toggle the ROUNDTABLE stage on/off  (strategist  ↔  multi-persona discussion). When it is on,
     the discussion STREAMS LIVE — each persona's turn prints the moment it is spoken — and
     before the manager assigns every next persona you may raise a hand and speak: your turn
     joins the table, then the next persona is assigned (or skip to let the manager continue)
@@ -246,7 +246,7 @@ async def _run_once() -> None:
     inputs = await _build_brief()
 
     _section("2 · ROUNDTABLE STAGE")
-    roundtable = await _yn("  Enable the multi-persona roundtable (replaces scout)?", default=True)
+    roundtable = await _yn("  Enable the multi-persona roundtable (replaces the strategist)?", default=True)
     os.environ["ROUNDTABLE_ENABLED"] = "true" if roundtable else "false"
     reset_settings()
     factory.reset_services()
@@ -287,7 +287,7 @@ def _cheat_sheet() -> None:
     to cover the rest — together these reach every path through the system."""
     _section("FLOW CHEAT-SHEET — inputs that exercise each path")
     rows = [
-        ("Standard (scout)",     "Roundtable = n"),
+        ("Standard (strategist)", "Roundtable = n"),
         ("Roundtable debate",    "Roundtable = Y  · raise a hand at any round to join the table"),
         ("Reject → rework",      "At the gate press r + type a comment → next draft shows 'Reworked to address: …'"),
         ("Approve-after-edit",   "At the gate press e + type your final copy"),

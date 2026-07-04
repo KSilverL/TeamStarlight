@@ -39,7 +39,7 @@ async def test_start_emits_progress_for_every_executor():
     events = svc.buffered_events("t1")
 
     progressed = {(e["node"], e["status"]) for e in events if e["type"] == "progress"}
-    for node in ("dispatcher", "scout", "creator", "reviewer"):
+    for node in ("dispatcher", "strategist", "creator", "reviewer"):
         assert (node, "running") in progressed
         assert (node, "done") in progressed
     # the gate interrupts (awaiting human) for each platform

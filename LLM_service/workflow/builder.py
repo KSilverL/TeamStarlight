@@ -2,7 +2,7 @@
 
 Graph (MIGRATION_PLAN §5.1):
 
-    dispatcher ──▶ scout ──▶ creator ──▶ reviewer
+    dispatcher ──▶ strategist ──▶ creator ──▶ reviewer
                                 ▲            │  switch-case edge (the circuit breaker):
                                 │            ├─ reject & retry<3  ─▶ creator
                                 └────────────┤
@@ -43,7 +43,7 @@ from .executors import (
     MediaEntryExecutor,
     MediaProducerExecutor,
     ReviewerExecutor,
-    ScoutExecutor,
+    StrategistExecutor,
 )
 from .messages import MAX_RETRIES, ReviewOutcome
 
@@ -74,9 +74,9 @@ def build_workflow(
     `roundtable_entry` (Phase 6) swaps the front of the graph: when True the roundtable
     stage has already produced the per-platform `CreativeStrategy` (run separately by the
     WorkflowService, §1 stage-chaining), so the workflow STARTS AT THE CREATOR with that
-    strategy as input and the `dispatcher → scout` legs are dropped. The creator and
+    strategy as input and the `dispatcher → strategist` legs are dropped. The creator and
     everything downstream are byte-identical either way. When False (the default) the graph
-    is exactly as before — `dispatcher → scout → creator → …` — so nothing regresses.
+    is exactly as before — `dispatcher → strategist → creator → …` — so nothing regresses.
 
     `media_only` (Case 4: the brief's `content_types` omit `text`) collapses the graph to
     `media_entry → media_producer`: with no copy to draft/review/approve, the whole
@@ -113,9 +113,9 @@ def build_workflow(
     )
 
     if not roundtable_entry:
-        # Original front: dispatcher (confirm + route) → scout (per-platform strategy) → creator.
-        scout = ScoutExecutor(id="scout")
-        builder = builder.add_edge(start_executor, scout).add_edge(scout, creator)
+        # Original front: dispatcher (confirm + route) → strategist (per-platform strategy) → creator.
+        strategist = StrategistExecutor(id="strategist")
+        builder = builder.add_edge(start_executor, strategist).add_edge(strategist, creator)
 
     return (
         builder

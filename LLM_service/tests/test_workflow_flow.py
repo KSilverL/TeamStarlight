@@ -1,7 +1,7 @@
 """
 End-to-end happy path (replaces test_mock_flow).
 
-A text brief flows through all four executors (dispatcher → scout → creator
+A text brief flows through all four executors (dispatcher → strategist → creator
 fan-out → reviewer) and reaches the human gate with a draft ready for every target
 platform; approving each yields one FinalDraft per platform. Fully mocked.
 """
@@ -60,8 +60,8 @@ async def test_executors_run_in_pipeline_order(workflow, make_brief):
         if ev.type == "executor_invoked":
             invoked.append(ev.executor_id)
 
-    # dispatcher → scout → creator → reviewer all run, then the human gate.
-    for executor_id in ("dispatcher", "scout", "creator", "reviewer", "human_gate"):
+    # dispatcher → strategist → creator → reviewer all run, then the human gate.
+    for executor_id in ("dispatcher", "strategist", "creator", "reviewer", "human_gate"):
         assert executor_id in invoked
-    assert invoked.index("dispatcher") < invoked.index("scout") < invoked.index("creator")
+    assert invoked.index("dispatcher") < invoked.index("strategist") < invoked.index("creator")
     assert invoked.index("creator") < invoked.index("reviewer") < invoked.index("human_gate")

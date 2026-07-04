@@ -5,7 +5,7 @@ platform, pure text, no user, fully mocked + deterministic.
 Covers:
   - reproducibility: same brief + same mock skills/profile → identical transcript + consensus.
   - read side (§6.5): brand_voice / user_advocate personas carry the injected profile / skills.
-  - drop-in shape: RoundtableConsensus.strategy has the SAME fields as the scout's CreativeStrategy.
+  - drop-in shape: RoundtableConsensus.strategy has the SAME fields as the strategist's CreativeStrategy.
   - termination: the table always stops at MAX_ROUNDS.
 
 All offline/mock via the autouse conftest fixtures (no network, mock mode forced).
@@ -23,7 +23,7 @@ from LLM_service.core.services.mock import (
 )
 from LLM_service.skills import load_skill
 from LLM_service.workflow import Brief
-from LLM_service.workflow.executors.scout import scout_strategies
+from LLM_service.workflow.executors.strategist import plan_strategies
 from LLM_service.workflow.messages import CreativeStrategy
 from LLM_service.workflow.roundtable import (
     RoundtableConsensus,
@@ -105,21 +105,21 @@ async def test_personas_carry_injected_profile_and_skills():
     assert "BRAND MUST DO" not in personas[AUDIENCE_ADVOCATE].instructions
 
 
-async def test_consensus_strategy_matches_scout_creativestrategy_shape():
-    """The consensus carries a real CreativeStrategy with the SAME fields the scout emits,
+async def test_consensus_strategy_matches_strategist_creativestrategy_shape():
+    """The consensus carries a real CreativeStrategy with the SAME fields the strategist emits,
     so it is a drop-in for the creator (Phase 6)."""
     brief = _brief()
     result = await run_table(PLATFORM, brief)
 
-    scout_out = CreativeStrategy(
+    strategist_out = CreativeStrategy(
         brief=brief,
-        strategies=await scout_strategies(
+        strategies=await plan_strategies(
             topic=brief.topic, platforms=[PLATFORM], user_intent=brief.user_intent
         ),
     )
 
-    assert type(result.consensus.strategy) is type(scout_out)
-    assert set(result.consensus.strategy.model_dump().keys()) == set(scout_out.model_dump().keys())
+    assert type(result.consensus.strategy) is type(strategist_out)
+    assert set(result.consensus.strategy.model_dump().keys()) == set(strategist_out.model_dump().keys())
     # Single-platform table → a strategies dict keyed by exactly that platform.
     assert set(result.consensus.strategy.strategies) == {PLATFORM}
 

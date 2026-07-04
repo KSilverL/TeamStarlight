@@ -167,7 +167,7 @@ class Settings:
     azure_voicelive_api_key: Optional[str] = None   # falls back to the OpenAI key (same resource)
 
     # ── Roundtable (multi-persona discussion stage) ────────────────────────────
-    # ROUNDTABLE_ENABLED gates the drop-in replacement of `scout` (wired in Phase 6);
+    # ROUNDTABLE_ENABLED gates the drop-in replacement of `strategist` (wired in Phase 6);
     # off → the pipeline behaves exactly as today. max_rounds is the per-table hard cap
     # that stops an infinite debate. The two model tiers (cheap personas / stronger
     # manager) are read in the production path (Phase 2); the mock path ignores them.

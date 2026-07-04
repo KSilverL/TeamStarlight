@@ -170,7 +170,7 @@ async def test_media_only_skips_the_gate_and_blanks_the_text(make_brief):
     # The SSE stream carried a `final` per platform and never a text `draft_ready` gate.
     events = svc.buffered_events("media-only-1")
     assert not any(e.get("status") == "draft_ready" for e in events)
-    assert not any(e.get("node") in ("creator", "reviewer", "human_gate", "dispatcher", "scout")
+    assert not any(e.get("node") in ("creator", "reviewer", "human_gate", "dispatcher", "strategist")
                    for e in events)
     finals = [e for e in events if e["type"] == "result" and e["status"] == "final"]
     assert {e["platform"] for e in finals} == {"linkedin", "instagram"}

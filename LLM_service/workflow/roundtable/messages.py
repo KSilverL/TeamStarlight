@@ -5,7 +5,7 @@ real signatures in docs/roundtable_api_notes.md).
 All models are serializable pydantic (same style as workflow/messages.py) so they can
 cross a checkpoint. The roundtable runs *before* the generation workflow (stage-chaining,
 not nesting), and its output is a `RoundtableConsensus` whose `.strategy` is the EXISTING
-`CreativeStrategy` — so the consensus is a drop-in replacement for the scout's output and
+`CreativeStrategy` — so the consensus is a drop-in replacement for the strategist's output and
 the creator and everything downstream need no change.
 
 `PreferenceSummary` is the bridge into the EXISTING per-user learning channel (it is NOT a

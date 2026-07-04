@@ -4,7 +4,7 @@ Dual-entry intake (new in M3).
 The whole point: the voice and text entries share one conversation state machine,
 one system prompt + function set, and one CreativeBrief product — only the transport
 differs. These tests prove that the same script produces an identical brief whether
-typed or spoken (mock), that the multi-turn slot-filling and copilot scout tool work,
+typed or spoken (mock), that the multi-turn slot-filling and copilot suggest_topic tool work,
 and that the brief feeds the M1/M2 workflow with zero changes. Fully mocked/offline.
 """
 
@@ -127,7 +127,7 @@ async def test_rich_opening_completes_with_zero_followups():
 
 async def test_followups_are_capped_then_force_completed():
     """A user who never supplies the goal is not interrogated forever: after MAX_INTAKE_FOLLOWUPS
-    clarifiers the engine fills the gaps itself (scout topic / default goal) and completes."""
+    clarifiers the engine fills the gaps itself (suggested topic / default goal) and completes."""
     from LLM_service.intake.base import MAX_INTAKE_FOLLOWUPS
 
     session = TextIntake()
@@ -145,7 +145,7 @@ async def test_followups_are_capped_then_force_completed():
 
     brief = await session.get_brief(sid)
     assert brief.topic and brief.user_intent                 # gaps filled by the force-complete
-    assert brief.route == "copilot_mode"                     # topic came from the scout fallback
+    assert brief.route == "copilot_mode"                     # topic came from the suggest_topic fallback
 
 
 # ── Prior-session context: continuing an earlier conversation ─────────────────
@@ -229,12 +229,12 @@ async def test_prior_context_malformed_400_and_empty_degrades():
     assert brief["prior_context"] is None
 
 
-# ── copilot_mode: scout proposes a topic when the user is unsure ──────────────
+# ── copilot_mode: suggest_topic proposes a topic when the user is unsure ──────
 
-async def test_copilot_mode_invokes_scout_tool():
+async def test_copilot_mode_invokes_suggest_topic_tool():
     brief, _ = await _drive(TextIntake(), _COPILOT, [])
     assert brief.route == "copilot_mode"
-    assert brief.topic                       # scout filled a topic the user never gave
+    assert brief.topic                       # suggest_topic filled a topic the user never gave
     assert "linkedin" in brief.target_platforms
     # voice path reaches the same copilot brief
     voice_brief, _ = await _drive(MockVoiceIntake(), _COPILOT, [])

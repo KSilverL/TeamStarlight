@@ -8,7 +8,7 @@ is demonstrable in one command (no stdin, auto-resolves the human gate):
 
   1. Branded user      — learned brand rules fold into the copy.
   2. No-brand user     — steers on tone_hint only (never touches the store).
-  3. Vague idea        — copilot_mode VOICE intake → scout proposes a topic → workflow.
+  3. Vague idea        — copilot_mode VOICE intake → a topic is suggested → workflow.
   4. Brand training    — edit → archivist distils a rule → kept → next run reflects it.
 
 Plus the circuit-breaker transparency flag and the HTML preview card. This showcase is
@@ -75,12 +75,12 @@ async def scenario_no_brand() -> None:
 
 
 async def scenario_copilot_voice() -> None:
-    _h("3 · VAGUE IDEA — copilot_mode VOICE intake → scout → workflow")
+    _h("3 · VAGUE IDEA — copilot_mode VOICE intake → suggest_topic → workflow")
     session = build_intake("voice")
     started = await session.start("sess-copilot", "Help me think of what to post on LinkedIn to promote our launch")
     brief = await session.get_brief(started["session_id"])
     print(f"  intake_mode={brief.intake_mode}  route={brief.route}")
-    print(f"  scout proposed topic: {brief.topic}")
+    print(f"  suggested topic: {brief.topic}")
     svc = WorkflowService()
     # Ask for all three deliverables so the showcase exercises the media_producer.
     await svc.start({**brief.model_dump(), "content_types": ["text", "brand", "video"]},
@@ -120,7 +120,7 @@ async def scenario_brand_training() -> None:
 
 
 async def scenario_roundtable() -> None:
-    _h("5 · ROUNDTABLE — multi-persona discussion drops in for scout")
+    _h("5 · ROUNDTABLE — multi-persona discussion drops in for strategist")
     os.environ["ROUNDTABLE_ENABLED"] = "true"
     reset_settings()
     factory.reset_services()
@@ -134,7 +134,7 @@ async def scenario_roundtable() -> None:
         evs = svc.buffered_events("showcase-roundtable")
         utts = [e for e in evs if e["type"] == "agent_utterance"]
         print(f"  discussion turns: {len(utts)} (seats: {sorted({e['speaker'] for e in utts})})")
-        print(f"  ✓ scout bypassed: {not any(e.get('node') == 'scout' for e in evs)}")
+        print(f"  ✓ strategist bypassed: {not any(e.get('node') == 'strategist' for e in evs)}")
         await svc.review("showcase-roundtable", {"linkedin": {"decision": "approve"}})
         finals = [e for e in svc.buffered_events("showcase-roundtable")
                   if e["type"] == "result" and e["status"] == "final"]

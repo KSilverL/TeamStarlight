@@ -376,7 +376,7 @@ class WorkflowService:
         # Choose the graph's front:
         #  • media-only (Case 4: no "text") → media_entry → media_producer (skip create/review/gate);
         #  • text + roundtable → creator entry (the discussion already produced the strategy);
-        #  • text, no roundtable → the original dispatcher → scout → creator path.
+        #  • text, no roundtable → the original dispatcher → strategist → creator path.
         # The roundtable stage (when enabled) still runs FIRST here (its own checkpoints + user
         # pauses) for both the text and media-only paths — stage-chaining (§1).
         if not text_requested:
@@ -420,7 +420,7 @@ class WorkflowService:
         #         t.model_dump() for r in results for t in r.consensus.transcript
         #     ]
         #     # Merge the N single-platform consensuses into ONE CreativeStrategy. With text it is
-        #     # the scout drop-in (→ creator); media-only it is the render brief (→ media_entry).
+        #     # the strategist drop-in (→ creator); media-only it is the render brief (→ media_entry).
         #     strategy = CreativeStrategy(
         #         brief=brief,
         #         strategies={
@@ -461,7 +461,7 @@ class WorkflowService:
                     t.model_dump() for r in results for t in r.consensus.transcript
                 ]
                 # Merge the N single-platform consensuses into ONE CreativeStrategy. With text it
-                # is the scout drop-in (→ creator); media-only it is the render brief (→ media_entry).
+                # is the strategist drop-in (→ creator); media-only it is the render brief (→ media_entry).
                 strategy = CreativeStrategy(
                     brief=brief,
                     strategies={
