@@ -17,6 +17,9 @@ Integration guide for the content-generation service (`LLM_service/api.py`).
                               GET /tasks/{id}  ← final outputs
                                       │
                               POST /tasks/{id}/confirm-learning  ← opt in to learning (optional)
+                                      │
+                              POST /tasks/{id}/render-video ─► GET /video-jobs/{job_id}[/download]
+                                      (optional — MP4 of the storyboard, if "video" was requested)
 ```
 
 1. **Intake** — the service **analyses the opening message** and builds the `CreativeBrief` in
@@ -189,7 +192,7 @@ Post a `CreativeBrief` (from intake) or build one directly:
 | `user_id` | string | optional | end-user ID; required to learn/apply per-user rules (via `/confirm-learning`) |
 | `tone_hint` | string | optional | voice hint for users without a brand |
 | `route` | string | optional | from intake; default `direct_generation` |
-| `content_types` | string[] | optional | Which deliverables to produce — any combination of `"text"` (post copy), `"brand"` (animated HTML card; `"html"` accepted as an alias), `"video"` (BrandVideoProps spec). **Omitted → `["text"]`.** Omitting `text` (brand/video only) is a **media-only** run: there is no copy to draft, so the review gate is skipped and the brief goes straight to media generation — the task completes with **no `awaiting_review` step**. Unknown values or an empty list → `400`. |
+| `content_types` | string[] | optional | Which deliverables to produce — any combination of `"text"` (post copy), `"brand"` (animated HTML card; `"html"` accepted as an alias), `"video"` (a `StoryboardSpec` video storyboard — data the render pipeline turns into an MP4, see [Video render](#video-render--post-taskstask_idrender-video--get-video-jobsjob_id)). **Omitted → `["text"]`.** Omitting `text` (brand/video only) is a **media-only** run: there is no copy to draft, so the review gate is skipped and the brief goes straight to media generation — the task completes with **no `awaiting_review` step**. Unknown values or an empty list → `400`. |
 | `session_id` | string | recommended | The conversation id from the intake session (e.g. `sess-…`). **Pass the same id you used for `POST /intake`** — the run and every `/tasks/{id}/*` op key on it, so intake + generation are **one session** with one id. Its intake transcript is also threaded in for per-user learning. |
 | `task_id` | string | optional | Deprecated alias for `session_id` (back-compat); used only when `session_id` is omitted. Auto-generated (`task-…`) if both are absent. |
 
@@ -212,7 +215,15 @@ run to reach `awaiting_review` (the review gate) — or `completed` for a **medi
 
 Subscribe once and watch the entire run. The stream replays all events so far, continues live, and **closes when the task completes**.
 
-Each line: `data: <json>\n\n`. Switch on `type`:
+Each line: `data: <json>\n\n`. Two envelope-wide details:
+
+- Every event carries a **`seq`** — a stable, monotonic per-task index. Because a reconnect
+  **replays the whole buffer**, key your side effects off `seq` (skip anything you've already
+  handled) instead of reacting to every delivery.
+- After 15 s of inactivity the server emits an SSE comment line (`: keep-alive`) — invisible to
+  `EventSource`, but keeps idle proxies/browsers from timing the connection out.
+
+Switch on `type`:
 
 **`progress`** — the service moved to a new step:
 ```json
@@ -240,17 +251,25 @@ Platform finalized (after `/review`) — enriched by the media_producer:
   "draft": "...", "decision": "approve_after_edit",
   "content_types": ["text", "brand", "video"],
   "html_preview": "<!DOCTYPE html>…</html>",
-  "video_props": { "brandName": "…", "tagline": "…", "primaryColor": "#…",
-                   "secondaryColor": "#…", "accentColor": "#…", "sectionLabel": "…",
-                   "stats": [{ "value": "…", "label": "…", "icon": "★" }, …],
-                   "headline": "…?", "subtext": "…", "ctaLabel": "…", "contact": "@… · ….com" },
+  "video_storyboard": { "brandName": "BREWORKS", "primaryColor": "#0d0d1a",
+                        "secondaryColor": "#5b8def", "accentColor": "#f0a500",
+                        "platform": "instagram",
+                        "slides": [
+                          { "type": "hook", "headline": "Cold brew, warmer mornings",
+                            "imageQuery": "iced coffee glass", "shape": "circle" },
+                          { "type": "counter_stat", "sectionLabel": "Why It Matters",
+                            "stats": [{ "value": "40%", "label": "Smoother", "icon": "★" }] },
+                          { "type": "outro", "brandName": "BREWORKS",
+                            "ctaLabel": "Try It Today", "contact": "@breworks · breworks.com" }
+                        ] },
   "needs_human_intervention": false,
   "proposed_rules": [] }
 ```
 
 > `content_types` echoes what the task requested. `html_preview` is present only when `"brand"`
-> was requested, `video_props` only when `"video"` was — otherwise each is `null`. On a media-only
-> run (no `"text"`) `draft` is `""` (there is no copy deliverable; it was only the render basis).
+> was requested, `video_storyboard` only when `"video"` was — otherwise each is `null`. On a
+> media-only run (no `"text"`) `draft` is `""` (there is no copy deliverable; it was only the
+> render basis).
 
 > The `final` event's `node` is `human_gate` for a normal (text) run (the in-graph archivist node
 > was removed — learning moved to the opt-in `POST /tasks/{id}/confirm-learning` step) or
@@ -263,10 +282,14 @@ Platform finalized (after `/review`) — enriched by the media_producer:
 > a 9:16 brand "video card" with inline CSS keyframes + SVG, no external assets) generated by
 > the LLM from the approved copy — drop it straight into an `<iframe>` or render it directly.
 > The draft text is HTML-escaped, so it is safe.
-> `video_props` is the structured spec (matching `BrandVideoProps`: brand identity, three
-> `stats`, CTA + a 3-colour palette) a downstream Remotion render turns into an MP4 — the LLM
-> produces the data only; rendering the actual video is external to this service. Both appear
-> only on the `final` event.
+> `video_storyboard` is a **`StoryboardSpec`** (`LLM_service/core/video_schema.py`): brand
+> identity + a 3-colour palette + an ordered list of 2–8 typed `slides` composed from a fixed
+> registry (`hook`, `counter_stat`, `collage`, `outro`, `pie_chart`, `line_chart`, `bar_chart`,
+> `node_diagram`, `comparison_table`). It is **data only** — image fields are stock-photo search
+> *keywords* (never URLs), and the final aspect ratio is derived server-side from `platform`. To
+> get the actual MP4, trigger the render pipeline with
+> [`POST /tasks/{id}/render-video`](#video-render--post-taskstask_idrender-video--get-video-jobsjob_id)
+> and poll `/video-jobs/{job_id}`. Both artifacts appear only on the `final` event.
 
 **Event sequence summary:**
 
@@ -374,7 +397,7 @@ Returned by `POST /tasks`, `POST /tasks/{id}/review`, and this endpoint:
     { "platform": "instagram", "draft": "...final copy...", "decision": "approve",
       "comment": "...", "needs_human_intervention": false, "proposed_rules": [],
       "content_types": ["text", "brand", "video"],
-      "html_card": "<!DOCTYPE html>…</html>", "video_props": { "brandName": "…", "...": "…" } }
+      "html_card": "<!DOCTYPE html>…</html>", "video_storyboard": { "brandName": "…", "slides": [ … ] } }
   ],
   "proposed_rules": [
     { "kind": "must_do", "rule": "Open with a striking statistic",
@@ -427,7 +450,8 @@ data: {"type":"result","status":"discussion_consensus","table_id":"linkedin","no
 ```
 
 - `agent_utterance` — one per discussion turn. `speaker`/`agent_id` is the persona name (or
-  `"user"` for the human seat); `role` ∈ `persona` | `user` | `manager`.
+  `"user"` for the human seat); `role` ∈ `persona` | `user` | `manager`. Not a closed enum:
+  with `TREND_SCOUT_ENABLED` a fifth `trend_scout` persona also speaks (no schema change).
 - `discussion_consensus` — one per table, after its last utterance. `strategy` is the
   platform→angle map fed downstream to the creator; `converged: false` means the table hit its
   round cap rather than reaching agreement.
@@ -493,8 +517,11 @@ result(s) (separable by `table_id`), or read the finished consensus off `GET /ta
 ## Media endpoints
 
 Standalone, one-shot generators — they don't go through the workflow/human-gate at all,
-so there's no `task_id`. Used by the frontend's per-content-type "Text / Video / Brand"
-buttons (`frontend_service/app/api/text|video|brand/route.ts` proxy straight to these).
+so there's no `task_id`. Used by the frontend's per-content-type "Text / Brand"
+buttons (proxied through the backend). **Video has no standalone generator**: a video
+storyboard is always produced by a workflow run (request `"video"` in `content_types`),
+and the MP4 render is triggered off that run — see [Video render](#video-render--post-taskstask_idrender-video--get-video-jobsjob_id)
+below. (The old `POST /generate-video` + `GET /jobs/{id}` BrandVideoProps pair has been removed.)
 
 **Multi-turn / continuing a conversation.** Each generator accepts an optional
 `history`: the prior conversation as a `[{ "role": "user"|"assistant"|"system",
@@ -540,67 +567,58 @@ Omit `history` (or send `[]`) for a fresh, single-turn generation. A malformed i
 `html` is a complete, self-contained document (inline CSS/SVG, no external assets) —
 render it directly or drop it in an `<iframe>`. `history` is optional (same shape as above).
 
-### `POST /generate-video` — start a `BrandVideoProps` spec job
+---
 
-Spec generation is one LLM call but is still job-based (matches the `/generate`'s
-poll-then-show shape the frontend already uses for the animated card).
+## Video render — `POST /tasks/{task_id}/render-video` + `GET /video-jobs/{job_id}`
+
+Unlike the storyboard (which the workflow produces as data), the MP4 render **is** performed by
+this service — as an explicit, separately-polled job, because a render takes 45+ seconds locally
+(asset resolution + a Remotion/headless-Chromium subprocess). The trigger reads the
+`video_storyboard` a finished workflow run already attached to a platform's output — it never
+re-generates a storyboard from a raw brief.
+
+### `POST /tasks/{task_id}/render-video` — trigger the render
 
 ```json
-// request
-{ "brief": "Launch announcement for our new cold brew", "history": [] }
+// request — task_id in the path is the workflow run; platform picks which output to render
+{ "platform": "instagram" }
 ```
 ```json
-// response (200)
-{ "job_id": "a1b2c3d4e5f6...", "status": "done" }
+// response (200) — returns immediately; the render runs in the background
+{ "job_id": "vid-a1b2c3d4e5f6", "status": "pending" }
 ```
 
-`status` is `"done"` or `"error"` — generation is synchronous server-side, so it never
-comes back `"pending"`; the job-id/poll shape exists only so the frontend's existing
-poll loop didn't need a separate code path.
+Errors: `404` if the task/platform has no finished draft yet; `409` if that platform's run did
+not request `"video"` (no storyboard to render).
 
-### `GET /jobs/{job_id}` — fetch the spec
+### `GET /video-jobs/{job_id}` — poll the render job
 
 ```json
 // response
 {
-  "job_id": "a1b2c3d4e5f6...",
+  "id": "vid-a1b2c3d4e5f6",
+  "task_id": "sess-1a2b3c4d5e6f",
+  "platform": "instagram",
   "status": "done",
+  "storyboard": { "brandName": "…", "slides": [ … ] },
+  "output_path": "/…/.video_jobs/vid-a1b2c3d4e5f6/output.mp4",
   "error": null,
-  "props": {
-    "brandName": "BREWORKS",
-    "tagline": "Crafted with intent",
-    "primaryColor": "#0d1117",
-    "secondaryColor": "#5b8def",
-    "accentColor": "#f0a500",
-    "sectionLabel": "Why It Matters",
-    "stats": [
-      { "value": "100%", "label": "On brand", "icon": "★" },
-      { "value": "3", "label": "Platforms", "icon": "◆" },
-      { "value": "24/7", "label": "Always on", "icon": "●" }
-    ],
-    "headline": "Ready to dive in?",
-    "subtext": "Join us and see what the buzz is about.",
-    "ctaLabel": "Learn More",
-    "contact": "@brand · brand.com"
-  }
+  "created_at": "2026-07-04T09:00:00+00:00",
+  "updated_at": "2026-07-04T09:01:10+00:00"
 }
 ```
 
-`props` is **plain JSON matching `BrandVideoProps`** (`LLM_service/core/media_schema.py`) —
-not HTML, not a rendered asset. This is the exact object to hand to Remotion as composition
-input props for the 3-scene render (Scene 1 = `brandName`/`tagline`/palette, Scene 2 =
-`sectionLabel` + the 3 `stats`, Scene 3 = `headline`/`subtext`/`ctaLabel`/`contact`). The
-service stops at this JSON — it never touches Remotion or produces an MP4; that render step
-is entirely downstream/external. If `status` is `"error"`, `props` is `null` and `error` holds
-the message.
+`status` goes `"pending"` → `"done"` (with `output_path`) or `"error"` (with the message —
+including a Remotion stderr tail on a render failure). A job never hangs the poll: any
+unexpected failure still lands as `"error"`. During the render the service resolves every
+storyboard image query (stock-photo search + background cutout) and generates a background
+track sized to the video — each of those degrades gracefully (missing image → plain colour
+shape; no music → silent video), so asset problems never fail the job.
 
-> The frontend's `VideoSpec` component (`frontend_service/app/chat/page.tsx`) renders this
-> same JSON as a styled poster/card — three boxes for the three scenes — purely as a
-> human-readable preview of what the eventual video will contain. That card is a client-side
-> visualization, **not** a different wire format: the bytes sent over HTTP are always this
-> plain JSON object, never HTML or markup. If you're piping the spec to Remotion, ignore the
-> card UI entirely and take `props` (here) or `video_props` (the workflow's SSE `final` event,
-> identical shape) directly.
+### `GET /video-jobs/{job_id}/download` — fetch the MP4
+
+Returns the finished file as `video/mp4`. `409` until the job is `"done"`, `404` if the
+rendered file is missing on disk.
 
 ---
 
@@ -609,8 +627,8 @@ the message.
 | Code | When |
 |---|---|
 | `400` | Missing/invalid fields (no `topic`, empty `target_platforms`, unknown/empty `content_types`, bad `decision`, `approve_after_edit` without `edited_draft`, `/say` or `/raise-hand` without `table_id`/`text`, `/roundtable` with no resolvable `platform`) |
-| `404` | Unknown `task_id` or `session_id` |
-| `409` | Task not awaiting review, `task_id` already exists, brief not complete, or `/confirm-learning` before the task is `completed` |
+| `404` | Unknown `task_id`, `session_id`, or video `job_id`; `/render-video` for a platform with no finished draft; `/download` when the rendered file is missing on disk |
+| `409` | Task not awaiting review, `task_id` already exists, brief not complete, `/confirm-learning` before the task is `completed`, `/render-video` on a platform whose run produced no storyboard, or `/download` before the job is `done` |
 | `422` | FastAPI request-body validation (malformed JSON / wrong field types); standard FastAPI `detail` payload |
 | `500` | Unexpected error on a **synchronous** call (e.g. `POST /review`). A failure during a **background** run (`POST /tasks` / `/roundtable[s]`, which already returned `running`) is **not** a `500` — the task goes `status: "error"` (with an `error` message) and the SSE stream closes on a `workflow`/`error` event. |
 
@@ -653,7 +671,8 @@ record Pending(String request_id, String platform, String draft, String comment,
 record Output(String platform, String draft, String decision, String comment,
               boolean needs_human_intervention, List<Map<String,Object>> proposed_rules,
               List<String> content_types,
-              String html_card, Map<String,Object> video_props) {}  // media present only if requested
+              String html_card, Map<String,Object> video_storyboard) {}  // media present only if requested
+record RenderVideo(String platform) {}                        // POST /tasks/{id}/render-video
 record TaskSnapshot(String task_id, String status, List<Pending> pending,
                     List<Output> outputs, List<Map<String,Object>> proposed_rules,
                     String error) {}   // error: present only when status == "error"
@@ -707,6 +726,9 @@ public class NewsroomClient {
     // Roundtable (only when ROUNDTABLE_ENABLED): reserve a turn, then send the message.
     public Map<String,Object> raiseHand(String id, String table) throws Exception { return post("/tasks/" + id + "/raise-hand", new RaiseHand(table), Map.class); }
     public Map<String,Object> say(String id, Say s)              throws Exception { return post("/tasks/" + id + "/say", s, Map.class); }
+    // Video render: trigger the MP4 for a finished platform's storyboard, then poll the job.
+    public Map<String,Object> renderVideo(String id, String platform) throws Exception { return post("/tasks/" + id + "/render-video", new RenderVideo(platform), Map.class); }
+    public Map<String,Object> videoJob(String jobId)             throws Exception { return get("/video-jobs/" + jobId, Map.class); }
 
     /** Stream SSE events until the task completes. */
     public void streamEvents(String id, Consumer<Map<String,Object>> onEvent) throws Exception {

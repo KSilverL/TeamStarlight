@@ -17,6 +17,7 @@ import httpx
 import pytest
 
 from LLM_service.api import IntakeService, WorkflowService, create_app
+from LLM_service.core.config import reset_settings
 from LLM_service.core.services import factory
 from LLM_service.tests.conftest import run_app
 from LLM_service.intake import CreativeBrief, PriorSessionContext, build_intake
@@ -239,6 +240,22 @@ async def test_copilot_mode_invokes_suggest_topic_tool():
     # voice path reaches the same copilot brief
     voice_brief, _ = await _drive(MockVoiceIntake(), _COPILOT, [])
     assert voice_brief.model_dump(exclude={"intake_mode"}) == brief.model_dump(exclude={"intake_mode"})
+
+
+async def test_copilot_suggest_topic_rides_trends_when_enabled(monkeypatch):
+    """Phase 4 (trend scout spread): with TREND_SCOUT_ENABLED, suggest_topic — which fires
+    exactly when the user doesn't know what to post — proposes from today's trends (the
+    MockStore fixture's first pick lands verbatim in the suggested topic). Toggle off
+    (the test above) stays trend-free."""
+    monkeypatch.setenv("TREND_SCOUT_ENABLED", "true")
+    reset_settings()
+    factory.reset_services()
+
+    brief, _ = await _drive(TextIntake(), _COPILOT, [])
+    assert brief.route == "copilot_mode"
+
+    picked = await factory.get_store().get_trends(limit=6)
+    assert picked and picked[0].text in brief.topic
 
 
 # ── The brief feeds the M1/M2 workflow with no changes (acceptance) ──────────

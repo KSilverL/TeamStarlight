@@ -36,11 +36,13 @@ from LLM_service.workflow.roundtable import (
     run_table,
     run_tables,
 )
+from LLM_service.core.trend_schema import Trend
 from LLM_service.workflow.roundtable.personas import (
     AUDIENCE_ADVOCATE,
     BRAND_VOICE,
     PLATFORM_EDITOR,
     ROSTER,
+    TREND_SCOUT,
     USER_ADVOCATE,
 )
 
@@ -371,3 +373,224 @@ async def test_each_platform_drafts_from_its_own_strategy():
     reqs = {e.data.platform: e.data for e in result.get_request_info_events()}
     assert reqs["linkedin"].strategy == "LEAD WITH A DATA HOOK"
     assert reqs["instagram"].strategy == "LEAD WITH A VISUAL STORY"
+
+
+# ── Trend scout — the optional fifth seat (docs/TREND_SCOUT_IMPLEMENTATION.md) ──
+# TREND_SCOUT_ENABLED tests flip the toggle themselves + reset the caches; the conftest
+# wipes toggle env vars per test, so every other test keeps running with the seat off.
+
+def _enable_trend_scout(monkeypatch) -> None:
+    monkeypatch.setenv("TREND_SCOUT_ENABLED", "true")
+    reset_settings()
+    factory.reset_services()
+
+
+async def test_trend_scout_off_by_default_no_seat_no_read(monkeypatch):
+    """Toggle off (the default): the roster is the four seats, and the trends store is
+    NEVER read — a get_trends that would raise proves the read path isn't touched."""
+    store = factory.get_store()
+
+    async def boom(**kwargs):
+        raise AssertionError("get_trends must not be called when TREND_SCOUT_ENABLED is off")
+
+    monkeypatch.setattr(store, "get_trends", boom)
+    brief = _brief()
+    context = await build_persona_context(brief)
+    assert context.trends == []
+
+    personas = build_personas(
+        PLATFORM, brief,
+        brand_profile=context.brand_profile, user_skills=context.user_skills,
+        trends=context.trends,
+    )
+    assert [p.name for p in personas] == ROSTER
+
+
+async def test_trend_scout_roster_and_verbatim_injection(monkeypatch):
+    """With the toggle on the seat joins every table, carrying the store's trends verbatim
+    in its instructions (with the fusion prompt's rejection permission); the other seats'
+    instructions are untouched."""
+    _enable_trend_scout(monkeypatch)
+
+    brief = _brief()
+    context = await build_persona_context(brief)
+    assert context.trends, "mock fixture trends should surface with zero setup"
+
+    personas = {
+        p.name: p
+        for p in build_personas(
+            PLATFORM, brief,
+            brand_profile=context.brand_profile, user_skills=context.user_skills,
+            trends=context.trends,
+        )
+    }
+    assert set(personas) == set(ROSTER) | {TREND_SCOUT}
+
+    scout_text = personas[TREND_SCOUT].instructions
+    assert "CURRENT TRENDS" in scout_text
+    for trend in context.trends:
+        assert trend.text in scout_text          # verbatim injection
+        assert f"[{trend.category}]" in scout_text  # variety tag rides along
+    assert "do not force" in scout_text          # permission to reject a forced fit
+
+    for other in ROSTER:
+        assert "CURRENT TRENDS" not in personas[other].instructions
+
+
+async def test_trend_scout_speaks_and_table_converges(monkeypatch):
+    """The seat takes real turns (mock scripted lines) and the table still converges."""
+    _enable_trend_scout(monkeypatch)
+
+    result = await run_table(PLATFORM, _brief())
+    speakers = {t.speaker for t in result.consensus.transcript}
+    assert TREND_SCOUT in speakers
+    assert speakers >= set(ROSTER)  # the original four still speak
+    assert result.consensus.converged is True
+    assert result.consensus.strategy.strategies[PLATFORM]
+
+
+async def test_trend_scout_stale_snapshot_degrades_gracefully(monkeypatch):
+    """An all-stale snapshot reads as [] — the seat still joins with the '(no current
+    trends available)' block and the discussion converges without a trend angle."""
+    _enable_trend_scout(monkeypatch)
+
+    stale = Trend(
+        text="an old moment", category="news",
+        captured_at="2020-01-01T00:00:00+00:00", expires_at="2020-01-04T00:00:00+00:00",
+    )
+    await factory.get_store().upsert_trends(trends=[stale])
+
+    brief = _brief()
+    context = await build_persona_context(brief)
+    assert context.trends == []
+
+    personas = {
+        p.name: p
+        for p in build_personas(
+            PLATFORM, brief,
+            brand_profile=context.brand_profile, user_skills=context.user_skills,
+            trends=context.trends,
+        )
+    }
+    assert "(no current trends available" in personas[TREND_SCOUT].instructions
+
+    result = await run_table(PLATFORM, brief)
+    assert result.consensus.converged is True
+
+
+async def test_trend_scout_store_failure_degrades_to_no_trends(monkeypatch):
+    """A store that raises on get_trends must never fail the run (§3.5): the context
+    degrades to [] and the discussion still runs to consensus."""
+    _enable_trend_scout(monkeypatch)
+
+    store = factory.get_store()
+
+    async def boom(**kwargs):
+        raise RuntimeError("trends table unavailable")
+
+    monkeypatch.setattr(store, "get_trends", boom)
+
+    context = await build_persona_context(_brief())
+    assert context.trends == []
+
+    result = await run_table(PLATFORM, _brief())
+    assert result.consensus.converged is True
+
+
+# ── The production LLM manager only ever assigns AGENTS on its own ─────────────────
+# (The mock manager is already user-safe: it rotates only `ai_names`, routing to the
+# user seat solely on a raised hand / queued message. These cover the LLM path.)
+
+# A distinctive description for the user seat: "user" alone is a substring of `user_advocate`
+# (and of the ledger prompt's own prose), so we sentinel on the description to prove the seat's
+# whole roster entry was dropped from what the LLM sees.
+USER_SENTINEL = "ZZZ_the_human_participant_ZZZ"
+
+
+def _ledger_json(next_speaker: str) -> str:
+    """A progress-ledger JSON payload naming `next_speaker` — the shape the LLM returns."""
+    import json
+
+    item = lambda a: {"reason": "x", "answer": a}
+    return json.dumps({
+        "is_request_satisfied": item(False),
+        "is_in_loop": item(False),
+        "is_progress_being_made": item(True),
+        "next_speaker": item(next_speaker),
+        "instruction_or_question": item("go"),
+    })
+
+
+def _interactive_manager(task_id: str):
+    """A production InteractiveMagenticManager wired to a user seat, over a mock chat client."""
+    from LLM_service.workflow.roundtable.manager import build_interactive_manager
+    from LLM_service.workflow.roundtable.user_seat import USER_SEAT_NAME
+
+    return build_interactive_manager(
+        factory.get_chat_client(agent_name="moderator"),
+        platform=PLATFORM, max_rounds=6, task_id=task_id,
+        store=factory.get_store(), user_name=USER_SEAT_NAME,
+    )
+
+
+def _context_with_user():
+    """A MagenticContext whose roster includes the user seat alongside the AI personas."""
+    from agent_framework.orchestrations import MagenticContext
+    from LLM_service.workflow.roundtable.user_seat import USER_SEAT_NAME
+
+    return MagenticContext(
+        task="plan a linkedin post",
+        participant_descriptions={
+            PLATFORM_EDITOR: "editor", BRAND_VOICE: "brand", USER_ADVOCATE: "advocate",
+            AUDIENCE_ADVOCATE: "audience", USER_SEAT_NAME: USER_SENTINEL,
+        },
+        round_count=1,
+    )
+
+
+async def test_llm_manager_hides_user_from_roster_and_never_selects_them():
+    """Idle user (no raised hand / no queued message): the LLM moderator must not even SEE the
+    user seat in the roster it picks from, and — even if the model hallucinated the name — the
+    turn is reassigned to an agent. The user speaks only via raise-hand."""
+    from agent_framework import Message
+    from LLM_service.workflow.roundtable.user_seat import USER_SEAT_NAME
+
+    mgr = _interactive_manager("t-llm-idle")
+    seen = {}
+
+    async def fake_complete(messages):
+        seen["prompt"] = messages[-1].text
+        # The model MISBEHAVES and names the user; the manager must still not select them.
+        return Message("assistant", [_ledger_json(USER_SEAT_NAME)])
+
+    mgr._complete = fake_complete
+
+    ledger = await mgr.create_progress_ledger(_context_with_user())
+
+    assert USER_SENTINEL not in seen["prompt"]             # user's roster entry hidden from the LLM
+    assert ledger.next_speaker.answer != USER_SEAT_NAME    # and never selected
+    assert ledger.next_speaker.answer in {
+        PLATFORM_EDITOR, BRAND_VOICE, USER_ADVOCATE, AUDIENCE_ADVOCATE,
+    }
+
+
+async def test_llm_manager_yields_to_user_on_raised_hand():
+    """When the user raises a hand the forced path wins — the mic goes to the user seat, and the
+    LLM is not even consulted (the model must NOT have been called)."""
+    from LLM_service.workflow.roundtable.gate import lower_hand
+    from LLM_service.workflow.roundtable.user_seat import USER_SEAT_NAME
+
+    mgr = _interactive_manager("t-llm-hand")
+
+    async def fail_complete(messages):
+        raise AssertionError("LLM must not be consulted when the user holds the floor")
+
+    mgr._complete = fail_complete
+
+    raise_hand("t-llm-hand", PLATFORM)
+    try:
+        ledger = await mgr.create_progress_ledger(_context_with_user())
+    finally:
+        lower_hand("t-llm-hand", PLATFORM)
+
+    assert ledger.next_speaker.answer == USER_SEAT_NAME

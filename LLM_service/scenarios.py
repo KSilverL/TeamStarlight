@@ -28,9 +28,12 @@ if __name__ == "__main__":
 
 import os
 
+from datetime import datetime, timezone
+
 from LLM_service.api import WorkflowService
 from LLM_service.core.config import get_settings, reset_settings
 from LLM_service.core.services import factory
+from LLM_service.core.trend_schema import Trend
 from LLM_service.intake import build_intake
 from LLM_service.workflow import Brief, HumanVerdict, build_workflow
 
@@ -120,11 +123,23 @@ async def scenario_brand_training() -> None:
 
 
 async def scenario_roundtable() -> None:
-    _h("5 · ROUNDTABLE — multi-persona discussion drops in for strategist")
+    _h("5 · ROUNDTABLE — multi-persona discussion drops in for strategist (+ trend scout)")
     os.environ["ROUNDTABLE_ENABLED"] = "true"
+    os.environ["TREND_SCOUT_ENABLED"] = "true"
     reset_settings()
     factory.reset_services()
     try:
+        # Seed today's trends through the dev/test write path (in production an external
+        # Foundry routine upserts the same rolling snapshot daily).
+        now = datetime.now(timezone.utc).isoformat()
+        await factory.get_store().upsert_trends(trends=[
+            Trend(text="The 'expectation vs reality' split-screen meme is peaking",
+                  category="meme", captured_at=now),
+            Trend(text="A feel-good small-business comeback story is trending in news feeds",
+                  category="news", captured_at=now),
+            Trend(text="One-take walking vlogs are the format of the week on short video",
+                  category="format", captured_at=now),
+        ])
         svc = WorkflowService()
         await svc.start({
             "topic": "our 2026 single-origin harvest", "target_platforms": ["linkedin"],
@@ -135,6 +150,8 @@ async def scenario_roundtable() -> None:
         utts = [e for e in evs if e["type"] == "agent_utterance"]
         print(f"  discussion turns: {len(utts)} (seats: {sorted({e['speaker'] for e in utts})})")
         print(f"  ✓ strategist bypassed: {not any(e.get('node') == 'strategist' for e in evs)}")
+        scout_turns = [e for e in utts if e["speaker"] == "trend_scout"]
+        print(f"  ✓ trend_scout at the table (from the seeded daily snapshot): {bool(scout_turns)}")
         await svc.review("showcase-roundtable", {"linkedin": {"decision": "approve"}})
         finals = [e for e in svc.buffered_events("showcase-roundtable")
                   if e["type"] == "result" and e["status"] == "final"]
@@ -143,6 +160,7 @@ async def scenario_roundtable() -> None:
         print(f"  ✓ animated HTML card produced: {card_ok}")
     finally:
         os.environ.pop("ROUNDTABLE_ENABLED", None)
+        os.environ.pop("TREND_SCOUT_ENABLED", None)
         reset_settings()
         factory.reset_services()
 

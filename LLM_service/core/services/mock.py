@@ -29,7 +29,9 @@ from agent_framework import (
 from agent_framework._types import ResponseStream
 
 from ...skills import parse_char_limit
+from ..config import get_settings
 from ..skill_schema import SkillCandidate, SkillRule, UserSkillDoc
+from ..trend_schema import Trend, select_current_trends
 from ..video_schema import StoryboardSpec
 from .base import (
     BackgroundRemovalService,
@@ -376,14 +378,20 @@ class MockLLM(LLMService):
         }
 
     async def plan_strategy(
-        self, *, topic: str, platform: str, user_intent: str
+        self, *, topic: str, platform: str, user_intent: str, trends: str = ""
     ) -> str:
         await asyncio.sleep(_MOCK_LATENCY)
         intent = user_intent or "raise awareness"
-        return (
+        strategy = (
             f"On {platform}, lead with {_focus(platform)}. "
             f"Anchor it to '{topic}' and aim to {intent}."
         )
+        # Deterministic trend fusion: weave the block's FIRST trend line in verbatim, so
+        # tests can assert the injection; empty block leaves the strategy byte-identical.
+        first = next((ln[2:] for ln in trends.splitlines() if ln.startswith("- ")), "")
+        if first:
+            strategy += f" If it genuinely fits, ride this current trend: {first}"
+        return strategy
 
     async def write_copy(
         self,
@@ -717,6 +725,27 @@ def _fixture_brand_profile() -> dict:
     }
 
 
+def _fixture_trends() -> List[Trend]:
+    """Deterministic stand-in for the daily snapshot the external Foundry routine writes,
+    so the trend_scout seat is observable with zero setup (like the brand/user fixtures
+    above). Far-future expiry keeps the fixture always fresh; a real `upsert_trends` overrides it.
+    Category-diverse on purpose — the read side's variety spread keys on `category`."""
+    captured = "2026-01-01T00:00:00+00:00"
+    never = "2099-01-01T00:00:00+00:00"
+    rows = [
+        ("meme", "The split-screen 'expectation vs reality' meme is everywhere this week"),
+        ("news", "A viral small-business comeback story is dominating feel-good news feeds"),
+        ("format", "The 'one-take walking vlog' format is spiking across short video"),
+        ("cultural", "Spring marathon season has amateur running content trending"),
+        ("general", "'Quiet luxury' aesthetics keep gaining search momentum"),
+        ("meme", "'Tell me without telling me' prompts are resurging on social"),
+    ]
+    return [
+        Trend(text=text, category=cat, source=None, captured_at=captured, expires_at=never)
+        for cat, text in rows
+    ]
+
+
 def _fixture_user_skills() -> dict:
     return UserSkillDoc(
         user_id=ROUNDTABLE_FIXTURE_USER_ID,
@@ -739,6 +768,7 @@ class MockStore(StoreService):
         self._checkpoints: Dict[str, dict] = {}
         self._user_skills: Dict[str, dict] = {}
         self._video_jobs: Dict[str, dict] = {}
+        self._trends: Optional[dict] = None  # the rolling `current` snapshot; None → fixture
 
     async def get_profile(self, *, business_id: Optional[str]) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
@@ -776,6 +806,24 @@ class MockStore(StoreService):
         # Store JSON-shaped (datetime → ISO string) so it round-trips like the Postgres doc.
         self._user_skills[user_id] = doc.model_dump(mode="json")
         return doc
+
+    async def get_trends(self, *, limit: int = 6) -> List[Trend]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        if self._trends is not None:
+            trends = [Trend(**t) for t in self._trends.get("trends", [])]
+        else:
+            trends = _fixture_trends()
+        ttl_days = get_settings().trend_scout_ttl_days
+        return select_current_trends(trends, limit=limit, ttl_days=ttl_days)
+
+    async def upsert_trends(self, *, trends: List[Trend]) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        if not trends:
+            return  # an empty scan never clobbers the last good snapshot
+        self._trends = {
+            "date": datetime.now(timezone.utc).date().isoformat(),
+            "trends": [t.model_dump(mode="json") for t in trends],
+        }
 
     async def save_checkpoint(self, *, task_id: str, data: dict) -> None:
         await asyncio.sleep(_MOCK_LATENCY)

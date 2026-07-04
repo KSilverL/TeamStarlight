@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from agent_framework import WorkflowRunState
 
+from LLM_service.core.config import get_settings, reset_settings
+from LLM_service.core.services import factory
 from LLM_service.workflow import HumanVerdict
 
 
@@ -65,3 +67,52 @@ async def test_executors_run_in_pipeline_order(workflow, make_brief):
         assert executor_id in invoked
     assert invoked.index("dispatcher") < invoked.index("strategist") < invoked.index("creator")
     assert invoked.index("creator") < invoked.index("reviewer") < invoked.index("human_gate")
+
+
+# ── Phase 4 (trend scout spread): the LINEAR strategist reads the daily trends ─
+# Same TREND_SCOUT_ENABLED toggle + degrade-to-empty rule as the roundtable seat;
+# tests flip the env themselves (conftest wipes it per test, so the default path
+# stays trend-free).
+
+def _enable_trend_scout(monkeypatch) -> None:
+    monkeypatch.setenv("TREND_SCOUT_ENABLED", "true")
+    reset_settings()
+    factory.reset_services()
+
+
+async def test_strategist_weaves_trends_when_enabled(monkeypatch, workflow, make_brief):
+    """With the toggle on, the ordinary (non-roundtable) run's strategy carries the
+    fused trend — the MockStore fixture's first pick lands verbatim at the gate."""
+    _enable_trend_scout(monkeypatch)
+
+    result = await workflow.run(make_brief(platforms=("linkedin",)))
+    strategy = result.get_request_info_events()[0].data.strategy
+    assert "ride this current trend" in strategy
+
+    picked = await factory.get_store().get_trends(limit=get_settings().trend_scout_limit)
+    assert picked and picked[0].text in strategy
+
+
+async def test_strategist_unchanged_when_disabled(workflow, make_brief):
+    """Default (toggle off): the strategy has no trend fusion — byte-identical to today."""
+    result = await workflow.run(make_brief(platforms=("linkedin",)))
+    strategy = result.get_request_info_events()[0].data.strategy
+    assert "ride this current trend" not in strategy
+
+
+async def test_strategist_degrades_on_trends_store_failure(monkeypatch, workflow, make_brief):
+    """A store that raises on get_trends never fails the run: the strategy is produced
+    without a trend angle and the draft still reaches the gate."""
+    _enable_trend_scout(monkeypatch)
+
+    store = factory.get_store()
+
+    async def boom(**kwargs):
+        raise RuntimeError("trends table unavailable")
+
+    monkeypatch.setattr(store, "get_trends", boom)
+
+    result = await workflow.run(make_brief(platforms=("linkedin",)))
+    req = result.get_request_info_events()[0].data
+    assert req.draft
+    assert "ride this current trend" not in req.strategy

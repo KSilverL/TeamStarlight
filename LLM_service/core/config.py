@@ -159,6 +159,7 @@ class Settings:
     # there. Honoured by PostgresStore._pool / PostgresCheckpointStorage._pool.
     postgres_sslmode: Optional[str] = None
     postgres_video_jobs_table: str = "video_jobs"
+    postgres_trends_table: str = "trends"
 
     # ── Voice Live API (voice intake) ──────────────────────────────────────────
     azure_voicelive_endpoint: Optional[str] = None
@@ -204,6 +205,17 @@ class Settings:
     # Per-user learning write-back from the roundtable (transcript + interjections + verdict).
     # LEARNING_ENABLED=false still READS stored skills but writes none (regression/isolation).
     learning_enabled: bool = True
+    # ── Trend scout (the roundtable's fifth seat; docs/TREND_SCOUT_IMPLEMENTATION.md) ──
+    # TREND_SCOUT_ENABLED adds the `trend_scout` persona to every table, fed from the daily
+    # trends snapshot an EXTERNAL Foundry routine writes to the store. Off (default) → the
+    # roster stays the current four seats and no trends read happens. The read degrades to
+    # [] on any store failure — trends are an enhancement, never a dependency.
+    trend_scout_enabled: bool = False
+    # How many trends are injected per run, chosen category-diverse at read time.
+    trend_scout_limit: int = 6
+    # Staleness safety net: a trend with no explicit expires_at is dropped this many days
+    # after captured_at (covers ~2-3 missed daily routine runs before degrading to "no trends").
+    trend_scout_ttl_days: int = 3
     # Cheap tier for the prod per-user preference summary call. Defaults to the same
     # rate-limit-friendly deployment as the roundtable personas (ROUNDTABLE_PERSONA_MODEL);
     # PREFERENCE_SUMMARY_MODEL overrides it. None → fall back to the main chat deployment.
@@ -340,6 +352,7 @@ def _load() -> Settings:
         postgres_checkpoints_table=os.getenv("POSTGRES_CHECKPOINTS_TABLE", "workflow_checkpoints"),
         postgres_sslmode=os.getenv("POSTGRES_SSLMODE"),
         postgres_video_jobs_table=os.getenv("POSTGRES_VIDEO_JOBS_TABLE", "video_jobs"),
+        postgres_trends_table=os.getenv("POSTGRES_TRENDS_TABLE", "trends"),
         azure_voicelive_endpoint=os.getenv("AZURE_VOICELIVE_ENDPOINT"),
         azure_voicelive_model=os.getenv("AZURE_VOICELIVE_MODEL", "gpt-realtime"),
         azure_voicelive_api_version=os.getenv("AZURE_VOICELIVE_API_VERSION", "2026-04-10"),
@@ -361,6 +374,9 @@ def _load() -> Settings:
         roundtable_persona_api_key=os.getenv("AZURE_PERSONA_API_KEY"),
         roundtable_user_turn_timeout=_env_float("ROUNDTABLE_USER_TURN_TIMEOUT", 300.0),
         learning_enabled=True if learning is None else learning,
+        trend_scout_enabled=bool(_env_bool("TREND_SCOUT_ENABLED")),
+        trend_scout_limit=_env_int("TREND_SCOUT_LIMIT", 6),
+        trend_scout_ttl_days=_env_int("TREND_SCOUT_TTL_DAYS", 3),
         # The per-user summary call reuses the cheap persona deployment by default
         # (ROUNDTABLE_PERSONA_MODEL); PREFERENCE_SUMMARY_MODEL overrides if set.
         preference_summary_model=(
