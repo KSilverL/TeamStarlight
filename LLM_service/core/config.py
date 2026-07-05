@@ -85,6 +85,28 @@ def load_dotenv(path: Union[str, Path, None] = None, *, override: bool = False) 
     return True
 
 
+def _env_int(name: str, default: int) -> int:
+    """Parse an int env var, falling back to `default` when unset or malformed."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Parse a float env var, falling back to `default` when unset or malformed."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return default
+
+
 def _env_bool(name: str) -> Optional[bool]:
     """
     Parse a boolean env var. Returns None when the var is unset, blank, or
@@ -109,13 +131,15 @@ class Settings:
     use_mock_safety: Optional[bool] = None
     use_mock_store: Optional[bool] = None
     use_mock_voice: Optional[bool] = None
+    use_mock_image_search: Optional[bool] = None
+    use_mock_background_removal: Optional[bool] = None
+    use_mock_music_generation: Optional[bool] = None
 
     # ── Azure OpenAI / Foundry (chat + structured output + copywriting) ────────
     azure_openai_endpoint: Optional[str] = None
     azure_openai_api_key: Optional[str] = None
     azure_openai_api_version: str = "2024-02-01"
     azure_chat_deployment: str = "gpt-4o"
-    foundry_project_endpoint: Optional[str] = None
 
     # ── Azure AI Content Safety (reviewer) ─────────────────────────────────────
     azure_content_safety_endpoint: Optional[str] = None
@@ -130,12 +154,84 @@ class Settings:
     postgres_profiles_table: str = "brand_profiles"
     postgres_user_skills_table: str = "user_skills"
     postgres_checkpoints_table: str = "workflow_checkpoints"
+    # libpq-style sslmode. Unset → let the DSN decide (Supabase works without it).
+    # Azure Cosmos DB for PostgreSQL *requires* SSL, so set POSTGRES_SSLMODE=require
+    # there. Honoured by PostgresStore._pool / PostgresCheckpointStorage._pool.
+    postgres_sslmode: Optional[str] = None
+    postgres_video_jobs_table: str = "video_jobs"
+    postgres_trends_table: str = "trends"
 
     # ── Voice Live API (voice intake) ──────────────────────────────────────────
     azure_voicelive_endpoint: Optional[str] = None
     azure_voicelive_model: str = "gpt-realtime"
     azure_voicelive_api_version: str = "2026-04-10"
     azure_voicelive_api_key: Optional[str] = None   # falls back to the OpenAI key (same resource)
+
+    # ── Roundtable (multi-persona discussion stage) ────────────────────────────
+    # ROUNDTABLE_ENABLED gates the drop-in replacement of `strategist` (wired in Phase 6);
+    # off → the pipeline behaves exactly as today. max_rounds is the per-table hard cap
+    # that stops an infinite debate. The two model tiers (cheap personas / stronger
+    # manager) are read in the production path (Phase 2); the mock path ignores them.
+    roundtable_enabled: bool = False
+    # Each persona turn is now a short, single-point contribution (see roundtable/personas.py),
+    # so the table can afford MANY more short exchanges — the cap is raised accordingly. It is
+    # still the per-table hard stop on the debate.
+    roundtable_max_rounds: int = 12
+    # Hard backstop on how long a single persona turn may be (None → no cap, rely on the prompt).
+    # Keeps turns short like a real discussion; passed to the persona chat clients as
+    # `max_completion_tokens`. The LLM manager is NOT capped (it needs room for the final strategy).
+    roundtable_persona_max_tokens: Optional[int] = None
+    # Reasoning effort for the persona seats (gpt-5.x are reasoning models). A persona turn is
+    # one short spoken point, so it needs NO hidden reasoning — and at a small max_tokens cap the
+    # reasoning pass would eat the whole budget, returning EMPTY content (finish_reason=length).
+    # "minimal" → reasoning_tokens=0, so the cap is spent on the visible answer and turns are ~2x
+    # faster. Blank/None → omit the param (use for a non-reasoning persona model). Manager unaffected.
+    roundtable_persona_reasoning_effort: Optional[str] = "minimal"
+    # Output verbosity for the persona seats (gpt-5.x). "low" keeps a turn to one short spoken
+    # point (a sentence or two) instead of an essay — faster turns + the intended discussion feel.
+    # Blank/None → omit (use for a non-gpt-5 persona model). Manager unaffected.
+    roundtable_persona_verbosity: Optional[str] = "low"
+    # The personas run on a cheaper, rate-limit-friendlier model; only the LLM manager keeps
+    # the main (gpt-5.4) deployment. The personas may live on a SEPARATE Azure resource
+    # (its own endpoint + key); when those are unset they fall back to the main resource and
+    # only the deployment name (roundtable_persona_model) differs.
+    roundtable_persona_model: Optional[str] = None
+    roundtable_manager_model: Optional[str] = None
+    roundtable_persona_endpoint: Optional[str] = None
+    roundtable_persona_api_key: Optional[str] = None
+    # How long the table waits for a user who raised a hand to actually send their message
+    # before proceeding without them (seconds) — bounds the "stop and wait for the user" pause.
+    roundtable_user_turn_timeout: float = 300.0
+    # Per-user learning write-back from the roundtable (transcript + interjections + verdict).
+    # LEARNING_ENABLED=false still READS stored skills but writes none (regression/isolation).
+    learning_enabled: bool = True
+    # ── Trend scout (the roundtable's fifth seat; docs/TREND_SCOUT_IMPLEMENTATION.md) ──
+    # TREND_SCOUT_ENABLED adds the `trend_scout` persona to every table, fed from the daily
+    # trends snapshot an EXTERNAL Foundry routine writes to the store. Off (default) → the
+    # roster stays the current four seats and no trends read happens. The read degrades to
+    # [] on any store failure — trends are an enhancement, never a dependency.
+    trend_scout_enabled: bool = False
+    # How many trends are injected per run, chosen category-diverse at read time.
+    trend_scout_limit: int = 6
+    # Staleness safety net: a trend with no explicit expires_at is dropped this many days
+    # after captured_at (covers ~2-3 missed daily routine runs before degrading to "no trends").
+    trend_scout_ttl_days: int = 3
+    # Cheap tier for the prod per-user preference summary call. Defaults to the same
+    # rate-limit-friendly deployment as the roundtable personas (ROUNDTABLE_PERSONA_MODEL);
+    # PREFERENCE_SUMMARY_MODEL overrides it. None → fall back to the main chat deployment.
+    preference_summary_model: Optional[str] = None
+    # ── Pexels (stock photo search) + Remove.bg (cut-out backgrounds) ──────────
+    pexels_api_key: Optional[str] = None
+    removebg_api_key: Optional[str] = None
+
+    # ── Soundraw (background music generation) ──────────────────────────────────
+    soundraw_api_key: Optional[str] = None
+
+    # ── Video render pipeline (local Remotion CLI) ──────────────────────────────
+    # Path to the video_renderer/ Node project (repo-root sibling of LLM_service/).
+    video_renderer_dir: Optional[str] = None
+    # Per-job working directory: resolved images + the final MP4. Not git-tracked.
+    video_jobs_dir: str = ".video_jobs"
 
     # ── Backend status webhook (legacy transport; SSE replaces it in M2) ───────
     webhook_url: str = "http://localhost:9999/status"
@@ -153,6 +249,15 @@ class Settings:
 
     def mock_voice(self) -> bool:
         return self.use_mock if self.use_mock_voice is None else self.use_mock_voice
+
+    def mock_image_search(self) -> bool:
+        return self.use_mock if self.use_mock_image_search is None else self.use_mock_image_search
+
+    def mock_background_removal(self) -> bool:
+        return self.use_mock if self.use_mock_background_removal is None else self.use_mock_background_removal
+
+    def mock_music_generation(self) -> bool:
+        return self.use_mock if self.use_mock_music_generation is None else self.use_mock_music_generation
 
     def notify_via_webhook(self) -> bool:
         """Whether status events are POSTed to the backend webhook. Defaults to
@@ -176,6 +281,36 @@ class Settings:
     def has_voice(self) -> bool:
         return bool(self.azure_voicelive_endpoint)
 
+    @property
+    def has_pexels(self) -> bool:
+        return bool(self.pexels_api_key)
+
+    @property
+    def has_removebg(self) -> bool:
+        return bool(self.removebg_api_key)
+
+    @property
+    def has_soundraw(self) -> bool:
+        return bool(self.soundraw_api_key)
+
+    @property
+    def resolved_video_renderer_dir(self) -> Path:
+        """Absolute path to the video_renderer/ Node project. VIDEO_RENDERER_DIR
+        overrides; otherwise defaults to the repo-root sibling of LLM_service/ (this
+        file is core/config.py, so parent.parent.parent is the repo root)."""
+        if self.video_renderer_dir:
+            return Path(self.video_renderer_dir)
+        return Path(__file__).resolve().parent.parent.parent / "video_renderer"
+
+    @property
+    def resolved_video_jobs_dir(self) -> Path:
+        """Absolute path to the per-job working directory (resolved images + the
+        final MP4). Relative `video_jobs_dir` values resolve under LLM_service/."""
+        path = Path(self.video_jobs_dir)
+        if path.is_absolute():
+            return path
+        return Path(__file__).resolve().parent.parent / path
+
     def mode_banner(self) -> str:
         """Human-readable one-liner describing the resolved mode of each service."""
         def tag(is_mock: bool) -> str:
@@ -184,23 +319,29 @@ class Settings:
         return (
             f"MODE: {overall}  "
             f"[llm={tag(self.mock_llm())} safety={tag(self.mock_safety())} "
-            f"store={tag(self.mock_store())} voice={tag(self.mock_voice())}]"
+            f"store={tag(self.mock_store())} voice={tag(self.mock_voice())} "
+            f"image_search={tag(self.mock_image_search())} "
+            f"background_removal={tag(self.mock_background_removal())} "
+            f"music_generation={tag(self.mock_music_generation())}]"
         )
 
 
 def _load() -> Settings:
     use_mock = _env_bool("USE_MOCK")
+    learning = _env_bool("LEARNING_ENABLED")
     return Settings(
         use_mock=True if use_mock is None else use_mock,
         use_mock_llm=_env_bool("USE_MOCK_LLM"),
         use_mock_safety=_env_bool("USE_MOCK_SAFETY"),
         use_mock_store=_env_bool("USE_MOCK_STORE"),
         use_mock_voice=_env_bool("USE_MOCK_VOICE"),
+        use_mock_image_search=_env_bool("USE_MOCK_IMAGE_SEARCH"),
+        use_mock_background_removal=_env_bool("USE_MOCK_BACKGROUND_REMOVAL"),
+        use_mock_music_generation=_env_bool("USE_MOCK_MUSIC_GENERATION"),
         azure_openai_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
         azure_openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
         azure_chat_deployment=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4o"),
-        foundry_project_endpoint=os.getenv("FOUNDRY_PROJECT_ENDPOINT"),
         azure_content_safety_endpoint=os.getenv("AZURE_CONTENTSAFETY_ENDPOINT")
         or os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT"),
         azure_content_safety_key=os.getenv("AZURE_CONTENTSAFETY_KEY")
@@ -209,10 +350,43 @@ def _load() -> Settings:
         postgres_profiles_table=os.getenv("POSTGRES_PROFILES_TABLE", "brand_profiles"),
         postgres_user_skills_table=os.getenv("POSTGRES_USER_SKILLS_TABLE", "user_skills"),
         postgres_checkpoints_table=os.getenv("POSTGRES_CHECKPOINTS_TABLE", "workflow_checkpoints"),
+        postgres_sslmode=os.getenv("POSTGRES_SSLMODE"),
+        postgres_video_jobs_table=os.getenv("POSTGRES_VIDEO_JOBS_TABLE", "video_jobs"),
+        postgres_trends_table=os.getenv("POSTGRES_TRENDS_TABLE", "trends"),
         azure_voicelive_endpoint=os.getenv("AZURE_VOICELIVE_ENDPOINT"),
         azure_voicelive_model=os.getenv("AZURE_VOICELIVE_MODEL", "gpt-realtime"),
         azure_voicelive_api_version=os.getenv("AZURE_VOICELIVE_API_VERSION", "2026-04-10"),
         azure_voicelive_api_key=os.getenv("AZURE_VOICELIVE_API_KEY"),
+        roundtable_enabled=bool(_env_bool("ROUNDTABLE_ENABLED")),
+        roundtable_max_rounds=_env_int("ROUNDTABLE_MAX_ROUNDS", 12),
+        roundtable_persona_max_tokens=(
+            _env_int("ROUNDTABLE_PERSONA_MAX_TOKENS", 0) or None
+        ),
+        roundtable_persona_reasoning_effort=(
+            os.getenv("ROUNDTABLE_PERSONA_REASONING_EFFORT", "minimal").strip() or None
+        ),
+        roundtable_persona_verbosity=(
+            os.getenv("ROUNDTABLE_PERSONA_VERBOSITY", "low").strip() or None
+        ),
+        roundtable_persona_model=os.getenv("ROUNDTABLE_PERSONA_MODEL"),
+        roundtable_manager_model=os.getenv("ROUNDTABLE_MANAGER_MODEL"),
+        roundtable_persona_endpoint=os.getenv("AZURE_PERSONA_ENDPOINT"),
+        roundtable_persona_api_key=os.getenv("AZURE_PERSONA_API_KEY"),
+        roundtable_user_turn_timeout=_env_float("ROUNDTABLE_USER_TURN_TIMEOUT", 300.0),
+        learning_enabled=True if learning is None else learning,
+        trend_scout_enabled=bool(_env_bool("TREND_SCOUT_ENABLED")),
+        trend_scout_limit=_env_int("TREND_SCOUT_LIMIT", 6),
+        trend_scout_ttl_days=_env_int("TREND_SCOUT_TTL_DAYS", 3),
+        # The per-user summary call reuses the cheap persona deployment by default
+        # (ROUNDTABLE_PERSONA_MODEL); PREFERENCE_SUMMARY_MODEL overrides if set.
+        preference_summary_model=(
+            os.getenv("PREFERENCE_SUMMARY_MODEL") or os.getenv("ROUNDTABLE_PERSONA_MODEL")
+        ),
+        pexels_api_key=os.getenv("PEXELS_API_KEY"),
+        removebg_api_key=os.getenv("REMOVEBG_API_KEY"),
+        soundraw_api_key=os.getenv("SOUNDRAW_API_KEY"),
+        video_renderer_dir=os.getenv("VIDEO_RENDERER_DIR"),
+        video_jobs_dir=os.getenv("VIDEO_JOBS_DIR", ".video_jobs"),
         webhook_url=os.getenv("WEBHOOK_URL", "http://localhost:9999/status"),
         webhook_enabled=_env_bool("WEBHOOK_ENABLED"),
     )

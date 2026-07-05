@@ -1,7 +1,7 @@
 """
 The MAF "virtual newsroom" workflow.
 
-`build_workflow()` assembles four role executors (dispatcher → scout → creator →
+`build_workflow()` assembles four role executors (dispatcher → strategist → creator →
 reviewer) plus a RequestPort human gate, with the circuit breaker expressed as an
 edge condition on the reviewer's outgoing edge. The whole thing runs fully mocked
 by default — every executor reaches its backend through core.services.factory.
@@ -10,7 +10,6 @@ by default — every executor reaches its backend through core.services.factory.
 from .builder import build_workflow
 from .messages import (
     ApprovedDraft,
-    ArchiveJob,
     BrandRule,
     Brief,
     CreativeStrategy,
@@ -33,6 +32,5 @@ __all__ = [
     "HumanVerdict",
     "ApprovedDraft",
     "FinalDraft",
-    "ArchiveJob",
     "BrandRule",
 ]

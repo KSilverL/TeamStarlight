@@ -1,7 +1,6 @@
 import { NextRequest } from "next/server";
 
-const VIDEO_AGENT_URL =
-  process.env.BRAND_VIDEO_AGENT_URL ?? "http://localhost:8001";
+const LLM_URL = process.env.LLM_SERVICE_URL ?? "http://localhost:8080";
 
 export async function GET(
   _request: NextRequest,
@@ -10,7 +9,7 @@ export async function GET(
   const { jobId } = await params;
 
   try {
-    const upstream = await fetch(`${VIDEO_AGENT_URL}/jobs/${jobId}`);
+    const upstream = await fetch(`${LLM_URL}/video-jobs/${jobId}`);
 
     if (!upstream.ok) {
       const text = await upstream.text();
@@ -25,13 +24,16 @@ export async function GET(
       JSON.stringify({
         status: data.status,
         error: data.error ?? null,
-        props: data.props ?? null,
+        // The storyboard itself was already delivered on the result/final SSE
+        // event before the render was even triggered — the poll response only
+        // needs to tell the card when (and where) the finished MP4 is.
+        downloadUrl: data.status === "done" ? `/api/video/${jobId}/download` : null,
       }),
       { headers: { "Content-Type": "application/json" } }
     );
   } catch (err) {
     const message =
-      err instanceof Error ? err.message : "Video agent unreachable";
+      err instanceof Error ? err.message : "LLM service unreachable";
     return new Response(JSON.stringify({ error: message }), {
       status: 502,
       headers: { "Content-Type": "application/json" },

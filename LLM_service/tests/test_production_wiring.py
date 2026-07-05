@@ -70,7 +70,7 @@ async def test_live_llm_render_html_card(monkeypatch):
     assert isinstance(html, str) and html.lstrip().startswith("<!DOCTYPE html>")
 
 
-async def test_live_llm_generate_video_props(monkeypatch):
+async def test_live_llm_generate_video_storyboard(monkeypatch):
     _use(monkeypatch,
          USE_MOCK_LLM="false",
          AZURE_OPENAI_ENDPOINT=os.getenv("LIVE_AZURE_OPENAI_ENDPOINT"),
@@ -78,11 +78,11 @@ async def test_live_llm_generate_video_props(monkeypatch):
          AZURE_OPENAI_CHAT_DEPLOYMENT=os.getenv("LIVE_AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4o"))
     llm = get_llm()
     assert isinstance(llm, azure.AzureLLM)
-    props = await llm.generate_video_props(
+    storyboard = await llm.generate_video_storyboard(
         topic="cold brew launch", draft="Our new cold brew is here — smooth and bold.",
-        tone_hint="warm",
+        tone_hint="warm", platform="instagram_reels",
     )
-    assert isinstance(props, dict) and len(props["stats"]) == 3  # schema-validated
+    assert isinstance(storyboard, dict) and 2 <= len(storyboard["slides"]) <= 8  # schema-validated
 
 
 async def test_live_safety_check(monkeypatch):

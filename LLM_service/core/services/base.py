@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from ..skill_schema import SkillCandidate, SkillRule, UserSkillDoc
+from ..trend_schema import Trend
 
 __all__ = [
     "SafetyResult",
@@ -30,6 +31,8 @@ __all__ = [
     "SafetyService",
     "StoreService",
     "VoiceService",
+    "ImageSearchService",
+    "BackgroundRemovalService",
     "empty_profile",
 ]
 
@@ -58,7 +61,7 @@ def empty_profile(business_id: Optional[str]) -> dict:
 
 class LLMService(ABC):
     """Chat, structured output, and platform copywriting. One service backs the
-    dispatcher (structured route), the scout (platform strategy), and the creator
+    dispatcher (structured route), the strategist (platform strategy), and the creator
     (per-platform draft)."""
 
     @abstractmethod
@@ -86,9 +89,15 @@ class LLMService(ABC):
         topic: str,
         platform: str,
         user_intent: str,
+        trends: str = "",
     ) -> str:
         """Return a platform-differentiated *strategy* (not copy) — the angle the
-        creator should take on this platform."""
+        creator should take on this platform. `trends` is a pre-rendered CURRENT TRENDS
+        block (`core.trend_schema.render_trends` — the Phase 4 spread of the daily
+        snapshot beyond the roundtable): when non-empty an impl offers to fuse ONE
+        genuinely-fitting trend into the angle, with explicit permission to use none —
+        a forced trend is worse than none. Empty means no trends available/enabled and
+        MUST leave the strategy exactly as before (degrade-to-empty rule)."""
         ...
 
     @abstractmethod
@@ -107,6 +116,8 @@ class LLMService(ABC):
         attempt: int = 1,
         user_skills: str = "",
         history: Optional[List[dict]] = None,
+        feedback: str = "",
+        prior_draft: str = "",
     ) -> str:
         """Return ready-to-publish, platform-native post copy (a real post the user
         can copy-paste — hook, body, CTA, hashtags/emojis — not an outline),
@@ -119,7 +130,12 @@ class LLMService(ABC):
         angle/hook on attempt > 1 rather than repeating the rejected copy. `user_skills`
         is a pre-rendered MUST DO / MUST AVOID block of the current user's learned rules
         (the per-`user_id` channel), injected alongside the static `skill`; empty for
-        users with no learned rules. `history` is the prior conversation as a list of
+        users with no learned rules. `feedback` is the specific reason the prior draft
+        was rejected (the human's gate comment, or the reviewer's safety/brand note) and
+        `prior_draft` is the rejected copy itself — both populated only on a re-draft
+        (attempt > 1): an impl MUST address that feedback head-on and rework the prior
+        draft rather than rerolling blindly, so the regenerated copy visibly fixes what
+        was flagged. `history` is the prior conversation as a list of
         {role, content} messages, supplied by the caller (the backend looks it up by
         conversation id and assembles the payload — this service stays stateless): an
         impl folds it in as prior turns so a follow-up like "make it punchier" continues
@@ -149,23 +165,27 @@ class LLMService(ABC):
         ...
 
     @abstractmethod
-    async def generate_video_props(
+    async def generate_video_storyboard(
         self,
         *,
         topic: str,
         draft: str,
         tone_hint: Optional[str],
+        platform: str,
         skill: str = "",
         history: Optional[List[dict]] = None,
     ) -> dict:
-        """Generate the structured spec for a 3-scene brand video (the "生成视频" idea,
-        ported from demos/brand_video_agent) as a JSON-friendly dict matching
-        core.media_schema.BrandVideoProps (brand identity / three stats / CTA + a 3-colour
-        palette). The LLM produces DATA only — no visual code; the actual Remotion render
-        is external to this service. `skill` is the static spec (skills/brand_video.md).
-        Every impl MUST return exactly 3 `stats`. `history` (optional) is the prior
-        {role, content} conversation the caller assembled, folded in as context for a
-        follow-up; None/empty = single-turn."""
+        """Generate a dynamic, composable storyboard for a short-form brand video as a
+        JSON-friendly dict matching core.video_schema.StoryboardSpec — an ordered list
+        of typed `slides` picked from the slide registry (hook / counter_stat / collage
+        / outro), not a fixed scene count. The LLM produces DATA only — no visual code,
+        and image fields are search keywords, never URLs; the actual Remotion render is
+        external to this service. `platform` lets the prompt reason about length/format
+        context, but the final aspect ratio is derived deterministically downstream
+        (core.video_schema.aspect_for_platform), never trusted from the LLM. `skill` is
+        the static spec (skills/brand_video_storyboard.md). `history` (optional) is the
+        prior {role, content} conversation the caller assembled, folded in as context
+        for a follow-up; None/empty = single-turn."""
         ...
 
     @abstractmethod
@@ -177,28 +197,15 @@ class LLMService(ABC):
         final_draft: str,
         existing_must_do: List[str],
         existing_must_avoid: List[str],
+        transcript: Optional[List[dict]] = None,
     ) -> List[dict]:
         """Compare the AI draft with the human's edited final and distil 1-3
         concrete brand-voice rules. Returns a JSON-friendly list of dicts, each
-        {"kind": "must_do"|"must_avoid", "rule": str, "rationale": str}. The
-        archivist reads the existing rules so it does not re-propose duplicates."""
-        ...
-
-    @abstractmethod
-    async def summarize_session(
-        self,
-        *,
-        brief: dict,
-        conversation: List[dict],
-        final_drafts: List[dict],
-    ) -> List[SkillCandidate]:
-        """Read a whole adopted session (the `brief`, the intake `conversation` as a
-        list of {role, content}, and the approved `final_drafts`) and distil 3-6
-        candidate writing rules for the per-`user_id` learning channel. Each candidate
-        infers a `platform` (None = cross-platform), a `suggested_kind`
-        ("positive"|"negative"), and a short `rationale`, so the user can three-way
-        classify them. This is the user-scoped analogue of `distill_rules` (which is
-        brand-scoped and edit-driven)."""
+        {"kind": "must_do"|"must_avoid", "rule": str, "rationale": str}. Reads the
+        existing rules so it does not re-propose duplicates. `transcript` (optional) is the
+        roundtable discussion (turns with speaker/role/text/platform); when present the brand
+        signal comes from the debate too — so a plain `approve` (no edit diff) can still yield
+        brand rules from what the brand-voice persona and the user argued for."""
         ...
 
     @abstractmethod
@@ -216,6 +223,42 @@ class LLMService(ABC):
         ...
 
     @abstractmethod
+    async def summarize_preferences(
+        self,
+        *,
+        transcript: List[dict],
+        verdicts: List[dict],
+    ) -> List[dict]:
+        """The single per-user distiller. Distil a user's writing preferences from whatever
+        user signal a run produced — a `transcript` of {speaker, role, text, platform, ...}
+        turns that includes the user's OWN turns (roundtable discussion turns AND/OR their
+        intake turns, reshaped to the same shape) — plus their final `verdicts` (each
+        {platform, decision, edited_draft?, reason?}). Returns a JSON-friendly list of
+        {"skill": str, "evidence": str} (0-3), where `evidence` traces the preference back to
+        the specific interjection or edit. The kept skills are consolidated via
+        `consolidate_skills` and persisted through `StoreService.upsert_user_skills`."""
+        ...
+
+    @abstractmethod
+    async def summarize_handoff(
+        self,
+        *,
+        transcript: List[dict],
+        verdicts: List[dict],
+    ) -> dict:
+        """Distil a "handoff" recap of a finished conversation so a NEXT session can carry it as
+        prior context (PriorSessionContext) — the forward-looking sibling of the learning
+        distillers (which produce durable rules; this produces one session's continuation seed).
+        Reads the same signal: a `transcript` of {speaker, role, text, platform, ...} turns (the
+        roundtable discussion and/or the user's intake turns) plus the final `verdicts` (each
+        {platform, decision, edited_draft?, reason?}). Returns a JSON-friendly dict with EXACTLY
+        the PriorSessionContext content keys — `topic`, `prior_strategy_summary` (both str|None),
+        `approved_directions`, `rejected_directions`, `user_notes` (str lists) — and NO others
+        (the caller attaches `parent_session_id`). An empty conversation yields the all-empty
+        shape, which the caller degrades to "no prior context"."""
+        ...
+
+    @abstractmethod
     async def fill_brief(
         self,
         *,
@@ -229,9 +272,9 @@ class LLMService(ABC):
         """One intake turn (function-calling): given the shared system prompt + tool
         definitions, the conversation so far, and the user's latest turn, decide which
         CreativeBrief fields the user just supplied. Returns:
-            {"brief_updates": dict, "wants_scout": bool}
+            {"brief_updates": dict, "wants_topic_idea": bool}
         `brief_updates` is the `update_brief` tool-call result (fields → values);
-        `wants_scout` flags the `scout_trends` tool call (copilot_mode — the user
+        `wants_topic_idea` flags the `suggest_topic` tool call (copilot_mode — the user
         asked for ideas). `pending_field` is the field the assistant just asked about,
         so a direct answer slots in even without an explicit cue. This single primitive
         is shared verbatim by the text and voice entry points — only the transport
@@ -281,6 +324,24 @@ class StoreService(ABC):
         ...
 
     @abstractmethod
+    async def get_trends(self, *, limit: int = 6) -> List[Trend]:
+        """Return up to `limit` current trends from the rolling daily snapshot (the
+        `current` doc an external Foundry routine upserts — docs/TREND_SCOUT_IMPLEMENTATION.md).
+        Deliberately takes NO domain/topic arg — trends are broad by design; fit judgment
+        happens at fusion time in the roundtable debate, not at retrieval. Drops trends
+        past their TTL, then spreads the pick across categories for variety. Empty list
+        when the routine has never run or everything is stale (the seat degrades)."""
+        ...
+
+    @abstractmethod
+    async def upsert_trends(self, *, trends: List[Trend]) -> None:
+        """Overwrite the rolling `current` trends snapshot. An EMPTY list is a no-op —
+        a failed/empty scan must never clobber the last good snapshot (decision #1).
+        This is the in-repo dev/test/showcase write path; in production the external
+        Foundry routine writes the same table directly."""
+        ...
+
+    @abstractmethod
     async def save_checkpoint(self, *, task_id: str, data: dict) -> None:
         """Persist workflow checkpoint state for a task (resume after restart)."""
         ...
@@ -288,6 +349,23 @@ class StoreService(ABC):
     @abstractmethod
     async def load_checkpoint(self, *, task_id: str) -> Optional[dict]:
         """Return the most recent checkpoint for a task, or None."""
+        ...
+
+    @abstractmethod
+    async def create_video_job(self, *, job_id: str, task_id: str, platform: str, storyboard: dict) -> dict:
+        """Create a `pending` video-render job row. Returns the stored document
+        (id, task_id, platform, status, storyboard, output_path, error, timestamps)."""
+        ...
+
+    @abstractmethod
+    async def update_video_job(self, *, job_id: str, **fields) -> dict:
+        """Merge `fields` (e.g. status, output_path, error) into an existing video job
+        and return the updated document."""
+        ...
+
+    @abstractmethod
+    async def get_video_job(self, *, job_id: str) -> Optional[dict]:
+        """Return the video job document, or None if `job_id` is unknown."""
         ...
 
 
@@ -301,4 +379,43 @@ class VoiceService(ABC):
     @abstractmethod
     async def transcribe_turn(self, *, session_id: str, user_audio: str) -> dict:
         """Turn a user audio turn into text. Contract keys: session_id, transcript."""
+        ...
+
+
+# ── Image search (Pexels) ──────────────────────────────────────────────────────
+
+class ImageSearchService(ABC):
+    """Stock-photo search for collage/hook slide image queries. Callers must treat
+    an empty result as a soft-fail (skip the image), never raise on a plain miss."""
+
+    @abstractmethod
+    async def search(self, *, query: str, per_page: int = 1) -> List[dict]:
+        """Return up to `per_page` candidate images for `query`, each a dict with at
+        least {url, photographer, width, height}. Empty list on no match."""
+        ...
+
+
+# ── Background removal (Remove.bg) ───────────────────────────────────────────────
+
+class BackgroundRemovalService(ABC):
+    """Cut-out photography: strips the background from a downloaded stock image so
+    it composites cleanly over a geometric shape."""
+
+    @abstractmethod
+    async def remove_background(self, *, image_bytes: bytes) -> bytes:
+        """Return PNG bytes with the background removed. Raises on a hard failure
+        (rate limit, bad image, network) — callers fall back to the original image."""
+        ...
+
+
+# ── Background music (Soundraw) ───────────────────────────────────────────────
+
+class MusicGenerationService(ABC):
+    """Background music generation, sized to a render's exact duration."""
+
+    @abstractmethod
+    async def generate(self, *, mood: str, genre: str, duration_seconds: float, energy: str) -> bytes:
+        """Return audio bytes (mp3) for a track matching the requested duration.
+        Raises on a hard failure (rate limit, bad params, network) — callers fall
+        back to a silent render."""
         ...

@@ -38,20 +38,30 @@ import asyncio
 import json
 import os
 import uuid
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Body, FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .core.config import load_dotenv
-from .core.events import DONE, INTERRUPTED, RUNNING, progress_event, result_event
+from .core.config import get_settings, load_dotenv
+from .core.events import DONE, ERROR, INTERRUPTED, RUNNING, progress_event, result_event
 from .core.services import factory
-from .core.skill_schema import SkillCandidate, SkillDecision
-from .intake import IntakeSession, build_intake
+from .intake import IntakeSession, PriorSessionContext, build_intake
 from .skills import load_skill
 from .workflow import Brief, HumanVerdict, build_workflow
 from .workflow.builder import WORKFLOW_NAME
+from .workflow.learning import archive_conversation
+from .workflow.learning.archivist import _intake_user_turns
+from .workflow.messages import CONTENT_TYPES, DEFAULT_CONTENT_TYPES, CreativeStrategy
+from .workflow.roundtable.gate import notify as _notify_user_gate
+from .workflow.roundtable.gate import raise_hand as _raise_user_hand
+from .workflow.roundtable.queue import push_utterance
+from .workflow.roundtable.runner import run_table, run_tables
+from .workflow.video.jobs import get_render_job, start_render_job
+from .core.skill_schema import SkillCandidate
+from .core.video_schema import StoryboardSpec
 
 # Sentinel pushed to SSE subscribers when a task finishes, so the stream closes.
 _STREAM_DONE = object()
@@ -92,6 +102,52 @@ def _normalize_history(raw) -> list[dict]:
     return out
 
 
+def _prior_context_from_payload(raw) -> Optional[PriorSessionContext]:
+    """Validate a backend-supplied `prior_context` (the recap of an earlier session this intake
+    continues). `None` → fresh conversation. A malformed object (not a dict, missing the required
+    `parent_session_id`) is a client error → HTTP 400 (not FastAPI's 422, since it arrives as a
+    free-form key). A well-formed but content-free recap (only `parent_session_id`) degrades back
+    to `None` — the fresh path (Phase 5) — so an empty recap never changes intake behaviour."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ApiError(400, "'prior_context' must be an object")
+    try:
+        ctx = PriorSessionContext(**raw)
+    except ValidationError as exc:
+        raise ApiError(400, f"invalid prior_context: {exc.errors(include_url=False)}")
+    return ctx if ctx.has_content() else None
+
+
+# "html" is accepted as an alias for the canonical "brand" (the animated HTML card), so a
+# backend can pass either name for the same deliverable.
+_CONTENT_TYPE_ALIASES = {"html": "brand"}
+
+
+def _content_types_from_inputs(inputs: dict) -> list[str]:
+    """Resolve the backend's requested deliverables. Omitted → the default (text only). When
+    given, every value must be a known content type (`text` / `brand` / `video`, with `html`
+    accepted as an alias for `brand`) — else 400; the list must be non-empty.
+
+    `text` is NOT forced in: a request for only `brand`/`video` (no `text`) is the media-only
+    path (Case 4) — the workflow skips drafting/reviewing copy and runs straight to the
+    media_producer (see WorkflowService.start / build_workflow(media_only=True))."""
+    raw = inputs.get("content_types")
+    if raw is None:
+        return list(DEFAULT_CONTENT_TYPES)
+    if not isinstance(raw, list) or any(not isinstance(t, str) for t in raw):
+        raise ApiError(400, "content_types must be an array of strings")
+    normalized = [_CONTENT_TYPE_ALIASES.get(t.strip().lower(), t.strip().lower()) for t in raw]
+    bad = [t for t in normalized if t not in CONTENT_TYPES]
+    if bad:
+        raise ApiError(400, f"unknown content_types {bad}; allowed: {list(CONTENT_TYPES)} (or 'html' for 'brand')")
+    seen: set[str] = set()
+    deduped = [t for t in normalized if not (t in seen or seen.add(t))]
+    if not deduped:
+        raise ApiError(400, f"content_types must list at least one of {list(CONTENT_TYPES)}")
+    return deduped
+
+
 def _brief_from_inputs(inputs: dict) -> Brief:
     """Build the workflow's Brief from the start payload."""
     topic = inputs.get("topic")
@@ -108,6 +164,7 @@ def _brief_from_inputs(inputs: dict) -> Brief:
         user_id=inputs.get("user_id"),
         tone_hint=inputs.get("tone_hint"),
         route=inputs.get("route", "direct_generation"),
+        content_types=_content_types_from_inputs(inputs),
     )
 
 
@@ -122,9 +179,18 @@ class _Task:
         self.subscribers: list[asyncio.Queue] = []   # live SSE queues
         self.pending: dict[str, dict] = {}           # request_id -> HumanReviewRequest data
         self.outputs: dict[str, dict] = {}           # platform -> FinalDraft dict
-        self.proposed_rules: list[dict] = []         # archivist rules awaiting tagging
+        self.proposed_rules: list[dict] = []         # brand rules written on confirm-learning (snapshot)
         self.conversation: list[dict] = []           # intake transcript threaded in at start
-        self.skill_candidates: dict[str, dict] = {}  # candidate_id -> SkillCandidate (learn-summarize)
+        self.roundtable_transcript: list[dict] = []   # discussion turns (roundtable mode) for learning
+        self.last_verdicts: list[dict] = []           # the user's gate verdicts (for learning evidence)
+        self.original_drafts: dict[str, str] = {}     # platform -> the AI draft the human reviewed
+        self.preference_summary: Optional[dict] = None  # PreferenceSummary written back on confirm
+        self.event_listener = None                    # optional sync hook: live-stream each event (CLI)
+        self.runner: Optional[asyncio.Task] = None    # background drive task (HTTP non-blocking path)
+        self.lock = asyncio.Lock()                    # serializes resumes: two concurrent /review calls
+        # (e.g. auto-approving two platforms' drafts back-to-back) must not both drive the same
+        # underlying `workflow` at once — that races on `task.pending` and can 409 a legitimate call.
+        self.error: Optional[str] = None              # set if the run raised; surfaced in the snapshot
         self.status = "running"
         self.done = False
 
@@ -149,9 +215,16 @@ class WorkflowService:
     # ── Event translation (MAF event → §7.2 envelope) + publish ───────────────
 
     def _publish(self, task: _Task, event: dict) -> None:
+        # A stable, monotonic per-task index baked into the stored event, so a client that
+        # reconnects (GET /tasks/{id}/events replays the full buffer — see `events()`) can tell
+        # a replayed event from a new one and avoid re-firing event-driven side effects
+        # (e.g. auto-approving a human-gate draft a second time, which 409s).
+        event["seq"] = len(task.events)
         task.events.append(event)
         for q in task.subscribers:
             q.put_nowait(event)
+        if task.event_listener is not None:  # live, in-process stream (the CLI prints as it lands)
+            task.event_listener(event)
 
     @staticmethod
     def _translate(ev) -> list[dict]:
@@ -179,12 +252,15 @@ class WorkflowService:
             ]
         if etype == "output":
             draft = ev.data  # FinalDraft (enriched by the media_producer)
-            node = "archivist" if draft.decision == "approve_after_edit" else "human_gate"
+            # Text flow: the final emits from the gate (no in-graph archivist). Media-only
+            # (Case 4: no "text") has no gate, so it emits from the media_producer.
+            node = "human_gate" if "text" in (draft.content_types or []) else "media_producer"
             return [result_event(node, "final", platform=draft.platform, payload={
                 "draft": draft.draft,
                 "decision": draft.decision,
+                "content_types": draft.content_types,  # what the backend asked to produce
                 "html_preview": draft.html_card,  # the LLM-rendered animated brand card
-                "video_props": draft.video_props.model_dump() if draft.video_props else None,
+                "video_storyboard": draft.video_storyboard.model_dump() if draft.video_storyboard else None,
                 "needs_human_intervention": draft.needs_human_intervention,
                 "proposed_rules": [r.model_dump() for r in draft.proposed_rules],
             })]
@@ -198,8 +274,14 @@ class WorkflowService:
     # ── Drive one run segment (start or resume) until the next pause / end ─────
 
     async def _drive(self, task: _Task, *, message=None, responses=None) -> dict:
-        answered = set(responses.keys()) if responses else set()
-        new_pending: dict[str, dict] = {}
+        # TODO (Revisit this to see if it needs to be altered)
+        # answered = set(responses.keys()) if responses else set()
+        # new_pending: dict[str, dict] = {}
+        # Answered gates stop being pending the moment we resume with their response — before
+        # the stream even starts, not after it drains (see below for why "after" is wrong).
+        if responses:
+            for req_id in responses:
+                task.pending.pop(req_id, None)
         stream = (
             task.workflow.run(message, stream=True)
             if message is not None
@@ -208,7 +290,7 @@ class WorkflowService:
         async for ev in stream:
             if ev.type == "request_info":
                 d = ev.data
-                new_pending[ev.request_id] = {
+                task.pending[ev.request_id] = {
                     "request_id": ev.request_id,
                     "platform": d.platform,
                     "draft": d.draft,
@@ -221,8 +303,8 @@ class WorkflowService:
                 self._publish(task, out)
 
         # Keep unanswered gates pending; drop the ones we just answered; add new ones.
-        task.pending = {k: v for k, v in task.pending.items() if k not in answered}
-        task.pending.update(new_pending)
+        # task.pending = {k: v for k, v in task.pending.items() if k not in answered}
+        # task.pending.update(new_pending)
 
         if task.pending:
             task.status = "awaiting_review"
@@ -235,131 +317,368 @@ class WorkflowService:
                 q.put_nowait(_STREAM_DONE)
         return self._snapshot(task)
 
+    async def _run_guarded(self, task: _Task, coro, *, reraise: bool) -> dict:
+        """Drive `coro` (a start/resume/roundtable segment) to its next pause/end, but never let
+        an executor exception leave SSE subscribers hung: on failure mark the task errored, emit a
+        terminal error event, and close every subscriber stream (push the done sentinel). With
+        `reraise` the exception still propagates (the synchronous caller surfaces HTTP 500); the
+        background path swallows it (already recorded on the task) and returns the snapshot."""
+        try:
+            return await coro
+        except Exception as exc:
+            task.status = "error"
+            task.error = str(exc)
+            task.done = True
+            self._publish(task, progress_event("workflow", ERROR))
+            for q in list(task.subscribers):
+                q.put_nowait(_STREAM_DONE)
+            if reraise:
+                raise
+            return self._snapshot(task)
+
     def _snapshot(self, task: _Task) -> dict:
-        return {
+        snap = {
             "task_id": task.task_id,
             "status": task.status,
             "pending": list(task.pending.values()),
             "outputs": list(task.outputs.values()),
             "proposed_rules": task.proposed_rules,
         }
+        if task.error is not None:
+            snap["error"] = task.error  # the run failed; status == "error"
+        if task.preference_summary is not None:
+            snap["preference_summary"] = task.preference_summary  # learned this run (roundtable)
+        return snap
 
     # ── Public operations ─────────────────────────────────────────────────────
 
     async def start(
-        self, inputs: dict, task_id: Optional[str] = None, conversation: Optional[list] = None
+        self, inputs: dict, task_id: Optional[str] = None, conversation: Optional[list] = None,
+        *, event_listener=None, before_round=None, background: bool = False,
     ) -> dict:
+        """`event_listener` (optional) is invoked with every published event as it lands, so an
+        interactive caller (the CLI) can stream the newsroom live instead of replaying buffered
+        events at the end. `before_round` (optional, roundtable only) is the per-round
+        user-interjection hook handed to each table's manager (see roundtable.BeforeRound).
+
+        `background=False` (the default, used by the CLI / tests) drives the run inline and returns
+        only once it reaches the human gate or completes. `background=True` (the HTTP route) spawns
+        the heavy work — the roundtable discussion + drafting can take minutes — as a task and
+        returns IMMEDIATELY with a `running` snapshot, so progress streams over SSE in real time
+        instead of arriving all at once when a blocking POST finally returns."""
         task_id = task_id or f"task-{uuid.uuid4().hex[:12]}"
         if task_id in self._tasks:
             raise ApiError(409, f"task_id already exists: {task_id}")
-        brief = _brief_from_inputs(inputs)
+        brief = _brief_from_inputs(inputs)  # validates synchronously (HTTP 400) before any spawn
+        roundtable = get_settings().roundtable_enabled
+        text_requested = "text" in brief.content_types
+
+        # Choose the graph's front:
+        #  • media-only (Case 4: no "text") → media_entry → media_producer (skip create/review/gate);
+        #  • text + roundtable → creator entry (the discussion already produced the strategy);
+        #  • text, no roundtable → the original dispatcher → strategist → creator path.
+        # The roundtable stage (when enabled) still runs FIRST here (its own checkpoints + user
+        # pauses) for both the text and media-only paths — stage-chaining (§1).
+        if not text_requested:
+            build_kwargs = {"media_only": True}
+        elif roundtable:
+            build_kwargs = {"roundtable_entry": True}
+        else:
+            build_kwargs = {}
+
         workflow = self._workflow_factory(
-            name=f"{WORKFLOW_NAME}:{task_id}", checkpoint_storage=self._storage()
+            name=f"{WORKFLOW_NAME}:{task_id}", checkpoint_storage=self._storage(), **build_kwargs,
         )
         task = _Task(task_id, workflow, brief)
         task.conversation = list(conversation or [])  # intake transcript for per-user learning
+        task.event_listener = event_listener
         self._tasks[task_id] = task
-        return await self._drive(task, message=brief)
+
+        coro = self._execute(
+            task, brief, roundtable=roundtable, text_requested=text_requested,
+            before_round=before_round,
+        )
+        if background:
+            task.runner = asyncio.create_task(self._run_guarded(task, coro, reraise=False))
+            return self._snapshot(task)  # status == "running"; watch GET /tasks/{id}/events
+        return await self._run_guarded(task, coro, reraise=True)
+
+    async def _execute(
+        self, task: _Task, brief: Brief, *, roundtable: bool, text_requested: bool, before_round,
+    ) -> dict:
+        # """The heavy segment of a start: (optional) roundtable discussion, then drive the MAF
+        # workflow to its first pause/end. Shared by the inline and background start paths."""
+        # if roundtable:
+        #     results = await run_tables(
+        #         brief, platforms=brief.target_platforms, task_id=task.task_id,
+        #         on_event=lambda ev: self._publish(task, ev),
+        #         before_round=before_round,
+        #     )
+        #     # Keep the full discussion transcript so the per-user learning loop can distil
+        #     # preferences from the user's interjections after the gate (§6.5 write side).
+        #     task.roundtable_transcript = [
+        #         t.model_dump() for r in results for t in r.consensus.transcript
+        #     ]
+        #     # Merge the N single-platform consensuses into ONE CreativeStrategy. With text it is
+        #     # the strategist drop-in (→ creator); media-only it is the render brief (→ media_entry).
+        #     strategy = CreativeStrategy(
+        #         brief=brief,
+        #         strategies={
+        #             r.consensus.platform: r.consensus.strategy.strategies.get(r.consensus.platform, "")
+        #             for r in results
+        #         },
+        #     )
+        #     return await self._drive(task, message=strategy)
+
+        # if not text_requested:
+        #     # Media-only without a roundtable: synthesize a (topic-based) strategy and run straight
+        #     # to the media_producer — no discussion, no copy, no human gate.
+        #     strategy = CreativeStrategy(
+        #         brief=brief, strategies={p: "" for p in brief.target_platforms})
+        #     return await self._drive(task, message=strategy)
+
+        # return await self._drive(task, message=brief)
+        """"
+        The heavy segment of a start: (optional) roundtable discussion, then drive the MAF
+        workflow to its first pause/end. Shared by the inline and background start paths.
+        Holds `task.lock` for the whole segment — the same lock `review()` takes before it
+        resumes — so a client can never call `task.workflow.run()` a second time (via a
+        same-task `review()`) while this first run is still mid-stream for a slower platform.
+        A platform that pauses early still surfaces in `task.pending` immediately (see
+        `_drive`) so a racing `review()` call queues on the lock instead of 409ing; once it
+        acquires the lock the whole segment (including any still-running sibling platform) has
+        already finished, and the workflow is safe to resume again."""
+        async with task.lock:
+            if roundtable:
+                results = await run_tables(
+                    brief, platforms=brief.target_platforms, task_id=task.task_id,
+                    on_event=lambda ev: self._publish(task, ev),
+                    before_round=before_round,
+                )
+                # Keep the full discussion transcript so the per-user learning loop can distil
+                # preferences from the user's interjections after the gate (§6.5 write side).
+                task.roundtable_transcript = [
+                    t.model_dump() for r in results for t in r.consensus.transcript
+                ]
+                # Merge the N single-platform consensuses into ONE CreativeStrategy. With text it
+                # is the strategist drop-in (→ creator); media-only it is the render brief (→ media_entry).
+                strategy = CreativeStrategy(
+                    brief=brief,
+                    strategies={
+                        r.consensus.platform: r.consensus.strategy.strategies.get(r.consensus.platform, "")
+                        for r in results
+                    },
+                )
+                return await self._drive(task, message=strategy)
+
+            if not text_requested:
+                # Media-only without a roundtable: synthesize a (topic-based) strategy and run
+                # straight to the media_producer — no discussion, no copy, no human gate.
+                strategy = CreativeStrategy(
+                    brief=brief, strategies={p: "" for p in brief.target_platforms})
+                return await self._drive(task, message=strategy)
+
+            return await self._drive(task, message=brief)
 
     async def review(self, task_id: str, verdicts: dict) -> dict:
         task = self._require(task_id)
-        if not task.pending:
-            raise ApiError(409, "task is not awaiting review")
+        # if not task.pending:
+        #     raise ApiError(409, "task is not awaiting review")
         if not isinstance(verdicts, dict) or not verdicts:
             raise ApiError(400, "'verdicts' must be a non-empty object keyed by platform")
 
-        responses: dict[str, HumanVerdict] = {}
-        for req_id, data in task.pending.items():
-            verdict = verdicts.get(data["platform"])
-            if verdict is None:
-                continue  # leave un-addressed platforms pending
-            responses[req_id] = _verdict_from_payload(verdict)
-        if not responses:
-            raise ApiError(400, "no verdict matched a pending platform")
-        return await self._drive(task, responses=responses)
+        # responses: dict[str, HumanVerdict] = {}
+        # for req_id, data in task.pending.items():
+        #     verdict = verdicts.get(data["platform"])
+        #     if verdict is None:
+        #         continue  # leave un-addressed platforms pending
+        #     responses[req_id] = _verdict_from_payload(verdict)
+        #     # Record the AI draft the human reviewed + the verdict, so confirm-learning can
+        #     # distil brand rules (AI-vs-final diff) and trace a learned preference to the edit.
+        #     task.original_drafts[data["platform"]] = data["draft"]
+        #     task.last_verdicts.append({"platform": data["platform"], **verdict})
+        # if not responses:
+        #     raise ApiError(400, "no verdict matched a pending platform")
+        # # Learning no longer runs automatically — it waits for POST /tasks/{id}/confirm-learning.
+        # # Guard the resume too: an executor failure (e.g. media render) must not hang subscribers.
+        # return await self._run_guarded(task, self._drive(task, responses=responses), reraise=True)
+         # Serialize resumes on this task: two platforms' drafts can both auto-approve within
+        # milliseconds of each other (see `task.lock`), and concurrently driving the same
+        # `task.workflow` races on `task.pending` — the loser can see a stale/emptied view and
+        # wrongly 409, or corrupt the bookkeeping for the platform it never touched.
+        async with task.lock:
+            if not task.pending:
+                raise ApiError(409, "task is not awaiting review")
 
-    async def archive_tags(self, task_id: str, tags: list) -> dict:
-        """Apply the user's keep/discard tags to the archivist's proposed rules and
-        write the kept ones into the Brand_Voice_Profile store (get_store)."""
+            responses: dict[str, HumanVerdict] = {}
+            for req_id, data in task.pending.items():
+                verdict = verdicts.get(data["platform"])
+                if verdict is None:
+                    continue  # leave un-addressed platforms pending
+                responses[req_id] = _verdict_from_payload(verdict)
+                # Record the AI draft the human reviewed + the verdict, so confirm-learning can
+                # distil brand rules (AI-vs-final diff) and trace a learned preference to the edit.
+                task.original_drafts[data["platform"]] = data["draft"]
+                task.last_verdicts.append({"platform": data["platform"], **verdict})
+            if not responses:
+                raise ApiError(400, "no verdict matched a pending platform")
+            # Learning no longer runs automatically — it waits for POST /tasks/{id}/confirm-learning.
+            # Guard the resume too: an executor failure (e.g. media render) must not hang subscribers.
+            return await self._run_guarded(task, self._drive(task, responses=responses), reraise=True)
+
+    async def confirm_learning(self, task_id: str, learn: bool) -> dict:
+        """One extra round: the user confirms whether THIS conversation should be learned.
+        Only on `learn=True` (and LEARNING_ENABLED) does the archivist run — it distils the
+        conversation into DB-ready preference skills and writes them STRAIGHT to the store, for
+        BOTH channels: brand voice (→ Brand_Voice_Profile, transcript-aware so a plain approve
+        learns too) and per-user (→ user_skills). Nothing is learned otherwise."""
         task = self._require(task_id)
-        if not isinstance(tags, list):
-            raise ApiError(400, "'tags' must be an array of {kind, rule, keep}")
-        business_id = task.brief.business_id
-        if not business_id:
-            raise ApiError(400, "task has no business_id; cannot persist brand rules")
+        if not task.done:
+            raise ApiError(409, "task is not complete; nothing to confirm yet")
+        if not learn or not get_settings().learning_enabled:
+            return {"task_id": task_id, "learned": False,
+                    "brand_rules": [], "preference_summary": None}
 
-        store = factory.get_store()
-        profile = await store.get_profile(business_id=business_id)
-        kept = 0
-        for tag in tags:
-            if not tag.get("keep"):
-                continue
-            kind = tag.get("kind")
-            rule = tag.get("rule")
-            if kind not in ("must_do", "must_avoid") or not rule:
-                continue
-            if rule not in profile.setdefault(kind, []):
-                profile[kind].append(rule)
-                kept += 1
-        await store.upsert_profile(business_id=business_id, profile=profile)
-        return {"task_id": task_id, "business_id": business_id, "rules_kept": kept, "profile": profile}
-
-    # ── Per-user learning (the per-`user_id` channel, DB-only) ────────────────
-
-    async def learn_summarize(self, task_id: str) -> dict:
-        """Distil candidate writing rules from the whole adopted session (brief + intake
-        transcript + approved drafts) for the user to three-way classify. The candidates
-        are retained on the task so learn_commit can resolve them by id."""
-        task = self._require(task_id)
-        user_id = task.brief.user_id
-        if not user_id:
-            raise ApiError(400, "task has no user_id; cannot learn user skills")
-        candidates = await factory.get_llm().summarize_session(
-            brief=task.brief.model_dump(),
+        result = await archive_conversation(
+            brief=task.brief,
+            transcript=task.roundtable_transcript or None,
             conversation=task.conversation,
-            final_drafts=list(task.outputs.values()),
+            outputs=task.outputs,
+            original_drafts=task.original_drafts,
+            verdicts=task.last_verdicts,
+            source_task_id=task.task_id,
         )
-        task.skill_candidates = {c.id: c.model_dump() for c in candidates}
-        return {"candidates": [c.model_dump() for c in candidates]}
+        task.proposed_rules = result["brand_rules"]            # what was stored (for the snapshot)
+        task.preference_summary = result["preference_summary"]
+        return {"task_id": task_id, "learned": True, **result}
 
-    async def learn_commit(self, task_id: str, decisions: list) -> dict:
-        """Apply the user's three-way verdicts: drop the ignored ones, consolidate the
-        kept candidates with the user's prior rules (this round overrides on conflict),
-        and persist the whole set to the user_skills store."""
-        task = self._require(task_id)
-        user_id = task.brief.user_id
-        if not user_id:
-            raise ApiError(400, "task has no user_id; cannot persist user skills")
-        if not isinstance(decisions, list):
-            raise ApiError(400, "'decisions' must be an array of {candidate_id, label, platform?}")
+    async def summarize_handoff(
+        self, parent_session_id: str, transcript: Optional[list] = None,
+        verdicts: Optional[list] = None,
+    ) -> dict:
+        """Distil a PriorSessionContext recap of a FINISHED conversation so the backend can seed
+        the NEXT session's `POST /intake` with it (one conversation → the next). The service stays
+        stateless: the backend assembles `transcript` + `verdicts` and posts them. As a convenience
+        for the all-Python dev flow, when both are omitted and `parent_session_id` is still a live
+        task in this process, its discussion transcript + intake turns + gate verdicts are used."""
+        if not (parent_session_id or "").strip():
+            raise ApiError(400, "'session_id' (the parent session to summarize) is required")
+        if transcript is None and verdicts is None:
+            task = self._tasks.get(parent_session_id)
+            if task is not None:
+                # Same reshape the archivist uses: discussion turns + the user's own intake turns.
+                transcript = list(task.roundtable_transcript) + _intake_user_turns(task.conversation)
+                verdicts = task.last_verdicts
+        content = await factory.get_llm().summarize_handoff(
+            transcript=transcript or [], verdicts=verdicts or [])
+        return PriorSessionContext(parent_session_id=parent_session_id, **content).model_dump()
 
-        kept: list[SkillCandidate] = []
-        for d in decisions:
-            label = (d.get("label") or "").lower()
-            if label not in ("positive", "negative", "ignore"):
-                raise ApiError(400, "label must be positive, negative, or ignore")
-            if label == "ignore":
-                continue
-            stored = task.skill_candidates.get(d.get("candidate_id"))
-            if stored is None:
-                continue  # unknown / already-resolved candidate id
-            candidate = SkillCandidate(**stored)
-            # The user's label is the final classification; an explicit platform re-scopes.
-            kept.append(candidate.model_copy(update={
-                "suggested_kind": label,
-                "platform": d.get("platform") or candidate.platform,
-            }))
-
-        store = factory.get_store()
-        prior = await store.get_user_skills(user_id=user_id)
-        merged = await factory.get_llm().consolidate_skills(
-            kept=kept, prior_rules=prior.rules if prior else [],
+    async def say(self, task_id: str, table_id: str, text: str, interrupt: bool = False) -> dict:
+        """Enqueue one user "raise hand" utterance for a roundtable table (§1 decision 4).
+        Keyed by (task_id, table_id) and persisted via the store, so a runner — even in
+        another process — picks it up at the next round boundary. The roundtable stage is
+        not yet driven from this service (Phase 6), so this only enqueues; it does not
+        require a registered task here."""
+        if not (text or "").strip():
+            raise ApiError(400, "'text' is required")
+        if not (table_id or "").strip():
+            raise ApiError(400, "'table_id' is required")
+        pending = await push_utterance(
+            factory.get_store(), task_id=task_id, table_id=table_id, text=text, interrupt=interrupt
         )
-        doc = await store.upsert_user_skills(user_id=user_id, rules=merged)
-        return {"skill_doc": doc.model_dump(mode="json")}
+        _notify_user_gate(task_id, table_id)  # wake a seat that's waiting for this delivery
+        return {"task_id": task_id, "table_id": table_id, "queued": True, "pending": pending}
+
+    async def raise_hand(self, task_id: str, table_id: str) -> dict:
+        """The user reserves the next turn on a table (§ Phase 3 refinement). Before each round
+        the manager sees the raised hand and makes the table WAIT for the user's message
+        (up to ROUNDTABLE_USER_TURN_TIMEOUT) instead of converging without them."""
+        if not (table_id or "").strip():
+            raise ApiError(400, "'table_id' is required")
+        _raise_user_hand(task_id, table_id)
+        return {"task_id": task_id, "table_id": table_id, "hand_raised": True}
+
+    async def run_roundtable(
+        self, inputs: dict, platform: str, *, task_id: Optional[str] = None, max_rounds=None,
+        background: bool = False,
+    ) -> dict:
+        """Run the discussion stage for ONE named `platform` to convergence, streaming each turn as
+        an `agent_utterance` event and the converged result as a `discussion_consensus` event over
+        the SAME SSE channel as the workflow (`GET /tasks/{id}/events`). The single sibling of
+        `run_roundtables` (which fans out over EVERY target platform). This is the discussion stage
+        on its own — it does not chain into the generation pipeline. The task record holds no MAF
+        workflow (None); it is an event sink. `background=True` (the HTTP route) spawns the run and
+        returns a `running` snapshot immediately; the consensus then arrives over SSE and is
+        readable via `GET /tasks/{id}`."""
+        task_id = task_id or f"rt-{uuid.uuid4().hex[:12]}"
+        if task_id in self._tasks:
+            raise ApiError(409, f"task_id already exists: {task_id}")
+        brief = _brief_from_inputs(inputs)
+        task = _Task(task_id, None, brief)  # event sink only; no generation workflow
+        self._tasks[task_id] = task
+
+        async def _go() -> dict:
+            result = await run_table(
+                platform, brief, task_id=task_id, max_rounds=max_rounds,
+                on_event=lambda ev: self._publish(task, ev),
+            )
+            task.outputs[platform] = result.consensus.model_dump()
+            task.status = "completed"
+            task.done = True
+            for q in list(task.subscribers):  # consensus is the last event — close live streams
+                q.put_nowait(_STREAM_DONE)
+            return {"task_id": task_id, "platform": platform,
+                    "consensus": result.consensus.model_dump()}
+
+        if background:
+            task.runner = asyncio.create_task(self._run_guarded(task, _go(), reraise=False))
+            return {"task_id": task_id, "platform": platform, "status": "running"}
+        return await self._run_guarded(task, _go(), reraise=True)
+
+    async def run_roundtables(
+        self, inputs: dict, *, task_id: Optional[str] = None, max_rounds=None,
+        background: bool = False,
+    ) -> dict:
+        """Fan-out sibling of `run_roundtable`: run one table per `target_platforms` CONCURRENTLY,
+        all streaming onto the same SSE channel (events stay separable by `table_id`). One
+        consensus per platform is returned and recorded on the task. `background=True` returns a
+        `running` snapshot immediately; the per-platform consensuses arrive over SSE and via
+        `GET /tasks/{id}`."""
+        task_id = task_id or f"rt-{uuid.uuid4().hex[:12]}"
+        if task_id in self._tasks:
+            raise ApiError(409, f"task_id already exists: {task_id}")
+        brief = _brief_from_inputs(inputs)
+        task = _Task(task_id, None, brief)  # event sink only; no generation workflow
+        self._tasks[task_id] = task
+
+        async def _go() -> dict:
+            results = await run_tables(
+                brief, task_id=task_id, max_rounds=max_rounds,
+                on_event=lambda ev: self._publish(task, ev),
+            )
+            for r in results:
+                task.outputs[r.consensus.platform] = r.consensus.model_dump()
+            task.status = "completed"
+            task.done = True
+            for q in list(task.subscribers):
+                q.put_nowait(_STREAM_DONE)
+            return {"task_id": task_id,
+                    "consensuses": [r.consensus.model_dump() for r in results]}
+
+        if background:
+            task.runner = asyncio.create_task(self._run_guarded(task, _go(), reraise=False))
+            return {"task_id": task_id, "status": "running"}
+        return await self._run_guarded(task, _go(), reraise=True)
 
     async def get(self, task_id: str) -> dict:
         return self._snapshot(self._require(task_id))
+
+    def get_final_draft(self, task_id: str, platform: str) -> Optional[dict]:
+        """The FinalDraft dict (including `video_storyboard`) media_producer already
+        produced for one platform of a task, or None if that platform hasn't reached
+        the workflow's output node yet. Used by VideoService.start so the render
+        trigger only needs {task_id, platform} — never a full storyboard round-trip."""
+        return self._require(task_id).outputs.get(platform)
 
     def buffered_events(self, task_id: str) -> list[dict]:
         """Non-blocking snapshot of the §7.2 event log so far (the SSE replay
@@ -368,7 +687,10 @@ class WorkflowService:
 
     async def events(self, task_id: str):
         """Async generator of §7.2 events for SSE: replays the buffer, then follows
-        live until the task completes."""
+        live until the task completes. Yields `None` (a heartbeat) every 15s of
+        inactivity so the route can keep the connection alive — an idle proxy/browser
+        timeout would otherwise force a reconnect, which replays the whole buffer and
+        can re-trigger a client's already-handled side effects."""
         task = self._require(task_id)
         q: asyncio.Queue = asyncio.Queue()
         task.subscribers.append(q)
@@ -380,7 +702,12 @@ class WorkflowService:
             if task.done:
                 return
             while True:
-                ev = await q.get()
+                # ev = await q.get()
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield None
+                    continue
                 if ev is _STREAM_DONE:
                     return
                 if id(ev) in seen:
@@ -407,13 +734,18 @@ class IntakeService:
         return session
 
     async def start(
-        self, mode: str, session_id: str, opening_input: Optional[str], user_id: Optional[str] = None
+        self, mode: str, session_id: str, opening_input: Optional[str],
+        user_id: Optional[str] = None, target_platforms: Optional[list] = None,
+        prior_context: Optional[dict] = None,
     ) -> dict:
         if mode not in ("voice", "text"):
             raise ApiError(400, "mode must be 'voice' or 'text'")
+        # Validate the optional prior-session recap here (400 on malformed); None / empty → fresh.
+        prior = _prior_context_from_payload(prior_context)
         session = build_intake(mode)
-        result = await session.start(session_id, opening_input, user_id=user_id)
-        print(result)
+        result = await session.start(
+            session_id, opening_input, user_id=user_id, target_platforms=target_platforms,
+            prior_context=prior)
         self._sessions[session_id] = session
         return {"intake_mode": mode, **result}
 
@@ -441,16 +773,15 @@ class IntakeService:
 
 class MediaService:
     """Async wrapper over the post-approval media generators, exposed as standalone
-    endpoints for the backend's "Brand Animation" + "Brand Video" content types.
+    endpoints for the backend's "Brand Animation" content type (one-shot, outside the
+    full workflow). Video storyboard generation has no standalone path — it is always
+    tied to an approved per-platform draft (media_producer's role); see VideoService
+    for the actual render trigger, which reads the storyboard the workflow already
+    produced rather than generating one from a free-text brief.
 
-    Both reach the LLM through `factory.get_llm()`, so they honour the same Azure ↔ mock
-    toggle as the workflow. The animated HTML card is synchronous; the video returns a
-    structured `BrandVideoProps` spec (this service does not render an MP4 — that stays
-    external), tracked under a job id so the backend's poll-then-show flow works unchanged.
+    Reaches the LLM through `factory.get_llm()`, so it honours the same Azure ↔ mock
+    toggle as the workflow.
     """
-
-    def __init__(self) -> None:
-        self._video_jobs: dict[str, dict] = {}
 
     async def generate_text(
         self, prompt: str, platform: str = "linkedin", history: Optional[list] = None
@@ -478,26 +809,42 @@ class MediaService:
         )
         return {"html": html}
 
-    async def start_video(self, brief: str, history: Optional[list] = None) -> dict:
-        if not brief.strip():
-            raise ApiError(400, "'brief' is required")
-        prior = _normalize_history(history)
-        job_id = uuid.uuid4().hex
-        try:
-            props = await factory.get_llm().generate_video_props(
-                topic=brief, draft=brief, tone_hint=None, skill=load_skill("brand_video"),
-                history=prior,
-            )
-            self._video_jobs[job_id] = {"status": "done", "props": props, "error": None}
-        except Exception as exc:  # surface generation failures to the backend poll
-            self._video_jobs[job_id] = {"status": "error", "props": None, "error": str(exc)}
-        return {"job_id": job_id, "status": self._video_jobs[job_id]["status"]}
+class VideoService:
+    """Async wrapper over the video render pipeline (workflow/video/). Reads the
+    storyboard media_producer already attached to a finished platform's FinalDraft
+    (via WorkflowService.get_final_draft) and triggers an explicit, separately
+    polled render job — never re-generates a storyboard from a raw brief, and never
+    blocks the request on the render itself (45+ seconds locally)."""
 
-    def video_job(self, job_id: str) -> dict:
-        job = self._video_jobs.get(job_id)
+    def __init__(self, *, workflow: WorkflowService) -> None:
+        self._workflow = workflow
+
+    async def start(self, task_id: str, platform: str) -> dict:
+        draft = self._workflow.get_final_draft(task_id, platform)
+        if draft is None:
+            raise ApiError(404, f"no finished draft for platform '{platform}' on task {task_id}")
+        storyboard = draft.get("video_storyboard")
+        if not storyboard:
+            raise ApiError(409, f"platform '{platform}' has no video storyboard yet")
+        doc = await start_render_job(
+            task_id=task_id, platform=platform, storyboard=StoryboardSpec(**storyboard),
+        )
+        return {"job_id": doc["id"], "status": doc["status"]}
+
+    async def get(self, job_id: str) -> dict:
+        job = await get_render_job(job_id=job_id)
         if job is None:
             raise ApiError(404, f"unknown video job: {job_id}")
-        return {"job_id": job_id, **job}
+        return job
+
+    async def download_path(self, job_id: str) -> Path:
+        job = await self.get(job_id)
+        if job["status"] != "done" or not job.get("output_path"):
+            raise ApiError(409, f"video job {job_id} is not done yet (status={job['status']})")
+        path = Path(job["output_path"])
+        if not path.is_file():
+            raise ApiError(404, f"rendered file for job {job_id} is missing on disk")
+        return path
 
 
 def _verdict_from_payload(payload: dict) -> HumanVerdict:
@@ -532,9 +879,18 @@ class StartTaskRequest(BaseModel):
     user_id: Optional[str] = Field(None, description="End-user id; required to persist per-user learned skills")
     tone_hint: Optional[str] = None
     route: Optional[str] = "direct_generation"
-    task_id: Optional[str] = Field(None, description="Caller-supplied id; auto-generated if omitted")
+    content_types: Optional[list[str]] = Field(
+        None, description="Which deliverables to produce, any combination of "
+        "'text' (post copy) / 'brand' (animated HTML card; 'html' accepted as an alias) / "
+        "'video' (BrandVideoProps spec). "
+        "Omitted → ['text'] (brand & video are off unless listed; text is always produced).")
     session_id: Optional[str] = Field(
-        None, description="Intake session id; its transcript is threaded in for per-user learning")
+        None, description="The conversation id from the intake session (e.g. sess-…). The workflow "
+        "run and every /tasks/{id}/* op key on it, so intake + generation share ONE id. Its intake "
+        "transcript is also threaded in for per-user learning.")
+    task_id: Optional[str] = Field(
+        None, description="Deprecated alias for session_id (back-compat); used only when session_id "
+        "is omitted. Auto-generated if both are absent.")
 
 
 class VerdictPayload(BaseModel):
@@ -550,38 +906,84 @@ class ReviewRequest(BaseModel):
         default_factory=dict, description="Map of platform -> verdict; resume the human gate")
 
 
-class TagPayload(BaseModel):
+class RaiseHandRequest(BaseModel):
+    """Reserve the next user turn on a table (POST /tasks/{id}/raise-hand) so the discussion
+    waits for the user's message instead of converging first."""
     model_config = ConfigDict(extra="allow")
 
-    kind: Optional[str] = Field(None, description="must_do | must_avoid")
-    rule: Optional[str] = None
-    keep: bool = False
+    table_id: str = Field(..., description="The table/platform to reserve a turn on")
 
 
-class ArchiveTagsRequest(BaseModel):
-    tags: list[TagPayload] = Field(default_factory=list)
-
-
-class DecisionPayload(BaseModel):
+class SayRequest(BaseModel):
+    """One user utterance into a roundtable table (POST /tasks/{id}/say). Mirrors
+    UserUtterance; task_id comes from the path. `interrupt` jumps the backlog. Sending also
+    wakes a seat that is waiting on a prior raise-hand."""
     model_config = ConfigDict(extra="allow")
 
-    candidate_id: str = Field(..., description="id of the SkillCandidate from learn-summarize")
-    label: str = Field(..., description="positive | negative | ignore")
-    platform: Optional[str] = Field(None, description="Optional override of the inferred platform")
+    table_id: str = Field(..., description="The table/platform this utterance is for")
+    text: str = Field(..., description="The user's words, relayed verbatim into the discussion")
+    interrupt: bool = Field(False, description="Prioritise ahead of the non-interrupt backlog")
 
 
-class LearnCommitRequest(BaseModel):
-    decisions: list[DecisionPayload] = Field(
-        default_factory=list, description="Per-candidate three-way verdicts to consolidate + persist")
+class ConfirmLearningRequest(BaseModel):
+    """The extra confirmation round: should THIS conversation be learned? On `learn=true`
+    both the brand-voice and per-user loops fire (POST /tasks/{id}/confirm-learning)."""
+    learn: bool = Field(True, description="True to learn from this conversation, False to skip")
+
+
+class RoundtableRequest(BaseModel):
+    """Start the standalone roundtable discussion stage. `POST /roundtable` runs ONE table
+    (`platform`, defaulting to the first target platform); `POST /roundtables` fans out one table
+    per `target_platforms`. Both stream `agent_utterance` + `discussion_consensus` over
+    `GET /tasks/{id}/events` (separable by `table_id`) and are background-driven (the POST returns a
+    `running` snapshot; results arrive over SSE and via `GET /tasks/{id}`)."""
+    model_config = ConfigDict(extra="allow")
+
+    topic: Optional[str] = Field(None, description="What the discussion is about (required)")
+    target_platforms: Optional[list[str]] = Field(
+        None, description="Platforms to debate, e.g. ['linkedin','instagram'] (required)")
+    platform: Optional[str] = Field(
+        None, description="/roundtable only: the single table to run; defaults to the first "
+        "target platform. Ignored by /roundtables.")
+    user_intent: Optional[str] = None
+    business_id: Optional[str] = Field(None, description="Brand id; seeds the brand-voice persona")
+    user_id: Optional[str] = Field(None, description="End-user id; seeds the user-advocate persona")
+    tone_hint: Optional[str] = None
+    max_rounds: Optional[int] = Field(None, description="Per-table round cap (default ROUNDTABLE_MAX_ROUNDS)")
+    task_id: Optional[str] = Field(None, description="Event-channel id; auto-generated (rt-…) if absent")
 
 
 class IntakeStartRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
     mode: str = Field(..., description="voice | text")
     session_id: str
     opening_input: Optional[str] = None
     user_id: Optional[str] = Field(None, description="End-user id; tags the session for per-user learning")
-    
-    model_config = ConfigDict(populate_by_name=True)
+    target_platforms: Optional[list[str]] = Field(
+        None, description="Platforms chosen by the backend (e.g. ['linkedin','instagram']). Seeded "
+        "into the brief so intake never asks about platforms — only the topic/goal are inferred.")
+    prior_context: Optional[dict] = Field(
+        None, description="Recap of an earlier session this conversation continues (a "
+        "PriorSessionContext from POST /summarize-handoff). Its presence means 'continue that "
+        "thread' — it folds a 前情提要 block into the intake prompt; absent (or content-free) is a "
+        "fresh conversation. Must carry a `parent_session_id`; malformed → 400.")
+
+
+class SummarizeHandoffRequest(BaseModel):
+    """Distil a finished conversation into a PriorSessionContext the backend seeds into the next
+    session's POST /intake. `transcript`/`verdicts` are assembled by the backend (the service is
+    stateless); if both are omitted and `session_id` is still a live task here, that run's data
+    is used (dev convenience)."""
+    model_config = ConfigDict(extra="allow")
+
+    session_id: str = Field(..., description="The PARENT session to summarize; becomes "
+                            "prior_context.parent_session_id")
+    transcript: Optional[list] = Field(
+        None, description="Prior conversation turns ([{role|speaker, text, platform?}]) assembled "
+        "by the backend")
+    verdicts: Optional[list] = Field(
+        None, description="The user's gate verdicts ([{platform, decision, edited_draft?, reason?}])")
 
 
 class IntakeTurnRequest(BaseModel):
@@ -610,9 +1012,8 @@ class GenerateHtmlRequest(BaseModel):
     history: Optional[list] = _HISTORY_FIELD
 
 
-class GenerateVideoRequest(BaseModel):
-    brief: str = Field(..., description="Brand brief for the BrandVideoProps spec")
-    history: Optional[list] = _HISTORY_FIELD
+class RenderVideoRequest(BaseModel):
+    platform: str = Field(..., description="Which finished platform draft's storyboard to render")
 
 
 # ── Dependencies: pull the per-app service singletons off app.state ───────────
@@ -629,11 +1030,18 @@ def _media(request: Request) -> MediaService:
     return request.app.state.media
 
 
+def _video(request: Request) -> VideoService:
+    return request.app.state.video
+
+
 # ── Routers ───────────────────────────────────────────────────────────────────
 
 tasks_router = APIRouter(prefix="/tasks", tags=["tasks"])
 intake_router = APIRouter(prefix="/intake", tags=["intake"])
 media_router = APIRouter(tags=["media"])
+handoff_router = APIRouter(tags=["handoff"])
+roundtable_router = APIRouter(tags=["roundtable"])
+video_jobs_router = APIRouter(prefix="/video-jobs", tags=["video"])
 
 
 @tasks_router.post("", summary="Start a workflow run from a brief")
@@ -642,10 +1050,16 @@ async def start_task(request: Request, body: StartTaskRequest) -> dict:
     # Drop unset/None fields so the service's defaults apply (the raw-dict contract:
     # an absent user_intent means "", not None).
     inputs = body.model_dump(exclude_none=True)
+    # One conversation == one session: the backend passes the SAME id it used for the
+    # intake session, so this workflow run (and every /tasks/{id}/* op) keys on it.
+    # `task_id` stays a fallback alias; absent both, the service auto-generates one.
+    conversation_id = body.session_id or body.task_id
     # If the brief came from an intake session, thread that transcript in so per-user
     # learning can later summarize the whole conversation (transport-layer wiring).
-    conversation = _intake(request).transcript(body.session_id) if body.session_id else None
-    return await svc.start(inputs, task_id=body.task_id, conversation=conversation)
+    conversation = _intake(request).transcript(conversation_id) if conversation_id else None
+    # Background-drive so the POST returns immediately with a `running` snapshot; progress then
+    # streams live over GET /tasks/{id}/events instead of arriving in one buffered blob.
+    return await svc.start(inputs, task_id=conversation_id, conversation=conversation, background=True)
 
 
 @tasks_router.get("/{task_id}", summary="Snapshot a task (status, outputs, pending gates)")
@@ -660,7 +1074,10 @@ async def task_events(request: Request, task_id: str) -> StreamingResponse:
 
     async def event_stream():
         async for ev in svc.events(task_id):
-            yield f"data: {json.dumps(ev, default=str)}\n\n"
+            # `None` is a heartbeat (see `events()`): an SSE comment line, ignored by
+            # EventSource but enough to keep an idle proxy/browser from timing out the
+            # connection and forcing a reconnect (which replays the whole buffer).
+            yield ": keep-alive\n\n" if ev is None else f"data: {json.dumps(ev, default=str)}\n\n"
 
     return StreamingResponse(
         event_stream(),
@@ -675,33 +1092,77 @@ async def review_task(request: Request, task_id: str, body: ReviewRequest) -> di
     return await _workflow(request).review(task_id, verdicts)
 
 
-@tasks_router.post("/{task_id}/archive-tags", summary="Keep/discard the archivist's proposed rules")
-async def archive_tags(request: Request, task_id: str, body: ArchiveTagsRequest) -> dict:
-    tags = [t.model_dump() for t in body.tags]
-    return await _workflow(request).archive_tags(task_id, tags)
+@tasks_router.post("/{task_id}/confirm-learning", summary="Confirm whether to learn from this conversation")
+async def confirm_learning(request: Request, task_id: str, body: ConfirmLearningRequest) -> dict:
+    return await _workflow(request).confirm_learning(task_id, body.learn)
 
 
-@tasks_router.post("/{task_id}/learn-summarize", summary="Distil per-user skill candidates from the session")
-async def learn_summarize(request: Request, task_id: str) -> dict:
-    return await _workflow(request).learn_summarize(task_id)
+@tasks_router.post("/{task_id}/raise-hand", summary="Reserve the next user turn on a roundtable table")
+async def raise_hand(request: Request, task_id: str, body: RaiseHandRequest) -> dict:
+    return await _workflow(request).raise_hand(task_id, body.table_id)
 
 
-@tasks_router.post("/{task_id}/learn-commit", summary="Consolidate + persist the user's kept skills")
-async def learn_commit(request: Request, task_id: str, body: LearnCommitRequest) -> dict:
-    decisions = [d.model_dump() for d in body.decisions]
-    return await _workflow(request).learn_commit(task_id, decisions)
+@tasks_router.post("/{task_id}/say", summary="Send a user utterance into a roundtable table")
+async def say(request: Request, task_id: str, body: SayRequest) -> dict:
+    return await _workflow(request).say(task_id, body.table_id, body.text, body.interrupt)
+
+
+@handoff_router.post("/summarize-handoff", summary="Distil a finished session into a prior-context recap")
+async def summarize_handoff(request: Request, body: SummarizeHandoffRequest) -> dict:
+    """Returns a PriorSessionContext the backend posts as `prior_context` on the NEXT session's
+    `POST /intake`, threading one conversation into the next while the service stays stateless."""
+    return await _workflow(request).summarize_handoff(
+        body.session_id, transcript=body.transcript, verdicts=body.verdicts)
+
+
+@roundtable_router.post("/roundtable", summary="Run ONE platform's discussion table (streams over /tasks/{id}/events)")
+async def start_roundtable(request: Request, body: RoundtableRequest) -> dict:
+    """Run the discussion stage for a single platform. Returns immediately with a `running`
+    snapshot; watch `GET /tasks/{task_id}/events` for `agent_utterance` turns + the
+    `discussion_consensus` result, or `GET /tasks/{task_id}` for the final consensus."""
+    inputs = body.model_dump(exclude_none=True)
+    platform = inputs.pop("platform", None) or (inputs.get("target_platforms") or [None])[0]
+    max_rounds = inputs.pop("max_rounds", None)
+    task_id = inputs.pop("task_id", None)
+    if not platform:
+        raise ApiError(400, "a 'platform' (or a non-empty target_platforms) is required")
+    # Seed target_platforms from the single platform so the brief validates even if only `platform`
+    # was given (the brief always needs a non-empty target_platforms).
+    inputs.setdefault("target_platforms", [platform])
+    return await _workflow(request).run_roundtable(
+        inputs, platform, task_id=task_id, max_rounds=max_rounds, background=True)
+
+
+@roundtable_router.post("/roundtables", summary="Fan out one discussion table per target platform")
+async def start_roundtables(request: Request, body: RoundtableRequest) -> dict:
+    """Run one discussion table per `target_platforms`, concurrently. Returns immediately with a
+    `running` snapshot; the per-platform consensuses stream over `GET /tasks/{task_id}/events`
+    (separable by `table_id`) and are readable via `GET /tasks/{task_id}`."""
+    inputs = body.model_dump(exclude_none=True)
+    inputs.pop("platform", None)
+    max_rounds = inputs.pop("max_rounds", None)
+    task_id = inputs.pop("task_id", None)
+    return await _workflow(request).run_roundtables(
+        inputs, task_id=task_id, max_rounds=max_rounds, background=True)
+
+
+@tasks_router.post(
+    "/{task_id}/render-video",
+    summary="Render the MP4 for one platform's already-produced video storyboard",
+)
+async def render_video(request: Request, task_id: str, body: RenderVideoRequest) -> dict:
+    return await _video(request).start(task_id, body.platform)
 
 
 @intake_router.post("", summary="Open an intake conversation (voice or text)")
 async def intake_start(request: Request, body: IntakeStartRequest) -> dict:
-    print("RAW BODY:", body.model_dump())
-    print("SESSION ID FIELD:", body.session_id)
-
     return await _intake(request).start(
         mode=body.mode,
         session_id=body.session_id,
         opening_input=body.opening_input,
         user_id=body.user_id,
+        target_platforms=body.target_platforms,
+        prior_context=body.prior_context,
     )
 
 @intake_router.post("/{session_id}/turn", summary="Send one user turn to an intake session")
@@ -749,14 +1210,15 @@ async def generate_html(request: Request, body: GenerateHtmlRequest) -> dict:
     return await _media(request).generate_html(body.prompt, body.history)
 
 
-@media_router.post("/generate-video", summary="Start a BrandVideoProps spec job")
-async def generate_video(request: Request, body: GenerateVideoRequest) -> dict:
-    return await _media(request).start_video(body.brief, body.history)
+@video_jobs_router.get("/{job_id}", summary="Poll a video render job")
+async def get_video_job(request: Request, job_id: str) -> dict:
+    return await _video(request).get(job_id)
 
 
-@media_router.get("/jobs/{job_id}", summary="Poll a video-spec job")
-async def video_job(request: Request, job_id: str) -> dict:
-    return _media(request).video_job(job_id)
+@video_jobs_router.get("/{job_id}/download", summary="Download the finished MP4")
+async def download_video_job(request: Request, job_id: str) -> FileResponse:
+    path = await _video(request).download_path(job_id)
+    return FileResponse(path, media_type="video/mp4", filename=f"{job_id}.mp4")
 
 
 # ── App factory ────────────────────────────────────────────────────────────────
@@ -766,6 +1228,7 @@ def create_app(
     service: Optional[WorkflowService] = None,
     intake: Optional[IntakeService] = None,
     media: Optional[MediaService] = None,
+    video: Optional[VideoService] = None,
 ) -> FastAPI:
     """Build the FastAPI app. Tests inject custom service instances; production uses
     fresh defaults wired to the toggle-resolved factory backends."""
@@ -778,6 +1241,7 @@ def create_app(
     app.state.workflow = service or WorkflowService()
     app.state.intake = intake or IntakeService()
     app.state.media = media or MediaService()
+    app.state.video = video or VideoService(workflow=app.state.workflow)
 
     @app.exception_handler(ApiError)
     async def _api_error_handler(_request: Request, exc: ApiError) -> JSONResponse:
@@ -790,6 +1254,9 @@ def create_app(
     app.include_router(tasks_router)
     app.include_router(intake_router)
     app.include_router(media_router)
+    app.include_router(handoff_router)
+    app.include_router(roundtable_router)
+    app.include_router(video_jobs_router)
     return app
 
 
