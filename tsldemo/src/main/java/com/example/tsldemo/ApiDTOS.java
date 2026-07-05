@@ -21,6 +21,9 @@ public class ApiDTOS {
 
         @JsonProperty("user_id")
         private String userId;
+        
+        @JsonProperty("prior_context")
+        private String priorContext;
 
     }
 	
@@ -57,5 +60,105 @@ public class ApiDTOS {
 	    Boolean complete
 		    
 	) {}
+	
+	public static class CreativeBrief {
+		String topic;
+		
+		@JsonProperty("target_platforms")
+		String[] targetPlatforms;
+
+		@JsonProperty("user_intent")
+		String userIntent;
+		
+		@JsonProperty("tone_hint")
+		String toneHint;
+		
+		@JsonProperty("business_id")
+		String businessId;
+		
+		@JsonProperty("user_id")
+		String userId;
+		
+		String route;
+		
+		@JsonProperty("intake_mode")
+		String intakeMode;
+		
+		@JsonProperty("prior_context")
+		String priorContext;
+		
+	}
+	
+	//TODO: Move the related api classes to related files to avoid littering this file
+	public static class TaskStatus {
+
+	    @JsonProperty("task_id")
+	    public String taskId;
+
+	    public String status;
+
+	    public PendingItem[] pending;
+
+	    public OutputItem[] outputs;
+
+	    @JsonProperty("proposed_rules")
+	    public ProposedRule[] proposedRules;
+
+	    public static class PendingItem {
+	        @JsonProperty("request_id")
+	        public String requestId;
+
+	        public String platform;
+	        public String draft;
+	        public String comment;
+
+	        @JsonProperty("needs_human_intervention")
+	        public boolean needsHumanIntervention;
+	    }
+
+	    public static class OutputItem {
+	        public String platform;
+	        public String draft;
+	        public String decision;
+	        public String comment;
+
+	        @JsonProperty("needs_human_intervention")
+	        public boolean needsHumanIntervention;
+
+	        @JsonProperty("proposed_rules")
+	        public ProposedRule[] proposedRules;
+
+	        @JsonProperty("content_types")
+	        public String[] contentTypes;
+
+	        @JsonProperty("html_card")
+	        public String htmlCard;
+
+	        @JsonProperty("video_storyboard")
+	        public VideoStoryboard videoStoryboard;
+	    }
+
+	    public static class VideoStoryboard {
+	        @JsonProperty("brandName")
+	        public String brandName;
+
+	        public Slide[] slides;
+	    }
+
+	    public static class Slide {
+	        @JsonProperty("type")
+	        public String type;
+
+	        @JsonProperty("content")
+	        public Object content;
+	    }
+
+	    public static class ProposedRule {
+	        public String kind;
+	        public String rule;
+	        public String rationale;
+	    }
+	}
+
 	
 }
