@@ -12,10 +12,12 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.client.RestClient;
 
 import com.example.tsldemo.ApiDTOS;
+import com.example.tsldemo.ApiDTOS.CreativeBrief;
 import com.example.tsldemo.ApiDTOS.IntakeRequest;
 import com.example.tsldemo.ApiDTOS.IntakeResponse;
 import com.example.tsldemo.Business;
@@ -55,7 +57,7 @@ public class SessionService {
                 .retrieve()
                 .body(IntakeResponse.class);
                 
-        //Remove if being saved by frontend
+        System.out.println(intakeResp.assistantMessage);
         Message userPrompt = new Message("user", intakeDTO.openingInput);
         Message openingMessage = new Message("assistant",intakeResp.assistantMessage);
         
@@ -90,6 +92,14 @@ public class SessionService {
                 .body(ApiDTOS.IntakeTurnResponse.class);
     	
     }
+    
+    public CreativeBrief getCreativeBrief(String sessionId) {
+        return restClient.get()
+                .uri(llmServiceBaseUrl + "/intake/" + sessionId + "/brief")
+                .retrieve()
+                .body(CreativeBrief.class);
+    }
+
     
 	public void addSession(Session s) {
 		repo.save(s);
