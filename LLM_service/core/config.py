@@ -202,6 +202,12 @@ class Settings:
     # How long the table waits for a user who raised a hand to actually send their message
     # before proceeding without them (seconds) — bounds the "stop and wait for the user" pause.
     roundtable_user_turn_timeout: float = 300.0
+    # Step mode (roundtable_mode: "manual" on POST /tasks|/roundtable[s]): how long each round's
+    # 4-way prompt (next / speak / enough / auto) waits for POST /tasks/{id}/round-control before
+    # the table goes hands-off (sticky auto) — an absent user degrades to the normal flow, never
+    # a hung table. The default mode is "auto" (no prompts), so this only bites when the caller
+    # explicitly asked to be prompted.
+    roundtable_control_timeout: float = 300.0
     # Per-user learning write-back from the roundtable (transcript + interjections + verdict).
     # LEARNING_ENABLED=false still READS stored skills but writes none (regression/isolation).
     learning_enabled: bool = True
@@ -373,6 +379,7 @@ def _load() -> Settings:
         roundtable_persona_endpoint=os.getenv("AZURE_PERSONA_ENDPOINT"),
         roundtable_persona_api_key=os.getenv("AZURE_PERSONA_API_KEY"),
         roundtable_user_turn_timeout=_env_float("ROUNDTABLE_USER_TURN_TIMEOUT", 300.0),
+        roundtable_control_timeout=_env_float("ROUNDTABLE_CONTROL_TIMEOUT", 300.0),
         learning_enabled=True if learning is None else learning,
         trend_scout_enabled=bool(_env_bool("TREND_SCOUT_ENABLED")),
         trend_scout_limit=_env_int("TREND_SCOUT_LIMIT", 6),

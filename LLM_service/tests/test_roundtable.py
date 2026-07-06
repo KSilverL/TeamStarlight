@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from LLM_service.core.config import reset_settings
 from LLM_service.core.services import factory
 from LLM_service.core.services.mock import (
@@ -26,15 +28,21 @@ from LLM_service.workflow import Brief
 from LLM_service.workflow.executors.strategist import plan_strategies
 from LLM_service.workflow.messages import CreativeStrategy
 from LLM_service.workflow.roundtable import (
+    AUTO,
+    ENOUGH,
+    NEXT,
     RoundtableConsensus,
+    await_decision,
     build_persona_context,
     build_personas,
     has_pending,
+    is_auto,
     notify,
     push_utterance,
     raise_hand,
     run_table,
     run_tables,
+    submit_decision,
 )
 from LLM_service.core.trend_schema import Trend
 from LLM_service.workflow.roundtable.personas import (
@@ -594,3 +602,199 @@ async def test_llm_manager_yields_to_user_on_raised_hand():
         lower_hand("t-llm-hand", PLATFORM)
 
     assert ledger.next_speaker.answer == USER_SEAT_NAME
+
+
+# ── Step mode (每轮 4 选 1): per-round user control ─────────────────────────────
+# `roundtable_mode: "manual"` pauses each table at every round boundary for the user's
+# 4-way choice — next / speak / enough / auto — answered via POST /tasks/{id}/round-control.
+# Default stays "auto" (hands-off), so nothing here changes the existing contract.
+
+def _step_inputs(**over) -> dict:
+    return {
+        "topic": "spring single-origin coffee launch",
+        "target_platforms": over.get("platforms", [PLATFORM]),
+        "business_id": ROUNDTABLE_FIXTURE_BUSINESS_ID,
+        "user_id": ROUNDTABLE_FIXTURE_USER_ID,
+        **{k: v for k, v in over.items() if k != "platforms"},
+    }
+
+
+def _enable_roundtable(monkeypatch, max_rounds: int = 3) -> None:
+    monkeypatch.setenv("ROUNDTABLE_ENABLED", "true")
+    monkeypatch.setenv("ROUNDTABLE_MAX_ROUNDS", str(max_rounds))
+    reset_settings()
+    factory.reset_services()
+
+
+async def test_control_primitives_submit_await_and_timeout():
+    """The decision slot is latest-wins and consumed once; an unanswered wait times out to
+    STICKY auto, so an absent user can never hang a table."""
+    submit_decision("t-ctl", PLATFORM, NEXT)
+    assert await await_decision("t-ctl", PLATFORM, timeout=1) == NEXT
+    assert is_auto("t-ctl", PLATFORM) is False
+    # Consumed — the next wait sees no decision and times out to hands-off (sticky).
+    assert await await_decision("t-ctl", PLATFORM, timeout=0.01) == AUTO
+    assert is_auto("t-ctl", PLATFORM) is True
+    # Sticky: no waiting at all any more.
+    assert await await_decision("t-ctl", PLATFORM, timeout=5) == AUTO
+
+    with pytest.raises(ValueError):
+        submit_decision("t-ctl", PLATFORM, "banana")
+
+
+async def test_enough_converges_early_with_partial_consensus():
+    """Choosing "enough" ends the debate at that boundary: the manager returns a satisfied
+    ledger and prepare_final_answer synthesizes the consensus from what was said — a genuine
+    convergence (converged=True), not the round-cap sentinel."""
+    async def before_round(table_id: str, round_index: int) -> None:
+        if round_index == 2:  # one persona has spoken; the user has heard enough
+            submit_decision("t-enough", table_id, ENOUGH)
+
+    result = await run_table(PLATFORM, _brief(), task_id="t-enough", max_rounds=6,
+                             before_round=before_round)
+
+    assert len(result.consensus.transcript) == 1   # exactly the one turn before "enough"
+    assert result.consensus.converged is True
+    assert result.consensus.strategy.strategies[PLATFORM]
+
+
+async def test_step_mode_inline_start_speak_then_enough(monkeypatch):
+    """The HTTP step-mode path end-to-end at the service layer: manual mode pauses every round
+    boundary after the first (nothing to read before anyone spoke), emits a `round_control`
+    "waiting" event, and resumes on the /round-control answer. Scripted here: speak (text rides
+    along → the mic goes to the user next round) then enough (converge now); the run then
+    continues to the human gate as usual."""
+    _enable_roundtable(monkeypatch, max_rounds=6)
+    from LLM_service.api import WorkflowService
+
+    svc = WorkflowService()
+    task_id = "rt-step"
+    script = [
+        {"action": "speak", "text": "please mention fair-trade sourcing"},
+        {"action": "enough"},
+    ]
+
+    def listener(ev):
+        if ev.get("type") == "round_control" and ev.get("status") == "waiting":
+            step = script.pop(0)
+            asyncio.get_running_loop().create_task(
+                svc.round_control(task_id, ev["table_id"], step["action"], step.get("text")))
+
+    snap = await svc.start(_step_inputs(roundtable_mode="manual"),
+                           task_id=task_id, event_listener=listener)
+
+    events = svc.buffered_events(task_id)
+    utts = [e for e in events if e["type"] == "agent_utterance"]
+    assert len(utts) == 2
+    assert utts[0]["role"] != "user"                    # round 1: a persona spoke first
+    assert utts[1]["role"] == "user"                    # "speak" took the mic next round
+    assert "fair-trade" in utts[1]["text"]
+
+    ctl = [e for e in events if e["type"] == "round_control"]
+    assert [e["status"] for e in ctl] == ["waiting", "resolved", "waiting", "resolved"]
+    assert [e["action"] for e in ctl if e["status"] == "resolved"] == ["speak", "enough"]
+
+    consensus = [e for e in events if e.get("status") == "discussion_consensus"]
+    assert len(consensus) == 1 and consensus[0]["converged"] is True
+    assert snap["status"] == "awaiting_review"          # the text flow still reaches the gate
+
+
+async def test_step_mode_tables_pause_independently(monkeypatch):
+    """Step mode with N tables stays CONCURRENT and per-table: instagram goes hands-off at its
+    first prompt and runs to the round cap, while linkedin is stepped and ended early — one
+    table's enough/auto never touches the other."""
+    _enable_roundtable(monkeypatch, max_rounds=3)
+    from LLM_service.api import WorkflowService
+
+    svc = WorkflowService()
+    task_id = "rt-step-multi"
+
+    def listener(ev):
+        if ev.get("type") == "round_control" and ev.get("status") == "waiting":
+            action = "auto" if ev["table_id"] == "instagram" else "enough"
+            asyncio.get_running_loop().create_task(
+                svc.round_control(task_id, ev["table_id"], action))
+
+    snap = await svc.start(
+        _step_inputs(platforms=["linkedin", "instagram"], roundtable_mode="manual"),
+        task_id=task_id, event_listener=listener)
+
+    events = svc.buffered_events(task_id)
+    li = [e for e in events if e["type"] == "agent_utterance" and e["table_id"] == "linkedin"]
+    ig = [e for e in events if e["type"] == "agent_utterance" and e["table_id"] == "instagram"]
+    assert len(li) == 1                                 # stepped: one turn, then "enough"
+    assert len(ig) == 3                                 # hands-off: runs to the round cap
+
+    ctl = [e for e in events if e["type"] == "round_control"]
+    waiting = [e for e in ctl if e["status"] == "waiting"]
+    assert {e["table_id"] for e in waiting} == {"linkedin", "instagram"}
+    assert len(waiting) == 2                            # exactly one prompt per table
+    assert [e["table_id"] for e in ctl if e["status"] == "auto"] == ["instagram"]
+    assert snap["status"] == "awaiting_review"
+
+
+async def test_step_mode_timeout_degrades_to_hands_off(monkeypatch):
+    """An unanswered prompt times out (ROUNDTABLE_CONTROL_TIMEOUT) into sticky auto: the switch
+    is announced on the stream, no further prompts fire, and the run completes hands-off
+    instead of hanging on an absent client."""
+    _enable_roundtable(monkeypatch, max_rounds=3)
+    monkeypatch.setenv("ROUNDTABLE_CONTROL_TIMEOUT", "0.05")
+    reset_settings()
+    from LLM_service.api import WorkflowService
+
+    svc = WorkflowService()
+    snap = await svc.start(_step_inputs(roundtable_mode="manual"), task_id="rt-step-timeout")
+
+    events = svc.buffered_events("rt-step-timeout")
+    ctl = [e for e in events if e["type"] == "round_control"]
+    assert [e["status"] for e in ctl] == ["waiting", "auto"]  # one prompt, then hands-off
+    assert len([e for e in events if e["type"] == "agent_utterance"]) == 3  # full cap
+    assert snap["status"] == "awaiting_review"
+
+
+async def test_step_mode_default_stays_hands_off(monkeypatch):
+    """Without `roundtable_mode: "manual"` the contract is unchanged: no prompts, no
+    round_control events, tables run to convergence exactly as before (default = auto)."""
+    _enable_roundtable(monkeypatch, max_rounds=3)
+    from LLM_service.api import WorkflowService
+
+    svc = WorkflowService()
+    snap = await svc.start(_step_inputs(), task_id="rt-step-off")
+
+    assert not [e for e in svc.buffered_events("rt-step-off") if e["type"] == "round_control"]
+    assert snap["status"] == "awaiting_review"
+
+
+async def test_step_mode_rejects_bad_mode_and_bad_action():
+    """Service-layer validation: an unknown roundtable_mode 400s before any spawn; an unknown
+    /round-control action 400s; an unknown task 404s."""
+    from LLM_service.api import ApiError, WorkflowService
+
+    svc = WorkflowService()
+    with pytest.raises(ApiError) as e400:
+        await svc.start(_step_inputs(roundtable_mode="sometimes"), task_id="rt-bad-mode")
+    assert e400.value.status == 400
+
+    with pytest.raises(ApiError) as e404:
+        await svc.round_control("rt-nope", PLATFORM, "next")
+    assert e404.value.status == 404
+
+
+async def test_llm_manager_converges_on_enough_without_consulting_the_llm():
+    """Step mode's "enough" on the production manager: the satisfied ledger is returned
+    directly (→ prepare_final_answer synthesizes the consensus) and the LLM ledger call is
+    skipped — the user already made the decision."""
+    from LLM_service.workflow.roundtable.user_seat import USER_SEAT_NAME
+
+    mgr = _interactive_manager("t-llm-enough")
+
+    async def fail_complete(messages):
+        raise AssertionError("LLM must not be consulted once the user ended the discussion")
+
+    mgr._complete = fail_complete
+    submit_decision("t-llm-enough", PLATFORM, ENOUGH)
+
+    ledger = await mgr.create_progress_ledger(_context_with_user())
+
+    assert ledger.is_request_satisfied.answer is True
+    assert ledger.next_speaker.answer != USER_SEAT_NAME   # synthesis never lands on the user seat

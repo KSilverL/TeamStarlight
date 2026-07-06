@@ -167,6 +167,7 @@ async def run_tables(
     user_turn_timeout: Optional[float] = None,
     on_event: Optional[Callable[[dict], None]] = None,
     before_round: Optional["BeforeRound"] = None,
+    sequential: Optional[bool] = None,
 ) -> List[RoundtableResult]:
     """Fan out: one table per target platform, returned in `platforms` order. By default the
     tables run CONCURRENTLY; each has its own `table_id` (== platform), persona set, manager,
@@ -183,9 +184,12 @@ async def run_tables(
     `on_event` may be invoked from any table; asyncio is single-threaded so the sync callback
     (e.g. WorkflowService._publish) runs atomically between awaits — no locking needed.
 
-    `before_round` (the per-round user-interjection hook) is forwarded to each table. When it is
-    set the tables run SEQUENTIALLY — an interactive per-round prompt must own the terminal one
-    table at a time, otherwise concurrent tables would race for the user's input."""
+    `before_round` (the per-round user-interjection hook) is forwarded to each table.
+    `sequential` decides the fan-out shape explicitly; when None (back-compat default) it
+    follows `before_round` — a TERMINAL prompt hook must own the console one table at a time,
+    otherwise concurrent tables would race for the user's input. The HTTP step-mode hook is
+    per-table (keyed by table_id, answered over SSE + POST /round-control), so the service
+    passes sequential=False and each table pauses independently while the others keep running."""
     platforms = platforms if platforms is not None else list(brief.target_platforms)
     context = await build_persona_context(brief)  # read once, shared across tables
 
@@ -196,6 +200,8 @@ async def run_tables(
         )
         return await run_table(platform, brief, build=build, on_event=on_event)
 
-    if before_round is not None:  # interactive: one table at a time so prompts don't interleave
+    if sequential is None:  # back-compat: a terminal prompt hook implies one table at a time
+        sequential = before_round is not None
+    if sequential:
         return [await _one(p) for p in platforms]
     return list(await asyncio.gather(*(_one(p) for p in platforms)))

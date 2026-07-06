@@ -195,6 +195,7 @@ Post a `CreativeBrief` (from intake) or build one directly:
 | `content_types` | string[] | optional | Which deliverables to produce — any combination of `"text"` (post copy), `"brand"` (animated HTML card; `"html"` accepted as an alias), `"video"` (a `StoryboardSpec` video storyboard — data the render pipeline turns into an MP4, see [Video render](#video-render--post-taskstask_idrender-video--get-video-jobsjob_id)). **Omitted → `["text"]`.** Omitting `text` (brand/video only) is a **media-only** run: there is no copy to draft, so the review gate is skipped and the brief goes straight to media generation — the task completes with **no `awaiting_review` step**. Unknown values or an empty list → `400`. |
 | `session_id` | string | recommended | The conversation id from the intake session (e.g. `sess-…`). **Pass the same id you used for `POST /intake`** — the run and every `/tasks/{id}/*` op key on it, so intake + generation are **one session** with one id. Its intake transcript is also threaded in for per-user learning. |
 | `task_id` | string | optional | Deprecated alias for `session_id` (back-compat); used only when `session_id` is omitted. Auto-generated (`task-…`) if both are absent. |
+| `roundtable_mode` | string | optional | Roundtable **step mode**: `"manual"` pauses every table at each round boundary for the user's 4-way choice (a `round_control` SSE event, answered via [`POST /tasks/{id}/round-control`](#post-taskstask_idround-control--step-mode-answer-a-round-prompt)); `"auto"` (**default**) never prompts — today's hands-off flow. Only meaningful when `ROUNDTABLE_ENABLED`; anything else → `400`. |
 
 > **One conversation = one session.** Intake and generation no longer use separate ids — the
 > backend supplies a `session_id` at `POST /intake` and reuses it at `POST /tasks`, so the
@@ -482,6 +483,50 @@ jumps ahead of any backlog. **Response:** `{ "task_id": "...", "table_id": "link
 > This works the same in the inline (`POST /tasks` with `ROUNDTABLE_ENABLED`) path, where the tables
 > run concurrently.
 
+### Step mode — per-round user control (`roundtable_mode: "manual"`)
+
+By default the discussion runs **hands-off** (the passive raise-hand model above). Pass
+`roundtable_mode: "manual"` on `POST /tasks` (or `/roundtable[s]`) and instead **every table pauses
+at every round boundary** — after each utterance, before the next speaker is assigned — and asks the
+user what happens next. That gives the user time to actually read each turn, a natural point to jump
+in, and a way to cut the debate short. A third SSE event `type` drives it:
+
+```
+data: {"type":"round_control","table_id":"linkedin","round_index":3,"status":"waiting",
+       "action":null,"timeout":300.0,"node":"roundtable","phase":"discuss","ts":...}
+```
+
+- `status: "waiting"` — the table is paused, asking for a decision (`timeout` = seconds until it
+  gives up and goes hands-off).
+- `status: "resolved"` — a decision arrived; `action` carries it (`next` / `speak` / `enough`).
+- `status: "auto"` — the table went hands-off (user chose `auto`, **or the wait timed out**); no
+  more prompts will follow for this table.
+
+On a reconnect (the stream replays the buffer) treat a `waiting` as stale iff a later
+`resolved`/`auto` exists for the same `table_id`. The first boundary of each table never prompts
+(nothing has been said yet).
+
+### `POST /tasks/{task_id}/round-control` — step mode: answer a round prompt
+
+```json
+{ "table_id": "linkedin", "action": "next" }
+```
+
+| `action` | Meaning |
+|---|---|
+| `next` | Advance one round — the manager assigns the next persona. |
+| `speak` | The user takes the mic next round. With a `"text"` field the message is enqueued immediately; without one the turn is only **reserved** (raise-hand) and the table waits for `POST /tasks/{id}/say` (up to `ROUNDTABLE_USER_TURN_TIMEOUT`). |
+| `enough` | The discussion is sufficient — the table **converges now**, synthesizing its consensus from what was said so far, and the run proceeds to generation. |
+| `auto` | Hands-off — no more prompts for this table; it runs to natural convergence (raise-hand / say still work). |
+
+**Response:** `{ "task_id": "...", "table_id": "linkedin", "action": "next", "accepted": true }`.
+Unknown `action` → `400`; unknown task → `404`. Decisions are per-table: `enough`/`auto` are
+**sticky** and `next`/`speak` are latest-wins, so answering while the table is still mid-turn is
+safe — it is consumed at the next boundary. Tables stay **concurrent** in step mode; each pauses
+independently, so one table's `enough`/`auto` never affects another. An unanswered prompt times out
+after `ROUNDTABLE_CONTROL_TIMEOUT` (default 300 s) into sticky `auto` — an absent user never hangs
+a run.
+
 ### Standalone discussion runs — `POST /roundtable` / `POST /roundtables`
 
 Run **only** the discussion stage (no drafting/review/media), e.g. to show or debug the debate, or
@@ -506,6 +551,7 @@ stage in `POST /tasks`, these **do not chain into generation** — they stop at 
 | `user_intent` / `tone_hint` | string | optional | brief context |
 | `max_rounds` | int | optional | per-table round cap (default `ROUNDTABLE_MAX_ROUNDS`) |
 | `task_id` | string | optional | the event-channel id; auto-generated (`rt-…`) if absent |
+| `roundtable_mode` | string | optional | `"manual"` = step mode (per-round `round_control` prompts, see above); `"auto"` (default) = hands-off |
 
 Both are **non-blocking**: the response is `{ "task_id": "...", "status": "running", "platform"? }`.
 Watch `GET /tasks/{task_id}/events` for the `agent_utterance` turns + the `discussion_consensus`
@@ -626,7 +672,7 @@ rendered file is missing on disk.
 
 | Code | When |
 |---|---|
-| `400` | Missing/invalid fields (no `topic`, empty `target_platforms`, unknown/empty `content_types`, bad `decision`, `approve_after_edit` without `edited_draft`, `/say` or `/raise-hand` without `table_id`/`text`, `/roundtable` with no resolvable `platform`) |
+| `400` | Missing/invalid fields (no `topic`, empty `target_platforms`, unknown/empty `content_types`, bad `decision`, `approve_after_edit` without `edited_draft`, `/say` or `/raise-hand` without `table_id`/`text`, `/roundtable` with no resolvable `platform`, an unknown `roundtable_mode` or `/round-control` `action`) |
 | `404` | Unknown `task_id`, `session_id`, or video `job_id`; `/render-video` for a platform with no finished draft; `/download` when the rendered file is missing on disk |
 | `409` | Task not awaiting review, `task_id` already exists, brief not complete, `/confirm-learning` before the task is `completed`, `/render-video` on a platform whose run produced no storyboard, or `/download` before the job is `done` |
 | `422` | FastAPI request-body validation (malformed JSON / wrong field types); standard FastAPI `detail` payload |
