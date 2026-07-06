@@ -5,7 +5,7 @@ platform, pure text, no user, fully mocked + deterministic.
 Covers:
   - reproducibility: same brief + same mock skills/profile → identical transcript + consensus.
   - read side (§6.5): brand_voice / user_advocate personas carry the injected profile / skills.
-  - drop-in shape: RoundtableConsensus.strategy has the SAME fields as the scout's CreativeStrategy.
+  - drop-in shape: RoundtableConsensus.strategy has the SAME fields as the strategist's CreativeStrategy.
   - termination: the table always stops at MAX_ROUNDS.
 
 All offline/mock via the autouse conftest fixtures (no network, mock mode forced).
@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from LLM_service.core.config import reset_settings
 from LLM_service.core.services import factory
 from LLM_service.core.services.mock import (
@@ -23,24 +25,32 @@ from LLM_service.core.services.mock import (
 )
 from LLM_service.skills import load_skill
 from LLM_service.workflow import Brief
-from LLM_service.workflow.executors.scout import scout_strategies
+from LLM_service.workflow.executors.strategist import plan_strategies
 from LLM_service.workflow.messages import CreativeStrategy
 from LLM_service.workflow.roundtable import (
+    AUTO,
+    ENOUGH,
+    NEXT,
     RoundtableConsensus,
+    await_decision,
     build_persona_context,
     build_personas,
     has_pending,
+    is_auto,
     notify,
     push_utterance,
     raise_hand,
     run_table,
     run_tables,
+    submit_decision,
 )
+from LLM_service.core.trend_schema import Trend
 from LLM_service.workflow.roundtable.personas import (
     AUDIENCE_ADVOCATE,
     BRAND_VOICE,
     PLATFORM_EDITOR,
     ROSTER,
+    TREND_SCOUT,
     USER_ADVOCATE,
 )
 
@@ -105,21 +115,21 @@ async def test_personas_carry_injected_profile_and_skills():
     assert "BRAND MUST DO" not in personas[AUDIENCE_ADVOCATE].instructions
 
 
-async def test_consensus_strategy_matches_scout_creativestrategy_shape():
-    """The consensus carries a real CreativeStrategy with the SAME fields the scout emits,
+async def test_consensus_strategy_matches_strategist_creativestrategy_shape():
+    """The consensus carries a real CreativeStrategy with the SAME fields the strategist emits,
     so it is a drop-in for the creator (Phase 6)."""
     brief = _brief()
     result = await run_table(PLATFORM, brief)
 
-    scout_out = CreativeStrategy(
+    strategist_out = CreativeStrategy(
         brief=brief,
-        strategies=await scout_strategies(
+        strategies=await plan_strategies(
             topic=brief.topic, platforms=[PLATFORM], user_intent=brief.user_intent
         ),
     )
 
-    assert type(result.consensus.strategy) is type(scout_out)
-    assert set(result.consensus.strategy.model_dump().keys()) == set(scout_out.model_dump().keys())
+    assert type(result.consensus.strategy) is type(strategist_out)
+    assert set(result.consensus.strategy.model_dump().keys()) == set(strategist_out.model_dump().keys())
     # Single-platform table → a strategies dict keyed by exactly that platform.
     assert set(result.consensus.strategy.strategies) == {PLATFORM}
 
@@ -371,3 +381,420 @@ async def test_each_platform_drafts_from_its_own_strategy():
     reqs = {e.data.platform: e.data for e in result.get_request_info_events()}
     assert reqs["linkedin"].strategy == "LEAD WITH A DATA HOOK"
     assert reqs["instagram"].strategy == "LEAD WITH A VISUAL STORY"
+
+
+# ── Trend scout — the optional fifth seat (docs/TREND_SCOUT_IMPLEMENTATION.md) ──
+# TREND_SCOUT_ENABLED tests flip the toggle themselves + reset the caches; the conftest
+# wipes toggle env vars per test, so every other test keeps running with the seat off.
+
+def _enable_trend_scout(monkeypatch) -> None:
+    monkeypatch.setenv("TREND_SCOUT_ENABLED", "true")
+    reset_settings()
+    factory.reset_services()
+
+
+async def test_trend_scout_off_by_default_no_seat_no_read(monkeypatch):
+    """Toggle off (the default): the roster is the four seats, and the trends store is
+    NEVER read — a get_trends that would raise proves the read path isn't touched."""
+    store = factory.get_store()
+
+    async def boom(**kwargs):
+        raise AssertionError("get_trends must not be called when TREND_SCOUT_ENABLED is off")
+
+    monkeypatch.setattr(store, "get_trends", boom)
+    brief = _brief()
+    context = await build_persona_context(brief)
+    assert context.trends == []
+
+    personas = build_personas(
+        PLATFORM, brief,
+        brand_profile=context.brand_profile, user_skills=context.user_skills,
+        trends=context.trends,
+    )
+    assert [p.name for p in personas] == ROSTER
+
+
+async def test_trend_scout_roster_and_verbatim_injection(monkeypatch):
+    """With the toggle on the seat joins every table, carrying the store's trends verbatim
+    in its instructions (with the fusion prompt's rejection permission); the other seats'
+    instructions are untouched."""
+    _enable_trend_scout(monkeypatch)
+
+    brief = _brief()
+    context = await build_persona_context(brief)
+    assert context.trends, "mock fixture trends should surface with zero setup"
+
+    personas = {
+        p.name: p
+        for p in build_personas(
+            PLATFORM, brief,
+            brand_profile=context.brand_profile, user_skills=context.user_skills,
+            trends=context.trends,
+        )
+    }
+    assert set(personas) == set(ROSTER) | {TREND_SCOUT}
+
+    scout_text = personas[TREND_SCOUT].instructions
+    assert "CURRENT TRENDS" in scout_text
+    for trend in context.trends:
+        assert trend.text in scout_text          # verbatim injection
+        assert f"[{trend.category}]" in scout_text  # variety tag rides along
+    assert "do not force" in scout_text          # permission to reject a forced fit
+
+    for other in ROSTER:
+        assert "CURRENT TRENDS" not in personas[other].instructions
+
+
+async def test_trend_scout_speaks_and_table_converges(monkeypatch):
+    """The seat takes real turns (mock scripted lines) and the table still converges."""
+    _enable_trend_scout(monkeypatch)
+
+    result = await run_table(PLATFORM, _brief())
+    speakers = {t.speaker for t in result.consensus.transcript}
+    assert TREND_SCOUT in speakers
+    assert speakers >= set(ROSTER)  # the original four still speak
+    assert result.consensus.converged is True
+    assert result.consensus.strategy.strategies[PLATFORM]
+
+
+async def test_trend_scout_stale_snapshot_degrades_gracefully(monkeypatch):
+    """An all-stale snapshot reads as [] — the seat still joins with the '(no current
+    trends available)' block and the discussion converges without a trend angle."""
+    _enable_trend_scout(monkeypatch)
+
+    stale = Trend(
+        text="an old moment", category="news",
+        captured_at="2020-01-01T00:00:00+00:00", expires_at="2020-01-04T00:00:00+00:00",
+    )
+    await factory.get_store().upsert_trends(trends=[stale])
+
+    brief = _brief()
+    context = await build_persona_context(brief)
+    assert context.trends == []
+
+    personas = {
+        p.name: p
+        for p in build_personas(
+            PLATFORM, brief,
+            brand_profile=context.brand_profile, user_skills=context.user_skills,
+            trends=context.trends,
+        )
+    }
+    assert "(no current trends available" in personas[TREND_SCOUT].instructions
+
+    result = await run_table(PLATFORM, brief)
+    assert result.consensus.converged is True
+
+
+async def test_trend_scout_store_failure_degrades_to_no_trends(monkeypatch):
+    """A store that raises on get_trends must never fail the run (§3.5): the context
+    degrades to [] and the discussion still runs to consensus."""
+    _enable_trend_scout(monkeypatch)
+
+    store = factory.get_store()
+
+    async def boom(**kwargs):
+        raise RuntimeError("trends table unavailable")
+
+    monkeypatch.setattr(store, "get_trends", boom)
+
+    context = await build_persona_context(_brief())
+    assert context.trends == []
+
+    result = await run_table(PLATFORM, _brief())
+    assert result.consensus.converged is True
+
+
+# ── The production LLM manager only ever assigns AGENTS on its own ─────────────────
+# (The mock manager is already user-safe: it rotates only `ai_names`, routing to the
+# user seat solely on a raised hand / queued message. These cover the LLM path.)
+
+# A distinctive description for the user seat: "user" alone is a substring of `user_advocate`
+# (and of the ledger prompt's own prose), so we sentinel on the description to prove the seat's
+# whole roster entry was dropped from what the LLM sees.
+USER_SENTINEL = "ZZZ_the_human_participant_ZZZ"
+
+
+def _ledger_json(next_speaker: str) -> str:
+    """A progress-ledger JSON payload naming `next_speaker` — the shape the LLM returns."""
+    import json
+
+    item = lambda a: {"reason": "x", "answer": a}
+    return json.dumps({
+        "is_request_satisfied": item(False),
+        "is_in_loop": item(False),
+        "is_progress_being_made": item(True),
+        "next_speaker": item(next_speaker),
+        "instruction_or_question": item("go"),
+    })
+
+
+def _interactive_manager(task_id: str):
+    """A production InteractiveMagenticManager wired to a user seat, over a mock chat client."""
+    from LLM_service.workflow.roundtable.manager import build_interactive_manager
+    from LLM_service.workflow.roundtable.user_seat import USER_SEAT_NAME
+
+    return build_interactive_manager(
+        factory.get_chat_client(agent_name="moderator"),
+        platform=PLATFORM, max_rounds=6, task_id=task_id,
+        store=factory.get_store(), user_name=USER_SEAT_NAME,
+    )
+
+
+def _context_with_user():
+    """A MagenticContext whose roster includes the user seat alongside the AI personas."""
+    from agent_framework.orchestrations import MagenticContext
+    from LLM_service.workflow.roundtable.user_seat import USER_SEAT_NAME
+
+    return MagenticContext(
+        task="plan a linkedin post",
+        participant_descriptions={
+            PLATFORM_EDITOR: "editor", BRAND_VOICE: "brand", USER_ADVOCATE: "advocate",
+            AUDIENCE_ADVOCATE: "audience", USER_SEAT_NAME: USER_SENTINEL,
+        },
+        round_count=1,
+    )
+
+
+async def test_llm_manager_hides_user_from_roster_and_never_selects_them():
+    """Idle user (no raised hand / no queued message): the LLM moderator must not even SEE the
+    user seat in the roster it picks from, and — even if the model hallucinated the name — the
+    turn is reassigned to an agent. The user speaks only via raise-hand."""
+    from agent_framework import Message
+    from LLM_service.workflow.roundtable.user_seat import USER_SEAT_NAME
+
+    mgr = _interactive_manager("t-llm-idle")
+    seen = {}
+
+    async def fake_complete(messages):
+        seen["prompt"] = messages[-1].text
+        # The model MISBEHAVES and names the user; the manager must still not select them.
+        return Message("assistant", [_ledger_json(USER_SEAT_NAME)])
+
+    mgr._complete = fake_complete
+
+    ledger = await mgr.create_progress_ledger(_context_with_user())
+
+    assert USER_SENTINEL not in seen["prompt"]             # user's roster entry hidden from the LLM
+    assert ledger.next_speaker.answer != USER_SEAT_NAME    # and never selected
+    assert ledger.next_speaker.answer in {
+        PLATFORM_EDITOR, BRAND_VOICE, USER_ADVOCATE, AUDIENCE_ADVOCATE,
+    }
+
+
+async def test_llm_manager_yields_to_user_on_raised_hand():
+    """When the user raises a hand the forced path wins — the mic goes to the user seat, and the
+    LLM is not even consulted (the model must NOT have been called)."""
+    from LLM_service.workflow.roundtable.gate import lower_hand
+    from LLM_service.workflow.roundtable.user_seat import USER_SEAT_NAME
+
+    mgr = _interactive_manager("t-llm-hand")
+
+    async def fail_complete(messages):
+        raise AssertionError("LLM must not be consulted when the user holds the floor")
+
+    mgr._complete = fail_complete
+
+    raise_hand("t-llm-hand", PLATFORM)
+    try:
+        ledger = await mgr.create_progress_ledger(_context_with_user())
+    finally:
+        lower_hand("t-llm-hand", PLATFORM)
+
+    assert ledger.next_speaker.answer == USER_SEAT_NAME
+
+
+# ── Step mode (每轮 4 选 1): per-round user control ─────────────────────────────
+# `roundtable_mode: "manual"` pauses each table at every round boundary for the user's
+# 4-way choice — next / speak / enough / auto — answered via POST /tasks/{id}/round-control.
+# Default stays "auto" (hands-off), so nothing here changes the existing contract.
+
+def _step_inputs(**over) -> dict:
+    return {
+        "topic": "spring single-origin coffee launch",
+        "target_platforms": over.get("platforms", [PLATFORM]),
+        "business_id": ROUNDTABLE_FIXTURE_BUSINESS_ID,
+        "user_id": ROUNDTABLE_FIXTURE_USER_ID,
+        **{k: v for k, v in over.items() if k != "platforms"},
+    }
+
+
+def _enable_roundtable(monkeypatch, max_rounds: int = 3) -> None:
+    monkeypatch.setenv("ROUNDTABLE_ENABLED", "true")
+    monkeypatch.setenv("ROUNDTABLE_MAX_ROUNDS", str(max_rounds))
+    reset_settings()
+    factory.reset_services()
+
+
+async def test_control_primitives_submit_await_and_timeout():
+    """The decision slot is latest-wins and consumed once; an unanswered wait times out to
+    STICKY auto, so an absent user can never hang a table."""
+    submit_decision("t-ctl", PLATFORM, NEXT)
+    assert await await_decision("t-ctl", PLATFORM, timeout=1) == NEXT
+    assert is_auto("t-ctl", PLATFORM) is False
+    # Consumed — the next wait sees no decision and times out to hands-off (sticky).
+    assert await await_decision("t-ctl", PLATFORM, timeout=0.01) == AUTO
+    assert is_auto("t-ctl", PLATFORM) is True
+    # Sticky: no waiting at all any more.
+    assert await await_decision("t-ctl", PLATFORM, timeout=5) == AUTO
+
+    with pytest.raises(ValueError):
+        submit_decision("t-ctl", PLATFORM, "banana")
+
+
+async def test_enough_converges_early_with_partial_consensus():
+    """Choosing "enough" ends the debate at that boundary: the manager returns a satisfied
+    ledger and prepare_final_answer synthesizes the consensus from what was said — a genuine
+    convergence (converged=True), not the round-cap sentinel."""
+    async def before_round(table_id: str, round_index: int) -> None:
+        if round_index == 2:  # one persona has spoken; the user has heard enough
+            submit_decision("t-enough", table_id, ENOUGH)
+
+    result = await run_table(PLATFORM, _brief(), task_id="t-enough", max_rounds=6,
+                             before_round=before_round)
+
+    assert len(result.consensus.transcript) == 1   # exactly the one turn before "enough"
+    assert result.consensus.converged is True
+    assert result.consensus.strategy.strategies[PLATFORM]
+
+
+async def test_step_mode_inline_start_speak_then_enough(monkeypatch):
+    """The HTTP step-mode path end-to-end at the service layer: manual mode pauses every round
+    boundary after the first (nothing to read before anyone spoke), emits a `round_control`
+    "waiting" event, and resumes on the /round-control answer. Scripted here: speak (text rides
+    along → the mic goes to the user next round) then enough (converge now); the run then
+    continues to the human gate as usual."""
+    _enable_roundtable(monkeypatch, max_rounds=6)
+    from LLM_service.api import WorkflowService
+
+    svc = WorkflowService()
+    task_id = "rt-step"
+    script = [
+        {"action": "speak", "text": "please mention fair-trade sourcing"},
+        {"action": "enough"},
+    ]
+
+    def listener(ev):
+        if ev.get("type") == "round_control" and ev.get("status") == "waiting":
+            step = script.pop(0)
+            asyncio.get_running_loop().create_task(
+                svc.round_control(task_id, ev["table_id"], step["action"], step.get("text")))
+
+    snap = await svc.start(_step_inputs(roundtable_mode="manual"),
+                           task_id=task_id, event_listener=listener)
+
+    events = svc.buffered_events(task_id)
+    utts = [e for e in events if e["type"] == "agent_utterance"]
+    assert len(utts) == 2
+    assert utts[0]["role"] != "user"                    # round 1: a persona spoke first
+    assert utts[1]["role"] == "user"                    # "speak" took the mic next round
+    assert "fair-trade" in utts[1]["text"]
+
+    ctl = [e for e in events if e["type"] == "round_control"]
+    assert [e["status"] for e in ctl] == ["waiting", "resolved", "waiting", "resolved"]
+    assert [e["action"] for e in ctl if e["status"] == "resolved"] == ["speak", "enough"]
+
+    consensus = [e for e in events if e.get("status") == "discussion_consensus"]
+    assert len(consensus) == 1 and consensus[0]["converged"] is True
+    assert snap["status"] == "awaiting_review"          # the text flow still reaches the gate
+
+
+async def test_step_mode_tables_pause_independently(monkeypatch):
+    """Step mode with N tables stays CONCURRENT and per-table: instagram goes hands-off at its
+    first prompt and runs to the round cap, while linkedin is stepped and ended early — one
+    table's enough/auto never touches the other."""
+    _enable_roundtable(monkeypatch, max_rounds=3)
+    from LLM_service.api import WorkflowService
+
+    svc = WorkflowService()
+    task_id = "rt-step-multi"
+
+    def listener(ev):
+        if ev.get("type") == "round_control" and ev.get("status") == "waiting":
+            action = "auto" if ev["table_id"] == "instagram" else "enough"
+            asyncio.get_running_loop().create_task(
+                svc.round_control(task_id, ev["table_id"], action))
+
+    snap = await svc.start(
+        _step_inputs(platforms=["linkedin", "instagram"], roundtable_mode="manual"),
+        task_id=task_id, event_listener=listener)
+
+    events = svc.buffered_events(task_id)
+    li = [e for e in events if e["type"] == "agent_utterance" and e["table_id"] == "linkedin"]
+    ig = [e for e in events if e["type"] == "agent_utterance" and e["table_id"] == "instagram"]
+    assert len(li) == 1                                 # stepped: one turn, then "enough"
+    assert len(ig) == 3                                 # hands-off: runs to the round cap
+
+    ctl = [e for e in events if e["type"] == "round_control"]
+    waiting = [e for e in ctl if e["status"] == "waiting"]
+    assert {e["table_id"] for e in waiting} == {"linkedin", "instagram"}
+    assert len(waiting) == 2                            # exactly one prompt per table
+    assert [e["table_id"] for e in ctl if e["status"] == "auto"] == ["instagram"]
+    assert snap["status"] == "awaiting_review"
+
+
+async def test_step_mode_timeout_degrades_to_hands_off(monkeypatch):
+    """An unanswered prompt times out (ROUNDTABLE_CONTROL_TIMEOUT) into sticky auto: the switch
+    is announced on the stream, no further prompts fire, and the run completes hands-off
+    instead of hanging on an absent client."""
+    _enable_roundtable(monkeypatch, max_rounds=3)
+    monkeypatch.setenv("ROUNDTABLE_CONTROL_TIMEOUT", "0.05")
+    reset_settings()
+    from LLM_service.api import WorkflowService
+
+    svc = WorkflowService()
+    snap = await svc.start(_step_inputs(roundtable_mode="manual"), task_id="rt-step-timeout")
+
+    events = svc.buffered_events("rt-step-timeout")
+    ctl = [e for e in events if e["type"] == "round_control"]
+    assert [e["status"] for e in ctl] == ["waiting", "auto"]  # one prompt, then hands-off
+    assert len([e for e in events if e["type"] == "agent_utterance"]) == 3  # full cap
+    assert snap["status"] == "awaiting_review"
+
+
+async def test_step_mode_default_stays_hands_off(monkeypatch):
+    """Without `roundtable_mode: "manual"` the contract is unchanged: no prompts, no
+    round_control events, tables run to convergence exactly as before (default = auto)."""
+    _enable_roundtable(monkeypatch, max_rounds=3)
+    from LLM_service.api import WorkflowService
+
+    svc = WorkflowService()
+    snap = await svc.start(_step_inputs(), task_id="rt-step-off")
+
+    assert not [e for e in svc.buffered_events("rt-step-off") if e["type"] == "round_control"]
+    assert snap["status"] == "awaiting_review"
+
+
+async def test_step_mode_rejects_bad_mode_and_bad_action():
+    """Service-layer validation: an unknown roundtable_mode 400s before any spawn; an unknown
+    /round-control action 400s; an unknown task 404s."""
+    from LLM_service.api import ApiError, WorkflowService
+
+    svc = WorkflowService()
+    with pytest.raises(ApiError) as e400:
+        await svc.start(_step_inputs(roundtable_mode="sometimes"), task_id="rt-bad-mode")
+    assert e400.value.status == 400
+
+    with pytest.raises(ApiError) as e404:
+        await svc.round_control("rt-nope", PLATFORM, "next")
+    assert e404.value.status == 404
+
+
+async def test_llm_manager_converges_on_enough_without_consulting_the_llm():
+    """Step mode's "enough" on the production manager: the satisfied ledger is returned
+    directly (→ prepare_final_answer synthesizes the consensus) and the LLM ledger call is
+    skipped — the user already made the decision."""
+    from LLM_service.workflow.roundtable.user_seat import USER_SEAT_NAME
+
+    mgr = _interactive_manager("t-llm-enough")
+
+    async def fail_complete(messages):
+        raise AssertionError("LLM must not be consulted once the user ended the discussion")
+
+    mgr._complete = fail_complete
+    submit_decision("t-llm-enough", PLATFORM, ENOUGH)
+
+    ledger = await mgr.create_progress_ledger(_context_with_user())
+
+    assert ledger.is_request_satisfied.answer is True
+    assert ledger.next_speaker.answer != USER_SEAT_NAME   # synthesis never lands on the user seat

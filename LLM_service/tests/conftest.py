@@ -22,7 +22,7 @@ from agent_framework import InMemoryCheckpointStorage
 from LLM_service.core.config import reset_settings
 from LLM_service.core.services.factory import reset_services
 from LLM_service.workflow import Brief, build_workflow
-from LLM_service.workflow.roundtable import reset_gates
+from LLM_service.workflow.roundtable import reset_controls, reset_gates
 
 _TOGGLE_VARS = ("USE_MOCK", "USE_MOCK_LLM", "USE_MOCK_SAFETY", "USE_MOCK_STORE", "USE_MOCK_VOICE",
                 "USE_MOCK_WEB_SEARCH", "TREND_SCOUT_ENABLED")
@@ -45,10 +45,12 @@ def _reset_caches():
     reset_settings()
     reset_services()
     reset_gates()
+    reset_controls()
     yield
     reset_settings()
     reset_services()
     reset_gates()
+    reset_controls()
 
 
 @pytest.fixture(autouse=True)

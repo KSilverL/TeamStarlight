@@ -8,10 +8,12 @@ Unlike scenarios.py (a fixed, non-interactive showcase), this lets you drive EVE
 by hand and watch it happen, all through the same `WorkflowService` the HTTP API uses:
 
   • build the brief manually, or via a text / (mock) voice intake conversation
-  • toggle the ROUNDTABLE stage on/off  (scout  ↔  multi-persona discussion). When it is on,
-    the discussion STREAMS LIVE — each persona's turn prints the moment it is spoken — and
-    before the manager assigns every next persona you may raise a hand and speak: your turn
-    joins the table, then the next persona is assigned (or skip to let the manager continue)
+  • toggle the ROUNDTABLE stage on/off  (strategist  ↔  multi-persona discussion). When it is on,
+    the discussion STREAMS LIVE — each persona's turn prints the moment it is spoken — and after
+    every turn you choose what happens next (step mode, 每轮 4 选 1): 1) the next persona speaks,
+    2) you take the mic (your turn joins the table, then the next persona is assigned),
+    3) enough — the table converges NOW on what was said, 4) hands-off — the rest of the
+    discussion runs automatically with no further prompts
   • the human gate: approve / edit / reject each platform's draft (reject re-drafts)
   • the post-approval media (animated HTML card + video spec)
   • the learning loop: confirm whether to learn this conversation → the archivist distils
@@ -37,6 +39,7 @@ from LLM_service.core.config import _DEFAULT_ENV_FILE, get_settings, load_dotenv
 from LLM_service.core.services import factory
 from LLM_service.intake import build_intake
 from LLM_service.workflow.roundtable import push_utterance
+from LLM_service.workflow.roundtable.control import AUTO, ENOUGH, is_auto, submit_decision
 
 
 # ── small TTY helpers ──────────────────────────────────────────────────────────
@@ -246,7 +249,7 @@ async def _run_once() -> None:
     inputs = await _build_brief()
 
     _section("2 · ROUNDTABLE STAGE")
-    roundtable = await _yn("  Enable the multi-persona roundtable (replaces scout)?", default=True)
+    roundtable = await _yn("  Enable the multi-persona roundtable (replaces the strategist)?", default=True)
     os.environ["ROUNDTABLE_ENABLED"] = "true" if roundtable else "false"
     reset_settings()
     factory.reset_services()
@@ -256,17 +259,34 @@ async def _run_once() -> None:
     svc = WorkflowService()
     task_id = f"cli-{os.urandom(3).hex()}"
 
-    # Per-round interjection (requirement 2): before the manager assigns each next persona, you
-    # get the floor. Speak → your turn joins the table, THEN the next persona is assigned; skip →
-    # the manager assigns the next persona directly. Pushing the utterance is enough — the
-    # manager sees it queued and routes that round to your seat.
+    # Per-round step control (每轮 4 选 1): after each persona speaks — before the manager
+    # assigns the next one — choose to advance, take the mic, converge now, or go hands-off.
+    # State is per table; the first boundary of a table is skipped (nothing spoken yet, so
+    # there is nothing to read). "enough" sets the finish flag the manager reads at the
+    # boundary (→ consensus from what was said); "auto" silences the menu for that table.
+    seen_tables: set[str] = set()
+
     async def _before_round(table_id: str, round_index: int) -> None:
-        if await _yn(f"\n  ✋ [{table_id}] round {round_index} — raise a hand & speak before the next persona?",
-                     default=False):
+        if is_auto(task_id, table_id):
+            return
+        if table_id not in seen_tables:
+            seen_tables.add(table_id)
+            return
+        print(f"\n  ⏸  [{table_id}] round {round_index} — what happens next?")
+        print("     1) next persona speaks          2) I take the mic")
+        print("     3) enough — converge now        4) hands-off (auto to the end)")
+        choice = (await _ask("     Choose 1-4", "1")).strip()
+        if choice.startswith("2"):
             msg = await _ask("     Your message")
             if msg.strip():
                 await push_utterance(factory.get_store(), task_id=task_id, table_id=table_id, text=msg.strip())
                 print("     ✋ queued — the table takes your turn next.")
+        elif choice.startswith("3"):
+            submit_decision(task_id, table_id, ENOUGH)
+            print("     ⏹  ending the discussion — consensus from what was said so far.")
+        elif choice.startswith("4"):
+            submit_decision(task_id, table_id, AUTO)
+            print("     ▶  hands-off — the table runs to convergence on its own.")
 
     _section("3 · LIVE — the discussion streams below as each persona speaks")
     # event_listener (requirement 1) prints every event the instant it lands — persona turns,
@@ -287,8 +307,8 @@ def _cheat_sheet() -> None:
     to cover the rest — together these reach every path through the system."""
     _section("FLOW CHEAT-SHEET — inputs that exercise each path")
     rows = [
-        ("Standard (scout)",     "Roundtable = n"),
-        ("Roundtable debate",    "Roundtable = Y  · raise a hand at any round to join the table"),
+        ("Standard (strategist)", "Roundtable = n"),
+        ("Roundtable debate",    "Roundtable = Y  · per-round menu: next / speak / enough / auto"),
         ("Reject → rework",      "At the gate press r + type a comment → next draft shows 'Reworked to address: …'"),
         ("Approve-after-edit",   "At the gate press e + type your final copy"),
         ("Circuit breaker",      "Topic contains 'unsafe' → 3 reviewer rejects → gate flagged ⚠"),
@@ -323,50 +343,13 @@ async def main() -> None:
     print("  Seats at the table: platform_editor · brand_voice · user_advocate · audience_advocate · you")
     _cheat_sheet()
 
-    print("\n  THE NEWSROOM — agents that hand work to one another:")
-    for executor_id in ("dispatcher", "scout", "creator", "reviewer", "human_gate",
-                        "archivist", "media_producer"):
-        name, role = _agent(executor_id)
-        print(f"    • {name} — {role}")
-
-    workflow = build_workflow()
-    brief = Brief(
-        topic="new harvest season beans from Ethiopia",
-        target_platforms=["linkedin", "instagram"],
-        user_intent="Highlight the limited-time launch and the farmers' story",
-        business_id="biz_demo_0001",
-        tone_hint="warm, authentic, educational",
-        route="direct_generation",
-    )
-    print(f"\n  Brief     : {brief.topic}")
-    print(f"  Platforms : {', '.join(brief.target_platforms)}")
-
-    _section("LIVE — dispatcher → scout → creator → reviewer → gate")
-    outputs: dict[str, object] = {}
-    requests, produced = await _stream_segment(workflow, message=brief)
-    outputs.update(produced)
-
-    # Resume the RequestPort until the workflow idles with no pending requests.
-    while requests:
-        responses = await _resolve_pending(requests)
-        _section("LIVE — resuming the newsroom")
-        requests, produced = await _stream_segment(workflow, responses=responses)
-        outputs.update(produced)
-
-    _section("WORKFLOW COMPLETE — final, ready-to-publish posts")
-    for platform, final in outputs.items():
-        print(f"\n  ── {platform} ({final.decision}) ──")
-        print(_draft_box(final.draft))
-        for rule in getattr(final, "proposed_rules", []):
-            print(f"  ↪ proposed brand rule [{rule.kind}]: {rule.rule}")
-        card = getattr(final, "html_card", None)
-        storyboard = getattr(final, "video_storyboard", None)
-        if card:
-            print(f"  ✓ animated HTML card produced ({len(card)} chars)")
-        if storyboard:
-            slide_types = " → ".join(s.type for s in storyboard.slides)
-            print(f"  ✓ video storyboard produced: {storyboard.brandName} — {slide_types}")
-    print()
+    # Each run drives ONE config through the same WorkflowService the HTTP API uses; loop so you
+    # can cover the rest of the cheat-sheet paths without restarting the harness.
+    while True:
+        await _run_once()
+        if not await _yn("\n  Run another?", default=False):
+            break
+    print("\n  bye.")
 
 
 if __name__ == "__main__":
