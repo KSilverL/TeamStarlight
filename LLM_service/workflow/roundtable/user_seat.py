@@ -25,6 +25,14 @@ from .queue import drain_utterances
 
 USER_SEAT_NAME = "user"
 
+# The seat's roster entry (Agent.description). The LLM moderator never selects this seat on
+# its own (`_roster_without_user` hides it), so this mainly keeps the participant registry
+# free of the "<no description>" placeholder for observers/checkpoints.
+USER_SEAT_DESCRIPTION = (
+    "The human owner of this post — a real participant who speaks only when they raise "
+    "a hand; never selected by the moderator unprompted."
+)
+
 # Spoken when the seat is invoked with nothing to say (hand raised but the user never sent in
 # time, i.e. the wait timed out) so the discussion proceeds instead of hanging.
 _NOTHING_TO_ADD = "(the user had nothing to add this round)"
@@ -82,5 +90,8 @@ def build_user_seat(platform: str, *, task_id: str, store, timeout: float) -> Pe
     """Build the user participant for one table, bound to its queue + the raise-hand gate."""
     client = UserSeatClient(task_id=task_id, table_id=platform, store=store, timeout=timeout)
     instructions = "You are the human participant. Your words are relayed verbatim."
-    agent = Agent(client, instructions=instructions, name=USER_SEAT_NAME)
-    return Persona(name=USER_SEAT_NAME, role="user", model_tier="user", instructions=instructions, agent=agent)
+    agent = Agent(client, instructions=instructions, name=USER_SEAT_NAME, description=USER_SEAT_DESCRIPTION)
+    return Persona(
+        name=USER_SEAT_NAME, role="user", model_tier="user",
+        instructions=instructions, agent=agent, description=USER_SEAT_DESCRIPTION,
+    )
