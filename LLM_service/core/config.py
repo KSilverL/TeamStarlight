@@ -492,6 +492,10 @@ def _load() -> Settings:
         azure_speech_key=os.getenv("AZURE_SPEECH_KEY"),
         azure_speech_region=os.getenv("AZURE_SPEECH_REGION"),
         voiceover_default_voice=os.getenv("VOICEOVER_DEFAULT_VOICE", "en-US-JennyNeural"),
+<<<<<<< Updated upstream
+=======
+        foundry_project_endpoint=os.getenv("FOUNDRY_PROJECT_ENDPOINT"),
+>>>>>>> Stashed changes
         web_search_agent_name=os.getenv("WEB_SEARCH_AGENT_NAME"),
         web_search_agent_version=os.getenv("WEB_SEARCH_AGENT_VERSION"),
         review_search_agent_name=os.getenv("REVIEW_SEARCH_AGENT_NAME"),

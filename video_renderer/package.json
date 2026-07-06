@@ -11,9 +11,12 @@
   "dependencies": {
     "@remotion/cli": "4.0.484",
     "@remotion/lambda": "4.0.484",
+<<<<<<< Updated upstream
     "d3-geo": "^3.1.0",
     "d3-scale": "^4.0.2",
     "d3-shape": "^3.2.0",
+=======
+>>>>>>> Stashed changes
     "react": "19.2.7",
     "react-dom": "19.2.7",
     "recharts": "^3.9.1",
