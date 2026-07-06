@@ -20,6 +20,8 @@ import com.example.tsldemo.ApiDTOS;
 import com.example.tsldemo.ApiDTOS.CreativeBrief;
 import com.example.tsldemo.ApiDTOS.IntakeRequest;
 import com.example.tsldemo.ApiDTOS.IntakeResponse;
+import com.example.tsldemo.ApiDTOS.IntakeTurnRequest;
+import com.example.tsldemo.ApiDTOS.IntakeTurnResponse;
 import com.example.tsldemo.Business;
 import com.example.tsldemo.Message;
 import com.example.tsldemo.Session;
@@ -83,11 +85,11 @@ public class SessionService {
     }
     
     
-    public ApiDTOS.IntakeTurnResponse getIntakeTurn(String prompt, String sessionId) {
+    public IntakeTurnResponse getIntakeTurn(IntakeTurnRequest request, String sessionId) {
     	return restClient.post()
                 .uri(llmServiceBaseUrl + "/intake/" + sessionId + "/turn")
                 .contentType(MediaType.APPLICATION_JSON)
-                .body(new ApiDTOS.IntakeTurnRequest(prompt))
+                .body(request)
                 .retrieve()
                 .body(ApiDTOS.IntakeTurnResponse.class);
     	
