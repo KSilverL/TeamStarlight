@@ -37,10 +37,10 @@ interface VideoStat {
 }
 
 // The dynamic storyboard the backend composes (core.video_schema.StoryboardSpec):
-// an ordered list of typed slides picked from a fixed registry, not a fixed scene
-// count. This service produces the storyboard (+ resolves it into an MP4 on
-// request via /api/video) — the agent decides which slides/order/length fit the
-// brief, never a hardcoded template.
+// an ordered list of typed slides — nine fixed templates plus "generated", a
+// bespoke Remotion scene the codegen agent authors from scratch when none of the
+// fixed types fit (workflow/video/codegen.py). The agent decides which slides,
+// order, and length fit the brief, never a hardcoded template count.
 interface HookSlide {
   type: "hook";
   headline: string;
@@ -69,7 +69,72 @@ interface OutroSlide {
   contact?: string | null;
   durationFrames?: number | null;
 }
-type VideoSlide = HookSlide | CounterStatSlide | CollageSlide | OutroSlide;
+interface PieSlice {
+  label: string;
+  value: number;
+}
+interface PieChartSlide {
+  type: "pie_chart";
+  headline?: string | null;
+  slices: PieSlice[];
+  calloutText?: string | null;
+  durationFrames?: number | null;
+}
+interface ChartSeries {
+  label: string;
+  values: number[];
+}
+interface LineChartSlide {
+  type: "line_chart";
+  headline?: string | null;
+  xLabels: string[];
+  series: ChartSeries[];
+  durationFrames?: number | null;
+}
+interface BarItem {
+  label: string;
+  value: number;
+}
+interface BarChartSlide {
+  type: "bar_chart";
+  headline?: string | null;
+  bars: BarItem[];
+  durationFrames?: number | null;
+}
+interface NodeDiagramSlide {
+  type: "node_diagram";
+  headline?: string | null;
+  nodes: string[];
+  durationFrames?: number | null;
+}
+interface ComparisonRow {
+  label: string;
+  values: string[];
+}
+interface ComparisonTableSlide {
+  type: "comparison_table";
+  headline?: string | null;
+  columns: string[];
+  rows: ComparisonRow[];
+  durationFrames?: number | null;
+}
+interface GeneratedSlide {
+  type: "generated";
+  description: string;
+  data: Record<string, unknown>;
+  durationFrames?: number | null;
+}
+type VideoSlide =
+  | HookSlide
+  | CounterStatSlide
+  | CollageSlide
+  | OutroSlide
+  | PieChartSlide
+  | LineChartSlide
+  | BarChartSlide
+  | NodeDiagramSlide
+  | ComparisonTableSlide
+  | GeneratedSlide;
 
 interface VideoStoryboard {
   brandName: string;
@@ -145,58 +210,7 @@ const INITIAL_MESSAGES: Message[] = [
     role: "assistant",
     content:
       "Welcome to Starlight! I'm your AI social media content assistant. Tell me about your business, brand tone, target audience, and what you'd like to promote — I'll generate platform-specific content and walk you through the approval process.",
-    timestamp: new Date(Date.now() - 6 * 60 * 1000),
-  },
-  {
-    id: "2",
-    role: "user",
-    content:
-      "We're EcoHome Solutions — we sell sustainable bamboo home products targeting eco-conscious millennials aged 25–40. Our brand tone is warm, aspirational, and educational. We want to promote our new Bamboo Kitchen Collection across Instagram and LinkedIn.",
-    timestamp: new Date(Date.now() - 5 * 60 * 1000),
-  },
-  {
-    id: "3",
-    role: "assistant",
-    content:
-      "Brand profile captured. Generating a multi-platform content strategy for EcoHome Solutions — Bamboo Kitchen Collection...",
-    variant: "status",
-    timestamp: new Date(Date.now() - 4 * 60 * 1000),
-  },
-  {
-    id: "4",
-    role: "assistant",
-    content: "Here's your Instagram draft. Review and approve or reject:",
-    variant: "draft",
-    platform: "instagram",
-    draft: {
-      text: "🌿 Meet your kitchen's new best friend — the Bamboo Kitchen Collection.\n\nCrafted from 100% organic bamboo, each piece is naturally antimicrobial, carbon-negative in production, and built to last a decade. Because sustainable living shouldn't mean settling for less. 🏡",
-      hashtags: [
-        "#EcoHome",
-        "#BambooKitchen",
-        "#SustainableLiving",
-        "#ZeroWaste",
-        "#GreenHome",
-        "#BambooDesign",
-        "#ConsciousLiving",
-        "#EcoConscious",
-      ],
-      imageDesc:
-        "Flat lay of bamboo cutting boards, utensils, and storage containers on white marble with fresh green herbs",
-    },
-    approval: "pending",
-    timestamp: new Date(Date.now() - 3 * 60 * 1000),
-  },
-  {
-    id: "5",
-    role: "assistant",
-    content: "And here's your LinkedIn draft:",
-    variant: "draft",
-    platform: "linkedin",
-    draft: {
-      text: "The sustainable homewares market is projected to reach $150B by 2030 — and EcoHome Solutions is proud to be part of that shift.\n\nToday we're launching the Bamboo Kitchen Collection: premium products that prove sustainable materials can exceed conventional standards.\n\nBamboo grows 3× faster than hardwood, sequesters carbon during growth, and outlasts plastic by decades. We invite designers, buyers, and conscious consumers to explore what responsible innovation looks like.\n\nThe kitchens we design today reflect the values we leave for tomorrow.",
-    },
-    approval: "pending",
-    timestamp: new Date(Date.now() - 2 * 60 * 1000),
+    timestamp: new Date(),
   },
 ];
 
@@ -767,26 +781,6 @@ export default function ChatPage() {
             </div>
           </div>
 
-          {/* Brand Profile */}
-          <div>
-            <h3 className="text-xs font-semibold text-[#9E9893] uppercase tracking-wider mb-3">
-              Brand Profile
-            </h3>
-            <div className="bg-[#F8F5EE] border border-[#E8E3DA] rounded-xl p-3.5 space-y-2.5 text-sm">
-              {[
-                { label: "Business", value: "EcoHome Solutions" },
-                { label: "Tone", value: "Warm, aspirational, educational" },
-                { label: "Topic", value: "Bamboo Kitchen Collection" },
-                { label: "Audience", value: "Eco-conscious millennials, 25–40" },
-                { label: "Notes", value: "Emphasise sustainability & durability" },
-              ].map(({ label, value }) => (
-                <div key={label}>
-                  <span className="text-[#9E9893] text-xs">{label}</span>
-                  <p className="text-[#1B1A17] mt-0.5">{value}</p>
-                </div>
-              ))}
-            </div>
-          </div>
         </div>
       </aside>
 
@@ -808,7 +802,7 @@ export default function ChatPage() {
             </button>
             <div>
               <h1 className="font-semibold text-sm text-[#1B1A17]">
-                EcoHome Solutions — Bamboo Kitchen Collection
+                {activeSessionId ? `Session ${activeSessionId}` : "New Session"}
               </h1>
               <p className="text-xs text-[#9E9893] mt-0.5">
                 {selectedPlatforms.length} platform
@@ -963,9 +957,15 @@ interface VideoStoryboardCardProps {
 
 const SLIDE_ICON: Record<VideoSlide["type"], string> = {
   hook: "🎬",
-  counter_stat: "📊",
+  counter_stat: "🔢",
   collage: "🖼️",
   outro: "🏁",
+  pie_chart: "🥧",
+  line_chart: "📈",
+  bar_chart: "📊",
+  node_diagram: "🔗",
+  comparison_table: "📋",
+  generated: "✨",
 };
 
 function slideSummary(slide: VideoSlide): string {
@@ -978,6 +978,18 @@ function slideSummary(slide: VideoSlide): string {
       return `${slide.imageQueries.length} image${slide.imageQueries.length === 1 ? "" : "s"}`;
     case "outro":
       return slide.ctaLabel;
+    case "pie_chart":
+      return `${slide.slices.length} slice${slide.slices.length === 1 ? "" : "s"}`;
+    case "line_chart":
+      return `${slide.series.length} series over ${slide.xLabels.length} points`;
+    case "bar_chart":
+      return `${slide.bars.length} bar${slide.bars.length === 1 ? "" : "s"}`;
+    case "node_diagram":
+      return slide.nodes.join(" → ");
+    case "comparison_table":
+      return `${slide.rows.length} row${slide.rows.length === 1 ? "" : "s"} × ${slide.columns.length} col${slide.columns.length === 1 ? "" : "s"}`;
+    case "generated":
+      return `custom scene — ${slide.description}`;
   }
 }
 

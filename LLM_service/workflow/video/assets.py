@@ -17,13 +17,17 @@ exhaust its attempt budget — see `_resolve_generated_slide`'s fallback.
 from __future__ import annotations
 
 import asyncio
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from ...core.config import Settings, get_settings
 from ...core.services import factory
+from ...core.services.media_assets import GeoapifyStaticMap
 from ...core.video_schema import (
     GeneratedSlideSpec,
+    MapPin,
+    MapSlideSpec,
     RenderableStoryboard,
     RenderBarChartSlide,
     RenderCollageSlide,
@@ -32,6 +36,7 @@ from ...core.video_schema import (
     RenderGeneratedSlide,
     RenderHookSlide,
     RenderLineChartSlide,
+    RenderMapSlide,
     RenderNodeDiagramSlide,
     RenderOutroSlide,
     RenderPieChartSlide,
@@ -95,6 +100,75 @@ async def _resolve_image(query: str, *, images_dir: Path, index: int) -> Resolve
     path = images_dir / f"{index}.png"
     path.write_bytes(cutout)
     return ResolvedImage(query=query, localPath=f"{images_dir.name}/{path.name}")
+
+
+def _mercator_y(lat: float) -> float:
+    """Normalized (0..1) Web Mercator y for a latitude.
+    KEEP IN SYNC WITH: video_renderer/src/map/geo.ts `mercatorY` — the Remotion side
+    re-projects pins over the basemap with this same formula; they only align with
+    the image if both sides compute identically."""
+    rad = math.radians(lat)
+    return (1 - math.log(math.tan(math.pi / 4 + rad / 2)) / math.pi) / 2
+
+
+def _basemap_geometry(
+    pins: List[MapPin], *, width: int, height: int
+) -> Tuple[Tuple[float, float], float]:
+    """Pick the ((center_lon, center_lat), zoom) for a static-map request so every
+    pin fits inside a width×height image with a little padding. Standard slippy-map
+    fit: zoom is how many doublings of the 256px world tile it takes for the pins'
+    bbox to fill the frame on its tighter axis. Center + zoom (never bbox) is what
+    gets sent to the provider — see GeoapifyStaticMap's docstring for why."""
+    lons = [p.lon for p in pins]
+    lats = [p.lat for p in pins]
+    lon_min, lon_max = min(lons), max(lons)
+    y_top, y_bottom = _mercator_y(max(lats)), _mercator_y(min(lats))
+
+    eps = 1e-9
+    lon_frac = (lon_max - lon_min) / 360
+    lat_frac = abs(y_bottom - y_top)
+    if lon_frac < eps and lat_frac < eps:
+        # Single pin (or identical pins): no bbox to fit — a fixed city-level zoom.
+        return ((lon_min, max(lats)), 6.0)
+
+    zoom_x = math.log2(width / 256 / max(lon_frac, eps))
+    zoom_y = math.log2(height / 256 / max(lat_frac, eps))
+    # -0.6 zoom ≈ 1.5x padding so edge pins (and their label cards) aren't clipped.
+    zoom = max(1.0, min(18.0, min(zoom_x, zoom_y) - 0.6))
+
+    center_lon = (lon_min + lon_max) / 2
+    # Midpoint in mercator space, not raw latitude — at high latitudes the two
+    # differ and the raw midpoint would leave the visual center off-frame-center.
+    y_mid = (y_top + y_bottom) / 2
+    center_lat = math.degrees(2 * math.atan(math.exp(math.pi * (1 - 2 * y_mid))) - math.pi / 2)
+    return ((center_lon, center_lat), zoom)
+
+
+async def _resolve_map_basemap(
+    slide: MapSlideSpec, *, index: int, job_dir: Path, width: int, height: int, settings: Settings,
+) -> Tuple[Optional[str], Optional[Tuple[float, float]], Optional[float]]:
+    """Fetch an optional Geoapify basemap image for one map slide. Returns
+    (job-relative path, (center_lon, center_lat), zoom) — or all-None, in which case
+    the Remotion side draws the bundled vector outline for slide.region instead.
+
+    Skipped entirely on the Lambda backend: job-dir assets are served via the local
+    render's --public-dir, and the deployed Lambda site bundle has no equivalent
+    (the same pre-existing limitation hook/collage images have) — the self-contained
+    vector map is the correct degradation there."""
+    if not settings.has_geoapify or settings.video_render_backend == "lambda":
+        return (None, None, None)
+    try:
+        (center_lon, center_lat), zoom = _basemap_geometry(slide.pins, width=width, height=height)
+        image_bytes = await GeoapifyStaticMap(settings).fetch(
+            center_lon=center_lon, center_lat=center_lat, zoom=zoom, width=width, height=height,
+        )
+        maps_dir = job_dir / "maps"
+        maps_dir.mkdir(parents=True, exist_ok=True)
+        path = maps_dir / f"{index}.png"
+        path.write_bytes(image_bytes)
+        return (f"maps/{path.name}", (center_lon, center_lat), zoom)
+    except Exception:
+        return (None, None, None)
 
 
 async def _resolve_generated_slide(
@@ -211,6 +285,17 @@ async def resolve_storyboard_assets(
             render_slides.append(RenderComparisonTableSlide(
                 headline=slide.headline, columns=slide.columns,
                 rows=slide.rows, durationFrames=duration,
+            ))
+        elif slide.type == "map":
+            # Inline await is fine here: at most a couple of map slides per
+            # storyboard, one small HTTP GET each (and usually none — no key).
+            basemap_path, basemap_center, basemap_zoom = await _resolve_map_basemap(
+                slide, index=i, job_dir=job_dir, width=width, height=height, settings=settings,
+            )
+            render_slides.append(RenderMapSlide(
+                headline=slide.headline, region=slide.region, pins=slide.pins,
+                basemapLocalPath=basemap_path, basemapCenter=basemap_center,
+                basemapZoom=basemap_zoom, durationFrames=duration,
             ))
         elif slide.type == "generated":
             # Sequential, not gathered with the rest of the loop: each attempt is a

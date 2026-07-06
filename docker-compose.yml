@@ -10,15 +10,12 @@ services:
     ports:
       - "3000:3000"
     environment:
-      # # Demo agent (brand card)
-      # - BRAND_AGENT_URL=http://brand-agent:8000
       # Main LLM service (text generation + MAF workflow /tasks + video render jobs)
       - TEXT_AGENT_URL=http://llm:8080
       - LLM_SERVICE_URL=http://llm:8080
       # Java backend (signup / login)
       - BACKEND_URL=http://backend:8081
     depends_on:
-      # - brand-agent
       - llm
       - backend
 
@@ -56,11 +53,23 @@ services:
       - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
       - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
       - AZURE_OPENAI_CHAT_DEPLOYMENT=${AZURE_OPENAI_CHAT_DEPLOYMENT}
+      # Web search (Bing grounding via Azure AI Foundry agents). FOUNDRY_PROJECT_ENDPOINT
+      # must be set here too — get_web_search() raises without it once USE_MOCK_WEB_SEARCH
+      # is false, since it's the endpoint the WEB_SEARCH_AGENT_* names below resolve against.
+      - FOUNDRY_PROJECT_ENDPOINT=${FOUNDRY_PROJECT_ENDPOINT}
+      - USE_MOCK_WEB_SEARCH=false
+      - WEB_SEARCH_AGENT_NAME=${WEB_SEARCH_AGENT_NAME}
+      - WEB_SEARCH_AGENT_VERSION=${WEB_SEARCH_AGENT_VERSION}
+      - REVIEW_SEARCH_AGENT_NAME=${REVIEW_SEARCH_AGENT_NAME}
+      - REVIEW_SEARCH_AGENT_VERSION=${REVIEW_SEARCH_AGENT_VERSION}
       - DATABASE_URL=${DATABASE_URL}
+      # Cosmos DB for PostgreSQL mandates SSL; Supabase doesn't need this set.
+      - POSTGRES_SSLMODE=${POSTGRES_SSLMODE}
       - USE_MOCK_IMAGE_SEARCH=false
       - USE_MOCK_BACKGROUND_REMOVAL=false
       - PEXELS_API_KEY=${PEXELS_API_KEY}
       - REMOVEBG_API_KEY=${REMOVEBG_API_KEY}
+      - GEOAPIFY_API_KEY=${GEOAPIFY_API_KEY}
       - USE_MOCK_MUSIC_GENERATION=true
       - USE_MOCK_SAFETY=true
       # - SOUNDRAW_API_KEY=${SOUNDRAW_API_KEY}
@@ -78,16 +87,3 @@ services:
       # - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       # - REMOTION_LAMBDA_FUNCTION_NAME=${REMOTION_LAMBDA_FUNCTION_NAME}
       # - REMOTION_LAMBDA_SERVE_URL=${REMOTION_LAMBDA_SERVE_URL}
-
-  # ---------------------------------------------------------------------------
-  # Brand Agent — FastAPI LLM service (demo, isolated from LLM_service core)
-  # Requires ANTHROPIC_API_KEY to be set in the environment or a .env file.
-  # ---------------------------------------------------------------------------
-  # brand-agent:
-  #   build:
-  #     context: LLM_service/demos/brand_agent
-  #     dockerfile: Dockerfile
-  #   ports:
-  #     - "8000:8000"
-  #   environment:
-  #     - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}

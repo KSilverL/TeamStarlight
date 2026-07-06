@@ -19,6 +19,7 @@ from .base import BackgroundRemovalService, ImageSearchService, MusicGenerationS
 
 _PEXELS_SEARCH_URL = "https://api.pexels.com/v1/search"
 _REMOVEBG_URL = "https://api.remove.bg/v1.0/removebg"
+_GEOAPIFY_STATICMAP_URL = "https://maps.geoapify.com/v1/staticmap"
 # Placeholder — Soundraw's exact generation endpoint/request/response contract has
 # not been verified against their live docs/account. See SoundrawMusic's docstring.
 _SOUNDRAW_GENERATE_URL = "https://api.soundraw.io/v1/generate"
@@ -64,6 +65,38 @@ class RemoveBgService(BackgroundRemovalService):
                 headers={"X-Api-Key": self._settings.removebg_api_key},
                 files={"image_file": ("image", image_bytes)},
                 data={"size": "auto"},
+            )
+            resp.raise_for_status()
+            return resp.content
+
+
+class GeoapifyStaticMap:
+    """Static-map basemap images for `map` slides. Requested by center + zoom (not
+    bbox) on purpose: bbox requests let the provider silently extend one axis to fit
+    the image's aspect ratio, which would desync the pins the Remotion side overlays
+    with its own slippy-map projection of the same center/zoom — see
+    workflow/video/assets.py `_basemap_geometry` and video_renderer src/map/geo.ts."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    async def fetch(
+        self, *, center_lon: float, center_lat: float, zoom: float, width: int, height: int
+    ) -> bytes:
+        import httpx  # lazy import
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                _GEOAPIFY_STATICMAP_URL,
+                params={
+                    # dark-matter matches the dark primaryColor look of every other slide
+                    "style": "dark-matter",
+                    "width": min(width, 4096),
+                    "height": min(height, 4096),
+                    "center": f"lonlat:{center_lon},{center_lat}",
+                    "zoom": round(zoom, 2),
+                    "apiKey": self._settings.geoapify_api_key,
+                },
             )
             resp.raise_for_status()
             return resp.content

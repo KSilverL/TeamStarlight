@@ -215,6 +215,10 @@ class Settings:
     pexels_api_key: Optional[str] = None
     removebg_api_key: Optional[str] = None
 
+    # ── Geoapify (static-map basemaps for `map` slides) ─────────────────────────
+    # No key → map slides render the bundled vector outline instead; never blocking.
+    geoapify_api_key: Optional[str] = None
+
     # ── Soundraw (background music generation) ──────────────────────────────────
     soundraw_api_key: Optional[str] = None
 
@@ -338,6 +342,10 @@ class Settings:
         return bool(self.removebg_api_key)
 
     @property
+    def has_geoapify(self) -> bool:
+        return bool(self.geoapify_api_key)
+
+    @property
     def has_soundraw(self) -> bool:
         return bool(self.soundraw_api_key)
 
@@ -456,11 +464,11 @@ def _load() -> Settings:
         ),
         pexels_api_key=os.getenv("PEXELS_API_KEY"),
         removebg_api_key=os.getenv("REMOVEBG_API_KEY"),
+        geoapify_api_key=os.getenv("GEOAPIFY_API_KEY"),
         soundraw_api_key=os.getenv("SOUNDRAW_API_KEY"),
         azure_speech_key=os.getenv("AZURE_SPEECH_KEY"),
         azure_speech_region=os.getenv("AZURE_SPEECH_REGION"),
         voiceover_default_voice=os.getenv("VOICEOVER_DEFAULT_VOICE", "en-US-JennyNeural"),
-        foundry_project_endpoint=os.getenv("FOUNDRY_PROJECT_ENDPOINT"),
         web_search_agent_name=os.getenv("WEB_SEARCH_AGENT_NAME"),
         web_search_agent_version=os.getenv("WEB_SEARCH_AGENT_VERSION"),
         review_search_agent_name=os.getenv("REVIEW_SEARCH_AGENT_NAME"),

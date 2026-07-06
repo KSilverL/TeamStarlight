@@ -35,16 +35,26 @@ enumerates them via the `type` discriminator. Never invent a new slide type.
   show how one idea leads to another (cause → effect, theme → theme).
 - **`comparison_table`** — 1-4 columns × 2-5 rows, revealed one row at a time. Use
   when there are several named things being compared on the same few attributes.
+- **`map`** — a country/region map with 1-5 animated location pins, each with a
+  `label` and up to 3 short `stats` lines. Use whenever the story is about *places*
+  (cities, offices, markets, regional expansion). `region` is the ISO 3166-1
+  alpha-2 country code, UPPERCASE (e.g. `"IE"` for Ireland); each pin needs real
+  WGS84 coordinates — `lon` (negative = west) and `lat` — e.g. Dublin is
+  lon `-6.26`, lat `53.35`. Prefer this over `generated` for ANY map-like request.
 - **`outro`** — brand name, call-to-action button, optional contact handle.
   Always the last slide.
 - **`generated`** — a BESPOKE scene, authored as real code by a separate agent, for
   when none of the fixed types above genuinely fit. You provide `description` (the
-  creative brief — what this scene should show/communicate) and `data` (whatever
-  structured content it needs: headline text, numbers, labels — its shape is
-  whatever `description` implies, not fixed). This is slower and less predictable
+  creative brief — HOW to present the scene) and `data`, which MUST carry ALL the
+  structured content the scene renders — numbers, labels, series, coordinates — as
+  typed JSON values. `description` says how to present what's in `data`; it must
+  never be the only carrier of the content itself. Bad: `description: "show
+  Dublin's population of 1.2M and Cork's of 0.2M as rising towers"` with `data: {}`.
+  Good: the same `description` with `data: {"cities": [{"name": "Dublin", "pop":
+  1200000}, {"name": "Cork", "pop": 220000}]}`. This is slower and less predictable
   than a fixed type (it's authored, typechecked, and preview-rendered fresh, with a
-  bounded number of retries), so use it sparingly — only when the story genuinely
-  needs something the registry can't express, not as a default choice.
+  bounded number of retries), so use it sparingly — if a fixed type (including
+  `map`) can express it, never use `generated`.
 
 ## Ordering conventions
 
@@ -77,6 +87,9 @@ consistent with any real figures mentioned in the brief; don't contradict them.
   in the same order. Also enforced server-side.
 - `node_diagram.nodes` reads left-to-right (or top-to-bottom on 9:16) as a sequence,
   not a free-form graph — order them in the sequence you want shown.
+- `map.pins[].lon`/`lat` must be real coordinates for the named places (lon/lat
+  bounds are enforced server-side); `stats` lines are invented-but-plausible like
+  the chart fields, e.g. `"Pop: 1.2M"`, `"GDP: €98bn"`, `"Tech · Pharma"`.
 
 ## Colour palette rules
 

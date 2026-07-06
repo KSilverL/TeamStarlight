@@ -63,6 +63,13 @@ BROKEN_CODEGEN_MARKER = "break-codegen"
 # fine, but the mock vision judge flags it anyway).
 VISUAL_QA_REJECT_MARKER = "bad-visual"
 
+# Substring that makes MockLLM.review_scene_preview reject on the FIRST attempt
+# with subject-mismatch feedback (the frame doesn't DEPICT the brief's subject —
+# e.g. a text card standing in for a requested map), mirroring the strengthened
+# depiction criterion in AzureLLM.review_scene_preview's rubric. Same
+# reject-once/approve-on-retry contract as VISUAL_QA_REJECT_MARKER.
+SUBJECT_MISMATCH_MARKER = "off-brief"
+
 # Platform-differentiated strategy angle (strategist). Keyed case-insensitively.
 _PLATFORM_FOCUS: Dict[str, str] = {
     "linkedin": "business analysis and credibility",
@@ -668,9 +675,11 @@ class MockLLM(LLMService):
         self, *, description: str, image_bytes: bytes, attempt: int = 1,
     ) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
-        reject = VISUAL_QA_REJECT_MARKER in description.lower() and attempt == 1
-        if reject:
-            return {"approved": False, "feedback": "mock visual QA: headline overlaps the frame edge"}
+        if attempt == 1:
+            if SUBJECT_MISMATCH_MARKER in description.lower():
+                return {"approved": False, "feedback": "mock visual QA: frame does not depict the brief's subject"}
+            if VISUAL_QA_REJECT_MARKER in description.lower():
+                return {"approved": False, "feedback": "mock visual QA: headline overlaps the frame edge"}
         return {"approved": True, "feedback": ""}
 
     async def fill_brief(

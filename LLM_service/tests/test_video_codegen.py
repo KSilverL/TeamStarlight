@@ -18,7 +18,12 @@ import logging
 import pytest
 
 from LLM_service.core.config import Settings
-from LLM_service.core.services.mock import BROKEN_CODEGEN_MARKER, VISUAL_QA_REJECT_MARKER, MockLLM
+from LLM_service.core.services.mock import (
+    BROKEN_CODEGEN_MARKER,
+    SUBJECT_MISMATCH_MARKER,
+    VISUAL_QA_REJECT_MARKER,
+    MockLLM,
+)
 from LLM_service.core.video_schema import (
     GeneratedSlideSpec,
     RenderableStoryboard,
@@ -98,6 +103,19 @@ async def test_mock_review_scene_preview_rejects_on_first_attempt_with_marker():
     first = await MockLLM().review_scene_preview(**kw, attempt=1)
     assert first["approved"] is False
     assert first["feedback"]
+
+    second = await MockLLM().review_scene_preview(**kw, attempt=2)
+    assert second["approved"] is True
+
+
+async def test_mock_review_scene_preview_rejects_subject_mismatch_on_first_attempt():
+    """The strengthened QA rubric's offline lever: a frame that doesn't DEPICT the
+    brief's subject (e.g. a text card standing in for a requested map) is rejected
+    with subject-specific feedback, then approved on the retry like the other marker."""
+    kw = dict(description=f"a map of Ireland ({SUBJECT_MISMATCH_MARKER})", image_bytes=b"png")
+    first = await MockLLM().review_scene_preview(**kw, attempt=1)
+    assert first["approved"] is False
+    assert "does not depict" in first["feedback"]
 
     second = await MockLLM().review_scene_preview(**kw, attempt=2)
     assert second["approved"] is True
@@ -191,6 +209,20 @@ async def test_generate_scene_recovers_after_visual_qa_rejection(scratch_setting
     spec = GeneratedSlideSpec(description=f"intro card ({VISUAL_QA_REJECT_MARKER})", data={})
     result = await codegen.generate_scene(
         job_id="job4", slide_index=0, spec=spec, width=1080, height=1920, fps=30,
+        settings=scratch_settings, max_attempts=3,
+    )
+    assert isinstance(result, RenderGeneratedSlide)
+
+
+async def test_generate_scene_recovers_after_subject_mismatch_rejection(scratch_settings, monkeypatch):
+    """Same retry path as the legibility rejection above, but through the
+    strengthened doesn't-depict-the-subject criterion."""
+    monkeypatch.setattr(codegen, "_run_typecheck", _ok_typecheck)
+    monkeypatch.setattr(codegen, "_run_preview_render", _ok_preview)
+
+    spec = GeneratedSlideSpec(description=f"a map of Ireland ({SUBJECT_MISMATCH_MARKER})", data={})
+    result = await codegen.generate_scene(
+        job_id="job4b", slide_index=0, spec=spec, width=1080, height=1920, fps=30,
         settings=scratch_settings, max_attempts=3,
     )
     assert isinstance(result, RenderGeneratedSlide)

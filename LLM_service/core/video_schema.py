@@ -63,6 +63,7 @@ DURATION_BUDGET: Dict[str, Tuple[int, int, int]] = {
     "bar_chart": (150, 90, 240),
     "node_diagram": (120, 90, 180),
     "comparison_table": (180, 120, 270),
+    "map": (180, 120, 270),
     "generated": (120, 60, 240),
 }
 
@@ -223,6 +224,30 @@ class ComparisonTableSlideSpec(BaseModel):
         return self
 
 
+class MapPin(BaseModel):
+    """One pinned location on a map slide. Coordinates are LLM-authored — reliable
+    for major cities, and the lon/lat bounds below catch swapped or garbage values."""
+
+    label: str = Field(min_length=1, max_length=30, description="Short place name, e.g. 'Dublin'")
+    lon: float = Field(ge=-180, le=180, description="WGS84 longitude (negative = west), e.g. -6.26 for Dublin")
+    lat: float = Field(ge=-90, le=90, description="WGS84 latitude, e.g. 53.35 for Dublin")
+    stats: List[str] = Field(
+        default_factory=list, max_length=3,
+        description="0-3 short stat lines shown on the pin's card, e.g. 'Pop: 1.2M', 'GDP: €98bn', 'Tech · Pharma'",
+    )
+
+
+class MapSlideSpec(BaseModel):
+    type: Literal["map"] = "map"
+    headline: Optional[str] = Field(None, description="Optional short header above the map")
+    region: str = Field(
+        pattern=r"^[A-Z]{2}$",
+        description="ISO 3166-1 alpha-2 country code, UPPERCASE, e.g. 'IE' for Ireland — selects the map outline",
+    )
+    pins: List[MapPin] = Field(min_length=1, max_length=5, description="1-5 pinned locations, revealed one by one")
+    durationFrames: Optional[int] = Field(None, description="Suggested frames at 30fps; clamped server-side")
+
+
 # ── Phase 3: bespoke, LLM-authored scene (autonomous video-agent plan) ──────
 # Unlike the fixed types above (a hand-written React component per type), `generated`
 # lets the storyboard LLM ask for a BESPOKE scene when none of the fixed types fit —
@@ -255,7 +280,7 @@ SlideSpec = Annotated[
     Union[
         HookSlideSpec, CounterStatSlideSpec, CollageSlideSpec, OutroSlideSpec,
         PieChartSlideSpec, LineChartSlideSpec, BarChartSlideSpec, NodeDiagramSlideSpec, ComparisonTableSlideSpec,
-        GeneratedSlideSpec,
+        MapSlideSpec, GeneratedSlideSpec,
     ],
     Field(discriminator="type"),
 ]
@@ -266,7 +291,7 @@ SlideSpec = Annotated[
 SLIDE_TYPES = frozenset({
     "hook", "counter_stat", "collage", "outro",
     "pie_chart", "line_chart", "bar_chart", "node_diagram", "comparison_table",
-    "generated",
+    "map", "generated",
 })
 
 
@@ -368,6 +393,24 @@ class RenderComparisonTableSlide(BaseModel):
     durationFrames: int
 
 
+class RenderMapSlide(BaseModel):
+    """A map slide after basemap resolution. The three basemap* fields are set
+    together (or all None) by workflow/video/assets.py: when a Geoapify key is
+    configured (and the backend is local), it fetches a static-map image into the
+    job dir and records the exact center/zoom it requested — the Remotion side
+    re-projects pins with the same slippy-map math so they align with the image.
+    All-None → the renderer draws the bundled vector outline for `region` instead."""
+
+    type: Literal["map"] = "map"
+    headline: Optional[str] = None
+    region: str
+    pins: List[MapPin]
+    basemapLocalPath: Optional[str] = None
+    basemapCenter: Optional[Tuple[float, float]] = None  # (lon, lat)
+    basemapZoom: Optional[float] = None
+    durationFrames: int
+
+
 class RenderGeneratedSlide(BaseModel):
     """A `generated` slide that codegen.py successfully authored + validated.
     `componentName` names the file written under
@@ -387,7 +430,7 @@ RenderSlide = Annotated[
     Union[
         RenderHookSlide, RenderCounterStatSlide, RenderCollageSlide, RenderOutroSlide,
         RenderPieChartSlide, RenderLineChartSlide, RenderBarChartSlide, RenderNodeDiagramSlide,
-        RenderComparisonTableSlide, RenderGeneratedSlide,
+        RenderComparisonTableSlide, RenderMapSlide, RenderGeneratedSlide,
     ],
     Field(discriminator="type"),
 ]

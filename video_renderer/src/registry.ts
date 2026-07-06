@@ -10,6 +10,7 @@ import { ComparisonTableSlide } from "./slides/ComparisonTableSlide";
 import { CounterStatSlide } from "./slides/CounterStatSlide";
 import { HookSlide } from "./slides/HookSlide";
 import { LineChartSlide } from "./slides/LineChartSlide";
+import { MapSlide } from "./slides/MapSlide";
 import { NodeDiagramSlide } from "./slides/NodeDiagramSlide";
 import { OutroSlide } from "./slides/OutroSlide";
 import { PieChartSlide } from "./slides/PieChartSlide";
@@ -39,6 +40,7 @@ export const SLIDE_REGISTRY: Record<Exclude<Slide["type"], "generated">, AnySlid
   bar_chart: BarChartSlide,
   node_diagram: NodeDiagramSlide,
   comparison_table: ComparisonTableSlide,
+  map: MapSlide,
 };
 
 // Populated at module-load time by a per-job entry point (src/generated/<job_id>/*),
