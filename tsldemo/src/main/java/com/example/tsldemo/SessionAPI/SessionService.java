@@ -95,6 +95,7 @@ public class SessionService {
     	
     }
     
+    //Call once session.isComplete = true;
     public CreativeBrief getCreativeBrief(String sessionId) {
         return restClient.get()
                 .uri(llmServiceBaseUrl + "/intake/" + sessionId + "/brief")

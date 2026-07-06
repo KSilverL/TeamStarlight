@@ -6,7 +6,11 @@ import java.util.Map;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.client.RestClient;
+
+import com.example.tsldemo.ApiDTOS.CreativeBrief;
+import com.example.tsldemo.ApiDTOS.TaskStatus;
 
 @Service
 public class AgentService {
@@ -44,5 +48,14 @@ public class AgentService {
     	
     	return response;
     }
+	
+	public TaskStatus getCurrentTaskStatus(CreativeBrief brief) {
+		return restClient.post()
+                .uri(llmServiceBaseUrl + "/tasks")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(brief)
+                .retrieve()
+                .body(TaskStatus.class);
+	}
 	
 }

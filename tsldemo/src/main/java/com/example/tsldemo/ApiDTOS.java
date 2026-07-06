@@ -62,6 +62,7 @@ public class ApiDTOS {
 	) {}
 	
 	public static class CreativeBrief {
+		@JsonProperty
 		String topic;
 		
 		@JsonProperty("target_platforms")
@@ -79,7 +80,11 @@ public class ApiDTOS {
 		@JsonProperty("user_id")
 		String userId;
 		
+		@JsonProperty
 		String route;
+		
+		@JsonProperty("content_types")
+		String[] contentTypes;
 		
 		@JsonProperty("intake_mode")
 		String intakeMode;
