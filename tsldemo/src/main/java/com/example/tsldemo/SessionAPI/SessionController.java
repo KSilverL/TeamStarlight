@@ -19,6 +19,8 @@ import tools.jackson.databind.ObjectMapper;
 
 import com.example.tsldemo.ApiDTOS.IntakeRequest;
 import com.example.tsldemo.ApiDTOS.IntakeResponse;
+import com.example.tsldemo.ApiDTOS.IntakeTurnRequest;
+import com.example.tsldemo.ApiDTOS.IntakeTurnResponse;
 import com.example.tsldemo.Message;
 import com.example.tsldemo.Session;
 import com.example.tsldemo.DTOs.ResponseReceived.IntakeRespDTO;
@@ -98,6 +100,25 @@ public class SessionController {
 	public List<Message> getMessages(@PathVariable String id) {
 		Session s = service.getSessionBy(id).get();
 		return s.getMessages();
+		
+	}
+	
+	
+	@PostMapping("/intakeTurn/{sessionId}")
+	public IntakeTurnResponse addIntakeTurnResponse(
+			@PathVariable String sessionId,
+            @RequestBody IntakeTurnRequest request) {
+		
+		IntakeTurnResponse response = service.getIntakeTurn(request, sessionId);
+		
+		Message assistantTurn = new Message("assistant", response.assistantMessage());
+		
+		Session session = service.getSessionBy(sessionId).get();
+		session.setComplete(response.complete());
+		
+		service.updateSession(sessionId, assistantTurn);
+		
+		return response;
 		
 	}
 	
