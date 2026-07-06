@@ -39,6 +39,7 @@ from .base import (
     LLMService,
     SafetyResult,
     SafetyService,
+    VoiceoverService,
     VoiceService,
 )
 
@@ -270,6 +271,81 @@ class AzureLLM(LLMService):
                     )},
                 ]
         raise last_error
+
+    async def review_scene_preview(
+        self, *, description: str, image_bytes: bytes, attempt: int = 1,
+    ) -> dict:
+        import base64
+
+        system = (
+            "You are a meticulous visual QA reviewer for short-form brand video "
+            "scenes. You'll see the creative brief for a scene and a still frame "
+            "rendered from the candidate code (already confirmed to compile and "
+            "render without crashing — you're judging how it LOOKS, not whether it "
+            "runs). Reject if: text overlaps other content or the frame edge, "
+            "contrast makes text illegible, the frame is blank/empty when it "
+            "shouldn't be, or the content clearly doesn't match the brief. Minor "
+            "stylistic taste is not grounds for rejection — only genuine visual "
+            "breakage. Reply with ONLY JSON: {\"approved\": bool, \"feedback\": "
+            "str}. `feedback` empty if approved; otherwise specific enough to fix "
+            "(name the exact problem and where it is)."
+        )
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        user_content = [
+            {"type": "text", "text": f"Scene brief: {description}"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+        ]
+        raw = await self._complete(
+            [{"role": "system", "content": system}, {"role": "user", "content": user_content}]
+        )
+        data = json.loads(_strip_fences(raw))
+        return {"approved": bool(data.get("approved", True)), "feedback": str(data.get("feedback") or "")}
+
+    async def generate_scene_component(
+        self,
+        *,
+        description: str,
+        data: dict,
+        width: int,
+        height: int,
+        fps: int,
+        duration_frames: int,
+        attempt: int = 1,
+        prior_error: Optional[str] = None,
+        prior_source: Optional[str] = None,
+    ) -> str:
+        system = (
+            "You are a Remotion (React + TypeScript) motion-graphics engineer. Author "
+            "ONE bespoke scene component's .tsx source for a short brand video. Your "
+            "default export MUST be a React.FC accepting EXACTLY the same prop shape "
+            "every other scene component in this project uses: "
+            "{ slide, accentColor, secondaryColor, primaryColor } — where `slide` is "
+            "{ type: \"generated\", componentName, data, durationFrames } and your "
+            "content comes from `slide.data`. Import that type as "
+            "`import type { GeneratedSlide } from \"../../types\";`. Do NOT expect "
+            "width/height/fps/durationFrames as props — call Remotion's "
+            "useVideoConfig() and useCurrentFrame() for those, exactly like every "
+            "other slide component does. Use only `remotion` (AbsoluteFill, "
+            "interpolate, spring, useCurrentFrame, useVideoConfig, Img, staticFile, "
+            "...) and `react` imports; nothing else is guaranteed to be installed in "
+            "the render project. Return ONLY the .tsx source — no markdown fences, "
+            "no explanation."
+        )
+        if attempt > 1 and prior_error:
+            system += (
+                f"\n\nYour previous attempt failed with this exact error:\n{prior_error}\n\n"
+                f"Previous source:\n{prior_source or ''}\n\n"
+                "Fix this specific failure directly — do not start over from scratch."
+            )
+        user = (
+            f"Scene brief: {description}\n"
+            f"Data available at runtime (props.data): {json.dumps(data)}\n"
+            f"Canvas: {width}x{height} @ {fps}fps, durationFrames={duration_frames}"
+        )
+        raw = await self._complete(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        )
+        return _strip_fences(raw)
 
     async def distill_rules(
         self,
@@ -676,3 +752,50 @@ class AzureVoice(VoiceService):
     async def transcribe_turn(self, *, session_id: str, user_audio: str) -> dict:
         transcript = await self._transcribe(user_audio)
         return {"session_id": session_id, "transcript": transcript}
+
+
+# ── Voiceover (Azure Speech text-to-speech) ────────────────────────────────────
+# UNVERIFIED against a live Azure Speech resource (no credentials were available
+# when this was written) — same caveat SoundrawMusic (media_assets.py) carries for
+# the same reason. The REST TTS endpoint/SSML/header shape below matches Azure
+# Speech's documented v1 API; confirm with one real call before trusting it in
+# production (see the implementation plan's Phase 3 verification steps).
+
+class AzureSpeechVoiceover(VoiceoverService):
+    """Text-to-speech via Azure Speech's REST endpoint (not the Voice Live
+    WebSocket API AzureVoice above uses — that's speech-to-text for intake; this is
+    speech synthesis for a rendered video's narration track)."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    def _synthesis_url(self) -> str:
+        region = self._settings.azure_speech_region
+        return f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
+
+    @staticmethod
+    def _ssml(text: str, voice: str) -> str:
+        import html as _html_mod
+
+        escaped = _html_mod.escape(text)
+        return (
+            '<speak version="1.0" xml:lang="en-US">'
+            f'<voice name="{voice}">{escaped}</voice>'
+            "</speak>"
+        )
+
+    async def synthesize(self, *, text: str, voice: str) -> bytes:
+        import httpx  # lazy import, matches the rest of core/services/*
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                self._synthesis_url(),
+                headers={
+                    "Ocp-Apim-Subscription-Key": self._settings.azure_speech_key,
+                    "Content-Type": "application/ssml+xml",
+                    "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+                },
+                content=self._ssml(text, voice).encode("utf-8"),
+            )
+            resp.raise_for_status()
+            return resp.content

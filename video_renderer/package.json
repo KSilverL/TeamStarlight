@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@remotion/cli": "4.0.484",
+    "@remotion/lambda": "4.0.484",
     "react": "19.2.7",
     "react-dom": "19.2.7",
     "recharts": "^3.9.1",

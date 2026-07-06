@@ -18,6 +18,7 @@ from LLM_service.core.video_schema import (
     CollageSlideSpec,
     ComparisonTableSlideSpec,
     CounterStatSlideSpec,
+    GeneratedSlideSpec,
     HookSlideSpec,
     LineChartSlideSpec,
     NodeDiagramSlideSpec,
@@ -42,6 +43,7 @@ def test_slide_type_registry_matches_implemented_models():
         BarChartSlideSpec.model_fields["type"].default,
         NodeDiagramSlideSpec.model_fields["type"].default,
         ComparisonTableSlideSpec.model_fields["type"].default,
+        GeneratedSlideSpec.model_fields["type"].default,
     }
     assert discriminators == SLIDE_TYPES
 
@@ -169,9 +171,26 @@ def test_storyboard_spec_accepts_phase_2_chart_slides():
     ("bar_chart", 150),
     ("node_diagram", 120),
     ("comparison_table", 180),
+    ("generated", 120),
 ])
 def test_clamp_duration_has_defaults_for_phase_2_types(slide_type, expected_default):
     assert clamp_duration(slide_type, None) == expected_default
+
+
+def test_storyboard_spec_accepts_a_generated_slide():
+    storyboard = StoryboardSpec(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        platform="linkedin",
+        slides=[
+            {"type": "hook", "headline": "Dublin Property Trends"},
+            {"type": "generated", "description": "A rotating 3D globe with pins dropping on Dublin",
+             "data": {"headline": "Now live in Dublin"}},
+            {"type": "outro", "brandName": "X", "ctaLabel": "Go"},
+        ],
+    )
+    generated = storyboard.slides[1]
+    assert generated.type == "generated"
+    assert generated.data == {"headline": "Now live in Dublin"}
 
 
 def test_renderable_storyboard_round_trips_a_full_storyboard():

@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Body, FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .core.config import get_settings, load_dotenv
@@ -769,7 +769,10 @@ class VideoService:
     def __init__(self, *, workflow: WorkflowService) -> None:
         self._workflow = workflow
 
-    async def start(self, task_id: str, platform: str) -> dict:
+    async def start(
+        self, task_id: str, platform: str, *,
+        narration_text: Optional[str] = None, narration_voice: Optional[str] = None,
+    ) -> dict:
         draft = self._workflow.get_final_draft(task_id, platform)
         if draft is None:
             raise ApiError(404, f"no finished draft for platform '{platform}' on task {task_id}")
@@ -778,6 +781,7 @@ class VideoService:
             raise ApiError(409, f"platform '{platform}' has no video storyboard yet")
         doc = await start_render_job(
             task_id=task_id, platform=platform, storyboard=StoryboardSpec(**storyboard),
+            narration_text=narration_text, narration_voice=narration_voice,
         )
         return {"job_id": doc["id"], "status": doc["status"]}
 
@@ -787,14 +791,22 @@ class VideoService:
             raise ApiError(404, f"unknown video job: {job_id}")
         return job
 
-    async def download_path(self, job_id: str) -> Path:
+    async def download_location(self, job_id: str) -> tuple[str, bool]:
+        """Returns (location, is_remote). `render_storyboard` (workflow/video/render.py)
+        returns a local Path when VIDEO_RENDER_BACKEND=local (the default) or an
+        https:// S3 URL when =lambda; jobs.py stores whichever verbatim as
+        `output_path` (str() either way), so this is where the two are told apart —
+        neither jobs.py nor the StoreService schema needs to know which ran."""
         job = await self.get(job_id)
         if job["status"] != "done" or not job.get("output_path"):
             raise ApiError(409, f"video job {job_id} is not done yet (status={job['status']})")
-        path = Path(job["output_path"])
+        location = job["output_path"]
+        if location.startswith("http://") or location.startswith("https://"):
+            return location, True
+        path = Path(location)
         if not path.is_file():
             raise ApiError(404, f"rendered file for job {job_id} is missing on disk")
-        return path
+        return str(path), False
 
 
 def _verdict_from_payload(payload: dict) -> HumanVerdict:
@@ -964,6 +976,14 @@ class GenerateHtmlRequest(BaseModel):
 
 class RenderVideoRequest(BaseModel):
     platform: str = Field(..., description="Which finished platform draft's storyboard to render")
+    narration_text: Optional[str] = Field(
+        None, description="Optional voiceover script to synthesize and mix into the render "
+        "(Phase 3: TTS via Azure Speech, or a silent mock). Omit for no narration."
+    )
+    narration_voice: Optional[str] = Field(
+        None, description="Provider voice id (e.g. an Azure Neural voice name). "
+        "Omit to use VOICEOVER_DEFAULT_VOICE."
+    )
 
 
 # ── Dependencies: pull the per-app service singletons off app.state ───────────
@@ -1101,7 +1121,10 @@ async def start_roundtables(request: Request, body: RoundtableRequest) -> dict:
     summary="Render the MP4 for one platform's already-produced video storyboard",
 )
 async def render_video(request: Request, task_id: str, body: RenderVideoRequest) -> dict:
-    return await _video(request).start(task_id, body.platform)
+    return await _video(request).start(
+        task_id, body.platform,
+        narration_text=body.narration_text, narration_voice=body.narration_voice,
+    )
 
 
 @intake_router.post("", summary="Open an intake conversation (voice or text)")
@@ -1165,10 +1188,17 @@ async def get_video_job(request: Request, job_id: str) -> dict:
     return await _video(request).get(job_id)
 
 
-@video_jobs_router.get("/{job_id}/download", summary="Download the finished MP4")
-async def download_video_job(request: Request, job_id: str) -> FileResponse:
-    path = await _video(request).download_path(job_id)
-    return FileResponse(path, media_type="video/mp4", filename=f"{job_id}.mp4")
+@video_jobs_router.get("/{job_id}/download", summary="Download or stream the finished MP4")
+async def download_video_job(request: Request, job_id: str):
+    """Local backend: streams the MP4 straight off disk (FileResponse), as before.
+    Lambda backend: 307-redirects to the S3 output URL instead of proxying the
+    bytes through this process — S3 already serves HTTP range requests natively, so
+    a <video> element can seek/scrub the redirected URL directly, satisfying
+    "stream, don't just download" without this service touching the bytes at all."""
+    location, is_remote = await _video(request).download_location(job_id)
+    if is_remote:
+        return RedirectResponse(location, status_code=307)
+    return FileResponse(location, media_type="video/mp4", filename=f"{job_id}.mp4")
 
 
 # ── App factory ────────────────────────────────────────────────────────────────

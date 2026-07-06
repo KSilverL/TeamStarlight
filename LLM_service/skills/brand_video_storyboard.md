@@ -37,6 +37,14 @@ enumerates them via the `type` discriminator. Never invent a new slide type.
   when there are several named things being compared on the same few attributes.
 - **`outro`** — brand name, call-to-action button, optional contact handle.
   Always the last slide.
+- **`generated`** — a BESPOKE scene, authored as real code by a separate agent, for
+  when none of the fixed types above genuinely fit. You provide `description` (the
+  creative brief — what this scene should show/communicate) and `data` (whatever
+  structured content it needs: headline text, numbers, labels — its shape is
+  whatever `description` implies, not fixed). This is slower and less predictable
+  than a fixed type (it's authored, typechecked, and preview-rendered fresh, with a
+  bounded number of retries), so use it sparingly — only when the story genuinely
+  needs something the registry can't express, not as a default choice.
 
 ## Ordering conventions
 

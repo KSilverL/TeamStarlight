@@ -30,8 +30,11 @@ __all__ = [
     "SafetyService",
     "StoreService",
     "VoiceService",
+    "WebSearchService",
     "ImageSearchService",
     "BackgroundRemovalService",
+    "MusicGenerationService",
+    "VoiceoverService",
     "empty_profile",
 ]
 
@@ -252,6 +255,77 @@ class LLMService(ABC):
         ...
 
     @abstractmethod
+    async def generate_scene_component(
+        self,
+        *,
+        description: str,
+        data: dict,
+        width: int,
+        height: int,
+        fps: int,
+        duration_frames: int,
+        attempt: int = 1,
+        prior_error: Optional[str] = None,
+        prior_source: Optional[str] = None,
+    ) -> str:
+        """Author ONE bespoke Remotion scene's TSX source for a `generated` slide
+        (core.video_schema.GeneratedSlideSpec) — real component code, not picked
+        from the fixed slide registry. `description` is the creative brief;
+        `data` is the structured content the component should render (its shape is
+        whatever `description` implies, not fixed). `width`/`height`/`fps`/
+        `duration_frames` are concrete (already resolved from the platform) and
+        given for CONTEXT — the component itself reads them at runtime via
+        Remotion's `useVideoConfig()`/`useCurrentFrame()`, it does not receive them
+        as props (see below), so it renders correctly at whatever size/duration the
+        actual render turns out to use.
+
+        MUST return a single .tsx module whose default export is a React.FC with
+        EXACTLY the same prop shape every fixed slide component already uses —
+        `{ slide, accentColor, secondaryColor, primaryColor }` (see e.g.
+        video_renderer/src/slides/HookSlide.tsx) — so it slots into the existing
+        Composition.tsx harness with no special-casing. `slide.data` is this
+        method's `data` dict; `slide.durationFrames` is `duration_frames`. Use
+        `useVideoConfig()` for width/height/fps and `useCurrentFrame()` for the
+        current frame — never assume they arrive as props. Use only `remotion`
+        (AbsoluteFill, interpolate, spring, useCurrentFrame, useVideoConfig, Img,
+        staticFile, ...) and `react` imports; nothing else is guaranteed to be
+        installed in the render project.
+
+        This is called in a bounded self-repair loop by workflow/video/codegen.py:
+        on `attempt` 1, `prior_error`/`prior_source` are None (a fresh attempt). On
+        a retry, `prior_error` is the EXACT compiler or preview-render failure from
+        the previous attempt and `prior_source` is the code that produced it — an
+        impl MUST fix that specific failure directly, not regenerate blindly from
+        scratch. Raises only on a hard backend failure (network, no credentials);
+        a merely-invalid-code attempt should still return SOME source (codegen.py's
+        typecheck/preview-render step is what catches that, not this method)."""
+        ...
+
+    @abstractmethod
+    async def review_scene_preview(
+        self, *, description: str, image_bytes: bytes, attempt: int = 1,
+    ) -> dict:
+        """Multimodal visual QA for a `generated` slide (Phase 3 of the video-agent
+        plan): given the ORIGINAL creative brief (`description`) and a still frame
+        (PNG bytes) rendered from the just-typechecked, just-rendered candidate
+        component, judge whether it actually looks right — not just "did it compile
+        and render without throwing" (workflow/video/codegen.py's typecheck +
+        preview-render already establish that), but "is the result legible,
+        on-brief, and not visually broken" (overlapping text, illegible contrast,
+        an empty/blank frame, content that doesn't match `description`). `attempt`
+        is contextual only (which retry this is), mirroring `generate_scene_component`.
+
+        Returns {"approved": bool, "feedback": str}. `feedback` is empty when
+        approved; when not approved, it's specific enough that codegen.py can feed
+        it back as the next attempt's `prior_error` (e.g. "the headline text
+        overflows the frame and is cut off on the right edge", not "looks bad").
+        Called only after typecheck + preview-render both already passed — this is
+        an ADDITIONAL bar, not a replacement for either. Raises only on a hard
+        backend failure; a genuinely bad-looking frame is a normal (not approved)
+        result, never an exception."""
+        ...
+
+    @abstractmethod
     async def fill_brief(
         self,
         *,
@@ -357,6 +431,36 @@ class VoiceService(ABC):
         ...
 
 
+# ── Web research (Bing grounding via Azure AI Foundry agents) ─────────────────
+
+class WebSearchService(ABC):
+    """Live web research: general search/grounding, single-page text fetch, and
+    review-quote mining. Callers must treat an empty result as a soft-fail (skip
+    the enrichment), never raise on a plain no-match — only a hard backend failure
+    (missing config, network) should raise."""
+
+    @abstractmethod
+    async def search_web(self, *, query: str, count: int = 5) -> List[dict]:
+        """Return up to `count` grounded results for `query`, each a dict with at
+        least {title, url, snippet}. Empty list on no match."""
+        ...
+
+    @abstractmethod
+    async def fetch_url_text(self, *, url: str) -> str:
+        """Return the cleaned main-body text of `url` (best-effort extraction, no
+        markup) — e.g. to read a search_web result in full. Empty string on a
+        fetch/parse failure; callers treat this as a soft-fail, never an aborted run."""
+        ...
+
+    @abstractmethod
+    async def search_reviews(self, *, subject: str, count: int = 5) -> List[dict]:
+        """Return up to `count` real, attributable customer review quotes for
+        `subject` (a brand or product name), each a dict with at least
+        {quote, source}; `rating`/`url` are included when the source exposes them.
+        Empty list on no match — never invent a quote."""
+        ...
+
+
 # ── Image search (Pexels) ──────────────────────────────────────────────────────
 
 class ImageSearchService(ABC):
@@ -393,4 +497,22 @@ class MusicGenerationService(ABC):
         """Return audio bytes (mp3) for a track matching the requested duration.
         Raises on a hard failure (rate limit, bad params, network) — callers fall
         back to a silent render."""
+        ...
+
+
+# ── Voiceover (Azure Speech text-to-speech) ────────────────────────────────────
+
+class VoiceoverService(ABC):
+    """Narration text-to-speech for an optional voiceover track (Phase 3 of the
+    video-agent plan) — distinct from VoiceService above, which bridges SPOKEN
+    input during intake (speech-to-text); this is spoken OUTPUT for a rendered
+    video. `workflow/video/voiceover.py` sizes/mixes the result; callers there
+    treat a hard failure as "no voiceover" (mirrors MusicGenerationService), never
+    a reason to abort the render."""
+
+    @abstractmethod
+    async def synthesize(self, *, text: str, voice: str) -> bytes:
+        """Return audio bytes (mp3) speaking `text` in `voice` (a provider-specific
+        voice id, e.g. an Azure Neural voice name). Raises on a hard failure (rate
+        limit, bad voice id, network) — callers fall back to no narration."""
         ...
