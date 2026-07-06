@@ -8,6 +8,10 @@ The roster (3-4 AI seats per table + the user, who joins in Phase 3):
   - brand_voice       — guards the brand's must_do / must_avoid; injects the brand profile.
   - user_advocate     — speaks for this user's learned preferences; injects user_skills.
   - audience_advocate — pure prompt; argues from the reader's seat.
+  - trend_scout       — OPTIONAL fifth seat (TREND_SCOUT_ENABLED, default off); injects the
+                        daily trends snapshot and proposes a trend-fusion angle, with explicit
+                        permission to reject a forced fit (docs/TREND_SCOUT_IMPLEMENTATION.md).
+                        Tool-free like every seat — it arrives already carrying the trends.
 
 The injected context (skill / brand profile / user skills) is folded VERBATIM into each
 persona's `instructions`, and also kept on the `Persona` record so it is testable without
@@ -24,6 +28,7 @@ from agent_framework import Agent
 from ...core.config import get_settings
 from ...core.services import factory
 from ...core.skill_schema import UserSkillDoc
+from ...core.trend_schema import Trend, render_trends
 from ...skills import load_skill
 from ..messages import Brief
 
@@ -32,7 +37,10 @@ PLATFORM_EDITOR = "platform_editor"
 BRAND_VOICE = "brand_voice"
 USER_ADVOCATE = "user_advocate"
 AUDIENCE_ADVOCATE = "audience_advocate"
+TREND_SCOUT = "trend_scout"
 
+# The always-on four seats. `trend_scout` is appended inside build_personas only when
+# TREND_SCOUT_ENABLED — with the toggle off the roster (and every existing test) is unchanged.
 ROSTER: List[str] = [PLATFORM_EDITOR, BRAND_VOICE, USER_ADVOCATE, AUDIENCE_ADVOCATE]
 
 # Appended VERBATIM to every seat's instructions so each turn reads like a real person speaking
@@ -77,6 +85,9 @@ def render_brand_profile(profile: dict) -> str:
     return "\n\n".join(parts)
 
 
+# render_trends now lives in core/trend_schema.py (shared with the linear strategist and
+# the intake copilot — Phase 4); re-exported here so the seat's renderer stays importable.
+
 def render_user_skills(doc: Optional[UserSkillDoc]) -> str:
     """Render this user's learned rules as a prompt block (empty when none)."""
     if not doc or not doc.rules:
@@ -97,11 +108,14 @@ def build_personas(
     *,
     brand_profile: dict,
     user_skills: Optional[UserSkillDoc],
+    trends: Optional[List[Trend]] = None,
     model_tier: str = "mini",
     chat_client_factory: Optional[Callable[[str], object]] = None,
 ) -> List[Persona]:
     """Build one table's personas for `platform`, injecting the static skill, the brand
-    profile, and the user's learned skills into the right seats. `chat_client_factory`
+    profile, and the user's learned skills into the right seats. With TREND_SCOUT_ENABLED
+    a fifth `trend_scout` seat joins, carrying the day's `trends` verbatim (an empty/None
+    list degrades its block to "(no current trends available)"). `chat_client_factory`
     maps a persona name → a fresh chat client (defaults to factory.get_chat_client, capped
     to the persona token budget so turns stay short)."""
     settings = get_settings()
@@ -118,6 +132,7 @@ def build_personas(
     skill_md = load_skill(platform)
     brand_block = render_brand_profile(brand_profile)
     user_block = render_user_skills(user_skills)
+    trend_block = render_trends(trends or [])
 
     instructions = {
         PLATFORM_EDITOR: (
@@ -139,10 +154,22 @@ def build_personas(
             "You are the audience advocate. Argue from the target reader's seat: push for "
             "the benefit up front, call out anything that would not land, and cut filler."
         ),
+        TREND_SCOUT: (
+            "You are the trend scout. Below are current, broad cultural/industry trends. "
+            "Find a GENUINE, creative connection between one of them and the topic under "
+            "discussion, and propose a concrete fusion angle. Prefer an unexpected but "
+            "honest link over an on-the-nose one. If none genuinely fits, say so plainly "
+            "and do not force one — a forced trend is worse than none.\n\n"
+            f"{trend_block or '(no current trends available — skip the trend angle)'}"
+        ),
     }
 
+    roster = list(ROSTER)
+    if settings.trend_scout_enabled:
+        roster.append(TREND_SCOUT)
+
     personas: List[Persona] = []
-    for name in ROSTER:
+    for name in roster:
         text = instructions[name] + "\n\n" + DISCUSSION_STYLE
         agent = Agent(make_client(name), instructions=text, name=name)
         personas.append(Persona(name=name, role=name, model_tier=model_tier, instructions=text, agent=agent))

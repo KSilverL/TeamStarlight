@@ -437,7 +437,7 @@ Each line is `data: <json>\n\n`. The stream replays all events so far, continues
 | Field          | Type   | Description                                                                 |
 |----------------|--------|-----------------------------------------------------------------------------|
 | `type`         | string | `"progress"` or `"result"` (plus `"agent_utterance"` in roundtable mode)    |
-| `node`         | string | The MAF executor (`dispatcher` / `scout` / `creator` / `reviewer` / `human_gate` / `media_producer` / `workflow`; the in-graph `archivist` was removed). The `final` result is emitted under `human_gate` (text runs) or `media_producer` (media-only runs, which have no gate) |
+| `node`         | string | The MAF executor (`dispatcher` / `strategist` / `creator` / `reviewer` / `human_gate` / `media_producer` / `workflow`; the in-graph `archivist` was removed). The `final` result is emitted under `human_gate` (text runs) or `media_producer` (media-only runs, which have no gate) |
 | `platform`     | string | The target platform (e.g. `"instagram"`); `null` for non-per-platform steps |
 | `status`       | string | `running` → `done` / `interrupted` / `error`, or `draft_ready` / `final` / `discussion_consensus` on a result |
 | `draft`        | string | The generated post copy                                                     |

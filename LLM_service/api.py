@@ -46,7 +46,15 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Stre
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .core.config import get_settings, load_dotenv
-from .core.events import DONE, ERROR, INTERRUPTED, RUNNING, progress_event, result_event
+from .core.events import (
+    DONE,
+    ERROR,
+    INTERRUPTED,
+    RUNNING,
+    progress_event,
+    result_event,
+    round_control_event,
+)
 from .core.services import factory
 from .intake import IntakeSession, PriorSessionContext, build_intake
 from .skills import load_skill
@@ -55,6 +63,7 @@ from .workflow.builder import WORKFLOW_NAME
 from .workflow.learning import archive_conversation
 from .workflow.learning.archivist import _intake_user_turns
 from .workflow.messages import CONTENT_TYPES, DEFAULT_CONTENT_TYPES, CreativeStrategy
+from .workflow.roundtable import control as _round_control
 from .workflow.roundtable.gate import notify as _notify_user_gate
 from .workflow.roundtable.gate import raise_hand as _raise_user_hand
 from .workflow.roundtable.queue import push_utterance
@@ -168,6 +177,17 @@ def _brief_from_inputs(inputs: dict) -> Brief:
     )
 
 
+def _roundtable_mode_from_inputs(inputs: dict) -> str:
+    """Pop + validate the per-request step-mode switch. "auto" (the default) never prompts —
+    today's hands-off flow; "manual" pauses every table at each round boundary for the user's
+    4-way choice (next / speak / enough / auto) via POST /tasks/{id}/round-control. Popped so
+    the remaining inputs stay a pure brief."""
+    mode = str(inputs.pop("roundtable_mode", None) or "auto").strip().lower()
+    if mode not in ("auto", "manual"):
+        raise ApiError(400, "'roundtable_mode' must be 'auto' or 'manual'")
+    return mode
+
+
 class _Task:
     """In-process record for one workflow run."""
 
@@ -187,6 +207,9 @@ class _Task:
         self.preference_summary: Optional[dict] = None  # PreferenceSummary written back on confirm
         self.event_listener = None                    # optional sync hook: live-stream each event (CLI)
         self.runner: Optional[asyncio.Task] = None    # background drive task (HTTP non-blocking path)
+        self.lock = asyncio.Lock()                    # serializes resumes: two concurrent /review calls
+        # (e.g. auto-approving two platforms' drafts back-to-back) must not both drive the same
+        # underlying `workflow` at once — that races on `task.pending` and can 409 a legitimate call.
         self.error: Optional[str] = None              # set if the run raised; surfaced in the snapshot
         self.lock = asyncio.Lock()                    # serializes resumes: two concurrent /review calls
         # (e.g. auto-approving two platforms' drafts back-to-back) must not both drive the same
@@ -369,14 +392,19 @@ class WorkflowService:
         task_id = task_id or f"task-{uuid.uuid4().hex[:12]}"
         if task_id in self._tasks:
             raise ApiError(409, f"task_id already exists: {task_id}")
+        rt_mode = _roundtable_mode_from_inputs(inputs)  # 400 on a bad value, before any spawn
         brief = _brief_from_inputs(inputs)  # validates synchronously (HTTP 400) before any spawn
         roundtable = get_settings().roundtable_enabled
         text_requested = "text" in brief.content_types
+        # A CALLER-supplied hook (the CLI menu) owns the terminal, so tables must run one at a
+        # time; the service's own step-mode hook (below) is per-table (SSE + /round-control),
+        # so tables pause independently and stay concurrent. Decide before any substitution.
+        rt_sequential = before_round is not None
 
         # Choose the graph's front:
         #  • media-only (Case 4: no "text") → media_entry → media_producer (skip create/review/gate);
         #  • text + roundtable → creator entry (the discussion already produced the strategy);
-        #  • text, no roundtable → the original dispatcher → scout → creator path.
+        #  • text, no roundtable → the original dispatcher → strategist → creator path.
         # The roundtable stage (when enabled) still runs FIRST here (its own checkpoints + user
         # pauses) for both the text and media-only paths — stage-chaining (§1).
         if not text_requested:
@@ -394,9 +422,15 @@ class WorkflowService:
         task.event_listener = event_listener
         self._tasks[task_id] = task
 
+        # Step mode (roundtable_mode: "manual"): the HTTP path has no terminal to prompt on, so
+        # the service provides its own per-round hook — pause each table, ask over SSE, resume
+        # on POST /tasks/{id}/round-control. A caller-supplied hook (the CLI) takes precedence.
+        if roundtable and before_round is None and rt_mode == "manual":
+            before_round = self._step_mode_hook(task)
+
         coro = self._execute(
             task, brief, roundtable=roundtable, text_requested=text_requested,
-            before_round=before_round,
+            before_round=before_round, rt_sequential=rt_sequential,
         )
         if background:
             task.runner = asyncio.create_task(self._run_guarded(task, coro, reraise=False))
@@ -405,6 +439,7 @@ class WorkflowService:
 
     async def _execute(
         self, task: _Task, brief: Brief, *, roundtable: bool, text_requested: bool, before_round,
+        rt_sequential: bool = False,
     ) -> dict:
         """The heavy segment of a start: (optional) roundtable discussion, then drive the MAF
         workflow to its first pause/end. Shared by the inline and background start paths.
@@ -549,6 +584,59 @@ class WorkflowService:
         _raise_user_hand(task_id, table_id)
         return {"task_id": task_id, "table_id": table_id, "hand_raised": True}
 
+    def _step_mode_hook(self, task: _Task):
+        """Build the HTTP step-mode `before_round` hook (roundtable_mode: "manual"): at each
+        round boundary — the previous speaker just finished, the next is not yet assigned —
+        publish a `round_control` "waiting" event and suspend THAT table until the user answers
+        POST /tasks/{id}/round-control with next / speak / enough / auto. The first boundary of
+        each table is skipped (nothing has been said yet, so there is nothing to read). A
+        timeout flips the table to sticky hands-off (auto), so an absent client degrades to the
+        normal flow instead of hanging the run. All state is per (task, table): tables pause
+        independently, and one table's enough/auto never touches another."""
+        opened: set = set()
+
+        async def _hook(table_id: str, round_index: int) -> None:
+            if _round_control.is_auto(task.task_id, table_id):
+                return
+            if table_id not in opened:  # first boundary: no utterance to read yet — don't ask
+                opened.add(table_id)
+                return
+            timeout = get_settings().roundtable_control_timeout
+            self._publish(task, round_control_event(
+                table_id=table_id, round_index=round_index, status="waiting", timeout=timeout))
+            action = await _round_control.await_decision(
+                task.task_id, table_id, timeout=timeout)
+            status = "auto" if action == _round_control.AUTO else "resolved"
+            self._publish(task, round_control_event(
+                table_id=table_id, round_index=round_index, status=status, action=action))
+
+        return _hook
+
+    async def round_control(
+        self, task_id: str, table_id: str, action: str, text: Optional[str] = None,
+    ) -> dict:
+        """Answer one step-mode round prompt: next / speak / enough / auto. `speak` with `text`
+        enqueues the message right away (the mic goes to the user seat next round); without
+        text it reserves the turn (raise-hand) and the table waits for POST /tasks/{id}/say up
+        to ROUNDTABLE_USER_TURN_TIMEOUT. `enough` converges the table now (the consensus is
+        synthesized from what was said so far); `auto` ends the prompts for the rest of that
+        table. enough/auto are sticky and next/speak latest-wins, so answering while the table
+        is mid-turn (not yet waiting) is safe — it is consumed at the next boundary."""
+        self._require(task_id)  # 404 before touching any control state
+        if not (table_id or "").strip():
+            raise ApiError(400, "'table_id' is required")
+        if action not in _round_control.ACTIONS:
+            raise ApiError(
+                400, f"'action' must be one of {', '.join(_round_control.ACTIONS)}")
+        if action == _round_control.SPEAK and (text or "").strip():
+            await push_utterance(
+                factory.get_store(), task_id=task_id, table_id=table_id, text=text.strip())
+            _notify_user_gate(task_id, table_id)
+        elif action == _round_control.SPEAK:
+            _raise_user_hand(task_id, table_id)
+        _round_control.submit_decision(task_id, table_id, action)
+        return {"task_id": task_id, "table_id": table_id, "action": action, "accepted": True}
+
     async def run_roundtable(
         self, inputs: dict, platform: str, *, task_id: Optional[str] = None, max_rounds=None,
         background: bool = False,
@@ -564,14 +652,16 @@ class WorkflowService:
         task_id = task_id or f"rt-{uuid.uuid4().hex[:12]}"
         if task_id in self._tasks:
             raise ApiError(409, f"task_id already exists: {task_id}")
+        rt_mode = _roundtable_mode_from_inputs(inputs)
         brief = _brief_from_inputs(inputs)
         task = _Task(task_id, None, brief)  # event sink only; no generation workflow
         self._tasks[task_id] = task
+        hook = self._step_mode_hook(task) if rt_mode == "manual" else None
 
         async def _go() -> dict:
             result = await run_table(
                 platform, brief, task_id=task_id, max_rounds=max_rounds,
-                on_event=lambda ev: self._publish(task, ev),
+                on_event=lambda ev: self._publish(task, ev), before_round=hook,
             )
             task.outputs[platform] = result.consensus.model_dump()
             task.status = "completed"
@@ -598,14 +688,19 @@ class WorkflowService:
         task_id = task_id or f"rt-{uuid.uuid4().hex[:12]}"
         if task_id in self._tasks:
             raise ApiError(409, f"task_id already exists: {task_id}")
+        rt_mode = _roundtable_mode_from_inputs(inputs)
         brief = _brief_from_inputs(inputs)
         task = _Task(task_id, None, brief)  # event sink only; no generation workflow
         self._tasks[task_id] = task
+        # The service hook is per-table, so step mode keeps the fan-out CONCURRENT — each
+        # table pauses for its own /round-control answer while the others keep debating.
+        hook = self._step_mode_hook(task) if rt_mode == "manual" else None
 
         async def _go() -> dict:
             results = await run_tables(
                 brief, task_id=task_id, max_rounds=max_rounds,
                 on_event=lambda ev: self._publish(task, ev),
+                before_round=hook, sequential=False,
             )
             for r in results:
                 task.outputs[r.consensus.platform] = r.consensus.model_dump()
@@ -853,6 +948,11 @@ class StartTaskRequest(BaseModel):
     task_id: Optional[str] = Field(
         None, description="Deprecated alias for session_id (back-compat); used only when session_id "
         "is omitted. Auto-generated if both are absent.")
+    roundtable_mode: Optional[str] = Field(
+        None, description="Roundtable step mode: 'manual' pauses every table at each round "
+        "boundary and emits a `round_control` SSE event — the user answers via "
+        "POST /tasks/{id}/round-control (next | speak | enough | auto). 'auto' (default) "
+        "never prompts. Only meaningful when ROUNDTABLE_ENABLED.")
 
 
 class VerdictPayload(BaseModel):
@@ -887,6 +987,20 @@ class SayRequest(BaseModel):
     interrupt: bool = Field(False, description="Prioritise ahead of the non-interrupt backlog")
 
 
+class RoundControlRequest(BaseModel):
+    """Answer a step-mode round prompt (POST /tasks/{id}/round-control), normally in response
+    to a `round_control` "waiting" SSE event. Also accepted between prompts: enough/auto are
+    sticky, next/speak latest-wins at the next round boundary."""
+    model_config = ConfigDict(extra="allow")
+
+    table_id: str = Field(..., description="The table/platform the choice applies to")
+    action: str = Field(..., description="next | speak | enough | auto — advance one round / "
+                        "take the mic / converge now / go hands-off (no more prompts)")
+    text: Optional[str] = Field(
+        None, description="speak only: the user's message, enqueued immediately. Omitted → the "
+        "turn is reserved (raise-hand) and the table waits for POST /tasks/{id}/say.")
+
+
 class ConfirmLearningRequest(BaseModel):
     """The extra confirmation round: should THIS conversation be learned? On `learn=true`
     both the brand-voice and per-user loops fire (POST /tasks/{id}/confirm-learning)."""
@@ -913,6 +1027,9 @@ class RoundtableRequest(BaseModel):
     tone_hint: Optional[str] = None
     max_rounds: Optional[int] = Field(None, description="Per-table round cap (default ROUNDTABLE_MAX_ROUNDS)")
     task_id: Optional[str] = Field(None, description="Event-channel id; auto-generated (rt-…) if absent")
+    roundtable_mode: Optional[str] = Field(
+        None, description="'manual' pauses each table every round for the user's 4-way choice "
+        "(round_control SSE event + POST /tasks/{id}/round-control); 'auto' (default) never prompts.")
 
 
 class IntakeStartRequest(BaseModel):
@@ -1075,6 +1192,16 @@ async def raise_hand(request: Request, task_id: str, body: RaiseHandRequest) -> 
 @tasks_router.post("/{task_id}/say", summary="Send a user utterance into a roundtable table")
 async def say(request: Request, task_id: str, body: SayRequest) -> dict:
     return await _workflow(request).say(task_id, body.table_id, body.text, body.interrupt)
+
+
+@tasks_router.post(
+    "/{task_id}/round-control",
+    summary="Answer a step-mode round prompt (next | speak | enough | auto)",
+)
+async def round_control(request: Request, task_id: str, body: RoundControlRequest) -> dict:
+    """Step mode only (`roundtable_mode: "manual"`): resume a table paused at a round boundary —
+    advance one round, take the mic, converge now, or go hands-off for the rest of the table."""
+    return await _workflow(request).round_control(task_id, body.table_id, body.action, body.text)
 
 
 @handoff_router.post("/summarize-handoff", summary="Distil a finished session into a prior-context recap")

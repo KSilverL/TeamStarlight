@@ -1,0 +1,6 @@
+# NEVER ship local secrets into the build context (gitignore does not apply to
+# docker/acr build contexts — this file does).
+.env
+sample_scan.json
+README.md
+role.sql

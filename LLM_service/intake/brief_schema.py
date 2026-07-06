@@ -4,7 +4,7 @@ The unified intake product: `CreativeBrief` (MIGRATION_PLAN §4.1).
 Both the voice and the text entry point produce exactly this model, so the
 downstream workflow takes one shape regardless of how it was gathered. `route`
 records how the topic was arrived at — `direct_generation` (the user brought a
-topic) or `copilot_mode` (the scout proposed one). Whether to *learn* from the
+topic) or `copilot_mode` (a topic was suggested). Whether to *learn* from the
 conversation is a separate, end-of-run decision (POST /tasks/{id}/confirm-learning),
 not an intake route. `intake_mode` records the source for the frontend / analytics only.
 """

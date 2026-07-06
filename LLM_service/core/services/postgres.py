@@ -25,6 +25,7 @@ from agent_framework import CheckpointStorage, WorkflowCheckpoint
 
 from ..config import Settings
 from ..skill_schema import SkillRule, UserSkillDoc
+from ..trend_schema import TRENDS_DOC_KEY, Trend, select_current_trends
 from .base import StoreService, empty_profile
 
 
@@ -87,6 +88,16 @@ def _video_jobs_ddl(table: str) -> str:
     )
 
 
+def _trends_ddl(table: str) -> str:
+    # The daily trends snapshot: one rolling row keyed `current`, whole doc in JSONB —
+    # written daily by the external Foundry routine, read by StoreService.get_trends.
+    return (
+        f"CREATE TABLE IF NOT EXISTS {table} ("
+        f"id TEXT PRIMARY KEY, doc JSONB NOT NULL, "
+        f"updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+    )
+
+
 class PostgresStore(StoreService):
     """brand_profiles + the StoreService checkpoint KV, on PostgreSQL."""
 
@@ -106,6 +117,7 @@ class PostgresStore(StoreService):
                 await conn.execute(_user_skills_ddl(s.postgres_user_skills_table))
                 await conn.execute(_checkpoints_ddl(s.postgres_checkpoints_table))
                 await conn.execute(_video_jobs_ddl(s.postgres_video_jobs_table))
+                await conn.execute(_trends_ddl(s.postgres_trends_table))
         return self._pool_obj
 
     async def _read(self, table: str, key: str) -> Optional[dict]:
@@ -157,6 +169,23 @@ class PostgresStore(StoreService):
         await self._write(self._settings.postgres_user_skills_table, user_id,
                           doc.model_dump(mode="json"))
         return doc
+
+    async def get_trends(self, *, limit: int = 6) -> List[Trend]:
+        doc = await self._read(self._settings.postgres_trends_table, TRENDS_DOC_KEY)
+        trends = [Trend(**t) for t in (doc or {}).get("trends", [])]
+        return select_current_trends(
+            trends, limit=limit, ttl_days=self._settings.trend_scout_ttl_days
+        )
+
+    async def upsert_trends(self, *, trends: List[Trend]) -> None:
+        if not trends:
+            return  # an empty scan never clobbers the last good snapshot
+        doc = {
+            "id": TRENDS_DOC_KEY,
+            "date": datetime.now(timezone.utc).date().isoformat(),
+            "trends": [t.model_dump(mode="json") for t in trends],
+        }
+        await self._write(self._settings.postgres_trends_table, TRENDS_DOC_KEY, doc)
 
     async def save_checkpoint(self, *, task_id: str, data: dict) -> None:
         await self._write(self._settings.postgres_checkpoints_table, task_id, {"id": task_id, **data})

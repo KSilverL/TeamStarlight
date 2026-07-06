@@ -22,6 +22,7 @@ PROGRESS = "progress"               # "the task is now at executor X"
 RESULT = "result"                   # "executor X produced this content"
 AGENT_UTTERANCE = "agent_utterance" # "a roundtable participant just spoke"
 DISCUSSION_CONSENSUS = "discussion_consensus"  # the table converged (a RESULT status)
+ROUND_CONTROL = "round_control"     # step mode: the table is asking the user what to do next
 
 # ── Progress `status` lifecycle ───────────────────────────────────────────────
 RUNNING = "running"          # executor entered
@@ -32,7 +33,7 @@ ERROR = "error"              # executor raised an exception
 # ── executor id → newsroom phase ──────────────────────────────────────────────
 NODE_PHASE: dict[str, str] = {
     "dispatcher": "dispatch",   # 总编导
-    "scout": "scout",           # 热点星探
+    "strategist": "strategist", # 内容策略师
     "creator": "create",        # 人格创作者 (per-platform fan-out)
     "reviewer": "review",       # 红队审核员
     "human_gate": "review",     # RequestPort 人工审批
@@ -108,6 +109,37 @@ def agent_utterance_event(
         "role": role,
         "text": text,
         "round_index": round_index,
+    }
+
+
+def round_control_event(
+    *,
+    table_id: str,
+    round_index: int,
+    status: str,
+    action: Optional[str] = None,
+    timeout: Optional[float] = None,
+) -> dict:
+    """Step mode's per-round prompt lifecycle on one table. `status` is one of:
+      - "waiting"  — the table paused at a round boundary and is asking the user to choose
+                     (next / speak / enough / auto) via POST /tasks/{id}/round-control;
+                     `timeout` says how long before the table goes hands-off on its own.
+      - "resolved" — the user answered; `action` carries the choice (next / speak / enough).
+      - "auto"     — the table went hands-off (the user chose auto, or the wait timed out);
+                     no more prompts will follow for this table.
+    A reconnecting client (the stream replays the buffer) treats a "waiting" as stale iff a
+    later "resolved"/"auto" exists for the same table."""
+    return {
+        "type": ROUND_CONTROL,
+        "node": "roundtable",
+        "phase": "discuss",
+        "platform": table_id,
+        "status": status,
+        "ts": time.time(),
+        "table_id": table_id,
+        "round_index": round_index,
+        "action": action,
+        "timeout": timeout,
     }
 
 

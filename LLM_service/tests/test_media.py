@@ -52,7 +52,7 @@ async def test_generate_video_storyboard_has_the_dynamic_storyboard_shape():
 # ── B. End-to-end through the workflow ────────────────────────────────────────
 
 async def test_approved_final_draft_carries_html_card_and_video_storyboard(workflow, make_brief):
-    result = await workflow.run(make_brief(platforms=("linkedin",)))
+    result = await workflow.run(make_brief(platforms=("linkedin",), content_types=["text", "brand", "video"]))
     rid = result.get_request_info_events()[0].request_id
 
     out = (await workflow.run(responses={rid: HumanVerdict(decision="approve")})).get_outputs()[0]
@@ -69,7 +69,7 @@ async def test_content_types_gate_which_media_is_produced(workflow, make_brief):
     res = await workflow.run(make_brief(platforms=("linkedin",)))
     rid = res.get_request_info_events()[0].request_id
     out = (await workflow.run(responses={rid: HumanVerdict(decision="approve")})).get_outputs()[0]
-    assert out.html_card is None and out.video_props is None
+    assert out.html_card is None and out.video_storyboard is None
     assert out.draft  # the post copy is always produced (the spine)
 
     # Ask for video only → video spec present, HTML card absent.
@@ -77,7 +77,7 @@ async def test_content_types_gate_which_media_is_produced(workflow, make_brief):
     rid = res.get_request_info_events()[0].request_id
     out = (await workflow.run(responses={rid: HumanVerdict(decision="approve")})).get_outputs()[0]
     assert out.html_card is None
-    assert out.video_props is not None and len(out.video_props.stats) == 3
+    assert out.video_storyboard is not None and len(out.video_storyboard.slides) >= 2
 
 
 # ── C. Multi-turn: caller-supplied conversation history threads into generation ──
@@ -165,12 +165,12 @@ async def test_media_only_skips_the_gate_and_blanks_the_text(make_brief):
         assert o["draft"] == ""                       # text was not requested
         assert o["content_types"] == ["brand", "video"]
         assert o["html_card"].startswith("<!DOCTYPE html>")
-        assert o["video_props"] and len(o["video_props"]["stats"]) == 3
+        assert o["video_storyboard"] and len(o["video_storyboard"]["slides"]) >= 2
 
     # The SSE stream carried a `final` per platform and never a text `draft_ready` gate.
     events = svc.buffered_events("media-only-1")
     assert not any(e.get("status") == "draft_ready" for e in events)
-    assert not any(e.get("node") in ("creator", "reviewer", "human_gate", "dispatcher", "scout")
+    assert not any(e.get("node") in ("creator", "reviewer", "human_gate", "dispatcher", "strategist")
                    for e in events)
     finals = [e for e in events if e["type"] == "result" and e["status"] == "final"]
     assert {e["platform"] for e in finals} == {"linkedin", "instagram"}
@@ -187,4 +187,4 @@ async def test_media_only_video_only_produces_just_the_video_spec(make_brief):
     assert snap["status"] == "completed"
     out = snap["outputs"][0]
     assert out["draft"] == "" and out["html_card"] is None
-    assert out["video_props"] and len(out["video_props"]["stats"]) == 3
+    assert out["video_storyboard"] and len(out["video_storyboard"]["slides"]) >= 2

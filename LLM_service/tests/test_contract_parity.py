@@ -12,6 +12,7 @@ fully offline and deterministic.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from agent_framework import ChatResponse, ChatResponseUpdate, Message
@@ -25,6 +26,7 @@ from LLM_service.core.services.base import (
     empty_profile,
 )
 from LLM_service.core.skill_schema import SkillCandidate, SkillRule, UserSkillDoc
+from LLM_service.core.trend_schema import Trend, render_trends
 from LLM_service.workflow import Brief
 from LLM_service.workflow.roundtable import PersonaContext, build_roundtable
 from LLM_service.workflow.roundtable.personas import ROSTER
@@ -91,6 +93,25 @@ async def test_plan_strategy_parity():
     a = await azure_llm("Lead with business credibility.").plan_strategy(**kw)
     assert isinstance(m, str) and isinstance(a, str)
     assert m and a
+
+
+async def test_plan_strategy_trends_parity():
+    """Phase 4: both impls accept the pre-rendered trends block and still return a str;
+    the mock weaves the block's first trend line in verbatim (the testable lever), and
+    an empty block leaves the strategy byte-identical to the no-trends call."""
+    block = render_trends([Trend(
+        text="A split-screen meme is peaking", category="meme",
+        captured_at="2026-07-04T00:00:00+00:00",
+    )])
+    kw = dict(topic="coffee launch", platform="linkedin", user_intent="signups")
+    m = await mock.MockLLM().plan_strategy(**kw, trends=block)
+    a = await azure_llm("Ride the split-screen meme with a brew-day reveal.").plan_strategy(
+        **kw, trends=block)
+    assert isinstance(m, str) and isinstance(a, str) and m and a
+    assert "A split-screen meme is peaking" in m
+
+    plain = await mock.MockLLM().plan_strategy(**kw)
+    assert await mock.MockLLM().plan_strategy(**kw, trends="") == plain
 
 
 @pytest.mark.parametrize("platform", ["linkedin", "instagram", "x", "tiktok"])
@@ -180,9 +201,9 @@ async def test_fill_brief_parity():
     a = await az.fill_brief(**kw)
 
     for out in (m, a):
-        assert set(out.keys()) == {"brief_updates", "wants_scout"}
+        assert set(out.keys()) == {"brief_updates", "wants_topic_idea"}
         assert isinstance(out["brief_updates"], dict)
-        assert isinstance(out["wants_scout"], bool)
+        assert isinstance(out["wants_topic_idea"], bool)
 
 
 async def test_summarize_preferences_parity():
@@ -349,6 +370,52 @@ async def test_checkpoint_roundtrip_parity():
         await store.save_checkpoint(task_id="t1", data={"state": "paused"})
         loaded = await store.load_checkpoint(task_id="t1")
         assert loaded is not None and loaded.get("state") == "paused"
+
+
+# ── Trends parity (trend-scout read side; docs/TREND_SCOUT_IMPLEMENTATION.md) ──
+
+def _trend(text: str, category: str = "general", **over) -> Trend:
+    base = dict(
+        text=text, category=category, source=None,
+        captured_at=datetime.now(timezone.utc).isoformat(), expires_at=None,
+    )
+    base.update(over)
+    return Trend(**base)
+
+
+async def test_trends_roundtrip_parity():
+    fresh = [_trend("a meme moment", "meme"), _trend("a news beat", "news")]
+    for store in (mock.MockStore(), postgres_store()):
+        await store.upsert_trends(trends=fresh)
+        got = await store.get_trends(limit=6)
+        assert all(isinstance(t, Trend) for t in got)
+        assert {t.text for t in got} == {"a meme moment", "a news beat"}
+
+        # An EMPTY scan is a no-op — the last good snapshot survives (decision #1).
+        await store.upsert_trends(trends=[])
+        kept = await store.get_trends(limit=6)
+        assert {t.text for t in kept} == {"a meme moment", "a news beat"}
+
+
+async def test_trends_ttl_and_variety_parity():
+    """Both impls drop stale trends (explicit expires_at OR captured_at + TTL) and
+    spread the pick across categories rather than returning one category's run."""
+    now = datetime.now(timezone.utc)
+    snapshot = [
+        _trend("news one", "news"),
+        _trend("news two", "news"),
+        _trend("meme one", "meme"),
+        _trend("expired explicit", "news", expires_at=(now - timedelta(days=1)).isoformat()),
+        _trend("expired by ttl", "meme", captured_at=(now - timedelta(days=10)).isoformat()),
+    ]
+    for store in (mock.MockStore(), postgres_store()):
+        await store.upsert_trends(trends=snapshot)
+        got = await store.get_trends(limit=2)
+        texts = [t.text for t in got]
+        # stale items never surface (default TREND_SCOUT_TTL_DAYS=3 covers the implicit case)
+        assert "expired explicit" not in texts and "expired by ttl" not in texts
+        # variety: one per category (round-robin), not two news in a row
+        assert texts == ["news one", "meme one"]
 
 
 # ── Roundtable chat client + build parity (Phase 2) ───────────────────────────

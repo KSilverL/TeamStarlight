@@ -82,6 +82,7 @@ def build_roundtable(
         brief,
         brand_profile=context.brand_profile,
         user_skills=context.user_skills,
+        trends=context.trends,
     )
     ai_names = [p.name for p in personas]
 
