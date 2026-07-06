@@ -9,9 +9,11 @@ by hand and watch it happen, all through the same `WorkflowService` the HTTP API
 
   • build the brief manually, or via a text / (mock) voice intake conversation
   • toggle the ROUNDTABLE stage on/off  (strategist  ↔  multi-persona discussion). When it is on,
-    the discussion STREAMS LIVE — each persona's turn prints the moment it is spoken — and
-    before the manager assigns every next persona you may raise a hand and speak: your turn
-    joins the table, then the next persona is assigned (or skip to let the manager continue)
+    the discussion STREAMS LIVE — each persona's turn prints the moment it is spoken — and after
+    every turn you choose what happens next (step mode, 每轮 4 选 1): 1) the next persona speaks,
+    2) you take the mic (your turn joins the table, then the next persona is assigned),
+    3) enough — the table converges NOW on what was said, 4) hands-off — the rest of the
+    discussion runs automatically with no further prompts
   • the human gate: approve / edit / reject each platform's draft (reject re-drafts)
   • the post-approval media (animated HTML card + video spec)
   • the learning loop: confirm whether to learn this conversation → the archivist distils
@@ -37,6 +39,7 @@ from LLM_service.core.config import _DEFAULT_ENV_FILE, get_settings, load_dotenv
 from LLM_service.core.services import factory
 from LLM_service.intake import build_intake
 from LLM_service.workflow.roundtable import push_utterance
+from LLM_service.workflow.roundtable.control import AUTO, ENOUGH, is_auto, submit_decision
 
 
 # ── small TTY helpers ──────────────────────────────────────────────────────────
@@ -256,17 +259,34 @@ async def _run_once() -> None:
     svc = WorkflowService()
     task_id = f"cli-{os.urandom(3).hex()}"
 
-    # Per-round interjection (requirement 2): before the manager assigns each next persona, you
-    # get the floor. Speak → your turn joins the table, THEN the next persona is assigned; skip →
-    # the manager assigns the next persona directly. Pushing the utterance is enough — the
-    # manager sees it queued and routes that round to your seat.
+    # Per-round step control (每轮 4 选 1): after each persona speaks — before the manager
+    # assigns the next one — choose to advance, take the mic, converge now, or go hands-off.
+    # State is per table; the first boundary of a table is skipped (nothing spoken yet, so
+    # there is nothing to read). "enough" sets the finish flag the manager reads at the
+    # boundary (→ consensus from what was said); "auto" silences the menu for that table.
+    seen_tables: set[str] = set()
+
     async def _before_round(table_id: str, round_index: int) -> None:
-        if await _yn(f"\n  ✋ [{table_id}] round {round_index} — raise a hand & speak before the next persona?",
-                     default=False):
+        if is_auto(task_id, table_id):
+            return
+        if table_id not in seen_tables:
+            seen_tables.add(table_id)
+            return
+        print(f"\n  ⏸  [{table_id}] round {round_index} — what happens next?")
+        print("     1) next persona speaks          2) I take the mic")
+        print("     3) enough — converge now        4) hands-off (auto to the end)")
+        choice = (await _ask("     Choose 1-4", "1")).strip()
+        if choice.startswith("2"):
             msg = await _ask("     Your message")
             if msg.strip():
                 await push_utterance(factory.get_store(), task_id=task_id, table_id=table_id, text=msg.strip())
                 print("     ✋ queued — the table takes your turn next.")
+        elif choice.startswith("3"):
+            submit_decision(task_id, table_id, ENOUGH)
+            print("     ⏹  ending the discussion — consensus from what was said so far.")
+        elif choice.startswith("4"):
+            submit_decision(task_id, table_id, AUTO)
+            print("     ▶  hands-off — the table runs to convergence on its own.")
 
     _section("3 · LIVE — the discussion streams below as each persona speaks")
     # event_listener (requirement 1) prints every event the instant it lands — persona turns,
@@ -288,7 +308,7 @@ def _cheat_sheet() -> None:
     _section("FLOW CHEAT-SHEET — inputs that exercise each path")
     rows = [
         ("Standard (strategist)", "Roundtable = n"),
-        ("Roundtable debate",    "Roundtable = Y  · raise a hand at any round to join the table"),
+        ("Roundtable debate",    "Roundtable = Y  · per-round menu: next / speak / enough / auto"),
         ("Reject → rework",      "At the gate press r + type a comment → next draft shows 'Reworked to address: …'"),
         ("Approve-after-edit",   "At the gate press e + type your final copy"),
         ("Circuit breaker",      "Topic contains 'unsafe' → 3 reviewer rejects → gate flagged ⚠"),

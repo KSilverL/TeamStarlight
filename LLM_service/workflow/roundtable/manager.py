@@ -23,6 +23,7 @@ from agent_framework.orchestrations import (
     StandardMagenticManager,
 )
 
+from .control import finish_requested
 from .gate import hand_raised
 from .queue import has_pending
 
@@ -118,7 +119,10 @@ class MockRoundtableManager(MagenticManagerBase):
         # Per-round interjection: ask the user BEFORE selecting the next persona (it may queue a turn).
         if self._before_round is not None and r <= self._max_rounds:
             await self._before_round(self._table_id or self._platform, r)
-        satisfied = r > self._max_rounds
+        # Step mode's "ENOUGH" converges NOW — the same satisfied path as the round cap, so
+        # prepare_final_answer still synthesizes a consensus from what was said so far.
+        satisfied = r > self._max_rounds or finish_requested(
+            self._task_id, self._table_id or self._platform)
         if not satisfied and await self._user_pending():
             return _user_floor_ledger(self._user, self._platform, r)
         nxt = self._ai[(r - 1) % len(self._ai)] if self._ai else ""
@@ -239,6 +243,19 @@ class InteractiveMagenticManager(StandardMagenticManager):
     async def create_progress_ledger(self, magentic_context: MagenticContext) -> MagenticProgressLedger:
         if self._before_round is not None:
             await self._before_round(self._platform, magentic_context.round_count)
+        # Step mode's "ENOUGH": converge now. A satisfied ledger routes the orchestrator to
+        # prepare_final_answer, which synthesizes the consensus from the partial transcript —
+        # no LLM ledger call is needed (or wanted) for a decision the user already made.
+        if finish_requested(self._task_id, self._platform):
+            agents = [n for n in magentic_context.participant_descriptions if n != self._user]
+            return MagenticProgressLedger(
+                is_request_satisfied=_item(True, "the user ended the discussion (enough)"),
+                is_in_loop=_item(False),
+                is_progress_being_made=_item(True),
+                next_speaker=_item(agents[0] if agents else (self._user or "")),
+                instruction_or_question=_item(
+                    f"The user ended the {self._platform} discussion; synthesize the consensus now."),
+            )
         # Raise-hand path: the user holds the floor this round → force the mic to the user seat.
         if await self._user_pending():
             return _user_floor_ledger(self._user, self._platform, magentic_context.round_count)

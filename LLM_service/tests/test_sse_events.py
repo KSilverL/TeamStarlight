@@ -284,6 +284,47 @@ def test_http_roundtable_single_and_fanout(http_server):
         assert any(e["type"] == "agent_utterance" for e in events)
 
 
+def test_http_round_control_steers_a_manual_roundtable(http_server):
+    """Step mode over plain HTTP: `roundtable_mode: "manual"` on POST /roundtable makes the
+    table pause each round and emit a `round_control` "waiting" event; the client answers via
+    POST /tasks/{id}/round-control — here "next" (advance one round) then "enough" (converge
+    now). Also the endpoint's validation: unknown task → 404, unknown action → 400."""
+    with httpx.Client(timeout=10) as client:
+        assert client.post(f"{http_server}/tasks/nope/round-control",
+                           json={"table_id": "linkedin", "action": "next"}).status_code == 404
+
+        started = client.post(f"{http_server}/roundtable", json={
+            "topic": "spring single-origin harvest", "target_platforms": ["linkedin"],
+            "max_rounds": 4, "roundtable_mode": "manual",
+        })
+        assert started.status_code == 200 and started.json()["status"] == "running"
+        task_id = started.json()["task_id"]
+
+        assert client.post(f"{http_server}/tasks/{task_id}/round-control",
+                           json={"table_id": "linkedin", "action": "dance"}).status_code == 400
+
+        # Follow the live stream and answer each prompt as it lands.
+        answers = ["next", "enough"]
+        events = []
+        with client.stream("GET", f"{http_server}/tasks/{task_id}/events") as stream:
+            for line in stream.iter_lines():
+                if not line.startswith("data: "):
+                    continue
+                ev = json.loads(line[6:])
+                events.append(ev)
+                if ev.get("type") == "round_control" and ev.get("status") == "waiting":
+                    res = client.post(f"{http_server}/tasks/{task_id}/round-control",
+                                      json={"table_id": "linkedin", "action": answers.pop(0)})
+                    assert res.status_code == 200 and res.json()["accepted"] is True
+
+        assert not answers                                   # both prompts asked and answered
+        # "next" advanced exactly one more persona turn before "enough" converged the table.
+        assert len([e for e in events if e["type"] == "agent_utterance"]) == 2
+        consensus = [e for e in events if e.get("status") == "discussion_consensus"]
+        assert len(consensus) == 1 and consensus[0]["converged"] is True
+        assert _await_completed(client, http_server, task_id)["status"] == "completed"
+
+
 # ── E. Offline guarantee: under USE_MOCK every service is a mock (no Azure) ───
 
 def test_no_real_backends_selected_in_mock_mode():

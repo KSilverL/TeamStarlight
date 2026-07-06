@@ -9,6 +9,18 @@ from __future__ import annotations
 
 from .builder import RoundtableBuild, build_roundtable
 from .context import PersonaContext, build_persona_context
+from .control import (
+    ACTIONS,
+    AUTO,
+    ENOUGH,
+    NEXT,
+    SPEAK,
+    await_decision,
+    finish_requested,
+    is_auto,
+    reset_controls,
+    submit_decision,
+)
 from .gate import (
     hand_raised,
     lower_hand,
@@ -65,4 +77,14 @@ __all__ = [
     "notify",
     "wait_for_delivery",
     "reset_gates",
+    "ACTIONS",
+    "NEXT",
+    "SPEAK",
+    "ENOUGH",
+    "AUTO",
+    "submit_decision",
+    "await_decision",
+    "is_auto",
+    "finish_requested",
+    "reset_controls",
 ]
