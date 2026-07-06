@@ -26,11 +26,8 @@ from ...core.services import factory
 from ...core.services.media_assets import GeoapifyStaticMap
 from ...core.video_schema import (
     GeneratedSlideSpec,
-<<<<<<< Updated upstream
     MapPin,
     MapSlideSpec,
-=======
->>>>>>> Stashed changes
     RenderableStoryboard,
     RenderBarChartSlide,
     RenderCollageSlide,
@@ -105,7 +102,6 @@ async def _resolve_image(query: str, *, images_dir: Path, index: int) -> Resolve
     return ResolvedImage(query=query, localPath=f"{images_dir.name}/{path.name}")
 
 
-<<<<<<< Updated upstream
 def _mercator_y(lat: float) -> float:
     """Normalized (0..1) Web Mercator y for a latitude.
     KEEP IN SYNC WITH: video_renderer/src/map/geo.ts `mercatorY` — the Remotion side
@@ -175,8 +171,6 @@ async def _resolve_map_basemap(
         return (None, None, None)
 
 
-=======
->>>>>>> Stashed changes
 async def _resolve_generated_slide(
     slide: GeneratedSlideSpec, *, slide_index: int, job_id: str, width: int, height: int,
     primary_color: str, secondary_color: str, accent_color: str, settings: Settings,
@@ -292,7 +286,6 @@ async def resolve_storyboard_assets(
                 headline=slide.headline, columns=slide.columns,
                 rows=slide.rows, durationFrames=duration,
             ))
-<<<<<<< Updated upstream
         elif slide.type == "map":
             # Inline await is fine here: at most a couple of map slides per
             # storyboard, one small HTTP GET each (and usually none — no key).
@@ -304,8 +297,6 @@ async def resolve_storyboard_assets(
                 basemapLocalPath=basemap_path, basemapCenter=basemap_center,
                 basemapZoom=basemap_zoom, durationFrames=duration,
             ))
-=======
->>>>>>> Stashed changes
         elif slide.type == "generated":
             # Sequential, not gathered with the rest of the loop: each attempt is a
             # real compile + preview-render, heavy enough that running several

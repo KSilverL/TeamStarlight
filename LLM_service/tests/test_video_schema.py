@@ -44,10 +44,7 @@ def test_slide_type_registry_matches_implemented_models():
         BarChartSlideSpec.model_fields["type"].default,
         NodeDiagramSlideSpec.model_fields["type"].default,
         ComparisonTableSlideSpec.model_fields["type"].default,
-<<<<<<< Updated upstream
         MapSlideSpec.model_fields["type"].default,
-=======
->>>>>>> Stashed changes
         GeneratedSlideSpec.model_fields["type"].default,
     }
     assert discriminators == SLIDE_TYPES
@@ -176,10 +173,7 @@ def test_storyboard_spec_accepts_phase_2_chart_slides():
     ("bar_chart", 150),
     ("node_diagram", 120),
     ("comparison_table", 180),
-<<<<<<< Updated upstream
     ("map", 180),
-=======
->>>>>>> Stashed changes
     ("generated", 120),
 ])
 def test_clamp_duration_has_defaults_for_phase_2_types(slide_type, expected_default):
@@ -202,7 +196,6 @@ def test_storyboard_spec_accepts_a_generated_slide():
     assert generated.data == {"headline": "Now live in Dublin"}
 
 
-<<<<<<< Updated upstream
 _IRELAND_PINS = [
     {"label": "Dublin", "lon": -6.26, "lat": 53.35, "stats": ["Pop: 1.2M", "GDP: €98bn", "Tech · Finance"]},
     {"label": "Cork", "lon": -8.47, "lat": 51.90, "stats": ["Pop: 220K", "Pharma · Tech"]},
@@ -269,8 +262,6 @@ def test_renderable_storyboard_accepts_map_slide_with_and_without_basemap():
         assert map_slide.basemapLocalPath == basemap_fields.get("basemapLocalPath")
 
 
-=======
->>>>>>> Stashed changes
 def test_renderable_storyboard_round_trips_a_full_storyboard():
     renderable = RenderableStoryboard(
         brandName="NOVAPULSE", primaryColor="#0d1117", secondaryColor="#2d4ed8", accentColor="#f5c84c",

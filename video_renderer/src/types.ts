@@ -115,7 +115,6 @@ export interface ComparisonTableSlide {
   durationFrames: number;
 }
 
-<<<<<<< Updated upstream
 export interface MapPin {
   label: string;
   lon: number; // WGS84 longitude, negative = west
@@ -137,8 +136,6 @@ export interface MapSlide {
   durationFrames: number;
 }
 
-=======
->>>>>>> Stashed changes
 // ── Phase 3: bespoke, LLM-authored scene (autonomous video-agent plan) ──────
 // Unlike the fixed types above, `generated` has no hand-written component in
 // registry.ts's SLIDE_REGISTRY. `componentName` names a file under
@@ -161,10 +158,7 @@ export type Slide =
   | BarChartSlide
   | NodeDiagramSlide
   | ComparisonTableSlide
-<<<<<<< Updated upstream
   | MapSlide
-=======
->>>>>>> Stashed changes
   | GeneratedSlide;
 
 export interface RenderableStoryboard {

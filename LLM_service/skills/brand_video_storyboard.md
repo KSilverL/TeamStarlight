@@ -45,7 +45,6 @@ enumerates them via the `type` discriminator. Never invent a new slide type.
   Always the last slide.
 - **`generated`** — a BESPOKE scene, authored as real code by a separate agent, for
   when none of the fixed types above genuinely fit. You provide `description` (the
-<<<<<<< Updated upstream
   creative brief — HOW to present the scene) and `data`, which MUST carry ALL the
   structured content the scene renders — numbers, labels, series, coordinates — as
   typed JSON values. `description` says how to present what's in `data`; it must
@@ -56,14 +55,6 @@ enumerates them via the `type` discriminator. Never invent a new slide type.
   than a fixed type (it's authored, typechecked, and preview-rendered fresh, with a
   bounded number of retries), so use it sparingly — if a fixed type (including
   `map`) can express it, never use `generated`.
-=======
-  creative brief — what this scene should show/communicate) and `data` (whatever
-  structured content it needs: headline text, numbers, labels — its shape is
-  whatever `description` implies, not fixed). This is slower and less predictable
-  than a fixed type (it's authored, typechecked, and preview-rendered fresh, with a
-  bounded number of retries), so use it sparingly — only when the story genuinely
-  needs something the registry can't express, not as a default choice.
->>>>>>> Stashed changes
 
 ## Ordering conventions
 
