@@ -48,6 +48,7 @@ from LLM_service.core.trend_schema import Trend
 from LLM_service.workflow.roundtable.personas import (
     AUDIENCE_ADVOCATE,
     BRAND_VOICE,
+    PERSONA_DESCRIPTIONS,
     PLATFORM_EDITOR,
     ROSTER,
     TREND_SCOUT,
@@ -113,6 +114,47 @@ async def test_personas_carry_injected_profile_and_skills():
 
     # audience_advocate is pure prompt — no injected store content.
     assert "BRAND MUST DO" not in personas[AUDIENCE_ADVOCATE].instructions
+
+
+async def test_personas_are_differentiated(monkeypatch):
+    """Each seat carries a distinct charter — pairwise-different instructions with the
+    seat's own identity marker and an explicit lane boundary — and a non-empty,
+    pairwise-distinct roster description that reaches the underlying Agent (Magentic's
+    ParticipantRegistry reads agent.description as the LLM moderator's selection roster)."""
+    _enable_trend_scout(monkeypatch)  # widest roster: all five seats
+
+    brief = _brief()
+    context = await build_persona_context(brief)
+    personas = {
+        p.name: p
+        for p in build_personas(
+            PLATFORM, brief,
+            brand_profile=context.brand_profile, user_skills=context.user_skills,
+            trends=context.trends,
+        )
+    }
+
+    markers = {
+        PLATFORM_EDITOR: "platform editor",
+        BRAND_VOICE: "brand-voice guardian",
+        USER_ADVOCATE: "user advocate",
+        AUDIENCE_ADVOCATE: "audience advocate",
+        TREND_SCOUT: "trend scout",
+    }
+    assert set(personas) == set(markers)
+    for name, marker in markers.items():
+        text = personas[name].instructions
+        assert marker in text                # the seat's own charter identity
+        assert "Stay in your lane" in text   # explicit boundary vs the other seats
+
+    texts = [p.instructions for p in personas.values()]
+    assert len(set(texts)) == len(texts)     # pairwise-distinct charters
+
+    for name, persona in personas.items():
+        assert persona.description == PERSONA_DESCRIPTIONS[name]
+        assert persona.agent.description == persona.description
+    descriptions = [p.description for p in personas.values()]
+    assert all(descriptions) and len(set(descriptions)) == len(descriptions)
 
 
 async def test_consensus_strategy_matches_strategist_creativestrategy_shape():
