@@ -67,6 +67,13 @@ public class AgentService {
     	return response;
     }
 	
+	public TaskSnapshot getTaskSnapshot(String taskId) {
+	    return restClient.get()
+	            .uri(llmServiceBaseUrl + "/tasks/" + taskId)
+	            .retrieve()
+	            .body(TaskSnapshot.class);
+	}
+	
 	public TaskSnapshot getCurrentTaskStatus(CreativeBrief brief) {
 		return restClient.post()
                 .uri(llmServiceBaseUrl + "/tasks")
