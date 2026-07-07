@@ -4,6 +4,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -58,8 +59,41 @@ public class AgentController {
 	
 	
 	@PostMapping("/{taskId}/review")
-    public TaskSnapshot submitReview( @PathVariable String taskId, @RequestBody ReviewRequest request) {
-		return service.reviewTask(taskId, request);
+    public TaskSnapshot submitReview(@PathVariable String taskId, @RequestBody ReviewRequest request) {
+        return service.reviewTask(taskId, request);
+    }
+
+    @PostMapping("/{taskId}/confirm-learning")
+    public ConfirmLearningResponse confirmLearning(
+            @PathVariable String taskId,
+            @RequestBody ConfirmLearningRequest request) {
+        return service.agentConfirmLearning(request.learn(), taskId);
+    }
+
+    @GetMapping("/{taskId}")
+    public TaskSnapshot getTaskSnapshot(@PathVariable String taskId) {
+        return service.getTaskSnapshot(taskId);
+    }
+
+    @PostMapping("/{taskId}/raise-hand")
+    public RaiseHandResponse raiseHand(
+            @PathVariable String taskId,
+            @RequestBody RaiseHandRequest request) {
+        return service.agentRaiseHand(taskId, request.tableId());
+    }
+
+    @PostMapping("/{taskId}/say")
+    public SayResponse say(
+            @PathVariable String taskId,
+            @RequestBody SayRequest request) {
+        return service.agentSay(taskId, request);
+    }
+
+    @PostMapping("/{taskId}/round-control")
+    public RoundControlResponse roundControl(
+            @PathVariable String taskId,
+            @RequestBody RoundControlRequest request) {
+        return service.agentRoundControl(taskId, request);
     }
 	
 	
