@@ -76,14 +76,13 @@ public class AgentService {
                 .body(TaskSnapshot.class);
 	}
 	
-	public TaskSnapshot submitReview(String taskId, ReviewRequest request) {
-        return restClient.post()
-                .uri(llmServiceBaseUrl + "/" + taskId + "/review")
-                .contentType(MediaType.APPLICATION_JSON)
-                .body(request)
-                .retrieve()
-                .body(TaskSnapshot.class);
-    }
+	public TaskSnapshot reviewTask(String taskId, ReviewTaskRequest request) {
+	    return post(
+	            "/tasks/" + taskId + "/review",
+	            request,
+	            TaskSnapshot.class
+	    );
+	}
 	
 	public ConfirmLearningResponse agentConfirmLearning(Boolean learn, String taskId) {
 	    return post(

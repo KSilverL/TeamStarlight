@@ -4,10 +4,16 @@ import java.util.HashMap;
 import java.util.Map;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+
+import com.example.tsldemo.ApiDTOS;
+import com.example.tsldemo.ApiDTOS.CreativeBrief;
+import com.example.tsldemo.ApiDTOS.ReviewRequest;
+import com.example.tsldemo.ApiDTOS.TaskSnapshot;
 
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.ObjectMapper;
@@ -20,6 +26,7 @@ public class AgentController {
 	
 	@PostMapping("/generate-text")
 	public String extractAssistantTextResponse(@RequestBody String prompt) {
+		System.out.println(prompt);
 		ObjectMapper objMap = new ObjectMapper();
 		
 		Map<String, Object> promptJSON = objMap.readValue(prompt, new TypeReference<Map<String, Object>>() {});
@@ -43,6 +50,18 @@ public class AgentController {
 		return objMap.writeValueAsString(videoResponse);
 		
 	}
+	
+	@PostMapping("/tasks") 
+	public TaskSnapshot sendCreativeBrief(@RequestBody CreativeBrief brief) {
+		return service.getCurrentTaskStatus(brief);
+	}
+	
+	
+	@PostMapping("/{taskId}/review")
+    public TaskSnapshot submitReview( @PathVariable String taskId, @RequestBody ReviewRequest request) {
+		return service.submitReview(taskId, request);
+    }
+	
 	
 }
 
