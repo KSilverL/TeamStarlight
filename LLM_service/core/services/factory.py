@@ -24,6 +24,7 @@ from .base import (
     ImageSearchService,
     LLMService,
     MusicGenerationService,
+    RealtimeVoiceService,
     SafetyService,
     StoreService,
     VoiceService,
@@ -34,6 +35,7 @@ __all__ = [
     "get_safety",
     "get_store",
     "get_voice",
+    "get_realtime_voice",
     "get_chat_client",
     "get_image_search",
     "get_background_removal",
@@ -111,6 +113,20 @@ def get_voice() -> VoiceService:
                  "AZURE_VOICELIVE_ENDPOINT", "USE_MOCK_VOICE=true")
         return azure.AzureVoice(s)
     return _cached("voice", build)
+
+
+def get_realtime_voice() -> RealtimeVoiceService:
+    """Native speech-to-speech bridge (GPT-Realtime), used by WS /intake/{sid}/voice.
+    Distinct from get_voice()'s cascaded transcribe_turn contract, kept as a fallback
+    (still reachable over the cascaded REST intake path)."""
+    def build() -> RealtimeVoiceService:
+        s = get_settings()
+        if s.mock_voice():
+            return mock.MockRealtimeVoice()
+        _require(s.has_voice, "Azure Voice Live API (realtime)",
+                 "AZURE_VOICELIVE_ENDPOINT", "USE_MOCK_VOICE=true")
+        return azure.AzureRealtimeVoice(s)
+    return _cached("realtime_voice", build)
 
 
 def get_chat_client(

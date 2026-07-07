@@ -154,12 +154,29 @@ class BriefConversation:
             brief_partial=dict(state.brief_partial),
             pending_field=pending,
         )
-        for key, value in result.get("brief_updates", {}).items():
+        await self.apply_tool_result(
+            state,
+            brief_updates=result.get("brief_updates", {}),
+            wants_topic_idea=result.get("wants_topic_idea", False),
+        )
+        return self._respond(state, greeting=greeting)
+
+    async def apply_tool_result(
+        self, state: _SessionState, *, brief_updates: dict, wants_topic_idea: bool,
+    ) -> None:
+        """Fold one turn's tool outcome into `state` — updates to `brief_partial`, the
+        `suggest_topic` copilot path, and the follow-up-cap force-complete check. This
+        is the ONE place brief-completion rules live, shared by both `turn()` (the
+        text/cascaded-voice engine, driven by `LLMService.fill_brief`'s tool-call
+        result) and the realtime voice engine (intake/realtime_voice.py, driven by a
+        `tool_call` event straight from the live GPT-Realtime session) — only how
+        `brief_updates`/`wants_topic_idea` are produced differs by transport."""
+        for key, value in brief_updates.items():
             if value:
                 state.brief_partial[key] = value
 
         # copilot_mode: the user asked for ideas and has no topic → suggest one.
-        if result.get("wants_topic_idea") and not state.brief_partial.get("topic"):
+        if wants_topic_idea and not state.brief_partial.get("topic"):
             state.brief_partial["topic"] = await suggest_topic(
                 user_intent=state.brief_partial.get("user_intent", ""),
                 platforms=state.brief_partial.get("target_platforms") or _DEFAULT_PLATFORMS,
@@ -171,8 +188,6 @@ class BriefConversation:
         # missing → stop interrogating and fill the gaps ourselves so the brief completes.
         if state.followups_asked >= MAX_INTAKE_FOLLOWUPS and self._missing(state.brief_partial):
             await self._force_complete(state)
-
-        return self._respond(state, greeting=greeting)
 
     def _respond(self, state: _SessionState, *, greeting: bool) -> dict:
         missing = self._missing(state.brief_partial)

@@ -14,10 +14,11 @@ reject path (and thus the circuit breaker) without any randomness to pin.
 from __future__ import annotations
 
 import asyncio
+import base64
 import html as _html
 import re
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import AsyncIterator, Dict, List, Optional
 
 from agent_framework import (
     BaseChatClient,
@@ -38,6 +39,9 @@ from .base import (
     ImageSearchService,
     LLMService,
     MusicGenerationService,
+    RealtimeEvent,
+    RealtimeVoiceService,
+    RealtimeVoiceSession,
     SafetyResult,
     SafetyService,
     StoreService,
@@ -869,6 +873,119 @@ class MockVoice(VoiceService):
         # so a faithful transcript is the verbatim text. This makes a voice intake
         # produce a CreativeBrief identical to the same words typed (§4.4).
         return {"session_id": session_id, "transcript": user_audio.strip()}
+
+
+# ── Realtime voice (offline stand-in for GPT-Realtime speech-to-speech) ───────
+# No real audio/network offline: `send_audio`'s `audio_b64` is base64 of the literal
+# spoken words (the same "the script provides the words" convention as MockVoice
+# above), decoded back to text and run through the SAME deterministic extraction
+# MockLLM.fill_brief uses (_free_extract / _COPILOT_TRIGGERS) to decide whether to
+# emit an `update_brief` or `suggest_topic` tool call. This drives the exact same
+# orchestration code (intake/realtime_voice.py) that the real Azure session does —
+# only the transport is faked.
+
+_SENTINEL = object()
+
+# Mirrors intake.base.REQUIRED_FIELDS (topic, user_intent) — duplicated as a tiny,
+# self-contained constant so this module stays independent of the intake package.
+# Lets the mock track "what would the model have just asked about" the same way
+# MockLLM.fill_brief's `pending_field` fallback does, so a bare answer to a spoken
+# follow-up (no "to <verb>..." phrasing) still slots into the right field.
+_REALTIME_REQUIRED_FIELDS = ("topic", "user_intent")
+
+
+def _mock_pcm16_silence(num_samples: int = 800) -> str:
+    """Base64 PCM16 silence — a deterministic stand-in for the assistant's spoken
+    audio in mock mode (there is no real TTS offline)."""
+    return base64.b64encode(bytes(num_samples * 2)).decode("ascii")
+
+
+class _MockRealtimeSession(RealtimeVoiceSession):
+    def __init__(self, *, session_id: str) -> None:
+        self._session_id = session_id
+        self._queue: "asyncio.Queue" = asyncio.Queue()
+        self._call_count = 0
+        # This session's own tally of what it has told the caller so far (from tool
+        # calls it emitted / their results) — used only to pick the pending field below.
+        self._known: Dict[str, str] = {}
+
+    def _pending_field(self) -> Optional[str]:
+        for field in _REALTIME_REQUIRED_FIELDS:
+            if not self._known.get(field):
+                return field
+        return None
+
+    async def _emit(self, event: RealtimeEvent) -> None:
+        await self._queue.put(event)
+
+    async def send_audio(self, *, audio_b64: str) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        text = base64.b64decode(audio_b64).decode("utf-8", errors="replace").strip()
+        # Side channel only, mirrors input_audio_transcription — never what decides
+        # the brief (that's the tool call below, exactly like the real model).
+        await self._emit(RealtimeEvent(type="input_transcript", text=text))
+
+        updates = _free_extract(text)
+        wants_topic_idea = any(trigger in text.lower() for trigger in _COPILOT_TRIGGERS)
+        # Pending-field fallback (mirrors MockLLM.fill_brief): a direct answer with no
+        # extractable phrasing still slots into whatever field is still missing —
+        # except a "give me ideas" turn must not become the topic itself.
+        pending = self._pending_field()
+        if pending and not updates.get(pending) and text and not (wants_topic_idea and pending == "topic"):
+            updates[pending] = text
+        self._known.update({k: v for k, v in updates.items() if v})
+
+        self._call_count += 1
+        call_id = f"call-{self._call_count}"
+        if wants_topic_idea:
+            await self._emit(RealtimeEvent(
+                type="tool_call", call_id=call_id, name="suggest_topic",
+                arguments={"user_intent": updates.get("user_intent", "")},
+            ))
+        elif updates:
+            await self._emit(RealtimeEvent(
+                type="tool_call", call_id=call_id, name="update_brief", arguments=updates,
+            ))
+        else:
+            # Nothing extracted: the model would just ask a follow-up out loud.
+            await self._emit(RealtimeEvent(type="output_transcript_delta", text="Could you tell me more?"))
+            await self._emit(RealtimeEvent(type="audio_delta", audio_b64=_mock_pcm16_silence()))
+            await self._emit(RealtimeEvent(type="response_done"))
+
+    async def send_tool_result(self, *, call_id: str, output: dict) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        if output.get("topic"):
+            self._known["topic"] = output["topic"]
+        # Deterministic narration of the tool's result — mirrors the real model
+        # speaking the function_call_output once it comes back.
+        line = f"How about this: {output['topic']}?" if output.get("topic") else "Got it, thanks."
+        await self._emit(RealtimeEvent(type="output_transcript_delta", text=line))
+        await self._emit(RealtimeEvent(type="audio_delta", audio_b64=_mock_pcm16_silence()))
+        await self._emit(RealtimeEvent(type="response_done"))
+
+    async def nudge(self, *, text: str) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        await self._emit(RealtimeEvent(type="output_transcript_delta", text="Great, that's everything I need."))
+        await self._emit(RealtimeEvent(type="audio_delta", audio_b64=_mock_pcm16_silence()))
+        await self._emit(RealtimeEvent(type="response_done"))
+
+    async def events(self) -> AsyncIterator[RealtimeEvent]:
+        while True:
+            event = await self._queue.get()
+            if event is _SENTINEL:
+                return
+            yield event
+
+    async def close(self) -> None:
+        await self._queue.put(_SENTINEL)
+
+
+class MockRealtimeVoice(RealtimeVoiceService):
+    async def open_session(
+        self, *, session_id: str, instructions: str, tools: List[dict],
+    ) -> RealtimeVoiceSession:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return _MockRealtimeSession(session_id=session_id)
 
 
 # ── Image search / background removal (offline stand-ins for Pexels / Remove.bg) ──

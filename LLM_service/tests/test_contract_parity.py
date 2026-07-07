@@ -521,3 +521,137 @@ async def test_voice_parity():
     assert set(a.keys()) == {"session_id", "transcript"}
     assert a["session_id"] == "s1" and a["transcript"] == "hello there"
     assert isinstance(azure.AzureVoice(get_settings()), VoiceService)
+
+
+# ── Realtime voice parity (native speech-to-speech, GPT-Realtime) ─────────────
+# AzureRealtimeVoice's network I/O goes through one seam (`_send_json`/the ws itself,
+# same pattern as AzureLLM._complete), so the wire-protocol shaping is testable with a
+# fake transport — no real socket/credentials, fully offline like the rest of this file.
+
+class _FakeRealtimeWS:
+    """A fake websocket: records every outbound frame, and replays scripted inbound
+    raw JSON strings on `async for`."""
+
+    def __init__(self, inbound: list[dict] | None = None) -> None:
+        self.sent: list[dict] = []
+        self._inbound = inbound or []
+
+    async def send(self, raw: str) -> None:
+        self.sent.append(json.loads(raw))
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def __aiter__(self):
+        return self._gen()
+
+    async def _gen(self):
+        for event in self._inbound:
+            yield json.dumps(event)
+
+
+def test_realtime_tool_schema_adapter():
+    """BRIEF_TOOL_DEFS (Chat-Completions' nested shape) reshapes to the Realtime
+    API's flat shape without losing any field the model needs."""
+    from LLM_service.intake.base import BRIEF_TOOL_DEFS
+
+    flat = azure._to_realtime_tools(BRIEF_TOOL_DEFS)
+    assert len(flat) == len(BRIEF_TOOL_DEFS)
+    for tool, nested in zip(flat, BRIEF_TOOL_DEFS):
+        fn = nested["function"]
+        assert tool == {
+            "type": "function",
+            "name": fn["name"],
+            "description": fn.get("description", ""),
+            "parameters": fn.get("parameters"),
+        }
+
+
+async def test_azure_realtime_session_wire_protocol():
+    """`_configure`/`send_audio`/`send_tool_result`/`nudge` shape the exact frames the
+    Realtime API expects, through the fake-ws seam (no real network)."""
+    ws = _FakeRealtimeWS()
+    session = azure._AzureRealtimeSession(ws, session_id="s1")
+
+    await session._configure(instructions="be nice", tools=[], voice="verse")
+    cfg = ws.sent[-1]
+    assert cfg["type"] == "session.update"
+    assert cfg["session"]["instructions"] == "be nice"
+    assert cfg["session"]["voice"] == "verse"
+    assert cfg["session"]["modalities"] == ["audio", "text"]
+    assert cfg["session"]["turn_detection"] == {"type": "server_vad"}
+    assert cfg["session"]["input_audio_transcription"] == {"model": "whisper-1"}
+
+    await session.send_audio(audio_b64="AAA=")
+    assert ws.sent[-1] == {"type": "input_audio_buffer.append", "audio": "AAA="}
+
+    await session.send_tool_result(call_id="call-1", output={"ok": True})
+    item_frame, response_frame = ws.sent[-2], ws.sent[-1]
+    assert item_frame["type"] == "conversation.item.create"
+    assert item_frame["item"]["type"] == "function_call_output"
+    assert item_frame["item"]["call_id"] == "call-1"
+    assert json.loads(item_frame["item"]["output"]) == {"ok": True}
+    assert response_frame == {"type": "response.create"}
+
+    await session.nudge(text="wrap up")
+    nudge_frame = ws.sent[-2]
+    assert nudge_frame["item"]["role"] == "system"
+    assert nudge_frame["item"]["content"] == [{"type": "input_text", "text": "wrap up"}]
+    assert ws.sent[-1] == {"type": "response.create"}
+
+
+def test_azure_realtime_translate_events():
+    """The server-event -> RealtimeEvent mapping the reader loop relies on."""
+    translate = azure._AzureRealtimeSession._translate
+
+    ev = translate({"type": "response.audio.delta", "delta": "abc"})
+    assert ev.type == "audio_delta" and ev.audio_b64 == "abc"
+
+    ev = translate({"type": "response.audio_transcript.delta", "delta": "hi"})
+    assert ev.type == "output_transcript_delta" and ev.text == "hi"
+
+    ev = translate({
+        "type": "conversation.item.input_audio_transcription.completed",
+        "transcript": " hey there ",
+    })
+    assert ev.type == "input_transcript" and ev.text == "hey there"
+
+    ev = translate({
+        "type": "response.function_call_arguments.done", "call_id": "call-1",
+        "name": "update_brief", "arguments": json.dumps({"topic": "x"}),
+    })
+    assert ev.type == "tool_call" and ev.call_id == "call-1"
+    assert ev.name == "update_brief" and ev.arguments == {"topic": "x"}
+
+    assert translate({"type": "input_audio_buffer.speech_started"}).type == "speech_started"
+    assert translate({"type": "response.done"}).type == "response_done"
+
+    ev = translate({"type": "error", "error": {"message": "boom"}})
+    assert ev.type == "error" and "boom" in ev.message
+
+    # Unrecognised event types are dropped, not raised on.
+    assert translate({"type": "session.created"}) is None
+
+
+async def test_azure_realtime_events_cancel_on_barge_in():
+    """Barge-in (`speech_started`) is forwarded to the caller AND cancels the
+    model's in-flight generation server-side."""
+    ws = _FakeRealtimeWS(inbound=[
+        {"type": "input_audio_buffer.speech_started"},
+        {"type": "response.done"},
+    ])
+    session = azure._AzureRealtimeSession(ws, session_id="s1")
+    events = [event async for event in session.events()]
+    assert [e.type for e in events] == ["speech_started", "response_done"]
+    assert {"type": "response.cancel"} in ws.sent
+
+
+async def test_realtime_voice_service_parity(monkeypatch):
+    """factory.get_realtime_voice() resolves mock vs Azure exactly like get_voice()."""
+    assert isinstance(factory.get_realtime_voice(), mock.MockRealtimeVoice)
+
+    monkeypatch.setenv("USE_MOCK_VOICE", "false")
+    monkeypatch.setenv("AZURE_VOICELIVE_ENDPOINT", "https://example.services.ai.azure.com")
+    reset_settings()
+    factory.reset_services()
+    assert isinstance(factory.get_realtime_voice(), azure.AzureRealtimeVoice)
