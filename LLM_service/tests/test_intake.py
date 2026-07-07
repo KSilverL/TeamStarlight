@@ -274,6 +274,30 @@ async def test_copilot_mode_invokes_suggest_topic_tool():
     assert voice_brief.model_dump(exclude={"intake_mode"}) == brief.model_dump(exclude={"intake_mode"})
 
 
+async def test_copilot_topic_suggestion_waits_for_the_goal():
+    """A bare "help me think" opening with NO extractable goal must not suggest a topic
+    off an empty seed (that produced a generic, unrelated proposal). Intake instead asks
+    for the goal — never the topic, which we'll propose ourselves — and the suggestion
+    fires on the next turn, seeded by the user's actual intent."""
+    from LLM_service.intake.base import _QUESTIONS
+
+    session = TextIntake()
+    started = await session.start(
+        "sess-defer", "Help me think of what I should share", target_platforms=["linkedin"])
+    assert started["complete"] is False
+    assert started["brief_partial"].get("topic") is None     # nothing suggested yet
+    assert started["assistant_message"].endswith(_QUESTIONS["user_intent"])
+
+    result = await session.send_user_turn("sess-defer", "make people want to try our launch")
+    assert result["complete"] is True
+
+    brief = await session.get_brief("sess-defer")
+    assert brief.route == "copilot_mode"
+    assert "make people want to try our launch" in brief.topic   # seeded by THEIR goal
+    assert "your brand story" not in brief.topic                 # not the generic fallback
+    assert "\n" not in brief.topic                               # a topic line, not a strategy doc
+
+
 async def test_copilot_suggest_topic_rides_trends_when_enabled(monkeypatch):
     """Phase 4 (trend scout spread): with TREND_SCOUT_ENABLED, suggest_topic — which fires
     exactly when the user doesn't know what to post — proposes from today's trends (the

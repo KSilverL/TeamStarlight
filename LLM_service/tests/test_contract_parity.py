@@ -114,6 +114,25 @@ async def test_plan_strategy_trends_parity():
     assert await mock.MockLLM().plan_strategy(**kw, trends="") == plain
 
 
+async def test_suggest_topic_parity():
+    """The copilot topic proposal is a ONE-LINER by contract (it lands verbatim in the
+    brief's topic): both impls return a non-empty str, the mock stays single-line and
+    weaves the first trend line in verbatim, and an empty trends block changes nothing."""
+    kw = dict(user_intent="promote our launch", platforms=["linkedin"])
+    m = await mock.MockLLM().suggest_topic(**kw)
+    a = await azure_llm("Launch week, unfiltered: the first pour").suggest_topic(**kw)
+    assert isinstance(m, str) and isinstance(a, str) and m and a
+    assert "\n" not in m
+
+    block = render_trends([Trend(
+        text="A split-screen meme is peaking", category="meme",
+        captured_at="2026-07-04T00:00:00+00:00",
+    )])
+    with_trends = await mock.MockLLM().suggest_topic(**kw, trends=block)
+    assert "A split-screen meme is peaking" in with_trends
+    assert await mock.MockLLM().suggest_topic(**kw, trends="") == m
+
+
 @pytest.mark.parametrize("platform", ["linkedin", "instagram", "x", "tiktok"])
 async def test_write_copy_parity(platform):
     kw = dict(

@@ -166,6 +166,29 @@ class AzureLLM(LLMService):
             [{"role": "system", "content": system}, {"role": "user", "content": user}]
         )
 
+    async def suggest_topic(
+        self, *, user_intent: str, platforms: List[str], trends: str = ""
+    ) -> str:
+        system = (
+            "You are a social-media content strategist. The user does not know what to "
+            "post. Propose ONE concrete post topic for the platforms given — a single "
+            "short line (an angle or working title). Reply with the topic line only: "
+            "no strategy document, no sections, no markdown, no copy."
+        )
+        if trends:
+            # Same fusion-with-rejection-permission framing as plan_strategy.
+            system += (
+                "\n\nBelow are current, broad cultural/industry trends. If ONE of them "
+                "has a genuine, creative connection to the goal, anchor the topic on it; "
+                "if none genuinely fits, use none — a forced trend is worse than none."
+                "\n\n" + trends
+            )
+        user = f"Platforms: {', '.join(platforms)}\nGoal: {user_intent}"
+        raw = await self._complete(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        )
+        return raw.strip()
+
     async def write_copy(
         self,
         *,

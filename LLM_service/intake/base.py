@@ -110,6 +110,11 @@ class _SessionState:
     messages: List[dict] = field(default_factory=list)  # [{role, content}]
     route: str = "direct_generation"
     used_topic_idea: bool = False
+    # The user asked for topic ideas (the suggest_topic tool fired). Latched across turns:
+    # the actual suggestion is DEFERRED until user_intent is known, so the proposal is
+    # seeded by their real goal — an early call off an empty intent produced a generic,
+    # unrelated topic. While set, clarifiers skip the topic question entirely.
+    wants_topic_idea: bool = False
     user_id: Optional[str] = None  # caller-supplied identity; keys per-user learning
     followups_asked: int = 0  # clarifying questions asked so far (capped at MAX_INTAKE_FOLLOWUPS)
     # The prior-session recap (backend-supplied) this conversation continues; None = fresh. An
@@ -126,8 +131,13 @@ class BriefConversation:
     def _missing(brief_partial: dict) -> List[str]:
         return [f for f in REQUIRED_FIELDS if not brief_partial.get(f)]
 
-    def _next_missing(self, brief_partial: dict) -> Optional[str]:
-        missing = self._missing(brief_partial)
+    def _next_missing(self, state: _SessionState) -> Optional[str]:
+        """The next field to ask the user about. A pending topic suggestion means we'll
+        propose the topic ourselves — never ask for it (the user already said they
+        don't know what to post)."""
+        missing = self._missing(state.brief_partial)
+        if state.wants_topic_idea:
+            missing = [f for f in missing if f != "topic"]
         return missing[0] if missing else None
 
     async def begin(self, state: _SessionState, opening_text: Optional[str]) -> dict:
@@ -139,7 +149,7 @@ class BriefConversation:
         history = list(state.messages)
         state.messages.append({"role": "user", "content": user_text})
 
-        pending = self._next_missing(state.brief_partial)
+        pending = self._next_missing(state)
         # When this conversation continues a prior session, append its recap to the system prompt so
         # the LLM resolves the new brief against it in the same analyse-first pass (prompt-only —
         # the state machine is otherwise unchanged). Empty/absent recap → INTAKE_SYSTEM_PROMPT as-is.
@@ -175,10 +185,19 @@ class BriefConversation:
             if value:
                 state.brief_partial[key] = value
 
-        # copilot_mode: the user asked for ideas and has no topic → suggest one.
-        if wants_topic_idea and not state.brief_partial.get("topic"):
+        # copilot_mode: the user asked for ideas and has no topic → suggest one, but only
+        # once the goal is known, so the proposal is seeded by THEIR intent. Until then the
+        # latched flag makes the clarifier ask for the goal instead of the topic; if the
+        # goal never arrives, _force_complete's fallback suggestion still terminates intake.
+        if result.get("wants_topic_idea"):
+            state.wants_topic_idea = True
+        if (
+            state.wants_topic_idea
+            and not state.brief_partial.get("topic")
+            and state.brief_partial.get("user_intent")
+        ):
             state.brief_partial["topic"] = await suggest_topic(
-                user_intent=state.brief_partial.get("user_intent", ""),
+                user_intent=state.brief_partial["user_intent"],
                 platforms=state.brief_partial.get("target_platforms") or _DEFAULT_PLATFORMS,
             )
             state.route = "copilot_mode"
@@ -197,7 +216,7 @@ class BriefConversation:
             message = f"Great — I've got everything: {self._summary(state.brief_partial)}. Handing this to the newsroom."
         else:
             state.followups_asked += 1  # we're about to ask one more clarifier
-            message = _QUESTIONS[missing[0]]
+            message = _QUESTIONS[self._next_missing(state) or missing[0]]
         if greeting:
             message = _GREETING + message
         state.messages.append({"role": "assistant", "content": message})
