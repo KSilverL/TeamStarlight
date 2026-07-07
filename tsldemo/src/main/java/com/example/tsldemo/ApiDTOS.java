@@ -136,6 +136,10 @@ public class ApiDTOS {
 			@JsonProperty
 			String reason) {}
 	
+	public record ReviewTaskRequest(
+	        Map<String, Verdict> verdicts
+	) {}
+	
 	public record ReviewRequest(@JsonProperty Map<String,Verdict> verdicts) {}
 	
 	public record ConfirmLearningRequest(Boolean learn) {}
