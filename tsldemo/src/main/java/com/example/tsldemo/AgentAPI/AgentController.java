@@ -10,7 +10,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
-import com.example.tsldemo.ApiDTOS;
+import com.example.tsldemo.ApiDTOS.*;
 import com.example.tsldemo.ApiDTOS.CreativeBrief;
 import com.example.tsldemo.ApiDTOS.ReviewRequest;
 import com.example.tsldemo.ApiDTOS.TaskSnapshot;
@@ -59,7 +59,7 @@ public class AgentController {
 	
 	@PostMapping("/{taskId}/review")
     public TaskSnapshot submitReview( @PathVariable String taskId, @RequestBody ReviewRequest request) {
-		return service.submitReview(taskId, request);
+		return service.reviewTask(taskId, request);
     }
 	
 	

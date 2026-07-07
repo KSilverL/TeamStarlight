@@ -76,7 +76,7 @@ public class AgentService {
                 .body(TaskSnapshot.class);
 	}
 	
-	public TaskSnapshot reviewTask(String taskId, ReviewTaskRequest request) {
+	public TaskSnapshot reviewTask(String taskId, ReviewRequest request) {
 	    return post(
 	            "/tasks/" + taskId + "/review",
 	            request,
