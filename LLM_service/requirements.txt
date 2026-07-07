@@ -25,3 +25,9 @@ asyncpg>=0.29.0
 # azure-ai-contentsafety>=1.0.0
 # Voice Live API (VoiceService) — STT over a WebSocket; required when USE_MOCK_VOICE=false:
 # websockets>=12.0
+# Azure AI Foundry (WebSearchService: Bing-grounded search/review-mining, core/services/web_search.py)
+# — required when USE_MOCK_WEB_SEARCH=false. Same packages trend_scout_routine/ already pins;
+# usually already present transitively via agent-framework-azure-ai, but pin explicitly since
+# this service imports them directly rather than through MAF:
+# azure-ai-projects>=2.1.0
+# azure-identity>=1.20.0

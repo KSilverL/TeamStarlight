@@ -1,4 +1,5 @@
-"""dispatcher (总编导) — the workflow's start executor.
+"""
+dispatcher (总编导) — the workflow's start executor.
 
 Validates the incoming brief and confirms the route (copilot_mode /
 direct_generation). When the intake layer (M3) already produced a complete brief,

@@ -115,6 +115,39 @@ export interface ComparisonTableSlide {
   durationFrames: number;
 }
 
+export interface MapPin {
+  label: string;
+  lon: number; // WGS84 longitude, negative = west
+  lat: number;
+  stats: string[]; // 0-3 short lines, e.g. "Pop: 1.2M"
+}
+
+export interface MapSlide {
+  type: "map";
+  headline?: string;
+  region: string; // ISO 3166-1 alpha-2, e.g. "IE" — resolved via map/regionIndex.ts
+  pins: MapPin[];
+  // The three basemap fields are set together (or not at all) by assets.py's
+  // Geoapify resolution; absent → the bundled vector map renders instead.
+  // basemapLocalPath is job-relative ("maps/0.png"), served via --public-dir.
+  basemapLocalPath?: string;
+  basemapCenter?: [number, number]; // [lon, lat]
+  basemapZoom?: number;
+  durationFrames: number;
+}
+
+// ── Phase 3: bespoke, LLM-authored scene (autonomous video-agent plan) ──────
+// Unlike the fixed types above, `generated` has no hand-written component in
+// registry.ts's SLIDE_REGISTRY. `componentName` names a file under
+// src/generated/<job_id>/ that a per-job entry point imports and registers via
+// registry.ts's registerGeneratedSlide — see workflow/video/codegen.py.
+export interface GeneratedSlide {
+  type: "generated";
+  componentName: string;
+  data: Record<string, unknown>;
+  durationFrames: number;
+}
+
 export type Slide =
   | HookSlide
   | CounterStatSlide
@@ -124,7 +157,9 @@ export type Slide =
   | LineChartSlide
   | BarChartSlide
   | NodeDiagramSlide
-  | ComparisonTableSlide;
+  | ComparisonTableSlide
+  | MapSlide
+  | GeneratedSlide;
 
 export interface RenderableStoryboard {
   brandName: string;
@@ -138,6 +173,9 @@ export interface RenderableStoryboard {
   // Job-relative path (e.g. "music.mp3"), resolved by workflow/video/music.py.
   // Absent/undefined when generation failed or was skipped — render stays silent.
   musicLocalPath?: string;
+  // Job-relative path (e.g. "voiceover.mp3"), resolved by workflow/video/voiceover.py.
+  // Absent/undefined when no narration was requested or synthesis failed.
+  voiceoverLocalPath?: string;
   // Index signature so this satisfies Remotion's `Record<string, unknown>` props
   // constraint (CalculateMetadataFunction / Composition generics require it).
   [key: string]: unknown;

@@ -41,7 +41,9 @@ from .base import (
     SafetyResult,
     SafetyService,
     StoreService,
+    VoiceoverService,
     VoiceService,
+    WebSearchService,
     empty_profile,
 )
 
@@ -49,6 +51,26 @@ from .base import (
 # copy, so a brief whose topic contains this marker produces a draft that is
 # rejected on every attempt — exactly what the circuit-breaker test needs.
 UNSAFE_MARKER = "unsafe"
+
+# Substring that makes MockLLM.generate_scene_component return deliberately invalid
+# TSX on the FIRST attempt only (a real prior_error clears it on retry) — the
+# offline lever for exercising workflow/video/codegen.py's self-repair loop
+# deterministically, mirroring UNSAFE_MARKER above.
+BROKEN_CODEGEN_MARKER = "break-codegen"
+
+# Substring that makes MockLLM.review_scene_preview reject on the FIRST attempt
+# only (attempt > 1 always approves) — the offline lever for exercising
+# codegen.py's visual-QA-driven retry deterministically, mirroring
+# BROKEN_CODEGEN_MARKER above (a different failure MODE: compiles and renders
+# fine, but the mock vision judge flags it anyway).
+VISUAL_QA_REJECT_MARKER = "bad-visual"
+
+# Substring that makes MockLLM.review_scene_preview reject on the FIRST attempt
+# with subject-mismatch feedback (the frame doesn't DEPICT the brief's subject —
+# e.g. a text card standing in for a requested map), mirroring the strengthened
+# depiction criterion in AzureLLM.review_scene_preview's rubric. Same
+# reject-once/approve-on-retry contract as VISUAL_QA_REJECT_MARKER.
+SUBJECT_MISMATCH_MARKER = "off-brief"
 
 # Platform-differentiated strategy angle (strategist). Keyed case-insensitively.
 _PLATFORM_FOCUS: Dict[str, str] = {
@@ -327,6 +349,48 @@ body{{background:#000;display:flex;justify-content:center;align-items:center;min
 </div></body></html>"""
 
 
+def _mock_scene_component(*, broken: bool) -> str:
+    """A deterministic, offline stand-in .tsx source, matching the SAME prop shape
+    every fixed slide component uses (`{ slide, accentColor, secondaryColor,
+    primaryColor }` — see e.g. video_renderer/src/slides/HookSlide.tsx) so it slots
+    into Composition.tsx with no special-casing. `broken` (driven by
+    BROKEN_CODEGEN_MARKER) returns code that references an undefined identifier —
+    valid-looking enough to write to disk, but fails a real typecheck/preview-render,
+    so codegen.py's retry loop has something genuine to recover from."""
+    if broken:
+        return (
+            'import React from "react";\n'
+            'import { AbsoluteFill } from "remotion";\n'
+            'import type { GeneratedSlide } from "../../types";\n\n'
+            "const GeneratedScene: React.FC<{ slide: GeneratedSlide; accentColor: string;\n"
+            "  secondaryColor: string; primaryColor: string }> = ({ slide }) => {\n"
+            "  return <AbsoluteFill>{undefinedIdentifierBoom}</AbsoluteFill>;\n"
+            "};\n\n"
+            "export default GeneratedScene;\n"
+        )
+    return (
+        'import React from "react";\n'
+        'import { AbsoluteFill, interpolate, useCurrentFrame } from "remotion";\n'
+        'import type { GeneratedSlide } from "../../types";\n\n'
+        "const GeneratedScene: React.FC<{\n"
+        "  slide: GeneratedSlide;\n"
+        "  accentColor: string;\n"
+        "  secondaryColor: string;\n"
+        "  primaryColor: string;\n"
+        "}> = ({ slide, primaryColor }) => {\n"
+        "  const frame = useCurrentFrame();\n"
+        '  const opacity = interpolate(frame, [0, 15], [0, 1], { extrapolateRight: "clamp" });\n'
+        '  const headline = String((slide.data as any).headline ?? "Generated Scene");\n'
+        "  return (\n"
+        '    <AbsoluteFill style={{ justifyContent: "center", alignItems: "center", backgroundColor: primaryColor }}>\n'
+        '      <h1 style={{ color: "white", fontSize: 64, opacity }}>{headline}</h1>\n'
+        "    </AbsoluteFill>\n"
+        "  );\n"
+        "};\n\n"
+        "export default GeneratedScene;\n"
+    )
+
+
 def _mock_storyboard(topic: str, draft: str, tone_hint: Optional[str], platform: str) -> dict:
     """A deterministic 4-slide StoryboardSpec-shaped dict — one of each Phase 1 slide
     type, in a typical order (hook -> collage -> counter_stat -> outro), so
@@ -597,6 +661,34 @@ class MockLLM(LLMService):
             "rejected_directions": _unique(rejected)[:5],
             "user_notes": _unique(notes)[:5],
         }
+
+    async def generate_scene_component(
+        self,
+        *,
+        description: str,
+        data: dict,
+        width: int,
+        height: int,
+        fps: int,
+        duration_frames: int,
+        attempt: int = 1,
+        prior_error: Optional[str] = None,
+        prior_source: Optional[str] = None,
+    ) -> str:
+        await asyncio.sleep(_MOCK_LATENCY)
+        broken = BROKEN_CODEGEN_MARKER in description.lower() and prior_error is None
+        return _mock_scene_component(broken=broken)
+
+    async def review_scene_preview(
+        self, *, description: str, image_bytes: bytes, attempt: int = 1,
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        if attempt == 1:
+            if SUBJECT_MISMATCH_MARKER in description.lower():
+                return {"approved": False, "feedback": "mock visual QA: frame does not depict the brief's subject"}
+            if VISUAL_QA_REJECT_MARKER in description.lower():
+                return {"approved": False, "feedback": "mock visual QA: headline overlaps the frame edge"}
+        return {"approved": True, "feedback": ""}
 
     async def fill_brief(
         self,
@@ -891,6 +983,24 @@ class MockImageSearch(ImageSearchService):
         ]
 
 
+class MockLiveImageSearch(ImageSearchService):
+    """Deterministic, offline stand-in for LiveImageSearch (core/services/web_search.py):
+    a distinct URL host from MockImageSearch so the two sourcing paths (stock vs.
+    live web) stay tellable apart in tests/logs even in mock mode."""
+
+    async def search(self, *, query: str, per_page: int = 1) -> List[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return [
+            {
+                "url": f"https://mock.bing.local/{i}/{query.replace(' ', '-')}.jpg",
+                "photographer": "mock-source.local",
+                "width": None,
+                "height": None,
+            }
+            for i in range(max(per_page, 0))
+        ]
+
+
 class MockBackgroundRemoval(BackgroundRemovalService):
     """Offline stand-in for Remove.bg: returns the input bytes unchanged (no real
     cutout), so callers exercise the same code path without a network call."""
@@ -935,3 +1045,60 @@ class MockMusicGeneration(MusicGenerationService):
     async def generate(self, *, mood: str, genre: str, duration_seconds: float, energy: str) -> bytes:
         await asyncio.sleep(_MOCK_LATENCY)
         return _silent_mp3(duration_seconds)
+
+
+# Average conversational speaking rate, used only to size the mock's silent
+# placeholder track (a real TTS call determines the ACTUAL duration; this is a
+# reasonable estimate purely so the offline pipeline has a plausible-length file).
+_MOCK_SPEAKING_RATE_WPM = 150
+
+
+class MockVoiceover(VoiceoverService):
+    """Offline stand-in for Azure Speech TTS: returns a real (silent) MP3 whose
+    duration is estimated from `text`'s word count at a typical speaking rate, so
+    the voiceover-resolution pipeline — including Remotion's ffprobe inspection of
+    the file — works end to end without real credentials. Reuses `_silent_mp3`
+    (already built for MockMusicGeneration; same ffprobe-decodability requirement)."""
+
+    async def synthesize(self, *, text: str, voice: str) -> bytes:
+        await asyncio.sleep(_MOCK_LATENCY)
+        words = len(text.split())
+        duration_seconds = max(1.0, (words / _MOCK_SPEAKING_RATE_WPM) * 60)
+        return _silent_mp3(duration_seconds)
+
+
+# ── Web research (offline stand-in for the Foundry-agent-backed search) ───────
+
+class MockWebSearch(WebSearchService):
+    """Deterministic, offline stand-in for AzureWebSearch: no network, results
+    derived purely from the query/subject text, so the whole pipeline (and its
+    tests) run without real search credentials."""
+
+    async def search_web(self, *, query: str, count: int = 5) -> List[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        slug = (query.strip() or "topic").replace(" ", "-").lower()
+        return [
+            {
+                "title": f"What to know about {query} (mock result {i + 1})",
+                "url": f"https://mock.search.local/{slug}/{i}",
+                "snippet": f"A brief mock summary about {query}, result #{i + 1}.",
+            }
+            for i in range(max(count, 0))
+        ]
+
+    async def fetch_url_text(self, *, url: str) -> str:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return f"[MOCK ARTICLE TEXT for {url}] This is a deterministic offline stand-in article body."
+
+    async def search_reviews(self, *, subject: str, count: int = 5) -> List[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        slug = (subject.strip() or "product").replace(" ", "-").lower()
+        return [
+            {
+                "quote": f"\"{subject} exceeded my expectations\" — mock review #{i + 1}.",
+                "rating": 4.5,
+                "source": "Mock Reviews",
+                "url": f"https://mock.reviews.local/{slug}/{i}",
+            }
+            for i in range(max(count, 0))
+        ]

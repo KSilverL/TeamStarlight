@@ -134,6 +134,8 @@ class Settings:
     use_mock_image_search: Optional[bool] = None
     use_mock_background_removal: Optional[bool] = None
     use_mock_music_generation: Optional[bool] = None
+    use_mock_web_search: Optional[bool] = None
+    use_mock_voiceover: Optional[bool] = None
 
     # ── Azure OpenAI / Foundry (chat + structured output + copywriting) ────────
     azure_openai_endpoint: Optional[str] = None
@@ -230,14 +232,69 @@ class Settings:
     pexels_api_key: Optional[str] = None
     removebg_api_key: Optional[str] = None
 
+    # ── Geoapify (static-map basemaps for `map` slides) ─────────────────────────
+    # No key → map slides render the bundled vector outline instead; never blocking.
+    geoapify_api_key: Optional[str] = None
+
     # ── Soundraw (background music generation) ──────────────────────────────────
     soundraw_api_key: Optional[str] = None
 
-    # ── Video render pipeline (local Remotion CLI) ──────────────────────────────
+    # ── Azure Speech (voiceover text-to-speech) ─────────────────────────────────
+    azure_speech_key: Optional[str] = None
+    azure_speech_region: Optional[str] = None
+    # Default Neural voice when a caller doesn't specify one (POST /tasks/{id}/render-video).
+    voiceover_default_voice: str = "en-US-JennyNeural"
+
+    # ── Web research (Bing grounding via Azure AI Foundry agents) ──────────────
+    # Reuses the same "Grounding with Bing Search" mechanism as
+    # trend_scout_routine/run_scan.py (a portal-defined Foundry agent, called
+    # through the OpenAI-compatible responses API) rather than a new search vendor.
+    # Two separate agents because their portal instructions differ (general web
+    # research vs. review-quote mining); both live on the same project endpoint.
+    foundry_project_endpoint: Optional[str] = None
+    web_search_agent_name: Optional[str] = None
+    web_search_agent_version: Optional[str] = None
+    review_search_agent_name: Optional[str] = None
+    review_search_agent_version: Optional[str] = None
+
+    # ── Video render pipeline (local Remotion CLI, or Remotion Lambda) ──────────
     # Path to the video_renderer/ Node project (repo-root sibling of LLM_service/).
     video_renderer_dir: Optional[str] = None
-    # Per-job working directory: resolved images + the final MP4. Not git-tracked.
+    # Per-job working directory: resolved images + the final MP4 (local backend
+    # only — the lambda backend never writes an MP4 to local disk). Not git-tracked.
     video_jobs_dir: str = ".video_jobs"
+    # "local" (default): the original `npx remotion render` subprocess, output on
+    # local disk. "lambda": workflow/video/lambda_render.py — compiles + renders on
+    # AWS Lambda, output in S3; render_storyboard() returns an https:// URL instead
+    # of a Path either way, so jobs.py/api.py don't need to know which ran.
+    video_render_backend: str = "local"
+    # ── Remotion Lambda (workflow/video/lambda_render.py) ───────────────────────
+    # Required when video_render_backend == "lambda". These name resources YOU
+    # deploy yourself first via the Remotion Lambda CLI (`npx remotion lambda
+    # functions deploy`, `npx remotion lambda sites create`) — this service only
+    # ever TRIGGERS renders against them, it never provisions them. AWS credentials
+    # are resolved the standard way (env vars / shared config / IAM role) by the
+    # AWS SDK the Node trigger scripts use — nothing AWS-specific is read from this
+    # Settings object beyond the region.
+    aws_region: Optional[str] = None
+    remotion_lambda_function_name: Optional[str] = None
+    # A STABLE, pre-deployed site's serve URL, used for any storyboard with no
+    # `generated` slides (the common, fast case — no per-job site deploy needed).
+    remotion_lambda_serve_url: Optional[str] = None
+    # A storyboard WITH `generated` slide(s) needs its own bespoke component(s)
+    # bundled in, so lambda_render.py deploys a fresh, job-scoped "site" instead of
+    # reusing remotion_lambda_serve_url — named "<prefix>-<job_id>".
+    remotion_lambda_site_name_prefix: str = "storyboard-job"
+    # S3 output location. None (default) → Remotion Lambda picks its own
+    # auto-created bucket in `aws_region` (its documented default behaviour).
+    remotion_lambda_output_bucket: Optional[str] = None
+    # Cross-slide attempt budget for one render job's WHOLE `generated`-slide
+    # codegen pass (workflow/video/codegen.CodegenBudget) — bounds total LLM calls
+    # + compiles + preview-renders across every bespoke slide in one storyboard,
+    # not just per-slide (codegen.DEFAULT_MAX_ATTEMPTS already bounds that). A
+    # storyboard with several struggling slides could otherwise spend
+    # max_attempts-per-slide x N-slides worth of real cost.
+    codegen_max_total_attempts: int = 9
 
     # ── Backend status webhook (legacy transport; SSE replaces it in M2) ───────
     webhook_url: str = "http://localhost:9999/status"
@@ -264,6 +321,12 @@ class Settings:
 
     def mock_music_generation(self) -> bool:
         return self.use_mock if self.use_mock_music_generation is None else self.use_mock_music_generation
+
+    def mock_web_search(self) -> bool:
+        return self.use_mock if self.use_mock_web_search is None else self.use_mock_web_search
+
+    def mock_voiceover(self) -> bool:
+        return self.use_mock if self.use_mock_voiceover is None else self.use_mock_voiceover
 
     def notify_via_webhook(self) -> bool:
         """Whether status events are POSTed to the backend webhook. Defaults to
@@ -296,16 +359,43 @@ class Settings:
         return bool(self.removebg_api_key)
 
     @property
+    def has_geoapify(self) -> bool:
+        return bool(self.geoapify_api_key)
+
+    @property
     def has_soundraw(self) -> bool:
         return bool(self.soundraw_api_key)
+
+    @property
+    def has_web_search(self) -> bool:
+        return bool(self.foundry_project_endpoint and self.web_search_agent_name)
+
+    @property
+    def has_azure_speech(self) -> bool:
+        return bool(self.azure_speech_key and self.azure_speech_region)
+
+    @property
+    def has_remotion_lambda(self) -> bool:
+        """Whether enough is configured to attempt a Lambda render: a function to
+        invoke, and a stable serve URL for the (common) no-`generated`-slide case.
+        A `generated`-slide job additionally needs `resolved_video_renderer_dir` to
+        exist locally (it deploys a fresh site from that project), checked at
+        render time, not here."""
+        return bool(self.remotion_lambda_function_name and self.remotion_lambda_serve_url)
 
     @property
     def resolved_video_renderer_dir(self) -> Path:
         """Absolute path to the video_renderer/ Node project. VIDEO_RENDERER_DIR
         overrides; otherwise defaults to the repo-root sibling of LLM_service/ (this
-        file is core/config.py, so parent.parent.parent is the repo root)."""
+        file is core/config.py, so parent.parent.parent is the repo root).
+        `.resolve()` on the override matters: render.py/codegen.py pass paths
+        derived from this property as subprocess args while also setting the
+        subprocess's `cwd` to this same directory — a RELATIVE VIDEO_RENDERER_DIR
+        left unresolved would have the subprocess reinterpret that relative path
+        against its own cwd (this directory), silently writing/reading a
+        double-nested path instead of the intended one."""
         if self.video_renderer_dir:
-            return Path(self.video_renderer_dir)
+            return Path(self.video_renderer_dir).resolve()
         return Path(__file__).resolve().parent.parent.parent / "video_renderer"
 
     @property
@@ -328,7 +418,9 @@ class Settings:
             f"store={tag(self.mock_store())} voice={tag(self.mock_voice())} "
             f"image_search={tag(self.mock_image_search())} "
             f"background_removal={tag(self.mock_background_removal())} "
-            f"music_generation={tag(self.mock_music_generation())}]"
+            f"music_generation={tag(self.mock_music_generation())} "
+            f"web_search={tag(self.mock_web_search())} "
+            f"voiceover={tag(self.mock_voiceover())}]"
         )
 
 
@@ -344,10 +436,13 @@ def _load() -> Settings:
         use_mock_image_search=_env_bool("USE_MOCK_IMAGE_SEARCH"),
         use_mock_background_removal=_env_bool("USE_MOCK_BACKGROUND_REMOVAL"),
         use_mock_music_generation=_env_bool("USE_MOCK_MUSIC_GENERATION"),
+        use_mock_web_search=_env_bool("USE_MOCK_WEB_SEARCH"),
+        use_mock_voiceover=_env_bool("USE_MOCK_VOICEOVER"),
         azure_openai_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
         azure_openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
         azure_chat_deployment=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4o"),
+        foundry_project_endpoint=os.getenv("FOUNDRY_PROJECT_ENDPOINT"),
         azure_content_safety_endpoint=os.getenv("AZURE_CONTENTSAFETY_ENDPOINT")
         or os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT"),
         azure_content_safety_key=os.getenv("AZURE_CONTENTSAFETY_KEY")
@@ -391,9 +486,24 @@ def _load() -> Settings:
         ),
         pexels_api_key=os.getenv("PEXELS_API_KEY"),
         removebg_api_key=os.getenv("REMOVEBG_API_KEY"),
+        geoapify_api_key=os.getenv("GEOAPIFY_API_KEY"),
         soundraw_api_key=os.getenv("SOUNDRAW_API_KEY"),
+        azure_speech_key=os.getenv("AZURE_SPEECH_KEY"),
+        azure_speech_region=os.getenv("AZURE_SPEECH_REGION"),
+        voiceover_default_voice=os.getenv("VOICEOVER_DEFAULT_VOICE", "en-US-JennyNeural"),
+        web_search_agent_name=os.getenv("WEB_SEARCH_AGENT_NAME"),
+        web_search_agent_version=os.getenv("WEB_SEARCH_AGENT_VERSION"),
+        review_search_agent_name=os.getenv("REVIEW_SEARCH_AGENT_NAME"),
+        review_search_agent_version=os.getenv("REVIEW_SEARCH_AGENT_VERSION"),
         video_renderer_dir=os.getenv("VIDEO_RENDERER_DIR"),
         video_jobs_dir=os.getenv("VIDEO_JOBS_DIR", ".video_jobs"),
+        video_render_backend=os.getenv("VIDEO_RENDER_BACKEND", "local").strip().lower(),
+        aws_region=os.getenv("AWS_REGION"),
+        remotion_lambda_function_name=os.getenv("REMOTION_LAMBDA_FUNCTION_NAME"),
+        remotion_lambda_serve_url=os.getenv("REMOTION_LAMBDA_SERVE_URL"),
+        remotion_lambda_site_name_prefix=os.getenv("REMOTION_LAMBDA_SITE_NAME_PREFIX", "storyboard-job"),
+        remotion_lambda_output_bucket=os.getenv("REMOTION_LAMBDA_OUTPUT_BUCKET"),
+        codegen_max_total_attempts=_env_int("CODEGEN_MAX_TOTAL_ATTEMPTS", 9),
         webhook_url=os.getenv("WEBHOOK_URL", "http://localhost:9999/status"),
         webhook_enabled=_env_bool("WEBHOOK_ENABLED"),
     )

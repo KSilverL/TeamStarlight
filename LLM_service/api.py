@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Body, FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .core.config import get_settings, load_dotenv
@@ -211,6 +211,9 @@ class _Task:
         # (e.g. auto-approving two platforms' drafts back-to-back) must not both drive the same
         # underlying `workflow` at once — that races on `task.pending` and can 409 a legitimate call.
         self.error: Optional[str] = None              # set if the run raised; surfaced in the snapshot
+        self.lock = asyncio.Lock()                    # serializes resumes: two concurrent /review calls
+        # (e.g. auto-approving two platforms' drafts back-to-back) must not both drive the same
+        # underlying `workflow` at once — that races on `task.pending` and can 409 a legitimate call.
         self.status = "running"
         self.done = False
 
@@ -294,9 +297,6 @@ class WorkflowService:
     # ── Drive one run segment (start or resume) until the next pause / end ─────
 
     async def _drive(self, task: _Task, *, message=None, responses=None) -> dict:
-        # TODO (Revisit this to see if it needs to be altered)
-        # answered = set(responses.keys()) if responses else set()
-        # new_pending: dict[str, dict] = {}
         # Answered gates stop being pending the moment we resume with their response — before
         # the stream even starts, not after it drains (see below for why "after" is wrong).
         if responses:
@@ -310,6 +310,13 @@ class WorkflowService:
         async for ev in stream:
             if ev.type == "request_info":
                 d = ev.data
+                # Written straight into `task.pending` (not a local buffer merged in after the
+                # loop): a multi-platform run keeps streaming (e.g. platform B still drafting)
+                # after platform A's `request_info` pauses it, and `_publish` below fires A's
+                # `draft_ready` SSE event immediately. A client that auto-approves on receipt
+                # must see A as pending right away, or a same-task `review()` call landing
+                # before this loop finishes for every platform wrongly 409s ("not awaiting
+                # review") even though the client just did exactly what the event told it to.
                 task.pending[ev.request_id] = {
                     "request_id": ev.request_id,
                     "platform": d.platform,
@@ -321,10 +328,6 @@ class WorkflowService:
                 self._record_output(task, ev.data)
             for out in self._translate(ev):
                 self._publish(task, out)
-
-        # Keep unanswered gates pending; drop the ones we just answered; add new ones.
-        # task.pending = {k: v for k, v in task.pending.items() if k not in answered}
-        # task.pending.update(new_pending)
 
         if task.pending:
             task.status = "awaiting_review"
@@ -438,41 +441,9 @@ class WorkflowService:
         self, task: _Task, brief: Brief, *, roundtable: bool, text_requested: bool, before_round,
         rt_sequential: bool = False,
     ) -> dict:
-        # """The heavy segment of a start: (optional) roundtable discussion, then drive the MAF
-        # workflow to its first pause/end. Shared by the inline and background start paths."""
-        # if roundtable:
-        #     results = await run_tables(
-        #         brief, platforms=brief.target_platforms, task_id=task.task_id,
-        #         on_event=lambda ev: self._publish(task, ev),
-        #         before_round=before_round,
-        #     )
-        #     # Keep the full discussion transcript so the per-user learning loop can distil
-        #     # preferences from the user's interjections after the gate (§6.5 write side).
-        #     task.roundtable_transcript = [
-        #         t.model_dump() for r in results for t in r.consensus.transcript
-        #     ]
-        #     # Merge the N single-platform consensuses into ONE CreativeStrategy. With text it is
-        #     # the strategist drop-in (→ creator); media-only it is the render brief (→ media_entry).
-        #     strategy = CreativeStrategy(
-        #         brief=brief,
-        #         strategies={
-        #             r.consensus.platform: r.consensus.strategy.strategies.get(r.consensus.platform, "")
-        #             for r in results
-        #         },
-        #     )
-        #     return await self._drive(task, message=strategy)
-
-        # if not text_requested:
-        #     # Media-only without a roundtable: synthesize a (topic-based) strategy and run straight
-        #     # to the media_producer — no discussion, no copy, no human gate.
-        #     strategy = CreativeStrategy(
-        #         brief=brief, strategies={p: "" for p in brief.target_platforms})
-        #     return await self._drive(task, message=strategy)
-
-        # return await self._drive(task, message=brief)
-        """"
-        The heavy segment of a start: (optional) roundtable discussion, then drive the MAF
+        """The heavy segment of a start: (optional) roundtable discussion, then drive the MAF
         workflow to its first pause/end. Shared by the inline and background start paths.
+
         Holds `task.lock` for the whole segment — the same lock `review()` takes before it
         resumes — so a client can never call `task.workflow.run()` a second time (via a
         same-task `review()`) while this first run is still mid-stream for a slower platform.
@@ -485,7 +456,7 @@ class WorkflowService:
                 results = await run_tables(
                     brief, platforms=brief.target_platforms, task_id=task.task_id,
                     on_event=lambda ev: self._publish(task, ev),
-                    before_round=before_round, sequential=rt_sequential,
+                    before_round=before_round,
                 )
                 # Keep the full discussion transcript so the per-user learning loop can distil
                 # preferences from the user's interjections after the gate (§6.5 write side).
@@ -493,7 +464,7 @@ class WorkflowService:
                     t.model_dump() for r in results for t in r.consensus.transcript
                 ]
                 # Merge the N single-platform consensuses into ONE CreativeStrategy. With text it
-                # is the strategist drop-in (→ creator); media-only it is the render brief (→ media_entry).
+                # is the scout drop-in (→ creator); media-only it is the render brief (→ media_entry).
                 strategy = CreativeStrategy(
                     brief=brief,
                     strategies={
@@ -514,27 +485,10 @@ class WorkflowService:
 
     async def review(self, task_id: str, verdicts: dict) -> dict:
         task = self._require(task_id)
-        # if not task.pending:
-        #     raise ApiError(409, "task is not awaiting review")
         if not isinstance(verdicts, dict) or not verdicts:
             raise ApiError(400, "'verdicts' must be a non-empty object keyed by platform")
 
-        # responses: dict[str, HumanVerdict] = {}
-        # for req_id, data in task.pending.items():
-        #     verdict = verdicts.get(data["platform"])
-        #     if verdict is None:
-        #         continue  # leave un-addressed platforms pending
-        #     responses[req_id] = _verdict_from_payload(verdict)
-        #     # Record the AI draft the human reviewed + the verdict, so confirm-learning can
-        #     # distil brand rules (AI-vs-final diff) and trace a learned preference to the edit.
-        #     task.original_drafts[data["platform"]] = data["draft"]
-        #     task.last_verdicts.append({"platform": data["platform"], **verdict})
-        # if not responses:
-        #     raise ApiError(400, "no verdict matched a pending platform")
-        # # Learning no longer runs automatically — it waits for POST /tasks/{id}/confirm-learning.
-        # # Guard the resume too: an executor failure (e.g. media render) must not hang subscribers.
-        # return await self._run_guarded(task, self._drive(task, responses=responses), reraise=True)
-         # Serialize resumes on this task: two platforms' drafts can both auto-approve within
+        # Serialize resumes on this task: two platforms' drafts can both auto-approve within
         # milliseconds of each other (see `task.lock`), and concurrently driving the same
         # `task.workflow` races on `task.pending` — the loser can see a stale/emptied view and
         # wrongly 409, or corrupt the bookkeeping for the platform it never touched.
@@ -794,7 +748,6 @@ class WorkflowService:
             if task.done:
                 return
             while True:
-                # ev = await q.get()
                 try:
                     ev = await asyncio.wait_for(q.get(), timeout=15)
                 except asyncio.TimeoutError:
@@ -911,7 +864,10 @@ class VideoService:
     def __init__(self, *, workflow: WorkflowService) -> None:
         self._workflow = workflow
 
-    async def start(self, task_id: str, platform: str) -> dict:
+    async def start(
+        self, task_id: str, platform: str, *,
+        narration_text: Optional[str] = None, narration_voice: Optional[str] = None,
+    ) -> dict:
         draft = self._workflow.get_final_draft(task_id, platform)
         if draft is None:
             raise ApiError(404, f"no finished draft for platform '{platform}' on task {task_id}")
@@ -920,6 +876,7 @@ class VideoService:
             raise ApiError(409, f"platform '{platform}' has no video storyboard yet")
         doc = await start_render_job(
             task_id=task_id, platform=platform, storyboard=StoryboardSpec(**storyboard),
+            narration_text=narration_text, narration_voice=narration_voice,
         )
         return {"job_id": doc["id"], "status": doc["status"]}
 
@@ -929,14 +886,22 @@ class VideoService:
             raise ApiError(404, f"unknown video job: {job_id}")
         return job
 
-    async def download_path(self, job_id: str) -> Path:
+    async def download_location(self, job_id: str) -> tuple[str, bool]:
+        """Returns (location, is_remote). `render_storyboard` (workflow/video/render.py)
+        returns a local Path when VIDEO_RENDER_BACKEND=local (the default) or an
+        https:// S3 URL when =lambda; jobs.py stores whichever verbatim as
+        `output_path` (str() either way), so this is where the two are told apart —
+        neither jobs.py nor the StoreService schema needs to know which ran."""
         job = await self.get(job_id)
         if job["status"] != "done" or not job.get("output_path"):
             raise ApiError(409, f"video job {job_id} is not done yet (status={job['status']})")
-        path = Path(job["output_path"])
+        location = job["output_path"]
+        if location.startswith("http://") or location.startswith("https://"):
+            return location, True
+        path = Path(location)
         if not path.is_file():
             raise ApiError(404, f"rendered file for job {job_id} is missing on disk")
-        return path
+        return str(path), False
 
 
 def _verdict_from_payload(payload: dict) -> HumanVerdict:
@@ -1128,6 +1093,14 @@ class GenerateHtmlRequest(BaseModel):
 
 class RenderVideoRequest(BaseModel):
     platform: str = Field(..., description="Which finished platform draft's storyboard to render")
+    narration_text: Optional[str] = Field(
+        None, description="Optional voiceover script to synthesize and mix into the render "
+        "(Phase 3: TTS via Azure Speech, or a silent mock). Omit for no narration."
+    )
+    narration_voice: Optional[str] = Field(
+        None, description="Provider voice id (e.g. an Azure Neural voice name). "
+        "Omit to use VOICEOVER_DEFAULT_VOICE."
+    )
 
 
 # ── Dependencies: pull the per-app service singletons off app.state ───────────
@@ -1275,7 +1248,10 @@ async def start_roundtables(request: Request, body: RoundtableRequest) -> dict:
     summary="Render the MP4 for one platform's already-produced video storyboard",
 )
 async def render_video(request: Request, task_id: str, body: RenderVideoRequest) -> dict:
-    return await _video(request).start(task_id, body.platform)
+    return await _video(request).start(
+        task_id, body.platform,
+        narration_text=body.narration_text, narration_voice=body.narration_voice,
+    )
 
 
 @intake_router.post("", summary="Open an intake conversation (voice or text)")
@@ -1339,10 +1315,17 @@ async def get_video_job(request: Request, job_id: str) -> dict:
     return await _video(request).get(job_id)
 
 
-@video_jobs_router.get("/{job_id}/download", summary="Download the finished MP4")
-async def download_video_job(request: Request, job_id: str) -> FileResponse:
-    path = await _video(request).download_path(job_id)
-    return FileResponse(path, media_type="video/mp4", filename=f"{job_id}.mp4")
+@video_jobs_router.get("/{job_id}/download", summary="Download or stream the finished MP4")
+async def download_video_job(request: Request, job_id: str):
+    """Local backend: streams the MP4 straight off disk (FileResponse), as before.
+    Lambda backend: 307-redirects to the S3 output URL instead of proxying the
+    bytes through this process — S3 already serves HTTP range requests natively, so
+    a <video> element can seek/scrub the redirected URL directly, satisfying
+    "stream, don't just download" without this service touching the bytes at all."""
+    location, is_remote = await _video(request).download_location(job_id)
+    if is_remote:
+        return RedirectResponse(location, status_code=307)
+    return FileResponse(location, media_type="video/mp4", filename=f"{job_id}.mp4")
 
 
 # ── App factory ────────────────────────────────────────────────────────────────
