@@ -101,6 +101,23 @@ class LLMService(ABC):
         ...
 
     @abstractmethod
+    async def suggest_topic(
+        self,
+        *,
+        user_intent: str,
+        platforms: List[str],
+        trends: str = "",
+    ) -> str:
+        """Propose ONE concrete post topic/angle — a single short line, never a strategy
+        document — for a copilot_mode user who doesn't know what to post. Seeded by the
+        user's stated goal. `trends` is the same pre-rendered CURRENT TRENDS block as
+        `plan_strategy` (empty MUST leave the proposal unchanged); when present an impl
+        may anchor the topic on ONE genuinely fitting trend. The intake layer puts the
+        return value verbatim into the brief's `topic` (which then rides every downstream
+        prompt and the intake summary line), so brevity is part of the contract."""
+        ...
+
+    @abstractmethod
     async def write_copy(
         self,
         *,
