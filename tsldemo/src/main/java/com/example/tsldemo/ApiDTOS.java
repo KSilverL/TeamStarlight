@@ -1,6 +1,7 @@
 package com.example.tsldemo;
 
 import java.util.List;
+import java.util.Map;
 
 import com.example.tsldemo.DTOs.Error.Detail;
 import com.example.tsldemo.DTOs.ResponseReceived.BriefPartial;
@@ -92,78 +93,155 @@ public class ApiDTOS {
 		@JsonProperty("prior_context")
 		String priorContext;
 		
+		@JsonProperty("roundtable_mode")
+		String roundtableMode;
 	}
 	
+	public record Pending(String request_id, String platform, String draft, String comment,
+            boolean needs_human_intervention) {}
+	
+	public record Output(String platform, String draft, String decision, String comment,
+            boolean needs_human_intervention, List<Map<String,Object>> proposed_rules,
+            List<String> content_types,
+            String html_card, Map<String,Object> video_storyboard) {}
+	
+	public record RenderVideo(String platform) {}
+	
 	//TODO: Move the related api classes to related files to avoid littering this file
-	public static class TaskStatus {
+	public static class TaskSnapshot {
 
 	    @JsonProperty("task_id")
 	    public String taskId;
 
 	    public String status;
 
-	    public PendingItem[] pending;
+	    public Pending[] pending;
 
-	    public OutputItem[] outputs;
+	    public Output[] outputs;
 
 	    @JsonProperty("proposed_rules")
-	    public ProposedRule[] proposedRules;
+	    List<Map<String,Object>> proposedRules;
 
-	    public static class PendingItem {
-	        @JsonProperty("request_id")
-	        public String requestId;
-
-	        public String platform;
-	        public String draft;
-	        public String comment;
-
-	        @JsonProperty("needs_human_intervention")
-	        public boolean needsHumanIntervention;
-	    }
-
-	    public static class OutputItem {
-	        public String platform;
-	        public String draft;
-	        public String decision;
-	        public String comment;
-
-	        @JsonProperty("needs_human_intervention")
-	        public boolean needsHumanIntervention;
-
-	        @JsonProperty("proposed_rules")
-	        public ProposedRule[] proposedRules;
-
-	        @JsonProperty("content_types")
-	        public String[] contentTypes;
-
-	        @JsonProperty("html_card")
-	        public String htmlCard;
-
-	        @JsonProperty("video_storyboard")
-	        public VideoStoryboard videoStoryboard;
-	    }
-
-	    public static class VideoStoryboard {
-	        @JsonProperty("brandName")
-	        public String brandName;
-
-	        public Slide[] slides;
-	    }
-
-	    public static class Slide {
-	        @JsonProperty("type")
-	        public String type;
-
-	        @JsonProperty("content")
-	        public Object content;
-	    }
-
-	    public static class ProposedRule {
-	        public String kind;
-	        public String rule;
-	        public String rationale;
-	    }
+	    String error;
+	    
 	}
+	
+	record Verdict(
+			@JsonProperty
+			String decision, 
+			
+			@JsonProperty
+			String edited_draft, 
+			
+			@JsonProperty
+			String reason) {}
+	
+	public record ReviewRequest(@JsonProperty Map<String,Verdict> verdicts) {}
+	
+	public record ConfirmLearningRequest(Boolean learn) {}
+	
+	public record ConfirmLearningResponse(
+	        @JsonProperty("task_id")
+	        String taskId,
 
+	        Boolean learned,
+
+	        @JsonProperty("brand_rules")
+	        List<BrandRule> brandRules,
+
+	        @JsonProperty("preference_summary")
+	        PreferenceSummary preferenceSummary
+	) {}
+	
+	public record BrandRule(
+	        String kind,
+	        String rule,
+	        String rationale
+	) {}
+	
+	public record PreferenceSummary(
+	        @JsonProperty("user_id")
+	        String userId,
+
+	        @JsonProperty("business_id")
+	        String businessId,
+
+	        @JsonProperty("learned_skills")
+	        List<String> learnedSkills,
+
+	        List<String> evidence,
+
+	        @JsonProperty("source_task_id")
+	        String sourceTaskId
+	) {}
+	
+	public record TaskSayRequest(
+			@JsonProperty("table_id")
+			String tableId,
+			
+			@JsonProperty
+			String text,
+			
+			@JsonProperty
+			boolean interrupt
+			) {}
+	
+	public record RaiseHandRequest(
+	        @JsonProperty("table_id")
+	        String tableId
+	) {}
+	
+	public record SayRequest(
+	        @JsonProperty("table_id")
+	        String tableId,
+
+	        String text,
+
+	        Boolean interrupt
+	) {}
+	
+	public record RoundControlRequest(
+	        @JsonProperty("table_id")
+	        String tableId,
+
+	        String action,
+
+	        String text
+	) {}
+	
+	public record RaiseHandResponse(
+	        @JsonProperty("task_id")
+	        String taskId,
+
+	        @JsonProperty("table_id")
+	        String tableId,
+
+	        @JsonProperty("hand_raised")
+	        Boolean handRaised
+	) {}
+	
+	public record SayResponse(
+	        @JsonProperty("task_id")
+	        String taskId,
+
+	        @JsonProperty("table_id")
+	        String tableId,
+
+	        Boolean queued,
+
+	        Integer pending
+	) {}
+	
+	public record RoundControlResponse(
+	        @JsonProperty("task_id")
+	        String taskId,
+
+	        @JsonProperty("table_id")
+	        String tableId,
+
+	        String action,
+
+	        Boolean accepted
+	) {}
 	
 }
