@@ -6,9 +6,10 @@ Double identity (MIGRATION_PLAN §5.3):
   - copilot_mode: a *tool* the intake layer calls when the user is unsure what to
     post ("帮我想想发什么") — `suggest_topic` proposes a topic/angle.
 
-Both share the same underlying strategy logic (`plan_strategies`), so the workflow and
-the intake conversation reuse one path. In production these hit the LLM's platform
-strategy prompt; in mock mode they derive a deterministic angle.
+The two share the daily-trends read, NOT the prompt: `plan_strategies` produces a full
+per-platform strategy for the graph, while `suggest_topic` uses the dedicated one-line
+`llm.suggest_topic` prompt — its return value becomes the brief's `topic` verbatim, so
+it must stay a short line, never a strategy document.
 
 NB: the live-web-trend fetcher is a SEPARATE concept — the strategist does NOT search
 the web itself; "scout" is reserved for the roundtable's `trend_scout` persona. What the
@@ -47,14 +48,15 @@ async def plan_strategies(*, topic: str, platforms: list[str], user_intent: str)
 
 
 async def suggest_topic(*, user_intent: str, platforms: list[str]) -> str:
-    """copilot_mode intake tool: propose a topic when the user has none yet.
-    Derives a deterministic angle from the platform strategy prompt."""
-    seed = user_intent.strip() or "your brand story"
-    strategies = await plan_strategies(
-        topic=seed, platforms=platforms or ["linkedin"], user_intent=user_intent
+    """copilot_mode intake tool: propose a topic when the user has none yet — ONE short
+    line from the dedicated `llm.suggest_topic` prompt, NOT `plan_strategies` (whose full
+    strategy document used to land verbatim in the brief's `topic` and bloat every
+    downstream prompt). Reads the same daily trends snapshot the strategist does."""
+    trend_block = render_trends(await read_current_trends())
+    topic = await factory.get_llm().suggest_topic(
+        user_intent=user_intent, platforms=platforms or ["linkedin"], trends=trend_block
     )
-    angle = next(iter(strategies.values()), "").strip()
-    return f"{seed} — {angle}" if angle else seed
+    return topic.strip() or user_intent.strip() or "your brand story"
 
 
 class StrategistExecutor(Executor):
