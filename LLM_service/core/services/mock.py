@@ -463,6 +463,20 @@ class MockLLM(LLMService):
             strategy += f" If it genuinely fits, ride this current trend: {first}"
         return strategy
 
+    async def suggest_topic(
+        self, *, user_intent: str, platforms: List[str], trends: str = ""
+    ) -> str:
+        await asyncio.sleep(_MOCK_LATENCY)
+        intent = user_intent.strip() or "raise awareness"
+        platform = platforms[0] if platforms else "linkedin"
+        topic = f"{intent} — a {_focus(platform)} angle"
+        # Deterministic trend fusion, same lever as plan_strategy: the block's FIRST
+        # trend line lands verbatim; an empty block leaves the topic byte-identical.
+        first = next((ln[2:] for ln in trends.splitlines() if ln.startswith("- ")), "")
+        if first:
+            topic += f", riding {first}"
+        return topic
+
     async def write_copy(
         self,
         *,
