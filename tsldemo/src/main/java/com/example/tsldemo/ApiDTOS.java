@@ -51,17 +51,6 @@ public class ApiDTOS {
 	
 	public record IntakeTurnRequest(String user_input) {}
 	
-	public record IntakeTurnResponse(
-		String sessionId,
-			
-		@JsonProperty("assistant_message")
-	    String assistantMessage,
-		    
-	    BriefPartial brief_partial,
-	    Boolean complete
-		    
-	) {}
-	
 	public static class CreativeBrief {
 		@JsonProperty
 		String topic;
