@@ -3,6 +3,11 @@ import { AbsoluteFill, Img, interpolate, spring, staticFile, useCurrentFrame, us
 import { geoMercator, geoPath } from "d3-geo";
 import type { MapSlide as MapSlideProps } from "../types";
 import { loadCountryFeature, lonLatToBasemapPx } from "../map/geo";
+import { textColorForTheme, type Theme } from "./theme";
+import { fadeIn } from "../design/animations";
+import { SlideHeadline } from "../design/components";
+import { displayFont } from "../design/fonts";
+import { fontSize, radius } from "../design/tokens";
 
 const PIN_START = 15; // frame the first pin drops
 const PIN_STAGGER = 12; // frames between consecutive pins
@@ -12,9 +17,11 @@ export const MapSlide: React.FC<{
   accentColor: string;
   secondaryColor: string;
   primaryColor: string;
-}> = ({ slide, accentColor, secondaryColor, primaryColor }) => {
+  theme?: Theme;
+}> = ({ slide, accentColor, secondaryColor, primaryColor, theme }) => {
   const frame = useCurrentFrame();
   const { fps, width, height } = useVideoConfig();
+  const textColor = textColorForTheme(theme);
 
   // Basemap mode only when assets.py resolved a static-map image AND its
   // center/zoom — pins are projected with the identical slippy-map math the
@@ -61,8 +68,23 @@ export const MapSlide: React.FC<{
     }
   }
 
-  const outlineOpacity = interpolate(frame, [0, 20], [0, 1], { extrapolateRight: "clamp" });
-  const headlineOpacity = interpolate(frame, [0, 12], [0, 1], { extrapolateRight: "clamp" });
+  const outlineOpacity = fadeIn(frame, { frames: 20 });
+  const headlineOpacity = fadeIn(frame, { frames: 12 });
+  const positions = slide.pins.map((p) => projectPin(p.lon, p.lat));
+
+  // journey variant: a route line draws through the pins in order BEFORE they
+  // drop, so pins are staggered later to let the route lead. The polyline uses
+  // strokeDasharray/offset to "draw on" frame-deterministically.
+  const isJourney = (slide.variant ?? "pins") === "journey" && positions.length > 1;
+  const routeDrawFrames = 30;
+  const routePoints = positions.map((p) => `${p.x},${p.y}`).join(" ");
+  const routeLen = positions.reduce((sum, p, i) => {
+    if (i === 0) return 0;
+    const q = positions[i - 1];
+    return sum + Math.hypot(p.x - q.x, p.y - q.y);
+  }, 0);
+  const routeProgress = isJourney ? fadeIn(frame, { frames: routeDrawFrames }) : 1;
+  const pinStart = isJourney ? PIN_START + routeDrawFrames : PIN_START;
 
   return (
     <AbsoluteFill style={{ backgroundColor: primaryColor }}>
@@ -74,8 +96,11 @@ export const MapSlide: React.FC<{
             src={staticFile(slide.basemapLocalPath as string)}
             style={{ position: "absolute", width: "100%", height: "100%", objectFit: "cover" }}
           />
-          {/* Tint keeps white labels legible over an arbitrary basemap. */}
-          <AbsoluteFill style={{ backgroundColor: primaryColor, opacity: 0.35 }} />
+          {/* Tint keeps the text legible over an arbitrary basemap. A light theme
+              gets a much fainter wash — its basemap (osm-bright) is already
+              near-white, and primaryColor is near-white too, so 0.35 would fog
+              the streets the pins are supposed to sit on. */}
+          <AbsoluteFill style={{ backgroundColor: primaryColor, opacity: theme === "light" ? 0.12 : 0.35 }} />
         </>
       )}
       {outlinePathD && (
@@ -83,32 +108,54 @@ export const MapSlide: React.FC<{
           <path d={outlinePathD} fill={secondaryColor} fillOpacity={0.16} stroke={accentColor} strokeWidth={3} />
         </svg>
       )}
+      {isJourney && (
+        <svg width={width} height={height} style={{ position: "absolute", inset: 0 }}>
+          <polyline
+            points={routePoints}
+            fill="none"
+            stroke={accentColor}
+            strokeWidth={4}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeDasharray={routeLen}
+            strokeDashoffset={routeLen * (1 - routeProgress)}
+            opacity={0.9}
+          />
+        </svg>
+      )}
       {slide.headline && (
-        <h2
-          style={{
-            position: "absolute",
-            top: "6%",
-            width: "100%",
-            textAlign: "center",
-            color: "white",
-            fontSize: 40,
-            fontWeight: 800,
-            opacity: headlineOpacity,
-            margin: 0,
-          }}
-        >
+        <SlideHeadline color={textColor} opacity={headlineOpacity}>
           {slide.headline}
-        </h2>
+        </SlideHeadline>
       )}
       {slide.pins.map((pin, i) => {
-        const { x, y } = projectPin(pin.lon, pin.lat);
-        const start = PIN_START + i * PIN_STAGGER;
+        const { x, y } = positions[i];
+        // Push the card away from the nearest OTHER pin vertically — two nearby
+        // venues (a few hundred metres apart in a city) otherwise put their cards
+        // on the same band and overlap. A single pin keeps the centered card.
+        let cardShift = "translateY(-50%)";
+        if (positions.length > 1) {
+          let nearest = 0;
+          let best = Infinity;
+          positions.forEach((q, j) => {
+            if (j === i) return;
+            const d = (q.x - x) ** 2 + (q.y - y) ** 2;
+            if (d < best) {
+              best = d;
+              nearest = j;
+            }
+          });
+          cardShift = positions[nearest].y >= y
+            ? "translateY(calc(-100% + 6px))" // neighbour below → card above the pin
+            : "translateY(-6px)"; // neighbour above → card below the pin
+        }
+        const start = pinStart + i * PIN_STAGGER;
         const drop = spring({ frame: Math.max(0, frame - start), fps, config: { damping: 12, mass: 0.5 } });
         const cardOpacity = interpolate(frame, [start + 8, start + 16], [0, 1], {
           extrapolateLeft: "clamp",
           extrapolateRight: "clamp",
         });
-        // Card sits on whichever side of the pin has more canvas.
+        // Card sits on whichever side of the pin has more canvas horizontally.
         const cardOnRight = x < width / 2;
         return (
           <React.Fragment key={i}>
@@ -132,18 +179,18 @@ export const MapSlide: React.FC<{
                 left: cardOnRight ? x + 26 : undefined,
                 right: cardOnRight ? undefined : width - x + 26,
                 top: y,
-                transform: "translateY(-50%)",
+                transform: cardShift,
                 opacity: cardOpacity,
                 backgroundColor: primaryColor,
-                borderRadius: 12,
+                borderRadius: radius.cell,
                 padding: "10px 16px",
                 boxShadow: "0 2px 12px rgba(0,0,0,0.35)",
                 maxWidth: width * 0.36,
               }}
             >
-              <div style={{ color: "white", fontSize: 34, fontWeight: 800, lineHeight: 1.15 }}>{pin.label}</div>
+              <div style={{ color: textColor, fontSize: 34, fontWeight: 800, fontFamily: displayFont, lineHeight: 1.15 }}>{pin.label}</div>
               {pin.stats.map((stat, j) => (
-                <div key={j} style={{ color: "white", opacity: 0.85, fontSize: 22, marginTop: 4 }}>
+                <div key={j} style={{ color: textColor, opacity: 0.85, fontSize: fontSize.caption + 2, marginTop: 4 }}>
                   {stat}
                 </div>
               ))}

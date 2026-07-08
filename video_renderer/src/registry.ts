@@ -26,6 +26,7 @@ type AnySlideComponent = React.FC<{
   accentColor: string;
   secondaryColor: string;
   primaryColor: string;
+  theme?: "dark" | "light";
 }>;
 
 // "generated" is intentionally absent here: it has no hand-written component.

@@ -1,0 +1,22 @@
+{
+  "brandName": "STARLIGHT",
+  "theme": "dark",
+  "primaryColor": "#0d1117",
+  "secondaryColor": "#2d4ed8",
+  "accentColor": "#f5c84c",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "slides": [
+    { "type": "node_diagram", "headline": "The process", "variant": "steps", "nodes": ["Collect", "Analyze", "Act", "Grow"], "durationFrames": 120 },
+    { "type": "node_diagram", "headline": "Our platform", "variant": "hub", "nodes": ["Core", "Data", "AI", "API", "Apps"], "durationFrames": 120 },
+    { "type": "comparison_table", "headline": "Us vs them", "variant": "scorecard", "highlightColumn": 0, "columns": ["Us", "Them"], "rows": [
+      { "label": "Speed", "values": ["Fast", "Slow"] },
+      { "label": "Price", "values": ["$9", "$29"] },
+      { "label": "Support", "values": ["24/7", "9-5"] }
+    ], "durationFrames": 120 },
+    { "type": "collage", "headline": "Our world", "variant": "grid", "layout": "polaroid", "captions": ["Team", "Office", "Launch"], "resolvedImages": [
+      { "query": "team", "localPath": null }, { "query": "office", "localPath": null }, { "query": "launch", "localPath": null }
+    ], "durationFrames": 120 }
+  ]
+}

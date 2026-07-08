@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Tuple
 
 from ...core.config import Settings, get_settings
 from ...core.services import factory
-from ...core.services.media_assets import GeoapifyStaticMap
+from ...core.services.media_assets import GeoapifyGeocoder, GeoapifyStaticMap, basemap_style
 from ...core.video_schema import (
     GeneratedSlideSpec,
     MapPin,
@@ -33,7 +33,6 @@ from ...core.video_schema import (
     RenderCollageSlide,
     RenderComparisonTableSlide,
     RenderCounterStatSlide,
-    RenderGeneratedSlide,
     RenderHookSlide,
     RenderLineChartSlide,
     RenderMapSlide,
@@ -45,7 +44,7 @@ from ...core.video_schema import (
     aspect_for_platform,
     clamp_duration,
 )
-from . import codegen
+from . import codegen, fallback, map_qa
 
 
 async def _download(url: str) -> Optional[bytes]:
@@ -144,12 +143,42 @@ def _basemap_geometry(
     return ((center_lon, center_lat), zoom)
 
 
+async def _geocode_map_pins(slide: MapSlideSpec, *, settings: Settings) -> List[MapPin]:
+    """Replace each pin's LLM-guessed coords with geocoded ones when the pin carries
+    a `query` and the geocoder returns a confident hit. Any miss/error keeps the
+    original pin — never blocks the render. Runs regardless of render backend (unlike
+    the basemap fetch): geocoded coords also improve the Lambda vector-outline path,
+    where the TS side projects pins itself."""
+    if not settings.has_geoapify or not any(p.query for p in slide.pins):
+        return list(slide.pins)
+
+    geocoder = GeoapifyGeocoder(settings)
+
+    async def _one(pin: MapPin) -> Optional[dict]:
+        if not pin.query:
+            return None
+        return await geocoder.geocode(
+            text=pin.query, bias_lon=pin.lon, bias_lat=pin.lat,
+            country_code=slide.region.lower(),
+        )
+
+    results = await asyncio.gather(*(_one(p) for p in slide.pins), return_exceptions=True)
+    return [
+        pin.model_copy(update={"lon": result["lon"], "lat": result["lat"]})
+        if isinstance(result, dict) else pin
+        for pin, result in zip(slide.pins, results)
+    ]
+
+
 async def _resolve_map_basemap(
-    slide: MapSlideSpec, *, index: int, job_dir: Path, width: int, height: int, settings: Settings,
+    slide: MapSlideSpec, *, pins: List[MapPin], index: int, job_dir: Path,
+    width: int, height: int, theme: str, settings: Settings,
 ) -> Tuple[Optional[str], Optional[Tuple[float, float]], Optional[float]]:
     """Fetch an optional Geoapify basemap image for one map slide. Returns
     (job-relative path, (center_lon, center_lat), zoom) — or all-None, in which case
     the Remotion side draws the bundled vector outline for slide.region instead.
+    `pins` are the (possibly geocoded) pins the geometry must be computed from —
+    NOT slide.pins, or the image center would drift from where the pins render.
 
     Skipped entirely on the Lambda backend: job-dir assets are served via the local
     render's --public-dir, and the deployed Lambda site bundle has no equivalent
@@ -158,9 +187,10 @@ async def _resolve_map_basemap(
     if not settings.has_geoapify or settings.video_render_backend == "lambda":
         return (None, None, None)
     try:
-        (center_lon, center_lat), zoom = _basemap_geometry(slide.pins, width=width, height=height)
+        (center_lon, center_lat), zoom = _basemap_geometry(pins, width=width, height=height)
         image_bytes = await GeoapifyStaticMap(settings).fetch(
             center_lon=center_lon, center_lat=center_lat, zoom=zoom, width=width, height=height,
+            style=basemap_style(settings, theme),
         )
         maps_dir = job_dir / "maps"
         maps_dir.mkdir(parents=True, exist_ok=True)
@@ -175,14 +205,15 @@ async def _resolve_generated_slide(
     slide: GeneratedSlideSpec, *, slide_index: int, job_id: str, width: int, height: int,
     primary_color: str, secondary_color: str, accent_color: str, settings: Settings,
     budget: Optional[codegen.CodegenBudget],
-) -> RenderGeneratedSlide:
+):
     """Run codegen.py's self-repair loop for one `generated` slide; on exhaustion,
-    fall back to a plain `hook`-style card built from the slide's own description
-    (an always-available static template) so a bad generation never blocks the
-    render — the video still completes, just less bespoke for this one slide.
-    `budget` is shared across every `generated` slide in THIS storyboard (see
-    resolve_storyboard_assets), so several struggling slides can't each spend the
-    full per-slide attempt budget independently."""
+    fall back via fallback.py — one LLM call converts the brief + data into the
+    best-fitting TEMPLATE slide (a bar chart brief becomes a real bar chart, not a
+    text card), degrading to a deterministic hook slide if even that fails — so a
+    bad generation never blocks the render. `budget` is shared across every
+    `generated` slide in THIS storyboard (see resolve_storyboard_assets), so
+    several struggling slides can't each spend the full per-slide attempt budget
+    independently."""
     fps = 30  # matches core.video_schema.FPS; the render harness always runs at 30fps
     result = await codegen.generate_scene(
         job_id=job_id, slide_index=slide_index, spec=slide,
@@ -192,12 +223,7 @@ async def _resolve_generated_slide(
     )
     if result is not None:
         return result
-    duration = clamp_duration("generated", slide.durationFrames)
-    fallback_headline = (slide.description or "").strip()[:60] or "See what's new"
-    return RenderHookSlide(
-        headline=fallback_headline, subtext=None, imageLocalPath=None,
-        shape="circle", durationFrames=duration,
-    )
+    return await fallback.fallback_slide_for(slide)
 
 
 async def resolve_storyboard_assets(
@@ -215,7 +241,13 @@ async def resolve_storyboard_assets(
     # Shared across every `generated` slide below (not reset per slide), so a
     # storyboard with several struggling bespoke scenes can't each independently
     # spend the full per-slide attempt budget — see CodegenBudget's docstring.
-    codegen_budget = codegen.CodegenBudget(settings.codegen_max_total_attempts)
+    # The configured total acts as a FLOOR, scaled up at 4 attempts per generated
+    # slide: a storyboard with 3 bespoke slides must not starve slide 3 just
+    # because slides 1-2 used their retries.
+    n_generated = sum(1 for s in storyboard.slides if s.type == "generated")
+    codegen_budget = codegen.CodegenBudget(
+        max(settings.codegen_max_total_attempts, 4 * n_generated)
+    )
 
     # Gather every (slide_index, query) pair across hook + collage slides so all
     # downloads/cutouts run in parallel, not slide-by-slide.
@@ -245,58 +277,83 @@ async def resolve_storyboard_assets(
         if slide.type == "hook":
             images = by_slide.get(i, [])
             render_slides.append(RenderHookSlide(
-                headline=slide.headline, subtext=slide.subtext,
+                headline=slide.headline, subtext=slide.subtext, kicker=slide.kicker,
                 imageLocalPath=images[0].localPath if images else None,
-                shape=slide.shape, durationFrames=duration,
+                shape=slide.shape, variant=slide.variant, background=slide.background,
+                durationFrames=duration,
             ))
         elif slide.type == "counter_stat":
             render_slides.append(RenderCounterStatSlide(
-                sectionLabel=slide.sectionLabel, stats=slide.stats, durationFrames=duration,
+                sectionLabel=slide.sectionLabel, stats=slide.stats,
+                variant=slide.variant, emphasisIndex=slide.emphasisIndex,
+                durationFrames=duration,
             ))
         elif slide.type == "collage":
             render_slides.append(RenderCollageSlide(
-                headline=slide.headline, layout=slide.layout,
+                headline=slide.headline, layout=slide.layout, captions=slide.captions,
                 resolvedImages=by_slide.get(i, []), durationFrames=duration,
             ))
         elif slide.type == "outro":
             render_slides.append(RenderOutroSlide(
                 brandName=slide.brandName, ctaLabel=slide.ctaLabel,
-                contact=slide.contact, durationFrames=duration,
+                contact=slide.contact, tagline=slide.tagline, variant=slide.variant,
+                durationFrames=duration,
             ))
         elif slide.type == "pie_chart":
             render_slides.append(RenderPieChartSlide(
                 headline=slide.headline, slices=slide.slices,
-                calloutText=slide.calloutText, durationFrames=duration,
+                calloutText=slide.calloutText, variant=slide.variant,
+                # A chart's own paletteName wins; otherwise inherit the storyboard's
+                # default so "set it once" works without repeating it per chart.
+                paletteName=slide.paletteName or storyboard.paletteName,
+                source=slide.source, durationFrames=duration,
             ))
         elif slide.type == "line_chart":
             render_slides.append(RenderLineChartSlide(
                 headline=slide.headline, xLabels=slide.xLabels,
-                series=slide.series, durationFrames=duration,
+                series=slide.series, variant=slide.variant, annotation=slide.annotation,
+                paletteName=slide.paletteName or storyboard.paletteName,
+                source=slide.source, durationFrames=duration,
             ))
         elif slide.type == "bar_chart":
             render_slides.append(RenderBarChartSlide(
-                headline=slide.headline, bars=slide.bars, durationFrames=duration,
+                headline=slide.headline, bars=slide.bars, variant=slide.variant,
+                highlightIndex=slide.highlightIndex,
+                paletteName=slide.paletteName or storyboard.paletteName,
+                source=slide.source, durationFrames=duration,
             ))
         elif slide.type == "node_diagram":
             render_slides.append(RenderNodeDiagramSlide(
-                headline=slide.headline, nodes=slide.nodes, durationFrames=duration,
+                headline=slide.headline, nodes=slide.nodes, variant=slide.variant,
+                durationFrames=duration,
             ))
         elif slide.type == "comparison_table":
             render_slides.append(RenderComparisonTableSlide(
                 headline=slide.headline, columns=slide.columns,
-                rows=slide.rows, durationFrames=duration,
+                rows=slide.rows, variant=slide.variant, highlightColumn=slide.highlightColumn,
+                durationFrames=duration,
             ))
         elif slide.type == "map":
             # Inline await is fine here: at most a couple of map slides per
-            # storyboard, one small HTTP GET each (and usually none — no key).
+            # storyboard, a handful of small HTTP GETs each (and usually none — no key).
+            # Geocode FIRST: the basemap center/zoom must be computed from the
+            # corrected coordinates or pins would drift off the image.
+            pins = await _geocode_map_pins(slide, settings=settings)
             basemap_path, basemap_center, basemap_zoom = await _resolve_map_basemap(
-                slide, index=i, job_dir=job_dir, width=width, height=height, settings=settings,
+                slide, pins=pins, index=i, job_dir=job_dir, width=width, height=height,
+                theme=storyboard.theme, settings=settings,
             )
-            render_slides.append(RenderMapSlide(
-                headline=slide.headline, region=slide.region, pins=slide.pins,
+            map_slide = RenderMapSlide(
+                headline=slide.headline, region=slide.region, pins=pins, variant=slide.variant,
                 basemapLocalPath=basemap_path, basemapCenter=basemap_center,
                 basemapZoom=basemap_zoom, durationFrames=duration,
-            ))
+            )
+            map_slide = await map_qa.review_and_repair_map_slide(
+                map_slide, slide_index=i, job_dir=job_dir, theme=storyboard.theme,
+                primary_color=storyboard.primaryColor, secondary_color=storyboard.secondaryColor,
+                accent_color=storyboard.accentColor, width=width, height=height, settings=settings,
+            )
+            render_slides.append(map_slide)
         elif slide.type == "generated":
             # Sequential, not gathered with the rest of the loop: each attempt is a
             # real compile + preview-render, heavy enough that running several
@@ -309,9 +366,13 @@ async def resolve_storyboard_assets(
 
     return RenderableStoryboard(
         brandName=storyboard.brandName,
+        theme=storyboard.theme,
         primaryColor=storyboard.primaryColor,
         secondaryColor=storyboard.secondaryColor,
         accentColor=storyboard.accentColor,
+        backgroundStyle=storyboard.backgroundStyle,
+        paletteName=storyboard.paletteName,
+        transition=storyboard.transition,
         width=width, height=height,
         slides=render_slides,
     )

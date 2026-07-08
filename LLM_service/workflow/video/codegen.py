@@ -18,11 +18,18 @@ subdirectory of the checked-in project (gitignored), not a full separate copy. T
 keeps concurrent jobs isolated from each other (each writes only its own job_id
 folder) while still resolving `remotion`/`react`/etc. from the ALREADY-INSTALLED
 video_renderer/node_modules via Node's normal upward module resolution — no per-job
-`npm install` or symlink needed. `tsc --noEmit` runs against the whole project
-(video_renderer/tsconfig.json already `include`s all of src/, so the new files are
-covered automatically); the preview render targets a small per-attempt entry point
-that registers ONLY the one component being validated, not the full storyboard, so
-each attempt stays fast.
+`npm install` or symlink needed. `tsc --noEmit` runs against a per-job tsconfig
+(_write_job_tsconfig) that includes ONLY this job's own files plus the shared src/
+modules they import — never a sibling job's directory — so one job's broken leftover
+file can't fail every other job's typecheck (the failure mode that used to cascade:
+the project-wide tsconfig `include`s all of src/, and src/generated/ was never
+cleaned in production, so a single bad .tsx poisoned all future typechecks). The
+preview render targets a small per-attempt entry point that registers ONLY the one
+component being validated, not the full storyboard, so each attempt stays fast.
+Cleanup is two-layered: jobs.py removes src/generated/<job_id>/ after the render
+completes (success or failure) via cleanup_job_generated(), and jobs.py also calls
+sweep_stale_generated() before each render to reap directories orphaned by crashed
+processes.
 
 Security note (implementation plan, Phase 1): this executes LLM-authored code inside
 the SAME Node/headless-Chromium process the rest of the project uses — an acceptable
@@ -56,6 +63,8 @@ import asyncio
 import json
 import logging
 import re
+import shutil
+import time
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -119,6 +128,66 @@ def _write_component(settings: Settings, job_id: str, name: str, source: str) ->
     return path
 
 
+# The shared src/ files a generated component may import (types.ts, registry.ts for
+# the entry point, the slide/map/design modules those pull in). Enumerated — NOT
+# `../../**/*` minus an exclude — so a sibling job under src/generated/<other>/ can
+# never match, no matter what it contains. `../../design/**/*` matches nothing until
+# the design-system directory exists; tsc treats a non-matching include pattern as
+# empty, not an error.
+_JOB_TSCONFIG_SHARED_INCLUDES = (
+    "../../*.ts", "../../*.tsx",
+    "../../slides/**/*", "../../map/**/*", "../../design/**/*",
+)
+
+
+def _write_job_tsconfig(settings: Settings, job_id: str) -> Path:
+    """Write src/generated/<job_id>/tsconfig.json scoping the typecheck to THIS
+    job's files + the shared src/ modules, structurally excluding every other job's
+    directory (see module docstring: a stale broken sibling used to fail every
+    future job's whole-project typecheck). Idempotent — rewritten before every
+    typecheck, so a compiler-option change in the parent tsconfig is picked up via
+    `extends` and a hand-edited leftover can't skew validation."""
+    path = _generated_dir(settings, job_id) / "tsconfig.json"
+    config = {
+        "extends": "../../../tsconfig.json",
+        "include": ["./**/*.ts", "./**/*.tsx", *_JOB_TSCONFIG_SHARED_INCLUDES],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    return path
+
+
+def cleanup_job_generated(settings: Settings, job_id: str) -> None:
+    """Remove src/generated/<job_id>/ entirely. Called by jobs.py in a `finally`
+    after the full render (success OR failure) — the per-job entry.tsx is the
+    render's entry point, so this must not run any earlier. Best-effort: a cleanup
+    failure must never mask the render result."""
+    shutil.rmtree(_generated_dir(settings, job_id), ignore_errors=True)
+
+
+def sweep_stale_generated(settings: Settings, *, max_age_hours: float = 24.0) -> int:
+    """Reap src/generated/* directories older than `max_age_hours` (by mtime) —
+    the safety net for job dirs orphaned by a crashed/killed process, which
+    cleanup_job_generated's `finally` can't cover. Returns how many were removed.
+    Best-effort like cleanup_job_generated; also tolerates the directory not
+    existing at all (fresh checkout, tests pointing at a scratch dir)."""
+    root = settings.resolved_video_renderer_dir / "src" / "generated"
+    if not root.is_dir():
+        return 0
+    cutoff = time.time() - max_age_hours * 3600
+    removed = 0
+    for child in root.iterdir():
+        try:
+            if child.is_dir() and child.stat().st_mtime < cutoff:
+                shutil.rmtree(child, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        logger.info("swept %d stale generated-slide director%s", removed, "y" if removed == 1 else "ies")
+    return removed
+
+
 def _write_preview_entry(
     settings: Settings, job_id: str, name: str, *,
     data: dict, width: int, height: int, fps: int, duration_frames: int,
@@ -159,44 +228,94 @@ def _write_preview_entry(
     return entry
 
 
-async def _run_typecheck(settings: Settings, *, timeout_s: float = _TYPECHECK_TIMEOUT_S) -> Tuple[bool, str]:
-    """`tsc --noEmit` against the whole video_renderer project (its tsconfig already
-    includes all of src/, so freshly-written generated files are covered automatically).
-    A plain module-level function (not a class seam) so tests patch it directly via
-    monkeypatch — mirrors the `_complete`/`_run_agent` overridable-seam convention
-    used elsewhere in core/services/*."""
+async def _run_typecheck(
+    settings: Settings, *, job_id: str, timeout_s: float = _TYPECHECK_TIMEOUT_S,
+) -> Tuple[bool, str]:
+    """`tsc --noEmit -p src/generated/<job_id>/tsconfig.json` — scoped to THIS job's
+    files plus the shared src/ modules (see _write_job_tsconfig), never a sibling
+    job's directory. tsc reports errors on stdout (not stderr), so both streams are
+    surfaced on failure. A plain module-level function (not a class seam) so tests
+    patch it directly via monkeypatch — mirrors the `_complete`/`_run_agent`
+    overridable-seam convention used elsewhere in core/services/*."""
     renderer_dir = settings.resolved_video_renderer_dir
+    tsconfig = _write_job_tsconfig(settings, job_id)
+    rel_tsconfig = tsconfig.resolve().relative_to(renderer_dir.resolve()).as_posix()
     proc = await asyncio.create_subprocess_exec(
-        npx_executable(), "tsc", "--noEmit",
+        npx_executable(), "tsc", "--noEmit", "-p", rel_tsconfig,
         cwd=str(renderer_dir),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     try:
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
         return False, f"tsc timed out after {timeout_s:.0f}s"
     if proc.returncode != 0:
-        return False, stderr.decode(errors="replace")[-4000:]
+        combined = (stdout.decode(errors="replace") + "\n" + stderr.decode(errors="replace")).strip()
+        return False, combined[-4000:]
     return True, ""
+
+
+# Error-category → one targeted repair instruction, appended to the exact error text
+# fed back on retry. The exact error alone often leads gpt-4o to a cosmetic rewrite;
+# a category hint points it at the CLASS of mistake (ordered: first match wins).
+_REPAIR_HINTS: Tuple[Tuple[re.Pattern, str], ...] = (
+    (re.compile(r"timed out", re.IGNORECASE),
+     "Remove any wall-clock animation, timers, async work, or network fetches — every visual "
+     "value must derive synchronously from useCurrentFrame()."),
+    (re.compile(r"inputRange|outputRange|interpolate", re.IGNORECASE),
+     "interpolate()'s inputRange must be strictly monotonically increasing and the same length "
+     "as outputRange; clamp with extrapolateLeft/extrapolateRight."),
+    (re.compile(r"Rendered more hooks|Rendered fewer hooks|Invalid hook call|conditionally", re.IGNORECASE),
+     "React hooks (useCurrentFrame, useVideoConfig, useMemo, ...) must be called unconditionally "
+     "at the top level of the component — never inside conditions, loops, or callbacks."),
+    (re.compile(r"\bTS\d{4,5}\b"),
+     "Fix ONLY the reported type error(s), keeping the visual design identical; where a chart/"
+     "topojson library's types fight you, cast the data with `as any` rather than restructuring."),
+)
+
+
+def _repair_hint(error: str) -> Optional[str]:
+    """The single most relevant repair instruction for this error text, or None."""
+    for pattern, hint in _REPAIR_HINTS:
+        if pattern.search(error):
+            return hint
+    return None
+
+
+def _with_repair_hint(error: str) -> str:
+    hint = _repair_hint(error)
+    return f"{error}\n\nRepair hint: {hint}" if hint else error
 
 
 async def _run_preview_render(
     settings: Settings, *, entry_path: Path, output_path: Path, frame: int = 0,
+    composition_id: str = _PREVIEW_COMPOSITION_ID,
+    props_path: Optional[Path] = None, public_dir: Optional[Path] = None,
     timeout_s: float = _PREVIEW_TIMEOUT_S,
 ) -> Tuple[bool, str]:
     """A fast, low-res, SINGLE still-frame render (`remotion still`, not a video —
     no encoding step, so this is strictly cheaper than the old 2-frame `render` this
-    replaced) of ONLY the preview composition, at `frame`. Enough to catch a
+    replaced) of ONLY the given composition, at `frame`. Enough to catch a
     runtime/Remotion error (a bad interpolate() range, a hooks-rule violation) that
     a plain typecheck can't — and `output_path` (a PNG) doubles as the input image
-    for the visual-QA pass in generate_scene()."""
+    for the visual-QA passes (generate_scene() here, map_qa.py for map slides).
+    Defaults render codegen's bare preview composition; map_qa.py instead passes the
+    shared "StoryboardVideo" composition with `props_path`/`public_dir` mirroring
+    render.py's full-render invocation."""
     renderer_dir = settings.resolved_video_renderer_dir
     rel_entry = entry_path.resolve().relative_to(renderer_dir.resolve()).as_posix()
-    proc = await asyncio.create_subprocess_exec(
-        npx_executable(), "remotion", "still", rel_entry, _PREVIEW_COMPOSITION_ID,
+    args = [
+        npx_executable(), "remotion", "still", rel_entry, composition_id,
         str(output_path), f"--frame={frame}", "--scale=0.5",
+    ]
+    if props_path is not None:
+        args.append(f"--props={props_path}")
+    if public_dir is not None:
+        args.append(f"--public-dir={public_dir.resolve().as_posix()}")
+    proc = await asyncio.create_subprocess_exec(
+        *args,
         cwd=str(renderer_dir),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
@@ -306,6 +425,10 @@ async def generate_scene(
     prior_source: Optional[str] = None
     log_ctx = {"job_id": job_id, "slide_index": slide_index}
 
+    # Stage 1 (video-agent Phase 5): one cheap visual-concept pass BEFORE any code,
+    # reused across every attempt so repairs fix code without re-rolling the concept.
+    design_plan = await llm.plan_scene_design(description=spec.description, data=spec.data)
+
     for attempt in range(1, max_attempts + 1):
         if budget is not None and not budget.take():
             logger.info("codegen budget exhausted for this storyboard, falling back",
@@ -316,13 +439,14 @@ async def generate_scene(
             description=spec.description, data=spec.data,
             width=width, height=height, fps=fps, duration_frames=duration,
             attempt=attempt, prior_error=prior_error, prior_source=prior_source,
+            design_plan=design_plan or None,
         )
         _write_component(settings, job_id, name, source)
 
-        ok, err = await _run_typecheck(settings)
+        ok, err = await _run_typecheck(settings, job_id=job_id)
         if not ok:
             logger.info("codegen attempt failed typecheck", extra={**log_ctx, "attempt": attempt, "error": err[:500]})
-            prior_error, prior_source = err, source
+            prior_error, prior_source = _with_repair_hint(err), source
             continue
 
         entry = _write_preview_entry(
@@ -337,7 +461,7 @@ async def generate_scene(
         if not ok:
             logger.info("codegen attempt failed preview render",
                         extra={**log_ctx, "attempt": attempt, "error": err[:500]})
-            prior_error, prior_source = err, source
+            prior_error, prior_source = _with_repair_hint(err), source
             continue
 
         review = await llm.review_scene_preview(
@@ -348,9 +472,25 @@ async def generate_scene(
             return RenderGeneratedSlide(componentName=name, data=spec.data, durationFrames=duration)
 
         feedback = review.get("feedback") or "visual QA rejected this attempt with no further detail"
-        logger.info("codegen attempt rejected by visual QA", extra={**log_ctx, "attempt": attempt, "feedback": feedback})
-        prior_error = f"Visual QA feedback (the code compiled and rendered, but looked wrong): {feedback}"
+        # Fold the QA's concrete, imperative fixes (Phase 5) into the repair prompt —
+        # far more actionable than the prose feedback alone.
+        fixes = review.get("fixes") or []
+        fix_block = ("\nApply these specific fixes:\n" + "\n".join(f"- {f}" for f in fixes)) if fixes else ""
+        logger.info("codegen attempt rejected by visual QA",
+                    extra={**log_ctx, "attempt": attempt, "feedback": feedback, "fixes": fixes})
+        prior_error = (
+            f"Visual QA feedback (the code compiled and rendered, but looked wrong): {feedback}{fix_block}"
+        )
         prior_source = source
 
     logger.warning("codegen exhausted its attempt budget, falling back to a static template slide", extra=log_ctx)
+    # Remove this slide's leftovers so a later `generated` slide in the SAME job
+    # doesn't inherit a broken sibling into its (job-scoped) typecheck — the
+    # intra-job analogue of the cross-job isolation _write_job_tsconfig provides.
+    for leftover in (
+        _component_path(settings, job_id, name),
+        _preview_entry_path(settings, job_id, name),
+        _generated_dir(settings, job_id) / f"{name}.preview.png",
+    ):
+        leftover.unlink(missing_ok=True)
     return None

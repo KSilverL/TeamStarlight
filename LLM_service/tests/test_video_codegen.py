@@ -13,7 +13,10 @@ fully offline, no real Node/tsc/Remotion invocation needed.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import time
 
 import pytest
 
@@ -95,7 +98,7 @@ async def test_mock_generate_scene_component_ignores_marker_without_the_substrin
 
 async def test_mock_review_scene_preview_approves_by_default():
     review = await MockLLM().review_scene_preview(description="a calm intro card", image_bytes=b"png")
-    assert review == {"approved": True, "feedback": ""}
+    assert review == {"approved": True, "feedback": "", "fixes": []}
 
 
 async def test_mock_review_scene_preview_rejects_on_first_attempt_with_marker():
@@ -233,11 +236,14 @@ async def test_generate_scene_returns_none_when_visual_qa_never_approves(scratch
     monkeypatch.setattr(codegen, "_run_preview_render", _ok_preview)
 
     class _AlwaysRejectLLM:
+        async def plan_scene_design(self, **kw):
+            return "- a plan"
+
         async def generate_scene_component(self, **kw):
             return "export default function X() { return null; }"
 
         async def review_scene_preview(self, **kw):
-            return {"approved": False, "feedback": "still wrong"}
+            return {"approved": False, "feedback": "still wrong", "fixes": ["do better"]}
 
     monkeypatch.setattr(codegen.factory, "get_llm", lambda: _AlwaysRejectLLM())
     spec = GeneratedSlideSpec(description="whatever", data={})
@@ -246,6 +252,43 @@ async def test_generate_scene_returns_none_when_visual_qa_never_approves(scratch
         settings=scratch_settings, max_attempts=2,
     )
     assert result is None
+
+
+async def test_generate_scene_runs_two_stage_and_threads_plan_and_fixes(scratch_settings, monkeypatch):
+    """Phase 5: plan_scene_design runs once up front; its plan is passed as
+    design_plan to every generate call; and a QA rejection's `fixes` are folded
+    into the next attempt's prior_error."""
+    monkeypatch.setattr(codegen, "_run_typecheck", _ok_typecheck)
+    monkeypatch.setattr(codegen, "_run_preview_render", _ok_preview)
+    calls = {"plan": 0, "design_plans": [], "prior_errors": []}
+
+    class _TwoStageLLM:
+        async def plan_scene_design(self, *, description, data):
+            calls["plan"] += 1
+            return "- centre the hero\n- stagger the rest"
+
+        async def generate_scene_component(self, *, design_plan=None, prior_error=None, **kw):
+            calls["design_plans"].append(design_plan)
+            calls["prior_errors"].append(prior_error)
+            return "export default function X() { return null; }"
+
+        async def review_scene_preview(self, *, attempt=1, **kw):
+            if attempt == 1:
+                return {"approved": False, "feedback": "too plain", "fixes": ["add a chart", "increase contrast"]}
+            return {"approved": True, "feedback": "", "fixes": []}
+
+    monkeypatch.setattr(codegen.factory, "get_llm", lambda: _TwoStageLLM())
+    spec = GeneratedSlideSpec(description="something bespoke", data={})
+    result = await codegen.generate_scene(
+        job_id="job7", slide_index=0, spec=spec, width=1080, height=1920, fps=30,
+        settings=scratch_settings, max_attempts=3,
+    )
+    assert isinstance(result, RenderGeneratedSlide)
+    assert calls["plan"] == 1  # planned exactly once, not per attempt
+    assert all(dp == "- centre the hero\n- stagger the rest" for dp in calls["design_plans"])
+    # Attempt 2's prior_error carries the QA feedback AND the concrete fixes.
+    assert "too plain" in calls["prior_errors"][1]
+    assert "add a chart" in calls["prior_errors"][1] and "increase contrast" in calls["prior_errors"][1]
 
 
 async def test_generate_scene_logs_each_attempt(scratch_settings, monkeypatch, caplog):
@@ -368,14 +411,23 @@ async def test_ensure_job_entry_point_typechecks_for_real_against_real_project()
         width=1080, height=1920,
         slides=[RenderGeneratedSlide(componentName="Generated_test_0", data={"headline": "Hi"}, durationFrames=90)],
     )
+    # A deliberately broken sibling job left behind (crash, kill -9) must NOT fail
+    # this job's typecheck — the job-scoped tsconfig excludes it structurally. This
+    # is the root-cause regression test: the old whole-project `tsc --noEmit` made
+    # one stale broken file poison every subsequent job's codegen into fallback.
+    broken_sibling_job = "test_entry_point_broken_sibling"
+    codegen._write_component(
+        real_settings, broken_sibling_job, "Generated_broken_0",
+        "export default not even TypeScript {{{",
+    )
     try:
         result = codegen.ensure_job_entry_point(real_settings, job_id, renderable)
         assert result is not None
-        ok, err = await codegen._run_typecheck(real_settings)
+        ok, err = await codegen._run_typecheck(real_settings, job_id=job_id)
         assert ok, err
     finally:
-        import shutil
-        shutil.rmtree(codegen._generated_dir(real_settings, job_id), ignore_errors=True)
+        codegen.cleanup_job_generated(real_settings, job_id)
+        codegen.cleanup_job_generated(real_settings, broken_sibling_job)
 
 
 # ── assets.py integration ──────────────────────────────────────────────────────
@@ -423,6 +475,33 @@ async def test_resolve_storyboard_assets_falls_back_when_codegen_exhausted(tmp_p
     assert fallback.headline == "A neon skyline sweep"
 
 
+async def test_resolve_storyboard_assets_scales_budget_with_generated_slide_count(tmp_path, monkeypatch):
+    """The env-configured total is a FLOOR: 3 generated slides get max(9, 4*3)=12
+    shared attempts, so a multi-bespoke storyboard can't starve its later slides."""
+    seen = {}
+
+    async def fake_generate_scene(**kw):
+        seen.setdefault("budget", kw["budget"])
+        spec = kw["spec"]
+        return RenderGeneratedSlide(componentName="G", data=spec.data, durationFrames=100)
+
+    monkeypatch.setattr(codegen, "generate_scene", fake_generate_scene)
+
+    storyboard = StoryboardSpec(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        platform="linkedin",
+        slides=[
+            {"type": "generated", "description": "one", "data": {}},
+            {"type": "generated", "description": "two", "data": {}},
+            {"type": "generated", "description": "three", "data": {}},
+            {"type": "outro", "brandName": "X", "ctaLabel": "Go"},
+        ],
+    )
+    settings = Settings(video_renderer_dir=str(tmp_path), codegen_max_total_attempts=9)
+    await resolve_storyboard_assets(storyboard, job_dir=tmp_path, settings=settings)
+    assert seen["budget"].remaining == 12  # the fake never take()s, so this is the initial total
+
+
 async def test_resolve_storyboard_assets_never_calls_codegen_for_fixed_slides(tmp_path, monkeypatch):
     def boom(**kw):
         raise AssertionError("codegen.generate_scene must not be called for fixed slide types")
@@ -436,3 +515,82 @@ async def test_resolve_storyboard_assets_never_calls_codegen_for_fixed_slides(tm
     )
     renderable = await resolve_storyboard_assets(storyboard, job_dir=tmp_path)
     assert [s.type for s in renderable.slides] == ["hook", "outro"]
+
+
+# ── typecheck isolation + cleanup (the fallback-cascade root-cause fixes) ───────
+
+def test_write_job_tsconfig_scopes_to_this_job_only(scratch_settings):
+    """The per-job tsconfig includes the job's own files + enumerated shared src/
+    dirs — never a `src/generated/**` (or any other) pattern a sibling job's files
+    could match."""
+    path = codegen._write_job_tsconfig(scratch_settings, "jobT")
+    assert path == scratch_settings.resolved_video_renderer_dir / "src" / "generated" / "jobT" / "tsconfig.json"
+    config = json.loads(path.read_text())
+    assert config["extends"] == "../../../tsconfig.json"
+    assert "./**/*.tsx" in config["include"]
+    assert "../../*.ts" in config["include"] and "../../*.tsx" in config["include"]
+    assert "../../slides/**/*" in config["include"]
+    # no include pattern can reach back into src/generated/ (where siblings live)
+    assert not any("generated" in pattern for pattern in config["include"])
+
+
+def test_cleanup_job_generated_removes_the_job_dir(scratch_settings):
+    codegen._write_component(scratch_settings, "jobC", "Generated_jobC_0", "export default 1;")
+    job_dir = codegen._generated_dir(scratch_settings, "jobC")
+    assert job_dir.is_dir()
+    codegen.cleanup_job_generated(scratch_settings, "jobC")
+    assert not job_dir.exists()
+    codegen.cleanup_job_generated(scratch_settings, "jobC")  # idempotent on a missing dir
+
+
+def test_sweep_stale_generated_reaps_only_old_dirs(scratch_settings):
+    codegen._write_component(scratch_settings, "job_old", "Generated_old_0", "x")
+    codegen._write_component(scratch_settings, "job_new", "Generated_new_0", "x")
+    old_dir = codegen._generated_dir(scratch_settings, "job_old")
+    two_days_ago = time.time() - 48 * 3600
+    os.utime(old_dir, (two_days_ago, two_days_ago))
+
+    removed = codegen.sweep_stale_generated(scratch_settings, max_age_hours=24)
+    assert removed == 1
+    assert not old_dir.exists()
+    assert codegen._generated_dir(scratch_settings, "job_new").is_dir()
+
+
+def test_sweep_stale_generated_tolerates_missing_root(tmp_path):
+    # No src/generated/ at all (fresh checkout / scratch project): a no-op, not an error.
+    (tmp_path / "src").mkdir()
+    assert codegen.sweep_stale_generated(Settings(video_renderer_dir=str(tmp_path))) == 0
+
+
+async def test_generate_scene_removes_its_files_after_exhaustion(scratch_settings, monkeypatch):
+    """A permanently failed slide must not leave its broken .tsx behind, or a LATER
+    `generated` slide in the SAME job would inherit it into its job-scoped typecheck."""
+    async def always_fails(settings, **kw):
+        return False, "TS2304: Cannot find name 'boom'."
+
+    monkeypatch.setattr(codegen, "_run_typecheck", always_fails)
+    monkeypatch.setattr(codegen, "_run_preview_render", _ok_preview)
+
+    spec = GeneratedSlideSpec(description="whatever", data={})
+    result = await codegen.generate_scene(
+        job_id="jobX", slide_index=0, spec=spec, width=1080, height=1920, fps=30,
+        settings=scratch_settings, max_attempts=2,
+    )
+    assert result is None
+    assert not codegen._component_path(scratch_settings, "jobX", "Generated_jobX_0").exists()
+
+
+# ── _repair_hint: error-category-specific retry guidance ────────────────────────
+
+def test_repair_hint_matches_error_categories():
+    assert "type error" in codegen._repair_hint("src/generated/j/G.tsx(4,5): error TS2304: Cannot find name 'x'.")
+    assert "monotonically increasing" in codegen._repair_hint("inputRange must be strictly monotonically increasing")
+    assert "unconditionally" in codegen._repair_hint("Error: Rendered more hooks than during the previous render.")
+    assert "useCurrentFrame" in codegen._repair_hint("preview render timed out after 60s")
+    assert codegen._repair_hint("some totally novel failure") is None
+
+
+def test_with_repair_hint_appends_only_when_matched():
+    hinted = codegen._with_repair_hint("error TS2749: 'Foo' refers to a value")
+    assert hinted.startswith("error TS2749") and "Repair hint:" in hinted
+    assert codegen._with_repair_hint("novel failure") == "novel failure"
