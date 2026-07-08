@@ -3,6 +3,7 @@ package com.example.tsldemo.AgentAPI;
 import java.util.HashMap;
 import java.util.Map;
 
+import org.springframework.http.MediaType;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -10,6 +11,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import com.example.tsldemo.ApiDTOS.*;
 import com.example.tsldemo.ApiDTOS.CreativeBrief;
@@ -54,7 +56,7 @@ public class AgentController {
 	
 	@PostMapping("/tasks") 
 	public TaskSnapshot sendCreativeBrief(@RequestBody CreativeBrief brief) {
-		return service.getCurrentTaskStatus(brief);
+		return service.startTask(brief);
 	}
 	
 	
@@ -96,6 +98,11 @@ public class AgentController {
         return service.agentRoundControl(taskId, request);
     }
 	
+    @GetMapping(value="/tasks/{taskId}/events",produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter streamEvents(@PathVariable String taskId) {
+    	return service.streamEvents(taskId);
+    	    
+    }
 	
 }
 

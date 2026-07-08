@@ -85,13 +85,13 @@ public class SessionService {
     }
     
     
-    public IntakeTurnResponse getIntakeTurn(IntakeTurnRequest request, String sessionId) {
+    public IntakeResponse getIntakeTurn(IntakeTurnRequest request, String sessionId) {
     	return restClient.post()
                 .uri(llmServiceBaseUrl + "/intake/" + sessionId + "/turn")
                 .contentType(MediaType.APPLICATION_JSON)
                 .body(request)
                 .retrieve()
-                .body(ApiDTOS.IntakeTurnResponse.class);
+                .body(ApiDTOS.IntakeResponse.class);
     	
     }
     

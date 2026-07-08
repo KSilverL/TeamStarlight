@@ -1,5 +1,6 @@
 package com.example.tsldemo.AgentAPI;
 
+import java.net.URI;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -8,15 +9,13 @@ import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import java.util.stream.Stream;
 
-import com.example.tsldemo.ApiDTOS.ConfirmLearningResponse;
-import com.example.tsldemo.ApiDTOS.CreativeBrief;
-import com.example.tsldemo.ApiDTOS.RaiseHandRequest;
-import com.example.tsldemo.ApiDTOS.RaiseHandResponse;
-import com.example.tsldemo.ApiDTOS.ReviewRequest;
-import com.example.tsldemo.ApiDTOS.SayRequest;
-import com.example.tsldemo.ApiDTOS.SayResponse;
-import com.example.tsldemo.ApiDTOS.TaskSayRequest;
+import java.net.http.HttpResponse;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+
 import com.example.tsldemo.ApiDTOS.*;
 
 
@@ -24,6 +23,8 @@ import com.example.tsldemo.ApiDTOS.*;
 public class AgentService {
 	private final RestClient restClient;
 
+	private final HttpClient http = HttpClient.newHttpClient();
+	
 	@Value("${llm.service.base-url:http://localhost:8080}")
 	private String llmServiceBaseUrl;
 	
@@ -74,7 +75,7 @@ public class AgentService {
 	            .body(TaskSnapshot.class);
 	}
 	
-	public TaskSnapshot getCurrentTaskStatus(CreativeBrief brief) {
+	public TaskSnapshot startTask(CreativeBrief brief) {
 		return restClient.post()
                 .uri(llmServiceBaseUrl + "/tasks")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -121,6 +122,66 @@ public class AgentService {
 	            request,
 	            RoundControlResponse.class
 	    );
+	}
+	
+	public SseEmitter streamEvents(String taskId) {
+	    SseEmitter emitter = new SseEmitter(Long.MAX_VALUE);
+
+	    new Thread(() -> {
+
+	        try {
+
+	            HttpRequest request = HttpRequest.newBuilder()
+	                    .uri(URI.create(
+	                        llmServiceBaseUrl 
+	                        + "/tasks/" 
+	                        + taskId 
+	                        + "/events"
+	                    ))
+	                    .GET()
+	                    .build();
+
+
+	            HttpResponse<Stream<String>> response =
+	                    http.send(
+	                        request,
+	                        HttpResponse.BodyHandlers.ofLines()
+	                    );
+
+
+	            response.body()
+	                    .filter(line -> line.startsWith("data: "))
+	                    .forEach(line -> {
+
+	                        try {
+
+	                            String json =
+	                                line.substring(6);
+
+	                            emitter.send(
+	                                SseEmitter.event()
+	                                    .data(json)
+	                            );
+
+	                        } catch(Exception e) {
+	                            emitter.completeWithError(e);
+	                        }
+
+	                    });
+
+
+	            emitter.complete();
+
+
+	        } catch(Exception e) {
+	            emitter.completeWithError(e);
+	        }
+
+
+	    }).start();
+
+
+	    return emitter;
 	}
 	
 	

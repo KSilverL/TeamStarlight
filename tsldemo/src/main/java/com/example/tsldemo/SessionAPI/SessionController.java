@@ -21,8 +21,11 @@ import com.example.tsldemo.ApiDTOS.IntakeRequest;
 import com.example.tsldemo.ApiDTOS.IntakeResponse;
 import com.example.tsldemo.ApiDTOS.IntakeTurnRequest;
 import com.example.tsldemo.ApiDTOS.IntakeTurnResponse;
+import com.example.tsldemo.ApiDTOS.Output;
+import com.example.tsldemo.ApiDTOS.TaskSnapshot;
 import com.example.tsldemo.Message;
 import com.example.tsldemo.Session;
+import com.example.tsldemo.AgentAPI.NewsroomRunner;
 import com.example.tsldemo.DTOs.ResponseReceived.IntakeRespDTO;
 import com.example.tsldemo.DTOs.ResponseToFrontEnd.FrontIntakeRespDTO;
 
@@ -49,8 +52,12 @@ public class SessionController {
 	@Value("${llm.service.base-url:http://localhost:8080}")
 	private String llmServiceBaseUrl;
 
-	public SessionController(SessionService service) {
+	private final NewsroomRunner newsroomRunner;
+	
+	public SessionController(SessionService service, NewsroomRunner newsroomRunner) {
 		this.service = service;
+		this.newsroomRunner = newsroomRunner;
+
 	}
 
 	// Must call this first to create a session before any other
@@ -105,19 +112,23 @@ public class SessionController {
 	
 	
 	@PostMapping("/intakeTurn/{sessionId}")
-	public IntakeTurnResponse addIntakeTurnResponse(
+	public IntakeResponse addIntakeTurnResponse(
 			@PathVariable String sessionId,
-            @RequestBody IntakeTurnRequest request) {
+            @RequestBody IntakeTurnRequest request) throws Exception {
 		
-		IntakeTurnResponse response = service.getIntakeTurn(request, sessionId);
+		IntakeResponse response = service.getIntakeTurn(request, sessionId);
 		
-		Message assistantTurn = new Message("assistant", response.assistantMessage());
+		Message assistantTurn = new Message("assistant", response.assistantMessage);
 		
 		Session session = service.getSessionBy(sessionId).get();
-		session.setComplete(response.complete());
+		session.setComplete(response.complete);
 		
 		service.updateSession(sessionId, assistantTurn);
 		
+		if (response.complete) {
+			newsroomRunner.run(sessionId);
+		}
+        
 		return response;
 		
 	}
