@@ -145,11 +145,25 @@ interface VideoStoryboard {
   slides: VideoSlide[];
 }
 
+// One turn in a roundtable discussion (agent_utterance event).
+interface RoundtableTurn {
+  speaker: string;
+  role: string;
+  text: string;
+  roundIndex: number;
+}
+
+// Step-mode's per-round prompt (round_control "waiting" event) — null once resolved/auto.
+interface RoundControlPrompt {
+  roundIndex: number;
+  timeout: number | null;
+}
+
 interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
-  variant?: "status" | "draft" | "text-preview" | "html-preview";
+  variant?: "status" | "draft" | "text-preview" | "html-preview" | "roundtable";
   platform?: Platform;
   draft?: DraftContent;
   html?: string;
@@ -159,6 +173,13 @@ interface Message {
   workflowTaskId?: string;
   needsHumanIntervention?: boolean;
   videoStoryboard?: VideoStoryboard;
+  // Roundtable-specific fields (variant === "roundtable") — one card grows in place as
+  // agent_utterance / discussion_consensus / round_control events land for its table.
+  roundtableTableId?: string;
+  roundtableTurns?: RoundtableTurn[];
+  roundtableConverged?: boolean;
+  roundtableStrategy?: string;
+  roundControlWaiting?: RoundControlPrompt | null;
 }
 
 const PLATFORMS: {
@@ -226,6 +247,20 @@ const NODE_LABELS: Record<string, string> = {
   media_producer: "Generating brand assets…",
 };
 
+// Display name + badge colour for each roundtable persona (workflow/roundtable/personas.py).
+const SPEAKER_LABELS: Record<string, { label: string; badge: string }> = {
+  platform_editor: { label: "Platform Editor", badge: "bg-sky-600" },
+  brand_voice: { label: "Brand Voice", badge: "bg-purple-600" },
+  user_advocate: { label: "User Advocate", badge: "bg-emerald-600" },
+  audience_advocate: { label: "Audience Advocate", badge: "bg-amber-600" },
+  trend_scout: { label: "Trend Scout", badge: "bg-rose-600" },
+  user: { label: "You", badge: "bg-[#FF4800]" },
+};
+
+function speakerInfo(speaker: string) {
+  return SPEAKER_LABELS[speaker] ?? { label: speaker, badge: "bg-[#6B6561]" };
+}
+
 // Monotonic message ids — several generators append concurrently when multiple
 // content types are selected, so Date.now() alone would collide.
 let _msgSeq = 0;
@@ -242,6 +277,9 @@ export default function ChatPage() {
     "linkedin",
   ]);
   const [contentTypes, setContentTypes] = useState<ContentType[]>(["text"]);
+  // "manual" pauses each roundtable table at round boundaries for a 4-way user prompt
+  // (round_control); "auto" (default) never prompts — the backend's own default.
+  const [roundtableMode, setRoundtableMode] = useState<"auto" | "manual">("auto");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -253,6 +291,9 @@ export default function ChatPage() {
   const sessionIdRef = useRef<string | null>(null);
   // Active EventSource for the MAF workflow SSE stream; replaced on each new workflow run.
   const workflowEsRef = useRef<EventSource | null>(null);
+  // table_id -> the id of that table's RoundtableCard message, so later agent_utterance /
+  // round_control events for the same table update the SAME card instead of spawning new ones.
+  const roundtableMsgIdRef = useRef<Map<string, string>>(new Map());
 
   /** Fire-and-forget: persist a message to the backend. Non-fatal if it fails. */
   async function persistMessage(sessionId: string, role: "user" | "assistant", content: string) {
@@ -405,6 +446,62 @@ export default function ChatPage() {
     setMessages((prev) => [...prev, { ...msg, id: newId(), timestamp: new Date() }]);
   }
 
+  // ── Roundtable card helpers — one growing card per table_id ──────────────────
+
+  /** Appends one turn to a table's card, creating the card on the first turn. */
+  function upsertRoundtableTurn(taskId: string, tableId: string, turn: RoundtableTurn) {
+    setMessages((prev) => {
+      const existingId = roundtableMsgIdRef.current.get(tableId);
+      if (existingId) {
+        return prev.map((m) =>
+          m.id === existingId
+            ? { ...m, roundtableTurns: [...(m.roundtableTurns ?? []), turn] }
+            : m
+        );
+      }
+      const id = newId();
+      roundtableMsgIdRef.current.set(tableId, id);
+      const msg: Message = {
+        id,
+        role: "assistant",
+        content: `Roundtable discussion — ${tableId}:`,
+        variant: "roundtable",
+        platform: tableId as Platform,
+        workflowTaskId: taskId,
+        roundtableTableId: tableId,
+        roundtableTurns: [turn],
+        roundtableConverged: false,
+        timestamp: new Date(),
+      };
+      return [...prev, msg];
+    });
+  }
+
+  function finalizeRoundtable(tableId: string, strategy: Record<string, unknown> | undefined) {
+    const existingId = roundtableMsgIdRef.current.get(tableId);
+    if (!existingId) return;
+    const summary = strategy
+      ? Object.entries(strategy)
+          .map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`)
+          .join(" · ")
+      : undefined;
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === existingId
+          ? { ...m, roundtableConverged: true, roundtableStrategy: summary, roundControlWaiting: null }
+          : m
+      )
+    );
+  }
+
+  function setRoundControlPrompt(tableId: string, prompt: RoundControlPrompt | null) {
+    const existingId = roundtableMsgIdRef.current.get(tableId);
+    if (!existingId) return;
+    setMessages((prev) =>
+      prev.map((m) => (m.id === existingId ? { ...m, roundControlWaiting: prompt } : m))
+    );
+  }
+
   // ── Per-content-type generators (each appends its own status + result) ──────
 
   async function genWorkflow(prompt: string) {
@@ -415,6 +512,9 @@ export default function ChatPage() {
       workflowEsRef.current.close();
       workflowEsRef.current = null;
     }
+    // Each call is a fresh task with its own tables — table_ids (== platform names) are
+    // reused across runs, so a stale map entry would otherwise append onto a dead card.
+    roundtableMsgIdRef.current.clear();
 
     // 1. Start the MAF workflow task.
     let taskId: string;
@@ -427,6 +527,7 @@ export default function ChatPage() {
           target_platforms: selectedPlatforms,
           user_intent: prompt,
           content_types: contentTypes,
+          roundtable_mode: roundtableMode,
         }),
       });
       const data = await res.json();
@@ -485,6 +586,35 @@ export default function ChatPage() {
         if (node === "workflow" && status === "done") {
           es.close();
           workflowEsRef.current = null;
+        }
+      }
+
+      // agent_utterance: one roundtable persona (or the user) spoke — grow that table's card.
+      if (type === "agent_utterance") {
+        const tableId = event.table_id as string;
+        upsertRoundtableTurn(taskId, tableId, {
+          speaker: event.speaker as string,
+          role: event.role as string,
+          text: event.text as string,
+          roundIndex: event.round_index as number,
+        });
+      }
+
+      // discussion_consensus: the table converged on a strategy before drafting starts.
+      if (type === "result" && status === "discussion_consensus") {
+        finalizeRoundtable(event.table_id as string, event.strategy as Record<string, unknown> | undefined);
+      }
+
+      // round_control: step mode (roundtable_mode: "manual") pausing at a round boundary.
+      if (type === "round_control") {
+        const tableId = event.table_id as string;
+        if ((event.status as string) === "waiting") {
+          setRoundControlPrompt(tableId, {
+            roundIndex: event.round_index as number,
+            timeout: (event.timeout as number | null) ?? null,
+          });
+        } else {
+          setRoundControlPrompt(tableId, null);
         }
       }
 
@@ -781,6 +911,39 @@ export default function ChatPage() {
             </div>
           </div>
 
+          {/* Roundtable discussion mode */}
+          <div>
+            <h3 className="text-xs font-semibold text-[#9E9893] uppercase tracking-wider mb-3">
+              Roundtable
+            </h3>
+            <button
+              onClick={() => setRoundtableMode((m) => (m === "auto" ? "manual" : "auto"))}
+              aria-pressed={roundtableMode === "manual"}
+              className={`flex items-center justify-between w-full px-3 py-2 rounded-lg text-sm transition-colors border ${
+                roundtableMode === "manual"
+                  ? "bg-[#FFF0EB] text-[#FF4800] border-[#FFCBB8]"
+                  : "text-[#6B6561] border-[#E8E3DA] hover:bg-[#F2EDE4]"
+              }`}
+            >
+              <span>Join the discussion</span>
+              <span
+                className={`w-9 h-5 rounded-full relative transition-colors flex-shrink-0 ${
+                  roundtableMode === "manual" ? "bg-[#FF4800]" : "bg-[#E8E3DA]"
+                }`}
+              >
+                <span
+                  className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+                    roundtableMode === "manual" ? "translate-x-4" : "translate-x-0"
+                  }`}
+                />
+              </span>
+            </button>
+            <p className="text-[10px] text-[#BDB6AE] mt-1.5 leading-relaxed">
+              When on, each table pauses for your call between rounds (next / speak / enough /
+              auto). Off runs the discussion hands-off.
+            </p>
+          </div>
+
         </div>
       </aside>
 
@@ -836,6 +999,10 @@ export default function ChatPage() {
               return (
                 <VideoStoryboardCard key={msg.id} message={msg} formatTime={formatTime} />
               );
+            }
+
+            if (msg.variant === "roundtable") {
+              return <RoundtableCard key={msg.id} message={msg} formatTime={formatTime} />;
             }
 
             if (msg.variant === "html-preview" && msg.html) {
@@ -1111,6 +1278,198 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
   );
 }
 
+// ── Roundtable Card ───────────────────────────────────────────────────────────
+
+interface RoundtableCardProps {
+  message: Message;
+  formatTime: (d: Date) => string;
+}
+
+/**
+ * One growing card per discussion table: renders every agent_utterance turn so far,
+ * in order, and — while roundtable_mode is "manual" — the step-mode 4-way prompt
+ * (next / speak / enough / auto) whenever the table pauses at a round boundary. A
+ * "raise hand" control is always available regardless of mode, letting the user
+ * inject a message into an otherwise hands-off ("auto") discussion.
+ */
+function RoundtableCard({ message, formatTime }: RoundtableCardProps) {
+  const [handRaised, setHandRaised] = useState(false);
+  const [sayText, setSayText] = useState("");
+  const [speakText, setSpeakText] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const taskId = message.workflowTaskId;
+  const tableId = message.roundtableTableId;
+  const turns = message.roundtableTurns ?? [];
+  const waiting = message.roundControlWaiting;
+
+  async function postJson(url: string, body: unknown) {
+    try {
+      await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } catch {
+      // Non-fatal — the SSE stream stays the source of truth; the user can retry.
+    }
+  }
+
+  async function handleRaiseHand() {
+    if (!taskId || !tableId) return;
+    setHandRaised(true);
+    await postJson(`/api/tasks/${taskId}/raise-hand`, { table_id: tableId });
+  }
+
+  async function handleSay() {
+    if (!taskId || !tableId || !sayText.trim()) return;
+    setBusy(true);
+    await postJson(`/api/tasks/${taskId}/say`, { table_id: tableId, text: sayText.trim() });
+    setSayText("");
+    setHandRaised(false);
+    setBusy(false);
+  }
+
+  async function handleRoundControl(action: "next" | "speak" | "enough" | "auto") {
+    if (!taskId || !tableId) return;
+    setBusy(true);
+    const text = action === "speak" && speakText.trim() ? speakText.trim() : undefined;
+    await postJson(`/api/tasks/${taskId}/round-control`, {
+      table_id: tableId,
+      action,
+      ...(text ? { text } : {}),
+    });
+    setSpeakText("");
+    setBusy(false);
+  }
+
+  return (
+    <div className="w-full max-w-lg">
+      <p className="text-sm text-[#6B6561] mb-2">{message.content}</p>
+      <div className="bg-white border border-[#E8E3DA] rounded-2xl overflow-hidden shadow-sm">
+        <div className="flex items-center justify-between px-4 py-2.5 bg-[#1B1A17] text-white">
+          <span className="text-sm font-semibold">🗣️ Roundtable — {tableId}</span>
+          {message.roundtableConverged && (
+            <span className="text-xs bg-green-500 text-white px-2 py-0.5 rounded-full font-medium">
+              Converged
+            </span>
+          )}
+        </div>
+
+        <div className="max-h-72 overflow-y-auto p-4 space-y-3 bg-[#F8F5EE]">
+          {turns.length === 0 && (
+            <p className="text-xs text-[#9E9893] italic">Waiting for the first speaker…</p>
+          )}
+          {turns.map((turn, i) => {
+            const info = speakerInfo(turn.speaker);
+            return (
+              <div key={i} className="bg-white border border-[#E8E3DA] rounded-xl px-3 py-2">
+                <div className="flex items-center gap-2 mb-1">
+                  <span
+                    className={`text-[10px] font-bold text-white px-1.5 py-0.5 rounded ${info.badge}`}
+                  >
+                    {info.label}
+                  </span>
+                  <span className="text-[10px] text-[#9E9893]">round {turn.roundIndex}</span>
+                </div>
+                <p className="text-sm text-[#1B1A17] whitespace-pre-wrap leading-relaxed">
+                  {turn.text}
+                </p>
+              </div>
+            );
+          })}
+        </div>
+
+        {waiting && !message.roundtableConverged && (
+          <div className="px-4 pt-2 pb-3 border-t border-[#E8E3DA] space-y-2">
+            <p className="text-xs text-[#9E9893]">
+              The table is waiting for your call — round {waiting.roundIndex}
+              {waiting.timeout ? ` (goes hands-off in ~${Math.round(waiting.timeout)}s)` : ""}.
+            </p>
+            <div className="flex gap-2">
+              <button
+                disabled={busy}
+                onClick={() => handleRoundControl("next")}
+                className="flex-1 bg-[#F2EDE4] hover:bg-[#E8E3DA] text-[#1B1A17] text-xs font-medium py-1.5 rounded-lg transition-colors disabled:opacity-40"
+              >
+                Next
+              </button>
+              <button
+                disabled={busy}
+                onClick={() => handleRoundControl("enough")}
+                className="flex-1 bg-[#F2EDE4] hover:bg-[#E8E3DA] text-[#1B1A17] text-xs font-medium py-1.5 rounded-lg transition-colors disabled:opacity-40"
+              >
+                Enough
+              </button>
+              <button
+                disabled={busy}
+                onClick={() => handleRoundControl("auto")}
+                className="flex-1 bg-[#F2EDE4] hover:bg-[#E8E3DA] text-[#1B1A17] text-xs font-medium py-1.5 rounded-lg transition-colors disabled:opacity-40"
+              >
+                Auto
+              </button>
+            </div>
+            <div className="flex gap-2">
+              <input
+                value={speakText}
+                onChange={(e) => setSpeakText(e.target.value)}
+                placeholder="Say something to the table…"
+                className="flex-1 bg-white border border-[#E8E3DA] rounded-lg px-3 py-1.5 text-xs text-[#1B1A17] placeholder:text-[#9E9893] focus:outline-none focus:border-[#FF4800]"
+              />
+              <button
+                disabled={busy || !speakText.trim()}
+                onClick={() => handleRoundControl("speak")}
+                className="bg-[#FF4800] hover:bg-[#E03E00] disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-medium px-3 py-1.5 rounded-lg transition-colors"
+              >
+                Speak
+              </button>
+            </div>
+          </div>
+        )}
+
+        {!message.roundtableConverged && !waiting && (
+          <div className="px-4 pt-2 pb-3 border-t border-[#E8E3DA]">
+            {!handRaised ? (
+              <button
+                onClick={handleRaiseHand}
+                className="text-xs font-medium text-[#FF4800] hover:underline"
+              >
+                ✋ Raise hand to join
+              </button>
+            ) : (
+              <div className="flex gap-2">
+                <input
+                  value={sayText}
+                  onChange={(e) => setSayText(e.target.value)}
+                  placeholder="Your turn — say something…"
+                  autoFocus
+                  className="flex-1 bg-white border border-[#E8E3DA] rounded-lg px-3 py-1.5 text-xs text-[#1B1A17] placeholder:text-[#9E9893] focus:outline-none focus:border-[#FF4800]"
+                />
+                <button
+                  disabled={busy || !sayText.trim()}
+                  onClick={handleSay}
+                  className="bg-[#FF4800] hover:bg-[#E03E00] disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-medium px-3 py-1.5 rounded-lg transition-colors"
+                >
+                  Send
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {message.roundtableConverged && message.roundtableStrategy && (
+          <div className="px-4 pb-3 pt-1 text-xs text-[#6B6561] border-t border-[#E8E3DA]">
+            <span className="text-[#9E9893]">Strategy: </span>
+            {message.roundtableStrategy}
+          </div>
+        )}
+
+        <p className="text-xs text-[#9E9893] px-4 pb-3">{formatTime(message.timestamp)}</p>
+      </div>
+    </div>
+  );
+}
+
 /**
  * Visualises a StoryboardSpec: a poster-style hero in the brand palette, then the
  * ordered list of slides the agent chose — i.e. the data a Remotion render turns
@@ -1252,6 +1611,43 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
   const platform = platformMap[message.platform!];
   const draft = message.draft!;
   const approval = message.approval;
+  const [postStatus, setPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
+  const [postError, setPostError] = useState<string | null>(null);
+
+  async function handlePostToLinkedIn() {
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setPostStatus("error");
+      setPostError("Log in, then connect LinkedIn from your Brand Profile before posting.");
+      return;
+    }
+    setPostStatus("posting");
+    setPostError(null);
+    const text =
+      draft.hashtags && draft.hashtags.length > 0
+        ? `${draft.text}\n\n${draft.hashtags.join(" ")}`
+        : draft.text;
+    try {
+      const res = await fetch("/api/linkedin/post", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ message: text }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setPostStatus("error");
+        setPostError(data.error ?? "Failed to post to LinkedIn.");
+        return;
+      }
+      setPostStatus("posted");
+    } catch {
+      setPostStatus("error");
+      setPostError("Could not reach the backend.");
+    }
+  }
 
   return (
     <div className="w-full max-w-lg">
@@ -1319,6 +1715,27 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
             >
               Reject &amp; Regenerate
             </button>
+          </div>
+        )}
+
+        {approval === "approved" && message.platform === "linkedin" && (
+          <div className="px-4 pb-4">
+            {postStatus === "posted" ? (
+              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+                ✓ Posted to LinkedIn
+              </div>
+            ) : (
+              <button
+                onClick={handlePostToLinkedIn}
+                disabled={postStatus === "posting"}
+                className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+              >
+                {postStatus === "posting" ? "Posting…" : "Post to LinkedIn"}
+              </button>
+            )}
+            {postStatus === "error" && postError && (
+              <p className="text-xs text-red-600 mt-2 text-center">{postError}</p>
+            )}
           </div>
         )}
 

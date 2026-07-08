@@ -211,9 +211,6 @@ class _Task:
         # (e.g. auto-approving two platforms' drafts back-to-back) must not both drive the same
         # underlying `workflow` at once — that races on `task.pending` and can 409 a legitimate call.
         self.error: Optional[str] = None              # set if the run raised; surfaced in the snapshot
-        self.lock = asyncio.Lock()                    # serializes resumes: two concurrent /review calls
-        # (e.g. auto-approving two platforms' drafts back-to-back) must not both drive the same
-        # underlying `workflow` at once — that races on `task.pending` and can 409 a legitimate call.
         self.status = "running"
         self.done = False
 

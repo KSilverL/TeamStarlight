@@ -32,6 +32,10 @@ services:
       - LLM_SERVICE_BASE_URL=http://llm:8080
       # Supabase credentials — override here or in a .env file if needed.
       # Defaults are already baked into application.properties.
+      # LinkedIn OAuth — must match the redirect URI registered on the LinkedIn Developer app,
+      # and where to send the browser back to after the OAuth round-trip.
+      - LINKEDIN_REDIRECT_URI=${LINKEDIN_REDIRECT_URI:-http://localhost:8081/linkedin/callback}
+      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-http://localhost:3000}
     depends_on:
       - llm
 
@@ -73,8 +77,24 @@ services:
       - GEOAPIFY_MAP_STYLE=${GEOAPIFY_MAP_STYLE}
       - USE_MOCK_MUSIC_GENERATION=true
       - USE_MOCK_SAFETY=true
-      - USE_MOCK_STORE=true
+      # Brand profiles + user skills come from the same Postgres DATABASE_URL above, so the
+      # roundtable's brand_voice/user_advocate personas argue from real data, not mocks.
+      - USE_MOCK_STORE=false
       # - SOUNDRAW_API_KEY=${SOUNDRAW_API_KEY}
+      # Roundtable discussion stage (multi-persona debate before drafting) — see .env.example
+      # for the full explanation of each knob. Manager stays on AZURE_OPENAI_CHAT_DEPLOYMENT;
+      # personas can run on a separate, cheaper resource via AZURE_PERSONA_*.
+      - ROUNDTABLE_ENABLED=${ROUNDTABLE_ENABLED}
+      - ROUNDTABLE_MAX_ROUNDS=${ROUNDTABLE_MAX_ROUNDS}
+      - ROUNDTABLE_PERSONA_MAX_TOKENS=${ROUNDTABLE_PERSONA_MAX_TOKENS}
+      - ROUNDTABLE_PERSONA_REASONING_EFFORT=${ROUNDTABLE_PERSONA_REASONING_EFFORT}
+      - ROUNDTABLE_PERSONA_VERBOSITY=${ROUNDTABLE_PERSONA_VERBOSITY}
+      - ROUNDTABLE_MANAGER_MODEL=${ROUNDTABLE_MANAGER_MODEL}
+      - ROUNDTABLE_PERSONA_MODEL=${ROUNDTABLE_PERSONA_MODEL}
+      - ROUNDTABLE_CONTROL_TIMEOUT=${ROUNDTABLE_CONTROL_TIMEOUT}
+      - AZURE_PERSONA_ENDPOINT=${AZURE_PERSONA_ENDPOINT}
+      - AZURE_PERSONA_API_KEY=${AZURE_PERSONA_API_KEY}
+      - TREND_SCOUT_ENABLED=${TREND_SCOUT_ENABLED}
       # Voiceover (Azure Speech TTS) — off by default (mock), opt-in per render via
       # POST /tasks/{id}/render-video's narration_text field either way.
       - USE_MOCK_VOICEOVER=true

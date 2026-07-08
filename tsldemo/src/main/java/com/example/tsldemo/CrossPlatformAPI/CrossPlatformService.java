@@ -9,12 +9,14 @@ import java.util.Map;
 import java.util.UUID;
 
 import org.springframework.beans.factory.annotation.*;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.server.ResponseStatusException;
 
 import com.example.tsldemo.CrossPlatformOAuth;
 import com.example.tsldemo.DTOs.Request.LinkedInCredsReqDTO;
@@ -33,29 +35,42 @@ public class CrossPlatformService {
 
 	private final RestClient restClient;
 
+    @Value("${linkedin.redirect-uri:http://localhost:8081/linkedin/callback}")
+    private String linkedInRedirectUri;
+
+    @Value("${frontend.base-url:http://localhost:3000}")
+    private String frontendBaseUrl;
+
     public CrossPlatformService(RestClient restClient) {
         this.restClient = restClient;
     }
-	
-    public void authCodeLinkedIn(LinkedInPostReqDTO requestDTO, HttpServletResponse response) throws IOException {
-        String state = UUID.randomUUID().toString();
 
-        CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(requestDTO.businessId(), PlatformEnum.LINKEDIN);
+    public void authCodeLinkedIn(int businessId, HttpServletResponse response) throws IOException {
+        CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(businessId, PlatformEnum.LINKEDIN);
+        if (crossPlatformOAuth == null) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND,
+                    "No LinkedIn app credentials on file for this business — call /linkedin/addCompCreds first.");
+        }
 
         if (crossPlatformOAuth.getAccessToken() == null || crossPlatformOAuth.getExpiresAt() == null || !crossPlatformOAuth.getExpiresAt().isAfter(Instant.now())) {
+            String state = UUID.randomUUID().toString();
 
             String authorizationUrl =
                 "https://www.linkedin.com/oauth/v2/authorization"
                 + "?response_type=code"
                 + "&client_id=" + URLEncoder.encode(crossPlatformOAuth.getClientId(), StandardCharsets.UTF_8)
-                + "&redirect_uri=" + URLEncoder.encode("http://localhost:8081/linkedin/callback", StandardCharsets.UTF_8)
+                + "&redirect_uri=" + URLEncoder.encode(linkedInRedirectUri, StandardCharsets.UTF_8)
                 + "&state=" + URLEncoder.encode(state, StandardCharsets.UTF_8)
                 + "&scope=" + URLEncoder.encode("openid profile email w_member_social", StandardCharsets.UTF_8);
 
-            response.sendRedirect(authorizationUrl);    
-
+            // Persist the state BEFORE redirecting, so the callback can always find it.
             crossPlatformOAuth.setState(state);
             crossPlatformRepository.save(crossPlatformOAuth);
+
+            response.sendRedirect(authorizationUrl);
+        } else {
+            // Already connected with a live token — send the user straight back into the app.
+            redirectToFrontend(response, true);
         }
     }
 
@@ -63,11 +78,14 @@ public class CrossPlatformService {
         RestClient restClient = RestClient.create();
 
         CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByStateAndPlatform(state, PlatformEnum.LINKEDIN);
+        if (crossPlatformOAuth == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Unknown or expired LinkedIn OAuth state.");
+        }
 
         MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
         form.add("grant_type", "authorization_code");
         form.add("code", authorizationCode);
-        form.add("redirect_uri", "http://localhost:8081/linkedin/callback");
+        form.add("redirect_uri", linkedInRedirectUri);
         form.add("client_id", crossPlatformOAuth.getClientId());
         form.add("client_secret", crossPlatformOAuth.getClientSecret());
 
@@ -86,9 +104,19 @@ public class CrossPlatformService {
         return token;
     }
 
-    public String postToLinkedIn(LinkedInPostReqDTO requestDTO) {
+    /** Sends the browser's top-level navigation back into the frontend app after the OAuth
+     * round-trip finishes (success or failure) — the callback is hit directly by LinkedIn, so
+     * this is the user's only way back into the SPA. */
+    public void redirectToFrontend(HttpServletResponse response, boolean connected) throws IOException {
+        response.sendRedirect(frontendBaseUrl + "/profile?linkedin=" + (connected ? "connected" : "error"));
+    }
 
-        CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(requestDTO.businessId(), PlatformEnum.LINKEDIN);
+    public String postToLinkedIn(int businessId, LinkedInPostReqDTO requestDTO) {
+
+        CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(businessId, PlatformEnum.LINKEDIN);
+        if (crossPlatformOAuth == null || crossPlatformOAuth.getAccessToken() == null) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "LinkedIn isn't connected for this business yet.");
+        }
 
         LinkedInUserInfoDTO linkedInUserInfo = restClient.get()
                 .uri("https://api.linkedin.com/v2/userinfo")
@@ -118,17 +146,20 @@ public class CrossPlatformService {
                 .body(requestBody)
                 .retrieve()
                 .toBodilessEntity();
-        
+
         return response.getHeaders().getFirst("x-restli-id");
     }
 
-    public void saveLinkedInCredentials(LinkedInCredsReqDTO creds) {
+    public void saveLinkedInCredentials(int businessId, LinkedInCredsReqDTO creds) {
+        CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(businessId, PlatformEnum.LINKEDIN);
+        if (crossPlatformOAuth == null) {
+            crossPlatformOAuth = new CrossPlatformOAuth();
+            crossPlatformOAuth.setBusinessId(businessId);
+            crossPlatformOAuth.setPlatform(PlatformEnum.LINKEDIN);
+        }
 
-        CrossPlatformOAuth crossPlatformOAuth = new CrossPlatformOAuth();
-        crossPlatformOAuth.setBusinessId(creds.businessId());
         crossPlatformOAuth.setClientId(creds.clientId());
         crossPlatformOAuth.setClientSecret(creds.clientSecret());
-        crossPlatformOAuth.setPlatform(PlatformEnum.LINKEDIN);
 
         crossPlatformRepository.save(crossPlatformOAuth);
     }

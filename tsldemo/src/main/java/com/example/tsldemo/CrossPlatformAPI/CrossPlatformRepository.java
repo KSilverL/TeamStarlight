@@ -9,6 +9,6 @@ public interface CrossPlatformRepository extends JpaRepository<CrossPlatformOAut
 	
     CrossPlatformOAuth findByStateAndPlatform(String state, PlatformEnum platform);
 
-    CrossPlatformOAuth findByBusinessIdAndPlatform(String businessId, PlatformEnum platform);
+    CrossPlatformOAuth findByBusinessIdAndPlatform(int businessId, PlatformEnum platform);
 
 }
