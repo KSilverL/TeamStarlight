@@ -115,18 +115,18 @@ public class ApiDTOS {
 
 	    public String status;
 
-	    public Pending[] pending;
+	    public List<Pending> pending;
 
-	    public Output[] outputs;
+	    public List<Output> outputs;
 
 	    @JsonProperty("proposed_rules")
 	    List<Map<String,Object>> proposedRules;
 
-	    String error;
+	    public String error;
 	    
 	}
 	
-	record Verdict(
+	public record Verdict(
 			@JsonProperty
 			String decision, 
 			
