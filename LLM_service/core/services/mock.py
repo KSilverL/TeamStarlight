@@ -72,6 +72,12 @@ VISUAL_QA_REJECT_MARKER = "bad-visual"
 # reject-once/approve-on-retry contract as VISUAL_QA_REJECT_MARKER.
 SUBJECT_MISMATCH_MARKER = "off-brief"
 
+# Substring that makes MockLLM.convert_generated_to_template return an INVALID
+# answer (it echoes `type: "generated"` back — exactly the failure the template-only
+# union validation in workflow/video/fallback.py must reject) — the offline lever
+# for exercising the deterministic hook-card floor of the fallback ladder.
+BROKEN_FALLBACK_MARKER = "break-fallback"
+
 # Platform-differentiated strategy angle (strategist). Keyed case-insensitively.
 _PLATFORM_FOCUS: Dict[str, str] = {
     "linkedin": "business analysis and credibility",
@@ -662,6 +668,13 @@ class MockLLM(LLMService):
             "user_notes": _unique(notes)[:5],
         }
 
+    async def plan_scene_design(self, *, description: str, data: dict) -> str:
+        """Deterministic offline stub: a fixed 2-bullet concept so codegen.py's
+        two-stage flow is exercised without a model. The real value is tuned in
+        AzureLLM.plan_scene_design."""
+        await asyncio.sleep(_MOCK_LATENCY)
+        return "- Centre the dominant element on the canvas\n- Stagger supporting elements in from below"
+
     async def generate_scene_component(
         self,
         *,
@@ -674,6 +687,7 @@ class MockLLM(LLMService):
         attempt: int = 1,
         prior_error: Optional[str] = None,
         prior_source: Optional[str] = None,
+        design_plan: Optional[str] = None,
     ) -> str:
         await asyncio.sleep(_MOCK_LATENCY)
         broken = BROKEN_CODEGEN_MARKER in description.lower() and prior_error is None
@@ -685,10 +699,49 @@ class MockLLM(LLMService):
         await asyncio.sleep(_MOCK_LATENCY)
         if attempt == 1:
             if SUBJECT_MISMATCH_MARKER in description.lower():
-                return {"approved": False, "feedback": "mock visual QA: frame does not depict the brief's subject"}
+                return {"approved": False, "feedback": "mock visual QA: frame does not depict the brief's subject",
+                        "fixes": ["render the subject as real graphics, not text"]}
             if VISUAL_QA_REJECT_MARKER in description.lower():
-                return {"approved": False, "feedback": "mock visual QA: headline overlaps the frame edge"}
-        return {"approved": True, "feedback": ""}
+                return {"approved": False, "feedback": "mock visual QA: headline overlaps the frame edge",
+                        "fixes": ["move the headline inside the central 84% of the canvas"]}
+        return {"approved": True, "feedback": "", "fixes": []}
+
+    async def convert_generated_to_template(
+        self, *, description: str, data: dict,
+    ) -> dict:
+        """Deterministic offline analogue of AzureLLM's conversion: chart-shaped
+        `data` (a list of {label-ish: str, value-ish: number} dicts) becomes a
+        `bar_chart`; anything else becomes a text-only `hook` built from the
+        brief's first words. BROKEN_FALLBACK_MARKER echoes `generated` back — the
+        invalid answer fallback.py's template-only validation must reject."""
+        await asyncio.sleep(_MOCK_LATENCY)
+        if BROKEN_FALLBACK_MARKER in description.lower():
+            return {"type": "generated", "description": description, "data": data}
+        bars = self._bar_items_from(data)
+        if bars:
+            return {"type": "bar_chart", "headline": description.split(".")[0][:60] or None, "bars": bars}
+        return {"type": "hook", "headline": " ".join(description.split()[:7]) or "See what's new"}
+
+    @staticmethod
+    def _bar_items_from(data: dict) -> list:
+        """First list in `data` that looks like 2-6 labelled numbers, reshaped to
+        BarItem dicts; [] when nothing chart-shaped exists."""
+        for value in data.values():
+            if not (isinstance(value, list) and 2 <= len(value) <= 6):
+                continue
+            bars = []
+            for item in value:
+                if not isinstance(item, dict):
+                    break
+                label = next((v for v in item.values() if isinstance(v, str)), None)
+                number = next((v for v in item.values() if isinstance(v, (int, float)) and not isinstance(v, bool)), None)
+                if label is None or number is None:
+                    break
+                bars.append({"label": label, "value": float(number)})
+            else:
+                if bars:
+                    return bars
+        return []
 
     async def fill_brief(
         self,

@@ -70,8 +70,10 @@ services:
       - PEXELS_API_KEY=${PEXELS_API_KEY}
       - REMOVEBG_API_KEY=${REMOVEBG_API_KEY}
       - GEOAPIFY_API_KEY=${GEOAPIFY_API_KEY}
+      - GEOAPIFY_MAP_STYLE=${GEOAPIFY_MAP_STYLE}
       - USE_MOCK_MUSIC_GENERATION=true
       - USE_MOCK_SAFETY=true
+      - USE_MOCK_STORE=true
       # - SOUNDRAW_API_KEY=${SOUNDRAW_API_KEY}
       # Voiceover (Azure Speech TTS) — off by default (mock), opt-in per render via
       # POST /tasks/{id}/render-video's narration_text field either way.

@@ -19,8 +19,9 @@ from typing import Optional
 
 from ...core.config import Settings, get_settings
 from ...core.services import factory
-from ...core.video_schema import StoryboardSpec
+from ...core.video_schema import StoryboardSpec, renderable_total_frames
 from .assets import resolve_storyboard_assets
+from .codegen import cleanup_job_generated, sweep_stale_generated
 from .music import resolve_storyboard_music
 from .render import RenderError, render_storyboard
 from .voiceover import resolve_storyboard_voiceover
@@ -36,9 +37,18 @@ async def _run_job(
 ) -> None:
     store = factory.get_store()
     job_dir = _job_dir(settings, job_id)
+    # Reap generated-slide dirs orphaned by crashed/killed past processes BEFORE
+    # this job writes its own (this call is why one old broken job can't degrade
+    # this one — see codegen.py's module docstring on typecheck isolation).
+    sweep_stale_generated(settings)
     try:
         renderable = await resolve_storyboard_assets(storyboard, job_dir=job_dir, settings=settings)
-        total_seconds = sum(s.durationFrames for s in renderable.slides) / renderable.fps
+        # Match the transition-adjusted length the renderer actually produces
+        # (metadata.ts), so music/voiceover don't run past the final frame.
+        total_frames = renderable_total_frames(
+            [s.durationFrames for s in renderable.slides], renderable.transition,
+        )
+        total_seconds = total_frames / renderable.fps
         renderable.musicLocalPath = await resolve_storyboard_music(
             job_dir=job_dir, duration_seconds=total_seconds,
         )
@@ -52,6 +62,12 @@ async def _run_job(
         await store.update_video_job(job_id=job_id, status="error", error=str(exc))
     except Exception as exc:  # any unexpected failure still resolves the poll, never hangs it
         await store.update_video_job(job_id=job_id, status="error", error=f"unexpected error: {exc}")
+    finally:
+        # The per-job entry.tsx under src/generated/<job_id>/ is the render's entry
+        # point, so this must run only after the render is fully over — success or
+        # failure. Leaving it behind is what used to poison every later job's
+        # typecheck (and slowly bloat the renderer project).
+        cleanup_job_generated(settings, job_id)
 
 
 async def start_render_job(

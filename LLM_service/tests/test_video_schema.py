@@ -288,3 +288,270 @@ def test_renderable_storyboard_accepts_resolved_music_path():
         musicLocalPath="music.mp3",
     )
     assert renderable.musicLocalPath == "music.mp3"
+
+
+# ── theme + colour validation (KEEP IN SYNC: types.ts theme, slides/theme.ts) ──
+
+def _spec(**overrides) -> StoryboardSpec:
+    fields = dict(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        platform="linkedin",
+        slides=[
+            {"type": "hook", "headline": "Hi"},
+            {"type": "outro", "brandName": "X", "ctaLabel": "Go"},
+        ],
+    )
+    fields.update(overrides)
+    return StoryboardSpec(**fields)
+
+
+def test_storyboard_theme_defaults_to_dark_and_accepts_light():
+    assert _spec().theme == "dark"
+    assert _spec(theme="light").theme == "light"
+    with pytest.raises(ValidationError):
+        _spec(theme="sepia")
+
+
+def test_storyboard_colors_must_be_hex():
+    for good in ("#000", "#f8FAfc"):
+        assert _spec(primaryColor=good).primaryColor == good
+    for bad in ("white", "rgb(0,0,0)", "#12345", "0d1117"):
+        with pytest.raises(ValidationError):
+            _spec(primaryColor=bad)
+
+
+def test_map_pin_query_is_optional():
+    without = MapSlideSpec(region="IE", pins=[{"label": "Dublin", "lon": -6.26, "lat": 53.35}])
+    assert without.pins[0].query is None
+    with_query = MapSlideSpec(region="IE", pins=[
+        {"label": "Aviva", "query": "Aviva Stadium, Dublin, Ireland", "lon": -6.23, "lat": 53.34},
+    ])
+    assert with_query.pins[0].query == "Aviva Stadium, Dublin, Ireland"
+
+
+# ── Phase 3: slide variants + optional creative fields (batch a) ──────────────
+
+def test_hook_variant_and_background_default_and_validate():
+    # Defaults reproduce the pre-variant look; legacy payloads (no variant/kicker/
+    # background) still validate unchanged.
+    legacy = HookSlideSpec(headline="Hi")
+    assert legacy.variant == "spotlight" and legacy.background == "solid" and legacy.kicker is None
+    poster = HookSlideSpec(headline="Hi", kicker="NOW LIVE", variant="poster", background="gradient")
+    assert poster.variant == "poster" and poster.kicker == "NOW LIVE"
+    with pytest.raises(ValidationError):
+        HookSlideSpec(headline="Hi", variant="carousel")
+    with pytest.raises(ValidationError):
+        HookSlideSpec(headline="Hi", background="plaid")
+
+
+def test_counter_stat_variant_and_emphasis():
+    legacy = CounterStatSlideSpec(stats=[{"value": "10", "label": "x", "icon": "★"}])
+    assert legacy.variant == "cards" and legacy.emphasisIndex is None
+    orbit = CounterStatSlideSpec(variant="orbit", emphasisIndex=1,
+                                 stats=[{"value": "10", "label": "x", "icon": "★"},
+                                        {"value": "20", "label": "y", "icon": "◆"}])
+    assert orbit.variant == "orbit" and orbit.emphasisIndex == 1
+    with pytest.raises(ValidationError):
+        CounterStatSlideSpec(emphasisIndex=-1, stats=[{"value": "10", "label": "x", "icon": "★"}])
+
+
+def test_outro_variant_and_tagline():
+    legacy = OutroSlideSpec(brandName="X", ctaLabel="Go")
+    assert legacy.variant == "badge" and legacy.tagline is None
+    sweep = OutroSlideSpec(brandName="X", ctaLabel="Go", tagline="Light the way", variant="sweep")
+    assert sweep.variant == "sweep" and sweep.tagline == "Light the way"
+
+
+def test_storyboard_background_style_and_palette_default_and_pass_through():
+    default = _spec()
+    assert default.backgroundStyle == "solid" and default.paletteName is None
+    styled = _spec(backgroundStyle="aurora", paletteName="vivid")
+    assert styled.backgroundStyle == "aurora" and styled.paletteName == "vivid"
+    with pytest.raises(ValidationError):
+        _spec(backgroundStyle="hologram")
+
+
+def test_batch_a_fields_survive_asset_resolution_round_trip():
+    """The new spec fields reach the Render* models (and thus the props JSON) —
+    guards the assets.py pass-through, not just the model definitions."""
+    import asyncio
+    from pathlib import Path
+    import tempfile
+    from LLM_service.workflow.video.assets import resolve_storyboard_assets
+
+    storyboard = StoryboardSpec(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        platform="linkedin", backgroundStyle="grid", paletteName="ocean",
+        slides=[
+            {"type": "hook", "headline": "Hi", "kicker": "NEW", "variant": "poster", "background": "orbs"},
+            {"type": "counter_stat", "variant": "ticker", "emphasisIndex": 2,
+             "stats": [{"value": "1", "label": "a", "icon": "★"}]},
+            {"type": "outro", "brandName": "X", "ctaLabel": "Go", "tagline": "hi", "variant": "sweep"},
+        ],
+    )
+    with tempfile.TemporaryDirectory() as d:
+        renderable = asyncio.run(resolve_storyboard_assets(storyboard, job_dir=Path(d) / "job"))
+    dumped = renderable.model_dump()
+    assert dumped["backgroundStyle"] == "grid" and dumped["paletteName"] == "ocean"
+    assert dumped["slides"][0]["variant"] == "poster" and dumped["slides"][0]["kicker"] == "NEW"
+    assert dumped["slides"][0]["background"] == "orbs"
+    assert dumped["slides"][1]["variant"] == "ticker" and dumped["slides"][1]["emphasisIndex"] == 2
+    assert dumped["slides"][2]["variant"] == "sweep" and dumped["slides"][2]["tagline"] == "hi"
+
+
+# ── Phase 3: chart variants + palette/source/annotation (batch b) ─────────────
+
+def test_chart_variants_default_and_validate():
+    assert PieChartSlideSpec(slices=[{"label": "a", "value": 1}, {"label": "b", "value": 2}]).variant == "classic"
+    assert LineChartSlideSpec(xLabels=["a", "b"], series=[{"label": "s", "values": [1, 2]}]).variant == "classic"
+    assert BarChartSlideSpec(bars=[{"label": "a", "value": 1}, {"label": "b", "value": 2}]).variant == "columns"
+    for bad_variant in ("scatter", "3d"):
+        with pytest.raises(ValidationError):
+            BarChartSlideSpec(variant=bad_variant, bars=[{"label": "a", "value": 1}, {"label": "b", "value": 2}])
+
+
+def test_chart_palette_name_is_constrained_and_optional():
+    ok = BarChartSlideSpec(paletteName="ocean", bars=[{"label": "a", "value": 1}, {"label": "b", "value": 2}])
+    assert ok.paletteName == "ocean"
+    default = BarChartSlideSpec(bars=[{"label": "a", "value": 1}, {"label": "b", "value": 2}])
+    assert default.paletteName is None  # inherits the storyboard's at resolution time
+    with pytest.raises(ValidationError):
+        BarChartSlideSpec(paletteName="banana", bars=[{"label": "a", "value": 1}, {"label": "b", "value": 2}])
+
+
+def test_chart_optional_creative_fields_pass_through():
+    import asyncio
+    from pathlib import Path
+    import tempfile
+    from LLM_service.workflow.video.assets import resolve_storyboard_assets
+
+    storyboard = StoryboardSpec(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        platform="linkedin", paletteName="heat",
+        slides=[
+            {"type": "bar_chart", "variant": "race", "highlightIndex": 1, "source": "Q3",
+             "bars": [{"label": "a", "value": 1}, {"label": "b", "value": 2}]},
+            {"type": "line_chart", "variant": "area_glow", "annotation": "peak", "paletteName": "vivid",
+             "xLabels": ["a", "b"], "series": [{"label": "s", "values": [1, 2]}]},
+            {"type": "pie_chart", "variant": "donut", "source": "survey",
+             "slices": [{"label": "a", "value": 1}, {"label": "b", "value": 2}]},
+        ],
+    )
+    with tempfile.TemporaryDirectory() as d:
+        renderable = asyncio.run(resolve_storyboard_assets(storyboard, job_dir=Path(d) / "job"))
+    slides = renderable.model_dump()["slides"]
+    assert slides[0]["variant"] == "race" and slides[0]["highlightIndex"] == 1 and slides[0]["source"] == "Q3"
+    # bar inherits the storyboard palette (heat); line overrides it (vivid).
+    assert slides[0]["paletteName"] == "heat"
+    assert slides[1]["variant"] == "area_glow" and slides[1]["annotation"] == "peak" and slides[1]["paletteName"] == "vivid"
+    assert slides[2]["variant"] == "donut" and slides[2]["source"] == "survey"
+
+
+def test_line_and_bar_duration_max_bumped_for_variants():
+    # step_reveal/race want more room; the max climbed to 300.
+    assert clamp_duration("line_chart", 300) == 300
+    assert clamp_duration("bar_chart", 300) == 300
+
+
+# ── Phase 3: collage / node / table / map variants (batch c) ──────────────────
+
+def test_collage_layout_extends_and_captions_optional():
+    legacy = CollageSlideSpec(imageQueries=["a"])
+    assert legacy.layout == "grid" and legacy.captions is None
+    film = CollageSlideSpec(imageQueries=["a", "b"], layout="filmstrip", captions=["one", "two"])
+    assert film.layout == "filmstrip" and film.captions == ["one", "two"]
+    with pytest.raises(ValidationError):
+        CollageSlideSpec(imageQueries=["a"], layout="mosaic")
+
+
+def test_node_table_map_variants_default_and_validate():
+    assert NodeDiagramSlideSpec(nodes=["a", "b", "c"]).variant == "chain"
+    assert NodeDiagramSlideSpec(nodes=["a", "b", "c"], variant="hub").variant == "hub"
+    table = ComparisonTableSlideSpec(columns=["A", "B"], variant="scorecard", highlightColumn=1,
+                                     rows=[{"label": "r1", "values": ["x", "y"]},
+                                           {"label": "r2", "values": ["p", "q"]}])
+    assert table.variant == "scorecard" and table.highlightColumn == 1
+    assert MapSlideSpec(region="IE", pins=[{"label": "Dublin", "lon": -6.26, "lat": 53.35}]).variant == "pins"
+    assert MapSlideSpec(region="IE", variant="journey",
+                        pins=[{"label": "Dublin", "lon": -6.26, "lat": 53.35}]).variant == "journey"
+    for model, kw in [
+        (NodeDiagramSlideSpec, dict(nodes=["a", "b", "c"], variant="web")),
+        (MapSlideSpec, dict(region="IE", variant="satellite", pins=[{"label": "D", "lon": 0, "lat": 0}])),
+    ]:
+        with pytest.raises(ValidationError):
+            model(**kw)
+
+
+def test_batch_c_fields_survive_asset_resolution_round_trip():
+    import asyncio
+    from pathlib import Path
+    import tempfile
+    from LLM_service.workflow.video.assets import resolve_storyboard_assets
+
+    storyboard = StoryboardSpec(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        platform="linkedin",
+        slides=[
+            {"type": "collage", "imageQueries": ["a", "b"], "layout": "polaroid", "captions": ["c1", "c2"]},
+            {"type": "node_diagram", "nodes": ["a", "b", "c"], "variant": "steps"},
+            {"type": "comparison_table", "columns": ["A", "B"], "variant": "versus",
+             "rows": [{"label": "r1", "values": ["x", "y"]}, {"label": "r2", "values": ["p", "q"]}]},
+        ],
+    )
+    with tempfile.TemporaryDirectory() as d:
+        renderable = asyncio.run(resolve_storyboard_assets(storyboard, job_dir=Path(d) / "job"))
+    slides = renderable.model_dump()["slides"]
+    assert slides[0]["layout"] == "polaroid" and slides[0]["captions"] == ["c1", "c2"]
+    assert slides[1]["variant"] == "steps"
+    assert slides[2]["variant"] == "versus"
+
+
+# ── Phase 4: cross-slide transitions + duration math ──────────────────────────
+
+def test_storyboard_transition_default_and_validate():
+    assert _spec().transition == "none"
+    assert _spec(transition="fade").transition == "fade"
+    with pytest.raises(ValidationError):
+        _spec(transition="dissolve")
+
+
+def test_renderable_total_frames_accounts_for_transition_overlap():
+    from LLM_service.core.video_schema import TRANSITION_OVERLAP_FRAMES, renderable_total_frames
+
+    durations = [90, 120, 90]  # 3 slides, 2 boundaries
+    # No transition → plain sum.
+    assert renderable_total_frames(durations, "none") == 300
+    # Active transition → minus overlap at each of the 2 boundaries.
+    assert renderable_total_frames(durations, "fade") == 300 - 2 * TRANSITION_OVERLAP_FRAMES
+    # A single slide has no boundary to overlap.
+    assert renderable_total_frames([90], "slide") == 90
+    # Never negative.
+    assert renderable_total_frames([1, 1], "wipe") == 0
+
+
+def test_transition_survives_asset_resolution_round_trip():
+    import asyncio
+    from pathlib import Path
+    import tempfile
+    from LLM_service.workflow.video.assets import resolve_storyboard_assets
+
+    storyboard = _spec(transition="slide")
+    with tempfile.TemporaryDirectory() as d:
+        renderable = asyncio.run(resolve_storyboard_assets(storyboard, job_dir=Path(d) / "job"))
+    assert renderable.transition == "slide"
+    assert renderable.model_dump()["transition"] == "slide"
+
+
+def test_renderable_storyboard_round_trips_theme():
+    renderable = RenderableStoryboard(
+        brandName="X", theme="light", primaryColor="#f8fafc", secondaryColor="#111", accentColor="#222",
+        width=1080, height=1920,
+        slides=[{"type": "outro", "brandName": "X", "ctaLabel": "Go", "durationFrames": 90}],
+    )
+    assert renderable.model_dump()["theme"] == "light"
+    # Pre-theme props JSON (no theme key) still validates, defaulting dark.
+    assert RenderableStoryboard(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        width=1080, height=1920,
+        slides=[{"type": "outro", "brandName": "X", "ctaLabel": "Go", "durationFrames": 90}],
+    ).theme == "dark"

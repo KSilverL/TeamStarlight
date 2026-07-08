@@ -232,9 +232,13 @@ class Settings:
     pexels_api_key: Optional[str] = None
     removebg_api_key: Optional[str] = None
 
-    # ── Geoapify (static-map basemaps for `map` slides) ─────────────────────────
+    # ── Geoapify (static maps + geocoding for `map` slides) ─────────────────────
     # No key → map slides render the bundled vector outline instead; never blocking.
     geoapify_api_key: Optional[str] = None
+    # Explicit basemap-style override. None (default) → the style is picked from the
+    # storyboard's theme (workflow/video/assets.py _MAP_STYLE_BY_THEME). See
+    # https://apidocs.geoapify.com/docs/maps/map-tiles/ for the preset names.
+    geoapify_map_style: Optional[str] = "osm-liberty"
 
     # ── Soundraw (background music generation) ──────────────────────────────────
     soundraw_api_key: Optional[str] = None
@@ -295,6 +299,12 @@ class Settings:
     # storyboard with several struggling slides could otherwise spend
     # max_attempts-per-slide x N-slides worth of real cost.
     codegen_max_total_attempts: int = 9
+    # Visual QA pass for `map` slides (workflow/video/map_qa.py): preview-still +
+    # vision review per map slide, with a bounded zoom-out repair on rejection.
+    # Cost per attempt ≈ one `remotion still` (5-20s) + one vision call, so
+    # MAP_QA_ENABLED=false is the latency/cost kill switch.
+    map_qa_enabled: bool = True
+    map_qa_max_attempts: int = 2
 
     # ── Backend status webhook (legacy transport; SSE replaces it in M2) ───────
     webhook_url: str = "http://localhost:9999/status"
@@ -427,6 +437,7 @@ class Settings:
 def _load() -> Settings:
     use_mock = _env_bool("USE_MOCK")
     learning = _env_bool("LEARNING_ENABLED")
+    map_qa = _env_bool("MAP_QA_ENABLED")
     return Settings(
         use_mock=True if use_mock is None else use_mock,
         use_mock_llm=_env_bool("USE_MOCK_LLM"),
@@ -487,6 +498,7 @@ def _load() -> Settings:
         pexels_api_key=os.getenv("PEXELS_API_KEY"),
         removebg_api_key=os.getenv("REMOVEBG_API_KEY"),
         geoapify_api_key=os.getenv("GEOAPIFY_API_KEY"),
+        geoapify_map_style=os.getenv("GEOAPIFY_MAP_STYLE") or None,
         soundraw_api_key=os.getenv("SOUNDRAW_API_KEY"),
         azure_speech_key=os.getenv("AZURE_SPEECH_KEY"),
         azure_speech_region=os.getenv("AZURE_SPEECH_REGION"),
@@ -504,6 +516,8 @@ def _load() -> Settings:
         remotion_lambda_site_name_prefix=os.getenv("REMOTION_LAMBDA_SITE_NAME_PREFIX", "storyboard-job"),
         remotion_lambda_output_bucket=os.getenv("REMOTION_LAMBDA_OUTPUT_BUCKET"),
         codegen_max_total_attempts=_env_int("CODEGEN_MAX_TOTAL_ATTEMPTS", 9),
+        map_qa_enabled=True if map_qa is None else map_qa,
+        map_qa_max_attempts=_env_int("MAP_QA_MAX_ATTEMPTS", 2),
         webhook_url=os.getenv("WEBHOOK_URL", "http://localhost:9999/status"),
         webhook_enabled=_env_bool("WEBHOOK_ENABLED"),
     )

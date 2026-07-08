@@ -70,19 +70,26 @@ TeamStarlight/
 │  │  ├─ builder.py       Assembles the executor graph (THE most important file to read first)
 │  │  ├─ messages.py      Every typed message that flows along the graph's edges
 │  │  ├─ executors/       One file per node: dispatcher, strategist, creator, reviewer, human_gate, media_producer, media_entry
-│  │  ├─ roundtable/      Optional multi-persona discussion stage (a *different* MAF orchestration pattern — Magentic)
-│  │  ├─ video/           Storyboard→MP4 render pipeline (subprocess into video_renderer/)
+│  │  ├─ roundtable/      Optional multi-persona discussion stage (a *different* MAF orchestration pattern — Magentic);
+│  │  │                   now includes control.py (next/speak/enough/auto user controls, §12) and an optional trend_scout seat
+│  │  ├─ video/           Storyboard→MP4 render pipeline (subprocess or Remotion Lambda into video_renderer/);
+│  │  │                   now also codegen.py (LLM-authored Remotion scenes), map_qa.py, fallback.py, voiceover.py, lambda_render.py (§11)
 │  │  └─ learning/        Brand-voice + per-user rule distillation (post-hoc, opt-in)
 │  ├─ core/
 │  │  ├─ config.py        Settings + the mock/production feature-toggle system
 │  │  ├─ events.py        The SSE wire-format builders
 │  │  ├─ video_schema.py  The dynamic storyboard schema (Pydantic discriminated unions)
 │  │  ├─ skill_schema.py  Per-user learned writing rules schema
-│  │  └─ services/        base.py (contracts) / mock.py / azure.py / postgres.py / factory.py
-│  ├─ skills/             Markdown style-guide "skills" injected into prompts (per platform + media)
-│  ├─ migrations/         Hand-written SQL for the Postgres tables
-│  └─ tests/               ~3,650 lines of pytest — read these to see the contracts exercised
-├─ video_renderer/         Remotion project — 9 typed "slide" React components + a generic composition
+│  │  ├─ trend_schema.py / trends.py   "Trend scout" context: TTL'd trend snippets read from Postgres (§6)
+│  │  ├─ agent_tools.py   MAF/OpenAI-style tool defs (web search, reviews, images) — defined, not yet wired to an executor (§14)
+│  │  └─ services/        base.py (contracts) / mock.py / azure.py / media_assets.py (Pexels/Remove.bg/Geoapify/Soundraw) /
+│  │                       web_search.py (Azure AI Foundry Bing-grounding agents) / postgres.py / factory.py
+│  ├─ skills/             Markdown style-guide "skills" injected into prompts (per platform + media);
+│  │                       now incl. remotion_scene_patterns.md for the codegen LLM (§11)
+│  ├─ migrations/         Hand-written SQL for the Postgres tables (incl. 003_trends.sql)
+│  └─ tests/               ~5,000+ lines of pytest — read these to see the contracts exercised
+├─ video_renderer/         Remotion project — 10 typed "slide" React components (incl. MapSlide) + a shared
+│                           design-token system (src/design/) + a generic composition
 ├─ docs/                   Design docs — some current, some stale (see §13)
 ├─ API.md                  Root-level API reference for `LLM_service` (also partly stale, see §13)
 └─ system.md                Existing architecture doc with mermaid diagrams (a good second read)
@@ -102,13 +109,20 @@ docker compose up --build
 This starts `frontend` (3000), `backend` (8081), and `llm` (8080). Look at
 `docker-compose.yml` closely though:
 
-- The `llm` service is started with **`USE_MOCK=false`** but most individual toggles are still
-  mock (`USE_MOCK_SAFETY=true`, `USE_MOCK_MUSIC_GENERATION=true`) — so a stock `docker compose up`
-  will actually try to hit **real Azure OpenAI** for copywriting/dispatch/strategy/media, using
-  whatever `AZURE_OPENAI_ENDPOINT`/`AZURE_OPENAI_API_KEY` you have in your shell env or root
-  `.env` (docker-compose interpolates `${VAR}` from there). **If you don't have those
-  credentials, export `USE_MOCK=true` (or unset it) before composing up**, or the `llm`
-  container will raise `RuntimeError` on first request (see `factory._require`, §8).
+- The `llm` service is started with **`USE_MOCK=false`** and now individually flips on several
+  more real integrations than before — `USE_MOCK_IMAGE_SEARCH=false`,
+  `USE_MOCK_BACKGROUND_REMOVAL=false`, `USE_MOCK_WEB_SEARCH=false` all point at real Pexels/
+  Remove.bg/Azure-AI-Foundry-Bing credentials — while others stay mock
+  (`USE_MOCK_SAFETY=true`, `USE_MOCK_MUSIC_GENERATION=true`, `USE_MOCK_STORE=true`,
+  `USE_MOCK_VOICEOVER=true`). So a stock `docker compose up` will try to hit **real Azure
+  OpenAI, Pexels, Remove.bg, Geoapify, and an Azure AI Foundry web-search agent**, using
+  whatever `AZURE_OPENAI_ENDPOINT`/`AZURE_OPENAI_API_KEY`/`FOUNDRY_PROJECT_ENDPOINT`/
+  `GEOAPIFY_API_KEY`/etc. you have in your shell env or root `.env` (docker-compose interpolates
+  `${VAR}` from there). **If you don't have those credentials, export `USE_MOCK=true` (or unset
+  it) before composing up**, or the `llm` container will raise `RuntimeError` on first request
+  for whichever integration is missing creds (see `factory._require`, §8). Remotion Lambda video
+  rendering is the one integration still commented out / off by default
+  (`VIDEO_RENDER_BACKEND=lambda` and its `REMOTION_LAMBDA_*` vars) — see §11 for why.
 - The `brand-agent` service (the old Anthropic-backed demo, port 8000) is **commented out**.
   The root `.env.example`'s `ANTHROPIC_API_KEY` note and the frontend's `/api/brand` route
   both refer to a service that no longer exists in the compose file or on disk (see §13).
@@ -164,8 +178,13 @@ npm run render               # remotion render src/index.tsx StoryboardVideo <ou
 
 `LLM_service/core/config.py` + `core/services/factory.py` implement a clean **strategy
 pattern**: every external dependency (LLM calls, content-safety screening, the Postgres store,
-voice transport, image search, background removal, music generation) has a `Mock*` and a
-production (`Azure*`/`Postgres*`) implementation behind a common ABC in `core/services/base.py`.
+voice transport, image search, background removal, music generation, and — newly —
+**web search/trend research** and **voiceover TTS**) has a `Mock*` and a production
+(`Azure*`/`Postgres*`/vendor-specific) implementation behind a common ABC in
+`core/services/base.py`. The list of independently-toggleable, independently-credentialed
+integrations keeps growing (Pexels, Remove.bg, Geoapify, Soundraw, Azure Speech, Azure AI
+Foundry Bing-grounding agents, and optionally AWS for Remotion Lambda) — see `.env.example` for
+the current full set before assuming `USE_MOCK=false` alone is enough to go live.
 Resolution order is `USE_MOCK_<SERVICE>` env var → global `USE_MOCK` → default `true`. This
 means:
 
@@ -418,6 +437,34 @@ call). Note this node does **not** render an MP4 — it only produces the `Story
 Actual video rendering is a separate, explicitly-triggered job (§11) kept out of this node on
 purpose because it can take 45+ seconds and this is the workflow's terminal, must-stay-fast node.
 
+### Trend scout — optional context injection (new)
+
+Not a graph node — it never appears in `builder.py`. `StrategistExecutor.plan_strategies`
+(`workflow/executors/strategist.py:34-46`) calls `core/trends.py`'s `read_current_trends()` once
+per run and, if it returns anything, passes a rendered trend block into
+`llm.plan_strategy(..., trends=trend_block)` so the LLM can angle a `CreativeStrategy` off a
+real current event/trend instead of purely the brief. Gated by `TREND_SCOUT_ENABLED` (default
+`false`, `core/config.py:221`); when off, `read_current_trends()` returns `[]` immediately
+without touching the store. `select_current_trends()` (`core/trend_schema.py:70-110`) drops
+TTL-expired rows (`TREND_SCOUT_TTL_DAYS`, default 3) and round-robins by category, capped at
+`TREND_SCOUT_LIMIT` (default 6).
+
+The trends themselves are **written by something outside this repo**: an external Foundry-agent
+daily scan job upserts one rolling row (key `"current"`) into a new `trends` table
+(`migrations/003_trends.sql`) via `StoreService.upsert_trends`
+(`core/services/base.py:427-437`, implemented in `core/services/postgres.py:173-188`) — the
+same whole-doc-in-JSONB pattern already used for `brand_profiles`/`user_skills`. If you're
+looking for the scan job itself, it isn't in this repo; treat the `trends` table as an external
+input the Python service only *reads*. The same trend block is also offered to an optional
+fifth roundtable persona, `trend_scout` (§12).
+
+A related but **not yet wired** piece: `core/agent_tools.py` defines a MAF/OpenAI-style tool
+set (`search_web`, `fetch_url_text`, `search_reviews`, `search_images`, `search_stock_images`)
+backed by a new `WebSearchService` (`MockWebSearch` / `AzureWebSearch` — the production impl
+calls an Azure AI Foundry "Grounding with Bing Search" agent, `core/services/web_search.py`).
+The module's own docstring says plainly that neither the strategist nor the creator calls these
+tools yet — it's scaffolding for a future agentic research step, not live behavior (see §14).
+
 ---
 
 ## 7. End-to-end trace: prompt → content
@@ -552,8 +599,15 @@ implementation (`azure.py` / `postgres.py`):
 | `StoreService` | `MockStore` (in-memory dict) | `PostgresStore` | brand profiles, per-user learned skills, and (via a separate getter) workflow checkpoints |
 | `VoiceService` | `MockVoice` | `AzureVoice` (Voice Live) | voice intake transport |
 
-Plus three narrower ones added for the video pipeline: `ImageSearchService` (Pexels),
-`BackgroundRemovalService` (Remove.bg), `MusicGenerationService` (Soundraw) — same pattern.
+Plus narrower ones added for the video pipeline, all in the same pattern —
+`ImageSearchService` (Pexels), `BackgroundRemovalService` (Remove.bg), `MusicGenerationService`
+(Soundraw), `VoiceoverService` (`MockVoiceover` / `AzureSpeechVoiceover`, Azure Speech TTS —
+backs the optional narration step, §11) — plus `WebSearchService` (`MockWebSearch` /
+`AzureWebSearch`, an Azure AI Foundry Bing-grounding agent — backs `core/agent_tools.py`'s
+not-yet-wired research tools and the optional `trend_scout` roundtable persona, §6/§12). Note
+that the non-Azure production vendors (Pexels, Remove.bg, Geoapify, Soundraw) live grouped in
+`core/services/media_assets.py` rather than `azure.py`, mirroring `azure.py`'s "one file per
+provider family" shape.
 
 **`tests/test_contract_parity.py`** is worth reading specifically: it asserts the mock and
 production implementations return *structurally identical* shapes, which is what makes it safe
@@ -614,34 +668,119 @@ Spring Boot 4 / Java 25, package-by-feature (`SignInAPI/`, `LoginAPI/`, `Session
 ## 11. Video render pipeline
 
 Two clearly separated stages, on purpose (rendering is slow; the workflow's terminal node must
-stay fast):
+stay fast). This pipeline had a substantial refactor since the graph itself was documented —
+slides can now be either **fixed templates** or **LLM-authored code**, and the render step can
+target either a local subprocess or Remotion Lambda.
 
 1. **Spec generation** (fast, inside the MAF graph): `media_producer.py`'s `_storyboard()` calls
    `llm.generate_video_storyboard(...)`, returning a `StoryboardSpec` — an ordered list of typed
-   slides (`hook`, `counter_stat`, `collage`, `outro`, `pie_chart`, `line_chart`, `bar_chart`,
-   `node_diagram`, `comparison_table`) validated by a Pydantic discriminated union
-   (`core/video_schema.py`). This is **data only** — no images resolved, no MP4.
+   slides validated by a Pydantic discriminated union (`core/video_schema.py`). The slide-type
+   catalogue is now: `hook`, `counter_stat`, `collage`, `outro`, `pie_chart`, `line_chart`,
+   `bar_chart`, `node_diagram`, `comparison_table`, **`map`** (pin/journey slides, new), and
+   **`generated`** (an open-ended, LLM-authored scene, new — see step 2b). Most template slide
+   types also now accept a per-slide `variant` (e.g. poster/split hooks, orbit/ticker stats,
+   donut/exploded pie), and the storyboard as a whole can carry a shared `backdrop`/`transition`.
+   This step is still **data only** — no images resolved, no code compiled, no MP4.
 2. **Render job** (slow, explicitly triggered by `POST /tasks/{id}/render-video`, *not* part of
-   the workflow graph): `workflow/video/jobs.py`'s `start_render_job` spawns a detached
-   `asyncio.create_task` that:
+   the workflow graph, now also accepting optional `narration_text`/`narration_voice`):
+   `workflow/video/jobs.py`'s `start_render_job` → `_run_job` (`jobs.py:34-70`) runs, in order:
+   - `sweep_stale_generated()` (`codegen.py:168-188`) — reaps orphaned per-job codegen scratch
+     directories left over from earlier crashed/aborted jobs.
    - `resolve_storyboard_assets` (`workflow/video/assets.py`) — turns each slide's
-     `imageQuery`/`imageQueries` into real local image files via Pexels + Remove.bg, producing a
-     `RenderableStoryboard` (fully resolved, camelCase, ready for React props).
+     `imageQuery`/`imageQueries` into real local image files via Pexels + Remove.bg; for a `map`
+     slide, geocodes its pins and fetches a Geoapify static basemap
+     (`_geocode_map_pins`/`_resolve_map_basemap`, `assets.py:146-199`), then runs `map_qa.py`'s
+     `review_and_repair_map_slide` (below). Produces a `RenderableStoryboard` (fully resolved,
+     camelCase, ready for React props).
    - `resolve_storyboard_music` — optionally attaches a generated background track (Soundraw, or
      mock).
-   - `render_storyboard` (`workflow/video/render.py:39-82`) — writes the renderable storyboard to
-     `props.json` and shells out: `npx remotion render src/index.tsx StoryboardVideo <out.mp4>
-     --props=props.json --public-dir=<job_dir>`, run with `cwd` set to `video_renderer/`.
+   - **`resolve_storyboard_voiceover`** (new, `jobs.py:55-58`) — if `narration_text` was
+     supplied, synthesizes narration audio via `VoiceoverService` (Azure Speech TTS, default
+     voice `en-US-JennyNeural`, `VOICEOVER_DEFAULT_VOICE`) and attaches it to the job.
+   - `render_storyboard` (`workflow/video/render.py:87-117`) — writes the renderable storyboard
+     to `props.json`, resolves an entry point (a per-job generated entry point if any slide is
+     `generated`, otherwise the normal `src/index.tsx`), then renders via whichever backend
+     `VIDEO_RENDER_BACKEND` selects (below).
+   - `cleanup_job_generated` runs in a `finally` block regardless of success/failure.
    - Job status/results are tracked in Postgres (`video_jobs` table) and polled via
      `GET /video-jobs/{job_id}` / downloaded via `GET /video-jobs/{job_id}/download`.
 
-`video_renderer/src/types.ts` is a **hand-maintained, line-for-line mirror** of the `Render*`
-Pydantic models in `core/video_schema.py` — there is no shared schema/codegen step, only
-explicit "KEEP IN SYNC WITH" comments on both sides and a **Python-only** test
+### 2b. `generated` slides — an LLM code-authoring loop (new)
+
+`workflow/video/codegen.py:406-496`'s `generate_scene(...)` is a genuinely new capability: for a
+`generated` slide, an LLM writes an actual Remotion React component rather than filling in a
+fixed template's props. The loop, per slide:
+
+1. `generate_scene_component` asks the LLM for TSX, guided by the new
+   `skills/remotion_scene_patterns.md` skill (frame-deterministic patterns: SVG draw-on,
+   odometer counters, staggered grids, radial bursts — plus hard rules like "no conditional
+   hooks," "monotonic `interpolate` ranges").
+2. The generated file is type-checked (`tsc --noEmit` against a per-job scratch tsconfig,
+   `_write_job_tsconfig`, `codegen.py:143-157`).
+3. A single-frame preview is rendered (`remotion still`, `codegen.py:292-332`) and passed through
+   a **vision QA** pass (`review_scene_preview`) that looks at the actual rendered pixels.
+4. On type-check failure or QA rejection, the LLM is asked to repair the code and the loop
+   retries, bounded per-slide by `DEFAULT_MAX_ATTEMPTS = 3` and, across the *whole* storyboard,
+   by a shared `CodegenBudget` (`CODEGEN_MAX_TOTAL_ATTEMPTS`, `codegen.py:78-99`) so one stubborn
+   slide can't blow the render job's time budget alone.
+5. If attempts are exhausted, `fallback.py`'s `fallback_slide_for` asks the LLM once more to
+   re-express the same creative brief as the nearest **fixed template** slide type (map included)
+   without any bespoke assets, or — as the absolute floor — degrades to a deterministic hook
+   card. A `generated` slide is therefore never allowed to hard-fail a render job.
+
+### Map slides and their QA loop (new)
+
+`video_renderer/src/slides/MapSlide.tsx` renders pin markers (staggered spring drop-in + label
+cards) in two modes: a **basemap mode** using a Geoapify raster tile fetched server-side
+(pins reprojected with the same slippy-map math on both sides — `assets.py`'s `_mercator_y` and
+`video_renderer/src/map/geo.ts`'s `mercatorY`, deliberately kept in sync per comments on both),
+and a **vector fallback** using `world-atlas` TopoJSON country outlines
+(`src/map/geo.ts` + `src/map/regionIndex.ts`'s alpha-2→numeric-ID lookup) projected with d3. It
+supports a `variant: "pins" | "journey"` (an animated route line between pins).
+
+Because a bad geocode or an ugly basemap composite (clipped/overlapping label cards, poor
+contrast) would otherwise only be caught by a human watching the final video,
+`workflow/video/map_qa.py`'s `review_and_repair_map_slide` renders a real preview still and runs
+it through the same vision-QA mechanism as `codegen.py`, retrying with a wider zoom-out up to
+`MAP_QA_MAX_ATTEMPTS` (default 2) before accepting the slide as-is. Gated by `MAP_QA_ENABLED`
+(default `true`); skipped automatically when there's no basemap, the render backend is `lambda`,
+or the renderer directory isn't reachable (`map_qa.py:75-83`).
+
+### Local subprocess vs. Remotion Lambda (new)
+
+`render.py` now branches on `VIDEO_RENDER_BACKEND` (default `"local"`):
+
+- `"local"` — unchanged from before: shells out `npx remotion render src/index.tsx
+  StoryboardVideo <out.mp4> --props=props.json --public-dir=<job_dir>`, `cwd` set to
+  `video_renderer/`.
+- `"lambda"` — `workflow/video/lambda_render.py`'s `render_on_lambda` deploys a per-job Remotion
+  site (or reuses a pre-deployed `REMOTION_LAMBDA_SERVE_URL` when no `generated` slide requires a
+  fresh bundle) via the new Node scripts `video_renderer/scripts/lambda-deploy-site.mjs` /
+  `lambda-render.mjs`, and returns an S3 URL instead of a local file path. Configured via
+  `REMOTION_LAMBDA_FUNCTION_NAME`, `REMOTION_LAMBDA_SERVE_URL`, `REMOTION_LAMBDA_SITE_NAME_PREFIX`,
+  `REMOTION_LAMBDA_OUTPUT_BUCKET`, `AWS_REGION`. **This path is explicitly flagged in its own
+  source comments as unverified against a live AWS account** (`lambda_render.py:17-23`) — treat
+  it as untested if you're the one who ends up flipping it on.
+
+### Shared design system (new)
+
+`video_renderer/src/design/` (`tokens.ts`, `palettes.ts`, `fonts.ts`, `animations.ts`,
+`backdrops.tsx`, `components.tsx`, `shapes.ts`) plus `src/slides/theme.ts` is a new shared
+styling layer — slide components (e.g. `BarChartSlide.tsx`, `HookSlide.tsx`) now import shared
+tokens/animations/palettes/theme helpers from here instead of styling ad hoc per slide. There's
+now also a small Vitest suite (`video_renderer/vitest.config.ts`) covering the pure
+design-system functions (`src/design/__tests__/*.test.ts`) — but it does **not** cover the slide
+components, `Composition.tsx`, or the registry, and there's no CI workflow in the repo to run it
+automatically; it closes part of the schema-mirror gap below only if someone runs it by hand.
+
+`video_renderer/src/types.ts` is still a **hand-maintained, line-for-line mirror** of the
+`Render*` Pydantic models in `core/video_schema.py` — there is no shared schema/codegen step,
+only explicit "KEEP IN SYNC WITH" comments on both sides and a **Python-only** test
 (`tests/test_video_schema.py::test_slide_type_registry_matches_implemented_models`). Adding a
-new slide type means touching three places by hand (the Python `Spec`+`Render` model pair, the
-TS interface, and `video_renderer/src/registry.ts`'s `SLIDE_REGISTRY`) with nothing in CI to
-catch a missed one on the TypeScript side.
+new slide type still means touching three places by hand (the Python `Spec`+`Render` model pair,
+the TS interface, and `video_renderer/src/registry.ts`'s `SLIDE_REGISTRY`), and — as above — the
+new Vitest suite doesn't check this, so nothing on the TypeScript side yet catches a missed slide
+type at build/test time.
 
 The Docker image for `LLM_service` bundles `video_renderer/` as a sibling directory inside the
 same container (build context is the repo root, not `LLM_service/`) and installs Node 20 +
@@ -658,7 +797,9 @@ multi-persona debate** (one "table" per platform) *before* the main graph, using
 different pattern from the plain `WorkflowBuilder` graph in §6:
 
 - **Participants** are chat-client-backed personas (`workflow/roundtable/personas.py`) plus,
-  when a `task_id` is given, a **user seat** (`user_seat.py`) representing the human.
+  when a `task_id` is given, a **user seat** (`user_seat.py`) representing the human. An
+  optional fifth persona, `trend_scout`, can be added to feed the same trend context described
+  in §6 directly into the table's discussion.
 - A **manager** (mock: deterministic round-robin, `build_mock_manager`; production: an
   LLM-backed `StandardMagenticManager` subclass, `build_interactive_manager`) decides who speaks
   each round and when the table has converged, rather than following fixed edges.
@@ -667,6 +808,16 @@ different pattern from the plain `WorkflowBuilder` graph in §6:
   (`roundtable/queue.py`, durable — survives a process restart) while an **in-memory
   live-wakeup gate** (`roundtable/gate.py`) lets the waiting table coroutine `await` the
   message's arrival without busy-looping or blocking the event loop.
+- **New: finer-grained round-by-round controls.** `workflow/roundtable/control.py` (a sibling
+  to `gate.py`) adds four user actions — `NEXT`, `SPEAK`, `ENOUGH`, `AUTO` — submitted via a new
+  `POST /tasks/{id}/round-control` route (`api.py`'s `round_control`, backed by
+  `WorkflowService.round_control`). A table can run in `roundtable_mode: "manual"` (pause at
+  each round boundary and `await_decision` on one of these actions, with a
+  `ROUNDTABLE_CONTROL_TIMEOUT`-second timeout that degrades to `AUTO`) or `"auto"`. `ENOUGH` and
+  `AUTO` are **sticky**: `ENOUGH` sets a `finish` flag that both the mock and the LLM-backed
+  manager check (`finish_requested`, `manager.py`) to converge the table immediately — for the
+  production manager this **skips the LLM ledger call entirely** rather than asking the LLM to
+  agree to stop. `SPEAK` with inline text is equivalent to raise-hand-then-say in one call.
 - The converged per-platform discussion becomes a `CreativeStrategy` — the exact same message
   type the strategist would have produced — which is why the main graph can be built with
   `roundtable_entry=True` and simply **start at `creator`**, skipping `dispatcher`/`strategist`
@@ -717,6 +868,11 @@ don't exist.
    schema (still shows "Media Producer → HTML card + BrandVideoProps JSON spec" in its Backing
    Services diagram) and doesn't show the video-render subprocess step at all. The diagrams in
    §4/§6/§11 of this document reflect the current code.
+5. **`system.md` and the older parts of this doc predate trend scout, the `generated`/`map`
+   slide types, Remotion Lambda, voiceover, and the roundtable `next/speak/enough/auto` controls**
+   — all added after this document's first pass (§6, §11, §12). None of the pre-existing
+   `docs/*.md` mention any of these either; this document is currently the only place they're
+   written down.
 
 ---
 
@@ -747,10 +903,22 @@ Ranked roughly by how much they'll bite a new contributor, not by severity.
   of thing that should be a git diff, not a permanent fixture — it roughly doubles the length of
   two of the most important methods in the file and makes it easy to accidentally read/edit the
   dead branch instead of the live one. Worth a cleanup pass.
+- **`core/agent_tools.py` is committed scaffolding, not live behavior.** It defines a full
+  five-tool MAF/OpenAI tool-calling contract (web search, URL fetch, reviews, images, stock
+  images) with safety-screening built in, but its own module docstring says outright that
+  neither the strategist nor the creator calls it yet. Worth flagging to whoever picks up
+  "make the strategist do live research" next, since the service layer/contract work is already
+  done — only the wiring into an executor is missing.
+- **`workflow/video/lambda_render.py` (Remotion Lambda rendering backend) is explicitly
+  unverified against a live AWS account** per its own source comments — treat `VIDEO_RENDER_BACKEND=lambda`
+  as untested code, not a supported alternative to the local subprocess path, until someone
+  exercises it against real AWS credentials.
 - Otherwise this service is the **best-organized part of the codebase**: consistent
   mock/production service contracts (`core/services/base.py`), a clean factory (no executor ever
   imports a concrete backend directly), and unusually thorough module-level docstrings that
-  explain *why*, not just *what* — the `workflow/*` package is genuinely pleasant to read.
+  explain *why*, not just *what* — the `workflow/*` package is genuinely pleasant to read. The
+  new `codegen.py`/`map_qa.py` vision-QA-and-retry loops (§11) follow the same discipline: bounded
+  retries, an explicit budget, and a guaranteed non-crashing fallback path.
 
 ### Frontend
 

@@ -274,6 +274,7 @@ class LLMService(ABC):
         attempt: int = 1,
         prior_error: Optional[str] = None,
         prior_source: Optional[str] = None,
+        design_plan: Optional[str] = None,
     ) -> str:
         """Author ONE bespoke Remotion scene's TSX source for a `generated` slide
         (core.video_schema.GeneratedSlideSpec) — real component code, not picked
@@ -309,6 +310,16 @@ class LLMService(ABC):
         ...
 
     @abstractmethod
+    async def plan_scene_design(self, *, description: str, data: dict) -> str:
+        """Stage 1 of two-stage `generated`-slide codegen (video-agent Phase 5): a
+        short visual concept (5-8 plain-text bullets — layout, dominant element,
+        motion beats, backdrop/palette) produced BEFORE any code, then passed to
+        every generate_scene_component call for that slide as `design_plan` so the
+        concept stays fixed across repairs. Returns "" on a soft failure (the loop
+        then proceeds without a plan); must not raise into the codegen loop."""
+        ...
+
+    @abstractmethod
     async def review_scene_preview(
         self, *, description: str, image_bytes: bytes, attempt: int = 1,
     ) -> dict:
@@ -322,14 +333,29 @@ class LLMService(ABC):
         an empty/blank frame, content that doesn't match `description`). `attempt`
         is contextual only (which retry this is), mirroring `generate_scene_component`.
 
-        Returns {"approved": bool, "feedback": str}. `feedback` is empty when
-        approved; when not approved, it's specific enough that codegen.py can feed
-        it back as the next attempt's `prior_error` (e.g. "the headline text
-        overflows the frame and is cut off on the right edge", not "looks bad").
-        Called only after typecheck + preview-render both already passed — this is
-        an ADDITIONAL bar, not a replacement for either. Raises only on a hard
-        backend failure; a genuinely bad-looking frame is a normal (not approved)
-        result, never an exception."""
+        Returns {"approved": bool, "feedback": str, "fixes": list[str]}. `feedback`
+        is empty when approved; `fixes` (Phase 5) is 1-3 concrete, imperative repair
+        instructions when NOT approved (empty when approved), which codegen.py folds
+        into the next attempt's `prior_error` (e.g. "move the caption above y=1700",
+        not "looks bad"). Called only after typecheck + preview-render both already
+        passed — an ADDITIONAL bar, not a replacement. Raises only on a hard backend
+        failure; a genuinely bad-looking frame is a normal (not approved) result."""
+        ...
+
+    @abstractmethod
+    async def convert_generated_to_template(
+        self, *, description: str, data: dict,
+    ) -> dict:
+        """Re-express an exhausted `generated` slide's creative brief + structured
+        `data` as the single best-fitting FIXED template slide (workflow/video/
+        fallback.py) — the smarter degradation path when codegen.py's self-repair
+        loop gives up. Returns the raw slide dict (e.g. {"type": "bar_chart",
+        "bars": [...]}); the CALLER validates it against the template-only
+        discriminated union (SlideSpec minus `generated`), so an impl should pick
+        a fixed type and carry every number/label from `data` into that type's
+        fields — never answer with `type: "generated"`, and never drop content
+        that a template field could hold. Raises only on a hard backend failure;
+        the caller degrades any invalid answer to a deterministic hook card."""
         ...
 
     @abstractmethod
