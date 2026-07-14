@@ -44,32 +44,40 @@ public class AgentService {
 	            .retrieve()
 	            .body(responseType);
 	}
+	
+	private <T> T get(String path, Class<T> responseType) {
+        return restClient.get()
+                .uri(llmServiceBaseUrl + path)
+                .retrieve()
+                .body(responseType);
+    }
 
 	
-	public Map<String, Object> getAgentTextResponse(Map<String, Object> promptJSON) { 	
-    	Map<String, Object> response = restClient.post()
-                .uri(llmServiceBaseUrl +"/generate-text")
-                .contentType(MediaType.APPLICATION_JSON)
-                .body(promptJSON)
-                .retrieve()
-                .body(Map.class);
-    	
-    	System.out.println(response);
-    	
-    	return response;
+	public GenerateTextResponse generateText(GenerateTextRequest request) {
+        return post("/generate-text", request, GenerateTextResponse.class);
     }
-	
-	public Map<String, Object> getAgentVideoResponse(Map<String, Object> promptJSON) { 	
-    	Map<String, Object> response = restClient.post()
-                .uri(llmServiceBaseUrl +"/generate-video")
-                .contentType(MediaType.APPLICATION_JSON)
-                .body(promptJSON)
+
+    public GenerateHtmlResponse generateHtmlCard(GenerateHtmlRequest request) {
+        return post("/generate", request, GenerateHtmlResponse.class);
+    }
+
+    public RenderVideoResponse renderVideo(String taskId, String platform) {
+        return post(
+            "/tasks/" + taskId + "/render-video",
+            new RenderVideoRequest(platform),
+            RenderVideoResponse.class
+        );
+    }
+
+    public VideoJobResponse getVideoJob(String jobId) {
+        return get("/video-jobs/" + jobId, VideoJobResponse.class);
+    }
+
+    public byte[] downloadVideo(String jobId) {
+        return restClient.get()
+                .uri(llmServiceBaseUrl + "/video-jobs/" + jobId + "/download")
                 .retrieve()
-                .body(Map.class);
-    	
-    	System.out.println(response);
-    	
-    	return response;
+                .body(byte[].class);
     }
 	
 	public TaskSnapshot getTaskSnapshot(String taskId) {

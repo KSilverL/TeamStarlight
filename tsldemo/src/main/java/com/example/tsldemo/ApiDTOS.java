@@ -233,4 +233,35 @@ public class ApiDTOS {
 	        Boolean accepted
 	) {}
 	
+	public record HistoryItem(String role, String content) {}
+
+	public record GenerateTextRequest(String prompt, String platform, List<HistoryItem> history) {
+	    public GenerateTextRequest(String prompt, String platform) {
+	        this(prompt, platform, List.of());
+	    }
+	}
+	public record GenerateTextResponse(String text, String platform) {}
+
+	public record GenerateHtmlRequest(String prompt, List<HistoryItem> history) {
+	    public GenerateHtmlRequest(String prompt) {
+	        this(prompt, List.of());
+	    }
+	}
+	public record GenerateHtmlResponse(String html) {}
+
+	public record RenderVideoRequest(String platform) {}
+	public record RenderVideoResponse(String jobId, String status) {}
+
+	public record VideoJobResponse(
+	    String id,
+	    String taskId,
+	    String platform,
+	    String status,       
+	    Object storyboard,
+	    String outputPath,
+	    String error,
+	    String createdAt,
+	    String updatedAt
+	) {}
+	
 }

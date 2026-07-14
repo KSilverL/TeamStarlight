@@ -17,7 +17,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.client.RestClient;
 
 import com.example.tsldemo.ApiDTOS;
-import com.example.tsldemo.ApiDTOS.CreativeBrief;
+import com.example.tsldemo.ApiDTOS.*;
 import com.example.tsldemo.ApiDTOS.IntakeRequest;
 import com.example.tsldemo.ApiDTOS.IntakeResponse;
 import com.example.tsldemo.ApiDTOS.IntakeTurnRequest;
@@ -125,5 +125,5 @@ public class SessionService {
 		repo.save(s);
 		
 	}
-	
+
 }
