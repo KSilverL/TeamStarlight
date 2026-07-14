@@ -21,7 +21,6 @@ import com.example.tsldemo.ApiDTOS.CreativeBrief;
 import com.example.tsldemo.ApiDTOS.IntakeRequest;
 import com.example.tsldemo.ApiDTOS.IntakeResponse;
 import com.example.tsldemo.ApiDTOS.IntakeTurnRequest;
-import com.example.tsldemo.ApiDTOS.IntakeTurnResponse;
 import com.example.tsldemo.Business;
 import com.example.tsldemo.Message;
 import com.example.tsldemo.Session;

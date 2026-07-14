@@ -98,11 +98,11 @@ public class AgentController {
         return service.agentRoundControl(taskId, request);
     }
 	
-    @GetMapping(value="/tasks/{taskId}/events",produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter streamEvents(@PathVariable String taskId) {
-    	return service.streamEvents(taskId);
-    	    
-    }
+//    @GetMapping(value="/tasks/{taskId}/events",produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+//    public SseEmitter streamEvents(@PathVariable String taskId) {
+//    	return service.consumeEvents(taskId);
+//    	    
+//    }
 	
 }
 

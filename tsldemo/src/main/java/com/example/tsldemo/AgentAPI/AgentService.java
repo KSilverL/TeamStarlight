@@ -18,10 +18,14 @@ import java.net.http.HttpRequest;
 
 import com.example.tsldemo.ApiDTOS.*;
 
+import io.netty.util.internal.shaded.org.jctools.queues.MessagePassingQueue.Consumer;
+import tools.jackson.databind.ObjectMapper;
+
 
 @Service
 public class AgentService {
 	private final RestClient restClient;
+	private final ObjectMapper mapper = new ObjectMapper();
 
 	private final HttpClient http = HttpClient.newHttpClient();
 	
@@ -124,64 +128,37 @@ public class AgentService {
 	    );
 	}
 	
-	public SseEmitter streamEvents(String taskId) {
-	    SseEmitter emitter = new SseEmitter(Long.MAX_VALUE);
-
-	    new Thread(() -> {
-
+	
+	public Thread consumeEvents(String taskId, Consumer<Map<String, Object>> onEvent) {
+	    Thread t = new Thread(() -> {
 	        try {
-
 	            HttpRequest request = HttpRequest.newBuilder()
-	                    .uri(URI.create(
-	                        llmServiceBaseUrl 
-	                        + "/tasks/" 
-	                        + taskId 
-	                        + "/events"
-	                    ))
+	                    .uri(URI.create(llmServiceBaseUrl + "/tasks/" + taskId + "/events"))
 	                    .GET()
 	                    .build();
 
-
 	            HttpResponse<Stream<String>> response =
-	                    http.send(
-	                        request,
-	                        HttpResponse.BodyHandlers.ofLines()
-	                    );
-
+	                    http.send(request, HttpResponse.BodyHandlers.ofLines());
 
 	            response.body()
 	                    .filter(line -> line.startsWith("data: "))
 	                    .forEach(line -> {
-
 	                        try {
-
-	                            String json =
-	                                line.substring(6);
-
-	                            emitter.send(
-	                                SseEmitter.event()
-	                                    .data(json)
-	                            );
-
-	                        } catch(Exception e) {
-	                            emitter.completeWithError(e);
+	                            Map<String, Object> ev = mapper.readValue(line.substring(6), Map.class);
+	                            onEvent.accept(ev);
+	                        } catch (Exception e) {
+	                            e.printStackTrace();
 	                        }
-
 	                    });
-
-
-	            emitter.complete();
-
-
-	        } catch(Exception e) {
-	            emitter.completeWithError(e);
+	        } catch (Exception e) {
+	            e.printStackTrace(); // now only fires for genuine connection errors
 	        }
-
-
-	    }).start();
-
-
-	    return emitter;
+	    });
+	    
+	    t.setDaemon(true);
+	    t.start();
+	    
+	    return t;
 	}
 	
 	
