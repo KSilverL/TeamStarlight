@@ -1,0 +1,26 @@
+{
+  "brandName": "STARLIGHT",
+  "theme": "dark",
+  "primaryColor": "#0d1117",
+  "secondaryColor": "#2d4ed8",
+  "accentColor": "#f5c84c",
+  "backgroundStyle": "aurora",
+  "paletteName": "brand",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "slides": [
+    { "type": "hook", "kicker": "NOW LIVE", "headline": "The future is bright", "subtext": "and it starts today", "variant": "poster", "background": "gradient", "durationFrames": 90 },
+    { "type": "counter_stat", "sectionLabel": "By the numbers", "variant": "orbit", "emphasisIndex": 0, "stats": [
+      { "value": "1200", "label": "Customers", "icon": "★" },
+      { "value": "98%", "label": "Retention", "icon": "◆" },
+      { "value": "24", "label": "Countries", "icon": "▲" }
+    ], "durationFrames": 120 },
+    { "type": "counter_stat", "sectionLabel": "Growth", "variant": "ticker", "stats": [
+      { "value": "3200", "label": "Signups", "icon": "▲" },
+      { "value": "5100", "label": "Active users", "icon": "●" },
+      { "value": "8800", "label": "Total reach", "icon": "★" }
+    ], "durationFrames": 120 },
+    { "type": "outro", "brandName": "STARLIGHT", "tagline": "Light the way", "ctaLabel": "Get Started", "contact": "@starlight · starlight.io", "variant": "sweep", "durationFrames": 90 }
+  ]
+}

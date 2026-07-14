@@ -34,8 +34,11 @@ __all__ = [
     "RealtimeEvent",
     "RealtimeVoiceSession",
     "RealtimeVoiceService",
+    "WebSearchService",
     "ImageSearchService",
     "BackgroundRemovalService",
+    "MusicGenerationService",
+    "VoiceoverService",
     "empty_profile",
 ]
 
@@ -279,6 +282,103 @@ class LLMService(ABC):
         ...
 
     @abstractmethod
+    async def generate_scene_component(
+        self,
+        *,
+        description: str,
+        data: dict,
+        width: int,
+        height: int,
+        fps: int,
+        duration_frames: int,
+        attempt: int = 1,
+        prior_error: Optional[str] = None,
+        prior_source: Optional[str] = None,
+        design_plan: Optional[str] = None,
+    ) -> str:
+        """Author ONE bespoke Remotion scene's TSX source for a `generated` slide
+        (core.video_schema.GeneratedSlideSpec) — real component code, not picked
+        from the fixed slide registry. `description` is the creative brief;
+        `data` is the structured content the component should render (its shape is
+        whatever `description` implies, not fixed). `width`/`height`/`fps`/
+        `duration_frames` are concrete (already resolved from the platform) and
+        given for CONTEXT — the component itself reads them at runtime via
+        Remotion's `useVideoConfig()`/`useCurrentFrame()`, it does not receive them
+        as props (see below), so it renders correctly at whatever size/duration the
+        actual render turns out to use.
+
+        MUST return a single .tsx module whose default export is a React.FC with
+        EXACTLY the same prop shape every fixed slide component already uses —
+        `{ slide, accentColor, secondaryColor, primaryColor }` (see e.g.
+        video_renderer/src/slides/HookSlide.tsx) — so it slots into the existing
+        Composition.tsx harness with no special-casing. `slide.data` is this
+        method's `data` dict; `slide.durationFrames` is `duration_frames`. Use
+        `useVideoConfig()` for width/height/fps and `useCurrentFrame()` for the
+        current frame — never assume they arrive as props. Use only `remotion`
+        (AbsoluteFill, interpolate, spring, useCurrentFrame, useVideoConfig, Img,
+        staticFile, ...) and `react` imports; nothing else is guaranteed to be
+        installed in the render project.
+
+        This is called in a bounded self-repair loop by workflow/video/codegen.py:
+        on `attempt` 1, `prior_error`/`prior_source` are None (a fresh attempt). On
+        a retry, `prior_error` is the EXACT compiler or preview-render failure from
+        the previous attempt and `prior_source` is the code that produced it — an
+        impl MUST fix that specific failure directly, not regenerate blindly from
+        scratch. Raises only on a hard backend failure (network, no credentials);
+        a merely-invalid-code attempt should still return SOME source (codegen.py's
+        typecheck/preview-render step is what catches that, not this method)."""
+        ...
+
+    @abstractmethod
+    async def plan_scene_design(self, *, description: str, data: dict) -> str:
+        """Stage 1 of two-stage `generated`-slide codegen (video-agent Phase 5): a
+        short visual concept (5-8 plain-text bullets — layout, dominant element,
+        motion beats, backdrop/palette) produced BEFORE any code, then passed to
+        every generate_scene_component call for that slide as `design_plan` so the
+        concept stays fixed across repairs. Returns "" on a soft failure (the loop
+        then proceeds without a plan); must not raise into the codegen loop."""
+        ...
+
+    @abstractmethod
+    async def review_scene_preview(
+        self, *, description: str, image_bytes: bytes, attempt: int = 1,
+    ) -> dict:
+        """Multimodal visual QA for a `generated` slide (Phase 3 of the video-agent
+        plan): given the ORIGINAL creative brief (`description`) and a still frame
+        (PNG bytes) rendered from the just-typechecked, just-rendered candidate
+        component, judge whether it actually looks right — not just "did it compile
+        and render without throwing" (workflow/video/codegen.py's typecheck +
+        preview-render already establish that), but "is the result legible,
+        on-brief, and not visually broken" (overlapping text, illegible contrast,
+        an empty/blank frame, content that doesn't match `description`). `attempt`
+        is contextual only (which retry this is), mirroring `generate_scene_component`.
+
+        Returns {"approved": bool, "feedback": str, "fixes": list[str]}. `feedback`
+        is empty when approved; `fixes` (Phase 5) is 1-3 concrete, imperative repair
+        instructions when NOT approved (empty when approved), which codegen.py folds
+        into the next attempt's `prior_error` (e.g. "move the caption above y=1700",
+        not "looks bad"). Called only after typecheck + preview-render both already
+        passed — an ADDITIONAL bar, not a replacement. Raises only on a hard backend
+        failure; a genuinely bad-looking frame is a normal (not approved) result."""
+        ...
+
+    @abstractmethod
+    async def convert_generated_to_template(
+        self, *, description: str, data: dict,
+    ) -> dict:
+        """Re-express an exhausted `generated` slide's creative brief + structured
+        `data` as the single best-fitting FIXED template slide (workflow/video/
+        fallback.py) — the smarter degradation path when codegen.py's self-repair
+        loop gives up. Returns the raw slide dict (e.g. {"type": "bar_chart",
+        "bars": [...]}); the CALLER validates it against the template-only
+        discriminated union (SlideSpec minus `generated`), so an impl should pick
+        a fixed type and carry every number/label from `data` into that type's
+        fields — never answer with `type: "generated"`, and never drop content
+        that a template field could hold. Raises only on a hard backend failure;
+        the caller degrades any invalid answer to a deterministic hook card."""
+        ...
+
+    @abstractmethod
     async def fill_brief(
         self,
         *,
@@ -402,88 +502,6 @@ class VoiceService(ABC):
         ...
 
 
-# ── Realtime voice (native speech-to-speech bridge, GPT-Realtime) ─────────────
-# A second, DUPLEX voice contract alongside VoiceService above. VoiceService's
-# transcribe_turn is a cascaded request/response shape (audio in -> text out, then the
-# text pipeline runs); this one is a live, persistent, event-streamed session where the
-# model consumes and produces audio directly and decides tool calls itself — there is no
-# "transcribe first" step on the path that drives the conversation. Transcripts still
-# arrive as a side channel (captions/logging/per-user learning), never as the mechanism.
-
-@dataclass(frozen=True)
-class RealtimeEvent:
-    """One event out of a live realtime session. `type` discriminates which of the
-    other (mostly-None) fields are populated:
-      - "audio_delta"               -> audio_b64 (assistant speech chunk)
-      - "output_transcript_delta"   -> text (assistant's spoken words, as text)
-      - "input_transcript"          -> text (the user's words, as text)
-      - "tool_call"                 -> call_id, name, arguments
-      - "speech_started"            -> (barge-in: the user started talking)
-      - "response_done"             -> (one assistant turn finished)
-      - "error"                     -> message
-    """
-    type: str
-    audio_b64: Optional[str] = None
-    text: Optional[str] = None
-    call_id: Optional[str] = None
-    name: Optional[str] = None
-    arguments: Optional[dict] = None
-    message: Optional[str] = None
-
-
-class RealtimeVoiceSession(ABC):
-    """One live duplex speech-to-speech session bound to a single intake conversation.
-    Callers push audio in and read `events()` for everything the model produces
-    (speech, transcripts, tool calls); a tool call MUST be answered via
-    `send_tool_result` so the model can continue (its narration of a tool's result,
-    e.g. a suggested topic, only happens once the result is fed back)."""
-
-    @abstractmethod
-    async def send_audio(self, *, audio_b64: str) -> None:
-        """Append one chunk of base64 PCM16 user audio to the session's input buffer."""
-        ...
-
-    @abstractmethod
-    async def send_tool_result(self, *, call_id: str, output: dict) -> None:
-        """Answer a "tool_call" event so the model resumes (and, for a tool whose
-        result the user should hear, narrates it)."""
-        ...
-
-    @abstractmethod
-    async def nudge(self, *, text: str) -> None:
-        """Inject an out-of-band system instruction (not spoken by the user) and
-        prompt a response — used once, e.g., to tell the model the brief is now
-        complete (the MAX_INTAKE_FOLLOWUPS cap was hit) so it wraps up the
-        conversation out loud instead of the brief completing silently behind it."""
-        ...
-
-    @abstractmethod
-    def events(self) -> AsyncIterator[RealtimeEvent]:
-        """The session's event stream, in order, until `close()`."""
-        ...
-
-    @abstractmethod
-    async def close(self) -> None:
-        """Tear down the session."""
-        ...
-
-
-class RealtimeVoiceService(ABC):
-    """Opens a RealtimeVoiceSession. Cheap/cached like the other service getters;
-    the actual connection is made fresh per intake conversation by `open_session`
-    (one session cannot be shared across conversations)."""
-
-    @abstractmethod
-    async def open_session(
-        self, *, session_id: str, instructions: str, tools: List[dict],
-    ) -> RealtimeVoiceSession:
-        """Open one live session. `instructions` is the system prompt (the shared
-        INTAKE_SYSTEM_PROMPT, optionally with a prior-context block folded in);
-        `tools` is BRIEF_TOOL_DEFS (Chat-Completions shape — the impl reshapes it to
-        whatever the wire format needs)."""
-        ...
-
-
 # ── Image search (Pexels) ──────────────────────────────────────────────────────
 
 class ImageSearchService(ABC):
@@ -520,4 +538,22 @@ class MusicGenerationService(ABC):
         """Return audio bytes (mp3) for a track matching the requested duration.
         Raises on a hard failure (rate limit, bad params, network) — callers fall
         back to a silent render."""
+        ...
+
+
+# ── Voiceover (Azure Speech text-to-speech) ────────────────────────────────────
+
+class VoiceoverService(ABC):
+    """Narration text-to-speech for an optional voiceover track (Phase 3 of the
+    video-agent plan) — distinct from VoiceService above, which bridges SPOKEN
+    input during intake (speech-to-text); this is spoken OUTPUT for a rendered
+    video. `workflow/video/voiceover.py` sizes/mixes the result; callers there
+    treat a hard failure as "no voiceover" (mirrors MusicGenerationService), never
+    a reason to abort the render."""
+
+    @abstractmethod
+    async def synthesize(self, *, text: str, voice: str) -> bytes:
+        """Return audio bytes (mp3) speaking `text` in `voice` (a provider-specific
+        voice id, e.g. an Azure Neural voice name). Raises on a hard failure (rate
+        limit, bad voice id, network) — callers fall back to no narration."""
         ...
