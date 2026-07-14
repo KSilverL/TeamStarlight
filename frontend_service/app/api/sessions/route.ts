@@ -17,7 +17,6 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   const body = await request.json();
-  console.log("[kaili][route.ts][POST]: body: ", JSON.stringify(body));
   const authHeader = request.headers.get("Authorization");
 
   try {
@@ -27,8 +26,7 @@ export async function POST(request: NextRequest) {
         "Content-Type": "application/json",
         ...(authHeader ? { Authorization: authHeader } : {}),
       },
-      // body: JSON.stringify({ mode: "text", opening_input: body.opening_input ?? null }),
-      body: JSON.stringify({ mode: "voice", opening_input: body.opening_input ?? null }),
+      body: JSON.stringify({ mode: "text", opening_input: body.opening_input ?? null }),
     });
 
     const data = await upstream.json();

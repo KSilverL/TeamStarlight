@@ -28,10 +28,6 @@ from .realtime_voice import RealtimeVoiceIntake
 from .text_intake import TextIntake
 from .voice_intake import MockVoiceIntake, VoiceIntake
 
-# kai Li beg
-import logging
-# Kai Li end
-
 
 __all__ = [
     "CreativeBrief",
@@ -49,14 +45,8 @@ __all__ = [
 def build_intake(mode: str) -> IntakeSession:
     """Pick the intake transport for the requested mode. Voice resolves to the
     deterministic mock unless USE_MOCK_VOICE=false (then the Voice Live bridge)."""
-    logger = logging.getLogger("uvicorn.error")
-    logger.info(f"[kaili][build_intake] mode: {mode}")
     if mode == "text":
         return TextIntake()
     if mode == "voice":
-        logger = logging.getLogger("uvicorn.error")
-        logger.info("[kaili]: calling [build_intake][__init__.py][LLM_service/intake]")
-        logger.info(f"[kaili]: mock_voice():  {get_settings().mock_voice()}")
-        # print("[kaili]: calling [build_intake][__init__.py][LLM_service/intake]")
         return MockVoiceIntake() if get_settings().mock_voice() else VoiceIntake(get_settings())
     raise ValueError(f"unknown intake mode: {mode!r} (expected 'text' or 'voice')")
