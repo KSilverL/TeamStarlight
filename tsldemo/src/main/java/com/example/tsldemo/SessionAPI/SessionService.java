@@ -73,6 +73,13 @@ public class SessionService {
         return intakeResp;
     }
     
+    public Session deleteSession(String id) {
+    	Session session = repo.findById(id).get();
+    	repo.deleteById(id);
+    	
+    	return session;
+    }
+    
     
 	public void addSession(Session s) {
 		repo.save(s);
