@@ -501,6 +501,35 @@ class VoiceService(ABC):
         """Turn a user audio turn into text. Contract keys: session_id, transcript."""
         ...
 
+# ── Web research (Bing grounding via Azure AI Foundry agents) ─────────────────
+
+class WebSearchService(ABC):
+    """Live web research: general search/grounding, single-page text fetch, and
+    review-quote mining. Callers must treat an empty result as a soft-fail (skip
+    the enrichment), never raise on a plain no-match — only a hard backend failure
+    (missing config, network) should raise."""
+
+    @abstractmethod
+    async def search_web(self, *, query: str, count: int = 5) -> List[dict]:
+        """Return up to `count` grounded results for `query`, each a dict with at
+        least {title, url, snippet}. Empty list on no match."""
+        ...
+
+    @abstractmethod
+    async def fetch_url_text(self, *, url: str) -> str:
+        """Return the cleaned main-body text of `url` (best-effort extraction, no
+        markup) — e.g. to read a search_web result in full. Empty string on a
+        fetch/parse failure; callers treat this as a soft-fail, never an aborted run."""
+        ...
+
+    @abstractmethod
+    async def search_reviews(self, *, subject: str, count: int = 5) -> List[dict]:
+        """Return up to `count` real, attributable customer review quotes for
+        `subject` (a brand or product name), each a dict with at least
+        {quote, source}; `rating`/`url` are included when the source exposes them.
+        Empty list on no match — never invent a quote."""
+        ...
+
 
 # ── Image search (Pexels) ──────────────────────────────────────────────────────
 

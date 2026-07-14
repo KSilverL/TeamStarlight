@@ -1027,10 +1027,6 @@ class AzureRealtimeVoice(RealtimeVoiceService):
         api_key = s.azure_voicelive_api_key or s.azure_openai_api_key
         headers = {"api-key": api_key} if api_key else {}
 
-        # kaili log begin
-        wss_url = _voice_live_ws_url(s)
-        
-        # kaili log end
         ws = await websockets.connect(_voice_live_ws_url(s), additional_headers=headers)
         session = _AzureRealtimeSession(ws, session_id=session_id)
         await session._configure(instructions=instructions, tools=tools, voice=s.azure_voicelive_voice)
