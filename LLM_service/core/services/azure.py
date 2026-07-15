@@ -34,7 +34,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from ..config import Settings
 from ..skill_schema import SkillCandidate, SkillRule
-from ..video_schema import StoryboardSpec, TemplateSlideSpec
+from ..video_schema import StoryboardSpec, TemplateSlideSpec, VideoPromptSpec
 from .base import (
     LLMService,
     SafetyResult,
@@ -372,6 +372,60 @@ class AzureLLM(LLMService):
             try:
                 data = json.loads(_strip_fences(raw))
                 return StoryboardSpec(**data).model_dump()
+            except (json.JSONDecodeError, ValidationError) as exc:
+                last_error = exc
+                messages = messages + [
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content": (
+                        f"Your previous JSON was invalid: {exc}. Return corrected JSON "
+                        "only, matching the schema exactly."
+                    )},
+                ]
+        raise last_error
+
+    async def generate_video_prompt(
+        self,
+        *,
+        topic: str,
+        draft: str,
+        tone_hint: Optional[str],
+        platform: str,
+        has_reference_images: bool = False,
+    ) -> dict:
+        schema = json.dumps(VideoPromptSpec.model_json_schema())
+        if has_reference_images:
+            mode_note = (
+                "The user attached 1-3 REFERENCE IMAGES the clip is generated FROM "
+                "(image-to-video). Your prompt must COMPLEMENT them — describe camera "
+                "movement, motion, lighting and atmosphere ONLY. Do NOT re-describe or "
+                "contradict the subject the images already fix."
+            )
+        else:
+            mode_note = (
+                "There are NO reference images (text-to-video), so your prompt must fully "
+                "specify the subject, setting, lighting and mood of the shot."
+            )
+        system = (
+            "You are a cinematographer writing a prompt for a generative video model. "
+            "Given a brand topic, the approved post copy, and the platform, write ONE "
+            "single cinematic shot description (subject/setting/lighting/mood as needed) "
+            "— not a storyboard, not post copy, not a list of scenes. " + mode_note +
+            " Return ONLY valid JSON (no markdown fences, no prose) matching this schema "
+            f"exactly:\n{schema}"
+        )
+        user = (
+            f"Brand topic: {topic}\n"
+            f"Approved post copy:\n{draft}\n"
+            f"Tone: {tone_hint or 'brand voice'}\n"
+            f"Target platform: {platform}"
+        )
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        last_error: Exception = ValueError("generate_video_prompt: no attempts made")
+        for _ in range(_VIDEO_STORYBOARD_MAX_ATTEMPTS):
+            raw = await self._complete(messages)
+            try:
+                data = json.loads(_strip_fences(raw))
+                return VideoPromptSpec(**data).model_dump()
             except (json.JSONDecodeError, ValidationError) as exc:
                 last_error = exc
                 messages = messages + [

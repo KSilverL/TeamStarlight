@@ -187,6 +187,21 @@ async def test_generate_video_storyboard_parity():
             assert "type" in slide
 
 
+async def test_generate_video_prompt_parity():
+    """Both impls return the VideoPromptSpec shape ({prompt, motion}) for the premium
+    Higgsfield path, with and without reference images (image-to-video vs text-to-video)."""
+    kw = dict(topic="coffee launch", draft="Our new single-origin is here.",
+              tone_hint="warm", platform="instagram_reels")
+    canned = json.dumps({"prompt": "a slow cinematic pour of fresh coffee", "motion": "slow dolly-in"})
+    for has_ref in (False, True):
+        m = await mock.MockLLM().generate_video_prompt(**kw, has_reference_images=has_ref)
+        a = await azure_llm(canned).generate_video_prompt(**kw, has_reference_images=has_ref)
+        for out in (m, a):
+            assert set(out.keys()) == {"prompt", "motion"}
+            assert isinstance(out["prompt"], str) and out["prompt"]
+            assert out["motion"] is None or isinstance(out["motion"], str)
+
+
 # ── Cross-language slide-variant parity (Python spec ⟷ types.ts) ──────────────
 # The renderer's types.ts is hand-mirrored from video_schema.py with no automated
 # check on the TS side; this guards the `variant` Literal unions specifically, since

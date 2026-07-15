@@ -136,6 +136,7 @@ class Settings:
     use_mock_music_generation: Optional[bool] = None
     use_mock_web_search: Optional[bool] = None
     use_mock_voiceover: Optional[bool] = None
+    use_mock_video_generation: Optional[bool] = None
 
     # ── Azure OpenAI / Foundry (chat + structured output + copywriting) ────────
     azure_openai_endpoint: Optional[str] = None
@@ -249,6 +250,20 @@ class Settings:
     # Default Neural voice when a caller doesn't specify one (POST /tasks/{id}/render-video).
     voiceover_default_voice: str = "en-US-JennyNeural"
 
+    # ── Higgsfield (premium generative AI video render backend) ─────────────────
+    # Used only when video_render_backend == "higgsfield" (see below). Auth + upload +
+    # polling go through the official `higgsfield-client` SDK (base URL
+    # platform.higgsfield.ai). The model ids are catalog paths passed to the SDK's
+    # subscribe(): the image id (DoP image-to-video) is confirmed against the docs;
+    # the text-to-video id is NOT — set HIGGSFIELD_TEXT_MODEL to the catalog path from
+    # your cloud.higgsfield.ai dashboard before using the no-reference-image path.
+    # Duration is clamped to the model's per-generation max (~15s for v1's single clip).
+    higgsfield_api_key: Optional[str] = None
+    higgsfield_api_secret: Optional[str] = None
+    higgsfield_text_model: str = ""  # unverified — set from the dashboard for text-to-video
+    higgsfield_image_model: str = "higgsfield-ai/dop/standard"
+    higgsfield_max_duration_s: float = 15.0
+
     # ── Web research (Bing grounding via Azure AI Foundry agents) ──────────────
     # Reuses the same "Grounding with Bing Search" mechanism as
     # trend_scout_routine/run_scan.py (a portal-defined Foundry agent, called
@@ -271,6 +286,10 @@ class Settings:
     # local disk. "lambda": workflow/video/lambda_render.py — compiles + renders on
     # AWS Lambda, output in S3; render_storyboard() returns an https:// URL instead
     # of a Path either way, so jobs.py/api.py don't need to know which ran.
+    # "higgsfield": the premium generative-AI-video path (workflow/video/higgsfield_render.py)
+    # — no Remotion; a single cinematic clip generated from a crafted prompt (+ optional
+    # user reference images for image-to-video), written to job_dir/output.mp4. This is
+    # the intended fee-paying-tier product; the free tier stays on "local"/"lambda".
     video_render_backend: str = "local"
     # ── Remotion Lambda (workflow/video/lambda_render.py) ───────────────────────
     # Required when video_render_backend == "lambda". These name resources YOU
@@ -338,6 +357,9 @@ class Settings:
     def mock_voiceover(self) -> bool:
         return self.use_mock if self.use_mock_voiceover is None else self.use_mock_voiceover
 
+    def mock_video_generation(self) -> bool:
+        return self.use_mock if self.use_mock_video_generation is None else self.use_mock_video_generation
+
     def notify_via_webhook(self) -> bool:
         """Whether status events are POSTed to the backend webhook. Defaults to
         production-only; WEBHOOK_ENABLED overrides (e.g. to test the receiver)."""
@@ -385,6 +407,10 @@ class Settings:
         return bool(self.azure_speech_key and self.azure_speech_region)
 
     @property
+    def has_higgsfield(self) -> bool:
+        return bool(self.higgsfield_api_key and self.higgsfield_api_secret)
+
+    @property
     def has_remotion_lambda(self) -> bool:
         """Whether enough is configured to attempt a Lambda render: a function to
         invoke, and a stable serve URL for the (common) no-`generated`-slide case.
@@ -430,7 +456,8 @@ class Settings:
             f"background_removal={tag(self.mock_background_removal())} "
             f"music_generation={tag(self.mock_music_generation())} "
             f"web_search={tag(self.mock_web_search())} "
-            f"voiceover={tag(self.mock_voiceover())}]"
+            f"voiceover={tag(self.mock_voiceover())} "
+            f"video_generation={tag(self.mock_video_generation())}]"
         )
 
 
@@ -449,6 +476,7 @@ def _load() -> Settings:
         use_mock_music_generation=_env_bool("USE_MOCK_MUSIC_GENERATION"),
         use_mock_web_search=_env_bool("USE_MOCK_WEB_SEARCH"),
         use_mock_voiceover=_env_bool("USE_MOCK_VOICEOVER"),
+        use_mock_video_generation=_env_bool("USE_MOCK_VIDEO_GENERATION"),
         azure_openai_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
         azure_openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
@@ -503,6 +531,11 @@ def _load() -> Settings:
         azure_speech_key=os.getenv("AZURE_SPEECH_KEY"),
         azure_speech_region=os.getenv("AZURE_SPEECH_REGION"),
         voiceover_default_voice=os.getenv("VOICEOVER_DEFAULT_VOICE", "en-US-JennyNeural"),
+        higgsfield_api_key=os.getenv("HIGGSFIELD_API_KEY"),
+        higgsfield_api_secret=os.getenv("HIGGSFIELD_API_SECRET"),
+        higgsfield_text_model=os.getenv("HIGGSFIELD_TEXT_MODEL", ""),
+        higgsfield_image_model=os.getenv("HIGGSFIELD_IMAGE_MODEL", "higgsfield-ai/dop/standard"),
+        higgsfield_max_duration_s=_env_float("HIGGSFIELD_MAX_DURATION_S", 15.0),
         web_search_agent_name=os.getenv("WEB_SEARCH_AGENT_NAME"),
         web_search_agent_version=os.getenv("WEB_SEARCH_AGENT_VERSION"),
         review_search_agent_name=os.getenv("REVIEW_SEARCH_AGENT_NAME"),

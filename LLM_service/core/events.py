@@ -21,6 +21,7 @@ from typing import Optional
 PROGRESS = "progress"               # "the task is now at executor X"
 RESULT = "result"                   # "executor X produced this content"
 AGENT_UTTERANCE = "agent_utterance" # "a roundtable participant just spoke"
+SPEAKER_SCHEDULED = "speaker_scheduled"  # "the manager just handed the mic to a participant"
 DISCUSSION_CONSENSUS = "discussion_consensus"  # the table converged (a RESULT status)
 ROUND_CONTROL = "round_control"     # step mode: the table is asking the user what to do next
 
@@ -108,6 +109,30 @@ def agent_utterance_event(
         "agent_id": speaker,
         "role": role,
         "text": text,
+        "round_index": round_index,
+    }
+
+
+def speaker_scheduled_event(
+    *,
+    table_id: str,
+    speaker: str,
+    round_index: int,
+) -> dict:
+    """The manager assigned the upcoming turn to `speaker` (emitted when the mic is handed
+    over, BEFORE the persona speaks — agent_utterance follows once the turn completes). This
+    is the moderator's "announcement": the UI can show who holds the floor in real time
+    instead of only learning about a turn after it finishes."""
+    return {
+        "type": SPEAKER_SCHEDULED,
+        "node": speaker,
+        "phase": "discuss",
+        "platform": table_id,
+        "status": "running",
+        "ts": time.time(),
+        "table_id": table_id,
+        "speaker": speaker,
+        "agent_id": speaker,
         "round_index": round_index,
     }
 

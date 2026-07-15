@@ -193,6 +193,32 @@ async def test_roundtable_streams_utterances_then_consensus():
     assert consensus[0]["strategy"]["linkedin"] and consensus[0]["converged"] is True
 
 
+async def test_roundtable_announces_each_speaker_before_their_turn():
+    """The manager's mic handoff streams as a `speaker_scheduled` event BEFORE that
+    speaker's `agent_utterance` — the live "who has the floor" signal for the UI."""
+    svc = WorkflowService()
+    await svc.run_roundtable(_RT_START, "linkedin", task_id="rt_sched", max_rounds=4)
+    events = svc.buffered_events("rt_sched")
+
+    scheduled = [e for e in events if e["type"] == "speaker_scheduled"]
+    assert scheduled, "expected the manager to announce each upcoming speaker"
+    for e in scheduled:
+        assert _ENVELOPE_KEYS <= set(e)
+        assert e["table_id"] == "linkedin" and e["speaker"] and e["agent_id"] == e["speaker"]
+
+    # Every persona turn was announced first: a matching (speaker, round) scheduled event
+    # appears in the stream strictly before the utterance itself.
+    for i, e in enumerate(events):
+        if e["type"] != "agent_utterance":
+            continue
+        assert any(
+            s["type"] == "speaker_scheduled"
+            and s["speaker"] == e["speaker"]
+            and s["round_index"] == e["round_index"]
+            for s in events[:i]
+        ), f"utterance by {e['speaker']} (round {e['round_index']}) was never announced"
+
+
 async def test_roundtable_user_utterance_appears_in_the_stream():
     """A queued user 'raise hand' shows up as a user-role agent_utterance in the SSE stream."""
     await push_utterance(factory.get_store(), task_id="rt2", table_id="linkedin",

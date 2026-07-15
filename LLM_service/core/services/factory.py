@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, Optional
 from agent_framework import CheckpointStorage, InMemoryCheckpointStorage
 
 from ..config import get_settings
-from . import azure, media_assets, mock, postgres, web_search
+from . import azure, higgsfield, media_assets, mock, postgres, web_search
 from .base import (
     BackgroundRemovalService,
     ImageSearchService,
@@ -26,6 +26,7 @@ from .base import (
     MusicGenerationService,
     SafetyService,
     StoreService,
+    VideoGenerationService,
     VoiceoverService,
     VoiceService,
     WebSearchService,
@@ -43,6 +44,7 @@ __all__ = [
     "get_music_generation",
     "get_web_search",
     "get_voiceover_generation",
+    "get_video_generation",
     "get_checkpoint_storage",
     "reset_services",
 ]
@@ -221,6 +223,20 @@ def get_voiceover_generation() -> VoiceoverService:
                  "AZURE_SPEECH_KEY and AZURE_SPEECH_REGION", "USE_MOCK_VOICEOVER=true")
         return azure.AzureSpeechVoiceover(s)
     return _cached("voiceover_generation", build)
+
+
+def get_video_generation() -> VideoGenerationService:
+    """Generative AI video (Higgsfield) — the premium render backend selected by
+    VIDEO_RENDER_BACKEND=higgsfield. Mock = a real, offline placeholder MP4;
+    production = the Higgsfield REST API (submit → poll → download)."""
+    def build() -> VideoGenerationService:
+        s = get_settings()
+        if s.mock_video_generation():
+            return mock.MockVideoGeneration()
+        _require(s.has_higgsfield, "Higgsfield",
+                 "HIGGSFIELD_API_KEY and HIGGSFIELD_API_SECRET", "USE_MOCK_VIDEO_GENERATION=true")
+        return higgsfield.HiggsfieldVideoGeneration(s)
+    return _cached("video_generation", build)
 
 
 def get_checkpoint_storage() -> CheckpointStorage:

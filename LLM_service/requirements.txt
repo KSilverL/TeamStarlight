@@ -31,3 +31,7 @@ asyncpg>=0.29.0
 # this service imports them directly rather than through MAF:
 # azure-ai-projects>=2.1.0
 # azure-identity>=1.20.0
+# Higgsfield generative AI video (VideoGenerationService, core/services/higgsfield.py) —
+# required when VIDEO_RENDER_BACKEND=higgsfield and USE_MOCK_VIDEO_GENERATION=false. The
+# official SDK owns the base URL, key auth, image upload, and submit/poll:
+higgsfield-client

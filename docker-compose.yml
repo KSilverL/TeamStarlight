@@ -1,5 +1,4 @@
 services:
-
   # ---------------------------------------------------------------------------
   # Frontend — Next.js production build
   # ---------------------------------------------------------------------------
@@ -54,6 +53,7 @@ services:
       - "8080:8080"
     environment:
       - USE_MOCK=false
+      - VIDEO_RENDER_BACKEND=higgsfield
       - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
       - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
       - AZURE_OPENAI_CHAT_DEPLOYMENT=${AZURE_OPENAI_CHAT_DEPLOYMENT}
@@ -97,15 +97,21 @@ services:
       - TREND_SCOUT_ENABLED=${TREND_SCOUT_ENABLED}
       # Voiceover (Azure Speech TTS) — off by default (mock), opt-in per render via
       # POST /tasks/{id}/render-video's narration_text field either way.
-      - USE_MOCK_VOICEOVER=true
       # - AZURE_SPEECH_KEY=${AZURE_SPEECH_KEY}
       # - AZURE_SPEECH_REGION=${AZURE_SPEECH_REGION}
       # Cloud (Remotion Lambda) video rendering — off by default (VIDEO_RENDER_BACKEND
       # defaults to "local", the subprocess path this image is already built for).
       # Uncomment once a function + stable site are deployed (see .env.example).
-      # - VIDEO_RENDER_BACKEND=lambda
       # - AWS_REGION=${AWS_REGION}
       # - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       # - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       # - REMOTION_LAMBDA_FUNCTION_NAME=${REMOTION_LAMBDA_FUNCTION_NAME}
       # - REMOTION_LAMBDA_SERVE_URL=${REMOTION_LAMBDA_SERVE_URL}
+
+      # Higgsfield credentials
+      - USE_MOCK_VIDEO_GENERATION=false
+      - HIGGSFIELD_API_KEY=${HIGGSFIELD_API_KEY}
+      - HIGGSFIELD_API_SECRET=${HIGGSFIELD_API_SECRET}
+      - HIGGSFIELD_IMAGE_MODEL=${HIGGSFIELD_IMAGE_MODEL}
+      - HIGGSFIELD_TEXT_MODEL=${HIGGSFIELD_TEXT_MODEL}
+      - HIGGSFIELD_MAX_DURATION_S=15
