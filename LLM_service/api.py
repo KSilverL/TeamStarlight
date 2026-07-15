@@ -38,6 +38,7 @@ import asyncio
 import json
 import os
 import uuid
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -68,8 +69,18 @@ from .workflow.roundtable.gate import notify as _notify_user_gate
 from .workflow.roundtable.gate import raise_hand as _raise_user_hand
 from .workflow.roundtable.queue import push_utterance
 from .workflow.roundtable.runner import run_table, run_tables
+from .workflow.roundtable.context import build_persona_context
+from .workflow.roundtable.personas import render_brand_profile, render_user_skills
 from .workflow.video.jobs import get_render_job, start_render_job
+from .core.plan_schema import (
+    PlanItem,
+    PostingPlan,
+    PostingPlanSpec,
+    clamp_item_dates,
+    select_due_items,
+)
 from .core.skill_schema import SkillCandidate
+from .core.trend_schema import render_trends
 from .core.video_schema import StoryboardSpec
 
 # Sentinel pushed to SSE subscribers when a task finishes, so the stream closes.
@@ -901,6 +912,248 @@ class VideoService:
         return str(path), False
 
 
+class PlanService:
+    """Async wrapper over posting plans — a multi-date campaign SCHEDULE (strategy +
+    dates + topics, never copy). `create` proposes a draft plan via the planner LLM;
+    `confirm` activates it; `due` answers the backend daily job's "what should go out
+    on this date?" (the date is caller-supplied — the clock never lives in this
+    service); `execute` turns one due item into an ordinary workflow run (item →
+    Brief → WorkflowService.start), so the copy is generated ON the planned day —
+    riding that day's trends snapshot and the brand/user rules as they stand then —
+    and waits at the human gate like any other draft.
+
+    No real platform publishing happens here: an item's `done` means its content was
+    produced and approved, not posted. Item statuses move planned → generating (set
+    by execute) → awaiting_review → done, mirrored from the workflow task by a
+    best-effort reconcile-on-read; the backend may also PATCH an item (e.g. skip)."""
+
+    # Workflow-task status → plan-item status (the reconcile mapping).
+    _TASK_TO_ITEM = {
+        "running": "generating",
+        "awaiting_review": "awaiting_review",
+        "completed": "done",
+        "error": "error",
+    }
+    _EDITABLE_ITEM_FIELDS = (
+        "planned_date", "time_of_day", "platforms", "topic", "angle",
+        "rationale", "content_types", "status",
+    )
+
+    def __init__(self, *, workflow: WorkflowService) -> None:
+        self._workflow = workflow
+
+    # ── internals ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _valid_date(raw, field: str) -> str:
+        if not isinstance(raw, str) or not raw.strip():
+            raise ApiError(400, f"missing required field: {field} (YYYY-MM-DD)")
+        try:
+            return date.fromisoformat(raw.strip()).isoformat()
+        except ValueError:
+            raise ApiError(400, f"'{field}' must be a YYYY-MM-DD date")
+
+    async def _require(self, plan_id: str) -> dict:
+        plan = await factory.get_store().get_posting_plan(plan_id=plan_id)
+        if plan is None:
+            raise ApiError(404, f"unknown plan_id: {plan_id}")
+        return plan
+
+    @staticmethod
+    def _find_item(plan: dict, item_id: str) -> dict:
+        for item in plan.get("items", []):
+            if item.get("item_id") == item_id:
+                return item
+        raise ApiError(404, f"unknown item_id: {item_id} on plan {plan.get('plan_id')}")
+
+    async def _save(self, plan: dict) -> None:
+        plan["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await factory.get_store().upsert_posting_plan(plan=plan)
+
+    async def _reconcile(self, plan: dict) -> None:
+        """Mirror each executed item's workflow-task status onto the item (so a read
+        shows generating → awaiting_review → done without any event coupling). A task
+        the in-memory registry no longer knows (e.g. after a restart) keeps the stored
+        status — reconcile degrades, never raises."""
+        changed = False
+        for item in plan.get("items", []):
+            if not item.get("task_id") or item.get("status") in ("done", "skipped"):
+                continue
+            try:
+                snapshot = await self._workflow.get(item["task_id"])
+            except ApiError:
+                continue
+            mapped = self._TASK_TO_ITEM.get(snapshot.get("status"))
+            if mapped and mapped != item.get("status"):
+                item["status"] = mapped
+                changed = True
+        if changed:
+            await self._save(plan)
+
+    # ── operations ─────────────────────────────────────────────────────────────
+
+    async def create(self, inputs: dict) -> dict:
+        goal = str(inputs.get("goal") or "").strip()
+        platforms = inputs.get("target_platforms")
+        if not goal:
+            raise ApiError(400, "missing required field: goal")
+        if not isinstance(platforms, list) or not platforms:
+            raise ApiError(400, "target_platforms must be a non-empty array of strings")
+        start_date = self._valid_date(inputs.get("start_date"), "start_date")
+        end_date = self._valid_date(inputs.get("end_date"), "end_date")
+        if end_date < start_date:
+            raise ApiError(400, "end_date must be on or after start_date")
+        content_types = _content_types_from_inputs(inputs)
+
+        # Read side reuses the roundtable's single store read (brand profile + user
+        # skills + the gated daily trends) and its renderers, so the planner opens
+        # knowing this brand's voice, this user's preferences, and today's trends —
+        # the same context every other generation path gets.
+        brief = Brief(
+            topic=goal, target_platforms=list(platforms), user_intent=goal,
+            business_id=inputs.get("business_id"), user_id=inputs.get("user_id"),
+            tone_hint=inputs.get("tone_hint"),
+        )
+        ctx = await build_persona_context(brief)
+        raw = await factory.get_llm().plan_campaign(
+            goal=goal, platforms=list(platforms),
+            start_date=start_date, end_date=end_date,
+            cadence_hint=str(inputs.get("cadence_hint") or ""),
+            tone_hint=inputs.get("tone_hint"),
+            brand_block=render_brand_profile(ctx.brand_profile),
+            user_block=render_user_skills(ctx.user_skills),
+            trends=render_trends(ctx.trends),
+            skill=load_skill("posting_plan"),
+        )
+        spec = PostingPlanSpec(**raw)
+        items_spec = clamp_item_dates(spec.items, start_date=start_date, end_date=end_date)
+        now = datetime.now(timezone.utc).isoformat()
+        plan = PostingPlan(
+            plan_id=f"plan-{uuid.uuid4().hex[:12]}",
+            business_id=inputs.get("business_id"),
+            user_id=inputs.get("user_id"),
+            goal=goal,
+            target_platforms=list(platforms),
+            start_date=start_date,
+            end_date=end_date,
+            status="draft",
+            strategy_summary=spec.strategy_summary,
+            items=[
+                PlanItem(
+                    **s.model_dump(), item_id=f"item-{i + 1}",
+                    content_types=list(content_types),
+                )
+                for i, s in enumerate(items_spec)
+            ],
+            created_at=now,
+            updated_at=now,
+        ).model_dump()
+        await factory.get_store().upsert_posting_plan(plan=plan)
+        return plan
+
+    async def get(self, plan_id: str) -> dict:
+        plan = await self._require(plan_id)
+        await self._reconcile(plan)
+        return plan
+
+    async def list(
+        self,
+        *,
+        business_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> dict:
+        plans = await factory.get_store().list_posting_plans(
+            business_id=business_id, user_id=user_id, status=status)
+        return {"plans": plans}
+
+    async def confirm(self, plan_id: str) -> dict:
+        plan = await self._require(plan_id)
+        if plan.get("status") != "draft":
+            raise ApiError(409, f"plan {plan_id} is not a draft (status={plan.get('status')})")
+        plan["status"] = "active"
+        await self._save(plan)
+        return plan
+
+    async def update_item(self, plan_id: str, item_id: str, fields: dict) -> dict:
+        plan = await self._require(plan_id)
+        item = self._find_item(plan, item_id)
+        if not fields:
+            raise ApiError(400, "no fields to update")
+        unknown = [k for k in fields if k not in self._EDITABLE_ITEM_FIELDS]
+        if unknown:
+            raise ApiError(
+                400,
+                f"cannot update fields {unknown}; editable: {list(self._EDITABLE_ITEM_FIELDS)}",
+            )
+        if "status" in fields and fields["status"] not in ("planned", "skipped"):
+            # The other statuses are owned by execute/reconcile, not the client.
+            raise ApiError(400, "item status can only be set to 'planned' or 'skipped'")
+        if "planned_date" in fields:
+            fields["planned_date"] = self._valid_date(fields["planned_date"], "planned_date")
+        if "content_types" in fields:
+            fields["content_types"] = _content_types_from_inputs(
+                {"content_types": fields["content_types"]})
+        try:
+            validated = PlanItem(**{**item, **fields}).model_dump()
+        except ValidationError as exc:
+            raise ApiError(400, f"invalid item update: {exc.errors(include_url=False)}")
+        item.clear()
+        item.update(validated)
+        await self._save(plan)
+        return plan
+
+    async def due(self, on_date: str, *, business_id: Optional[str] = None) -> dict:
+        on_date = self._valid_date(on_date, "date")
+        plans = await factory.get_store().list_posting_plans(
+            business_id=business_id, status="active")
+        for plan in plans:
+            await self._reconcile(plan)
+        return {"date": on_date, "items": select_due_items(plans, on_date=on_date)}
+
+    async def execute(
+        self, plan_id: str, item_id: str, *, session_id: Optional[str] = None
+    ) -> dict:
+        plan = await self._require(plan_id)
+        item = self._find_item(plan, item_id)
+        if plan.get("status") != "active":
+            raise ApiError(
+                409, f"plan {plan_id} is not active (status={plan.get('status')}) — confirm it first")
+        if item.get("status") != "planned":
+            raise ApiError(409, f"item {item_id} is not executable (status={item.get('status')})")
+        task_id = session_id or f"{plan_id}--{item_id}"
+        # Series continuity, deterministically (no extra LLM call): the campaign goal,
+        # this slot's angle/rationale, and what already went out ride user_intent —
+        # which every downstream prompt (strategist, creator) already folds in.
+        done_topics = [
+            i.get("topic", "") for i in plan.get("items", [])
+            if i.get("status") == "done" and i.get("topic")
+        ]
+        intent_lines = [f"Campaign goal: {plan.get('goal', '')}"]
+        if item.get("angle"):
+            intent_lines.append(f"This slot's angle: {item['angle']}")
+        if item.get("rationale"):
+            intent_lines.append(f"Why this slot: {item['rationale']}")
+        if done_topics:
+            intent_lines.append(
+                "Already published in this series: " + "; ".join(done_topics))
+        inputs = {
+            "topic": item.get("topic"),
+            "target_platforms": list(item.get("platforms") or []),
+            "user_intent": "\n".join(intent_lines),
+            "business_id": plan.get("business_id"),
+            "user_id": plan.get("user_id"),
+            "content_types": list(item.get("content_types") or ["text"]),
+        }
+        # WorkflowService.start 409s on a duplicate task_id, so a double-execute that
+        # raced past the item-status guard still cannot start a second run.
+        snapshot = await self._workflow.start(inputs, task_id=task_id, background=True)
+        item["status"] = "generating"
+        item["task_id"] = task_id
+        await self._save(plan)
+        return {"plan_id": plan_id, "item": item, "task": snapshot}
+
+
 def _verdict_from_payload(payload: dict) -> HumanVerdict:
     decision = (payload.get("decision") or "").lower()
     if decision not in ("approve", "approve_after_edit", "reject"):
@@ -1100,6 +1353,54 @@ class RenderVideoRequest(BaseModel):
     )
 
 
+class CreatePlanRequest(BaseModel):
+    """Generate a multi-date posting plan (strategy + schedule, never copy) —
+    POST /plans. Returned as a `draft` for the user to review/edit; activate it with
+    POST /plans/{plan_id}/confirm before the daily job can pick its items up."""
+    model_config = ConfigDict(extra="allow")
+
+    goal: Optional[str] = Field(None, description="The campaign goal the schedule serves (required)")
+    target_platforms: Optional[list[str]] = Field(
+        None, description="Non-empty list, e.g. ['linkedin', 'instagram'] (required)")
+    start_date: Optional[str] = Field(None, description="Window start, YYYY-MM-DD (required)")
+    end_date: Optional[str] = Field(None, description="Window end, YYYY-MM-DD (required)")
+    cadence_hint: Optional[str] = Field(
+        None, description="Free-text pacing wish, e.g. '2 posts a week'; omitted → the planner picks")
+    tone_hint: Optional[str] = None
+    business_id: Optional[str] = Field(None, description="Brand id; folds the brand voice profile into planning")
+    user_id: Optional[str] = Field(None, description="End-user id; folds the user's learned skills into planning")
+    content_types: Optional[list[str]] = Field(
+        None, description="Default deliverables for every slot ('text' / 'brand' / 'video', "
+        "'html' accepted as an alias). Omitted → ['text']. Editable per item afterwards.")
+
+
+class UpdatePlanItemRequest(BaseModel):
+    """Edit one plan item — PATCH /plans/{plan_id}/items/{item_id}. Only supplied
+    fields change. `status` accepts only 'skipped' (drop the slot) or 'planned'
+    (un-skip); the other statuses are owned by execute/reconcile."""
+    model_config = ConfigDict(extra="allow")
+
+    planned_date: Optional[str] = Field(None, description="New date, YYYY-MM-DD")
+    time_of_day: Optional[str] = None
+    platforms: Optional[list[str]] = None
+    topic: Optional[str] = None
+    angle: Optional[str] = None
+    rationale: Optional[str] = None
+    content_types: Optional[list[str]] = None
+    status: Optional[str] = Field(None, description="'skipped' or 'planned' only")
+
+
+class ExecutePlanItemRequest(BaseModel):
+    """Run one plan item now — POST /plans/{plan_id}/items/{item_id}/execute. The
+    backend's daily job calls this for each item GET /plans/due returned; the run
+    then behaves like any POST /tasks task (SSE events, human gate, review)."""
+    model_config = ConfigDict(extra="allow")
+
+    session_id: Optional[str] = Field(
+        None, description="Conversation id for the spawned run (every /tasks/{id}/* op keys "
+        "on it). Omitted → '{plan_id}--{item_id}'.")
+
+
 # ── Dependencies: pull the per-app service singletons off app.state ───────────
 
 def _workflow(request: Request) -> WorkflowService:
@@ -1118,6 +1419,10 @@ def _video(request: Request) -> VideoService:
     return request.app.state.video
 
 
+def _plans(request: Request) -> PlanService:
+    return request.app.state.plans
+
+
 # ── Routers ───────────────────────────────────────────────────────────────────
 
 tasks_router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -1126,6 +1431,7 @@ media_router = APIRouter(tags=["media"])
 handoff_router = APIRouter(tags=["handoff"])
 roundtable_router = APIRouter(tags=["roundtable"])
 video_jobs_router = APIRouter(prefix="/video-jobs", tags=["video"])
+plans_router = APIRouter(prefix="/plans", tags=["plans"])
 
 
 @tasks_router.post("", summary="Start a workflow run from a brief")
@@ -1325,6 +1631,63 @@ async def download_video_job(request: Request, job_id: str):
     return FileResponse(location, media_type="video/mp4", filename=f"{job_id}.mp4")
 
 
+@plans_router.post("", summary="Generate a multi-date posting plan (returned as a draft)")
+async def create_plan(request: Request, body: CreatePlanRequest) -> dict:
+    return await _plans(request).create(body.model_dump(exclude_none=True))
+
+
+@plans_router.get("", summary="List posting plans")
+async def list_plans(
+    request: Request,
+    business_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    status: Optional[str] = None,
+) -> dict:
+    return await _plans(request).list(business_id=business_id, user_id=user_id, status=status)
+
+
+# NB: declared BEFORE the /{plan_id} route — FastAPI matches in registration order,
+# so "due" must not be swallowed as a plan_id.
+@plans_router.get("/due", summary="Which plan items should go out on this date? (the daily job's query)")
+async def due_plan_items(
+    request: Request, date: str = "", business_id: Optional[str] = None
+) -> dict:
+    """The backend's daily cron calls this with ITS "today" (the service never reads
+    its own clock for due-ness), then POSTs each returned item's /execute — so the
+    planned content is drafted on the planned day and waits at the human gate."""
+    return await _plans(request).due(date, business_id=business_id)
+
+
+@plans_router.get("/{plan_id}", summary="Fetch one plan (item statuses reconciled)")
+async def get_plan(request: Request, plan_id: str) -> dict:
+    return await _plans(request).get(plan_id)
+
+
+@plans_router.post("/{plan_id}/confirm", summary="Activate a draft plan")
+async def confirm_plan(request: Request, plan_id: str) -> dict:
+    return await _plans(request).confirm(plan_id)
+
+
+@plans_router.patch("/{plan_id}/items/{item_id}", summary="Edit or skip one plan item")
+async def update_plan_item(
+    request: Request, plan_id: str, item_id: str, body: UpdatePlanItemRequest
+) -> dict:
+    return await _plans(request).update_item(
+        plan_id, item_id, body.model_dump(exclude_unset=True, exclude_none=True))
+
+
+@plans_router.post(
+    "/{plan_id}/items/{item_id}/execute",
+    summary="Run one plan item through the workflow (drafts wait at the human gate)",
+)
+async def execute_plan_item(
+    request: Request, plan_id: str, item_id: str,
+    body: Optional[ExecutePlanItemRequest] = None,
+) -> dict:
+    return await _plans(request).execute(
+        plan_id, item_id, session_id=body.session_id if body else None)
+
+
 # ── App factory ────────────────────────────────────────────────────────────────
 
 def create_app(
@@ -1333,6 +1696,7 @@ def create_app(
     intake: Optional[IntakeService] = None,
     media: Optional[MediaService] = None,
     video: Optional[VideoService] = None,
+    plans: Optional[PlanService] = None,
 ) -> FastAPI:
     """Build the FastAPI app. Tests inject custom service instances; production uses
     fresh defaults wired to the toggle-resolved factory backends."""
@@ -1346,6 +1710,7 @@ def create_app(
     app.state.intake = intake or IntakeService()
     app.state.media = media or MediaService()
     app.state.video = video or VideoService(workflow=app.state.workflow)
+    app.state.plans = plans or PlanService(workflow=app.state.workflow)
 
     @app.exception_handler(ApiError)
     async def _api_error_handler(_request: Request, exc: ApiError) -> JSONResponse:
@@ -1361,6 +1726,7 @@ def create_app(
     app.include_router(handoff_router)
     app.include_router(roundtable_router)
     app.include_router(video_jobs_router)
+    app.include_router(plans_router)
     return app
 
 

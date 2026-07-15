@@ -33,6 +33,7 @@ from agent_framework._types import ResponseStream
 from pydantic import TypeAdapter, ValidationError
 
 from ..config import Settings
+from ..plan_schema import PostingPlanSpec
 from ..skill_schema import SkillCandidate, SkillRule
 from ..video_schema import StoryboardSpec, TemplateSlideSpec
 from .base import (
@@ -47,6 +48,7 @@ from .base import (
 # on the first try than the old fixed shape — bounded retry, re-prompting with the
 # validation error, before failing loudly.
 _VIDEO_STORYBOARD_MAX_ATTEMPTS = 3
+_PLAN_CAMPAIGN_MAX_ATTEMPTS = 3
 
 
 def _strip_fences(text: str) -> str:
@@ -248,6 +250,68 @@ class AzureLLM(LLMService):
             [{"role": "system", "content": system}, {"role": "user", "content": user}]
         )
         return raw.strip()
+
+    async def plan_campaign(
+        self,
+        *,
+        goal: str,
+        platforms: List[str],
+        start_date: str,
+        end_date: str,
+        cadence_hint: str = "",
+        tone_hint: Optional[str] = None,
+        brand_block: str = "",
+        user_block: str = "",
+        trends: str = "",
+        skill: str = "",
+    ) -> dict:
+        schema = json.dumps(PostingPlanSpec.model_json_schema())
+        style_guide = f"\n\n{skill}" if skill else ""
+        system = (
+            "You are a social-media campaign strategist. Design a posting PLAN — a "
+            "dated schedule of post slots (strategy, not copy): for each slot say the "
+            "date, the platform(s), the topic, the specific angle, and WHY that topic "
+            "on that date (the rationale). Every planned_date must fall between "
+            f"{start_date} and {end_date} inclusive. Return ONLY valid JSON (no "
+            "markdown fences, no prose) matching this schema exactly:\n"
+            f"{schema}" + style_guide
+        )
+        if trends:
+            # Same fusion-with-rejection-permission framing as plan_strategy.
+            system += (
+                "\n\nBelow are current, broad cultural/industry trends. Where ONE has a "
+                "genuine, creative connection to a slot, fuse it into that slot's angle "
+                "and say so in the rationale; if none genuinely fits, use none — a "
+                "forced trend is worse than none.\n\n" + trends
+            )
+        for block in (brand_block, user_block):
+            if block:
+                system += f"\n\n{block}"
+        user = (
+            f"Campaign goal: {goal}\n"
+            f"Platforms: {', '.join(platforms)}\n"
+            f"Window: {start_date} to {end_date}\n"
+            f"Cadence: {cadence_hint or 'your call — pick a pace that serves the goal'}\n"
+            f"Tone: {tone_hint or 'brand voice'}"
+        )
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": user}]
+        last_error: Exception = ValueError("plan_campaign: no attempts made")
+        for _ in range(_PLAN_CAMPAIGN_MAX_ATTEMPTS):
+            raw = await self._complete(messages)
+            try:
+                data = json.loads(_strip_fences(raw))
+                return PostingPlanSpec(**data).model_dump()
+            except (json.JSONDecodeError, ValidationError) as exc:
+                last_error = exc
+                messages = messages + [
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content": (
+                        f"Your previous JSON was invalid: {exc}. Return corrected JSON "
+                        "only, matching the schema exactly."
+                    )},
+                ]
+        raise last_error
 
     async def write_copy(
         self,

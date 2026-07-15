@@ -187,6 +187,35 @@ async def test_generate_video_storyboard_parity():
             assert "type" in slide
 
 
+_PLAN_KEYS = {"strategy_summary", "items"}
+_PLAN_ITEM_KEYS = {"planned_date", "time_of_day", "platforms", "topic", "angle", "rationale"}
+
+
+async def test_plan_campaign_parity():
+    kw = dict(goal="grow subscription signups", platforms=["linkedin", "instagram"],
+              start_date="2026-08-01", end_date="2026-08-14")
+    m = await mock.MockLLM().plan_campaign(**kw)
+    canned = json.dumps({
+        "strategy_summary": "Two weeks: educate first, convert last.",
+        "items": [
+            {"planned_date": "2026-08-03", "time_of_day": "morning",
+             "platforms": ["linkedin"], "topic": "Why subscriptions beat one-off buying",
+             "angle": "educate", "rationale": "Tuesday morning reach on LinkedIn."},
+            {"planned_date": "2026-08-12", "platforms": ["instagram"],
+             "topic": "Subscriber results in numbers", "angle": "proof",
+             "rationale": "Close the window with conversion proof."},
+        ],
+    })
+    a = await azure_llm(canned).plan_campaign(**kw)
+    for out in (m, a):
+        assert isinstance(out, dict) and set(out) == _PLAN_KEYS
+        assert isinstance(out["strategy_summary"], str)
+        assert isinstance(out["items"], list) and out["items"]
+        for item in out["items"]:
+            assert set(item) == _PLAN_ITEM_KEYS
+            assert isinstance(item["platforms"], list) and item["platforms"]
+
+
 # ── Cross-language slide-variant parity (Python spec ⟷ types.ts) ──────────────
 # The renderer's types.ts is hand-mirrored from video_schema.py with no automated
 # check on the TS side; this guards the `variant` Literal unions specifically, since

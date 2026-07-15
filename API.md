@@ -34,6 +34,7 @@ Integration guide for the content-generation service (`LLM_service/api.py`).
 3. **Progress** streams over **SSE** (`GET /tasks/{id}/events`) — open it right after `POST /tasks`
    to catch the gate. Review resumes over REST (`POST /review`, synchronous).
 4. **Optional extras:** with `ROUNDTABLE_ENABLED` the run opens with a multi-persona discussion you can join ([Roundtable](#roundtable-optional)); after completion, `POST /tasks/{id}/confirm-learning` makes the service learn from the run.
+5. **Posting plans** — `POST /plans` turns a campaign goal into a dated posting *schedule* (topics + timing + rationale, no copy); the backend's daily cron then asks `GET /plans/due?date=<today>` and `POST …/execute`s each due item into an ordinary run, so the planned content is drafted **on the planned day** and waits at the gate ([Posting plans](#posting-plans--post-plans--the-daily-dueexecute-loop)).
 
 ---
 
@@ -668,13 +669,188 @@ rendered file is missing on disk.
 
 ---
 
+## Posting plans — `POST /plans` + the daily due/execute loop
+
+A **posting plan** is a multi-date campaign schedule: which topic/angle to post on which date, on
+which platforms, and *why* that timing (`rationale`) — **strategy + schedule, never the copy
+itself**. The copy is generated **on the planned day** by executing the item through the ordinary
+`POST /tasks` pipeline, so it rides that day's trends snapshot and the brand/user rules as they
+stand then, and waits at the human gate like any other draft.
+
+**Division of labour:** the LLM service stores the plan and answers "what is due on date X?" —
+**the clock lives in the backend**. There is no scheduler in this service and it never reads its
+own time for due-ness; the backend's daily cron supplies "today" explicitly (its own timezone).
+There is also **no real platform publishing**: an item's `done` means its content was produced
+and approved, not posted.
+
+```
+  POST /plans (goal + window + platforms) ─► draft plan (user reviews/edits it)
+        PATCH /plans/{pid}/items/{iid}    ─► move a date / change a topic / skip a slot
+        POST /plans/{pid}/confirm         ─► draft → active
+  ── every day, backend cron: ──────────────────────────────────────────────────
+        GET /plans/due?date=<today>       ─► the items whose date has arrived
+        POST /plans/{pid}/items/{iid}/execute ─► ordinary workflow run to the human gate
+        (then notify the user: "today's draft is ready to review")
+```
+
+### `POST /plans` — generate a plan (synchronous; returned as a draft)
+
+```json
+// request
+{
+  "goal": "Launch our new coffee subscription",
+  "target_platforms": ["linkedin", "instagram"],
+  "start_date": "2026-08-01",
+  "end_date": "2026-08-21",
+  "cadence_hint": "about 2 posts a week",        // optional pacing wish
+  "tone_hint": "warm, confident",                 // optional
+  "business_id": "biz-123",                       // optional — folds the brand voice in
+  "user_id": "user-9",                            // optional — folds learned preferences in
+  "content_types": ["text"]                       // optional per-slot default (text/brand/video)
+}
+```
+```json
+// response (200) — the whole plan document, status "draft"
+{
+  "plan_id": "plan-1d8a34b25b30",
+  "business_id": "biz-123", "user_id": "user-9",
+  "goal": "Launch our new coffee subscription",
+  "target_platforms": ["linkedin", "instagram"],
+  "start_date": "2026-08-01", "end_date": "2026-08-21",
+  "status": "draft",
+  "strategy_summary": "Three weeks: educate first, convert last…",
+  "items": [
+    {
+      "item_id": "item-1", "planned_date": "2026-08-01", "time_of_day": "morning",
+      "platforms": ["linkedin"], "topic": "Why subscriptions beat one-off buying",
+      "angle": "educate", "rationale": "Open the window with broad value on LinkedIn's weekday-morning reach.",
+      "status": "planned", "content_types": ["text"], "task_id": null
+    }
+  ],
+  "created_at": "2026-08-01T09:00:00+00:00", "updated_at": "2026-08-01T09:00:00+00:00"
+}
+```
+
+The planner reads the brand profile (`business_id`), the user's learned skills (`user_id`) and —
+with `TREND_SCOUT_ENABLED` — the daily trends snapshot, same as every other generation path.
+Item dates are clamped into the window server-side (LLM dates are never trusted). `400` on a
+missing/blank `goal`, empty `target_platforms`, malformed dates, or `end_date` before `start_date`.
+
+### `GET /plans` / `GET /plans/{plan_id}` — list / fetch
+
+`GET /plans` filters by any of `?business_id=&user_id=&status=` and returns `{ "plans": [...] }`.
+`GET /plans/{plan_id}` returns the document with item statuses **reconciled**: each executed
+item mirrors its workflow task's current state (`generating` → `awaiting_review` → `done`), so a
+plain read shows where every slot stands.
+
+### `POST /plans/{plan_id}/confirm` — activate
+
+`draft` → `active`. Only active plans' items appear in `/plans/due`. `409` if the plan is not a
+draft.
+
+### `PATCH /plans/{plan_id}/items/{item_id}` — edit or skip a slot
+
+Any of `planned_date` / `time_of_day` / `platforms` / `topic` / `angle` / `rationale` /
+`content_types` / `status` — only supplied fields change; returns the whole updated plan.
+`status` accepts only `"skipped"` (drop the slot) or `"planned"` (un-skip); the other statuses
+are owned by execute/reconcile. `400` on unknown fields or a malformed date.
+
+### `GET /plans/due?date=YYYY-MM-DD[&business_id=…]` — the daily job's query
+
+```json
+// response — items from ACTIVE plans, still "planned", whose date has arrived
+{
+  "date": "2026-08-04",
+  "items": [
+    { "plan_id": "plan-1d8a34b25b30", "goal": "Launch our new coffee subscription",
+      "item": { "item_id": "item-2", "planned_date": "2026-08-04", "...": "…" },
+      "overdue": false }
+  ]
+}
+```
+
+`planned_date <= date` items are all returned (a slot missed yesterday still shows up, flagged
+`"overdue": true`), so a skipped cron day self-heals on the next run. `400` without a valid
+`date` — the caller always supplies the date; the service never uses its own clock.
+
+### `POST /plans/{plan_id}/items/{item_id}/execute` — run one slot now
+
+```json
+// request (body optional)
+{ "session_id": "sess-noodle-aug4" }   // omitted → "{plan_id}--{item_id}"
+```
+```json
+// response (200)
+{
+  "plan_id": "plan-1d8a34b25b30",
+  "item": { "item_id": "item-2", "status": "generating", "task_id": "plan-1d8a34b25b30--item-2", "...": "…" },
+  "task": { "task_id": "plan-1d8a34b25b30--item-2", "status": "running", "pending": [], "outputs": [] }
+}
+```
+
+Builds a brief from the item (topic + platforms + the campaign goal / slot angle / rationale —
+plus a **series recap** of what already went out, for continuity) and starts an ordinary
+**non-blocking** workflow run. From here everything is the standard task flow: watch
+`GET /tasks/{task_id}/events`, approve/edit at `POST /tasks/{task_id}/review`; on approval the
+item lands `done`. `409` if the plan is not active, if the item is not in `planned` state
+(double-execute guard), or if the `task_id` already exists.
+
+Item lifecycle: `planned` → `generating` (execute) → `awaiting_review` (the run reached the
+gate) → `done` (approved) — mirrored from the task on every plan read; plus `skipped` (via
+PATCH) and `error` (the run failed). After a service restart the in-memory task registry is
+empty, so an in-flight item keeps its last stored status rather than erroring.
+
+### Backend responsibility — the daily scheduler (⚠️ you must build this)
+
+**This service has no scheduler and never fires on its own.** It only *stores* the plan and
+*answers* "what is due on date X?"; **the clock, the recurring trigger, and the user notification
+all live in the backend.** A plan sitting in the store does nothing until your backend runs the
+loop below. Concretely, stand up **one recurring job** (Spring `@Scheduled(cron=…)`, a Quartz
+job, a k8s `CronJob`, or an Azure Container Apps Job — the same shape as the trends routine) that
+fires **once a day** and does:
+
+```
+# pseudo-code for the daily cron (run it in the user's timezone, early morning)
+today = LocalDate.now(userZone)                         # YOUR clock — the service never reads its own
+for each active brand/user you manage:
+    due = GET /plans/due?date={today}&business_id={brandId}
+    for item in due.items:
+        if item.overdue: log/alert — a slot slipped (cron missed a day, or the plan was confirmed late)
+        result = POST /plans/{item.plan_id}/items/{item.item_id}/execute
+        # result.task.task_id is now an ordinary run sitting at (or heading to) the human gate
+        notify the user: "Today's post for '{item.item.topic}' is drafting — review it here: <link to task_id>"
+```
+
+Then the user opens your review UI and drives the spawned `task_id` through the **normal task
+flow** (SSE events → `POST /tasks/{id}/review`) — a plan item is not special once executed, it is
+just a task. Practical rules:
+
+- **Idempotency is already handled for you.** `execute` 409s on a non-`planned` item and the
+  spawned `task_id` (`{plan_id}--{item_id}`) 409s if it already exists — so if your cron runs
+  twice, or you retry after a network blip, the second call is safely rejected. Treat a `409` on
+  `execute` as "already started", not an error to surface.
+- **Missed days self-heal.** `due` returns every `planned` item with `planned_date <= date`
+  (flagged `overdue: true`), so a cron that didn't run yesterday picks up yesterday's slots today.
+  You don't need a catch-up mechanism.
+- **Pass the date explicitly, every time.** The service is timezone-agnostic on purpose; `today`
+  must be *your* date in *your* user's timezone. Never assume the service's wall clock.
+- **Timezone/quiet-hours/"post at 09:00" scheduling is yours.** The plan carries a `time_of_day`
+  hint per item (e.g. `"morning"`, `"18:00"`) — the *advice* for when to publish — but this
+  service does nothing with it. If you want to draft at 06:00 and remind the user at 09:00, that
+  is your cron's job.
+- **No auto-publishing exists anywhere.** Executing an item produces a draft that waits at the
+  human gate. Actually posting the approved copy to LinkedIn/Instagram/X is out of scope for this
+  service — it would be a separate integration you build on top of the approved `outputs`.
+
+---
+
 ## Error codes
 
 | Code | When |
 |---|---|
-| `400` | Missing/invalid fields (no `topic`, empty `target_platforms`, unknown/empty `content_types`, bad `decision`, `approve_after_edit` without `edited_draft`, `/say` or `/raise-hand` without `table_id`/`text`, `/roundtable` with no resolvable `platform`, an unknown `roundtable_mode` or `/round-control` `action`) |
-| `404` | Unknown `task_id`, `session_id`, or video `job_id`; `/render-video` for a platform with no finished draft; `/download` when the rendered file is missing on disk |
-| `409` | Task not awaiting review, `task_id` already exists, brief not complete, `/confirm-learning` before the task is `completed`, `/render-video` on a platform whose run produced no storyboard, or `/download` before the job is `done` |
+| `400` | Missing/invalid fields (no `topic`, empty `target_platforms`, unknown/empty `content_types`, bad `decision`, `approve_after_edit` without `edited_draft`, `/say` or `/raise-hand` without `table_id`/`text`, `/roundtable` with no resolvable `platform`, an unknown `roundtable_mode` or `/round-control` `action`; `/plans` without `goal`/platforms/valid dates, `/plans/due` without a `date`, a PATCH with unknown item fields or a status other than `skipped`/`planned`) |
+| `404` | Unknown `task_id`, `session_id`, `plan_id`/`item_id`, or video `job_id`; `/render-video` for a platform with no finished draft; `/download` when the rendered file is missing on disk |
+| `409` | Task not awaiting review, `task_id` already exists, brief not complete, `/confirm-learning` before the task is `completed`, `/render-video` on a platform whose run produced no storyboard, `/download` before the job is `done`; `/plans/{id}/confirm` on a non-draft plan, `/execute` on a non-active plan or a non-`planned` item (double-execute guard) |
 | `422` | FastAPI request-body validation (malformed JSON / wrong field types); standard FastAPI `detail` payload |
 | `500` | Unexpected error on a **synchronous** call (e.g. `POST /review`). A failure during a **background** run (`POST /tasks` / `/roundtable[s]`, which already returned `running`) is **not** a `500` — the task goes `status: "error"` (with an `error` message) and the SSE stream closes on a `workflow`/`error` event. |
 
@@ -722,6 +898,22 @@ record RenderVideo(String platform) {}                        // POST /tasks/{id
 record TaskSnapshot(String task_id, String status, List<Pending> pending,
                     List<Output> outputs, List<Map<String,Object>> proposed_rules,
                     String error) {}   // error: present only when status == "error"
+
+// Posting plans
+record CreatePlan(String goal, List<String> target_platforms, String start_date, String end_date,
+                  String cadence_hint, String tone_hint, String business_id, String user_id,
+                  List<String> content_types) {}   // dates are YYYY-MM-DD; only goal/platforms/dates required
+record PlanItem(String item_id, String planned_date, String time_of_day, List<String> platforms,
+                String topic, String angle, String rationale, String status,
+                List<String> content_types, String task_id) {}
+record PostingPlan(String plan_id, String business_id, String user_id, String goal,
+                   List<String> target_platforms, String start_date, String end_date,
+                   String status, String strategy_summary, List<PlanItem> items,
+                   String created_at, String updated_at) {}
+record DueItem(String plan_id, String goal, PlanItem item, boolean overdue) {}
+record DueResponse(String date, List<DueItem> items) {}
+record ExecutePlanItem(String session_id) {}   // optional; omit → "{plan_id}--{item_id}"
+record ExecuteResult(String plan_id, PlanItem item, TaskSnapshot task) {}
 ```
 
 ### Client
@@ -775,6 +967,19 @@ public class NewsroomClient {
     // Video render: trigger the MP4 for a finished platform's storyboard, then poll the job.
     public Map<String,Object> renderVideo(String id, String platform) throws Exception { return post("/tasks/" + id + "/render-video", new RenderVideo(platform), Map.class); }
     public Map<String,Object> videoJob(String jobId)             throws Exception { return get("/video-jobs/" + jobId, Map.class); }
+
+    // Posting plans. Create returns a draft; confirm activates it; the daily cron calls
+    // due(today) then execute(...) for each returned item (see the scheduler below).
+    public PostingPlan  createPlan(CreatePlan r)                 throws Exception { return post("/plans", r, PostingPlan.class); }
+    public PostingPlan  plan(String pid)                        throws Exception { return get("/plans/" + pid, PostingPlan.class); }
+    public PostingPlan  confirmPlan(String pid)                 throws Exception { return post("/plans/" + pid + "/confirm", Map.of(), PostingPlan.class); }
+    public DueResponse  duePlanItems(String date, String brandId) throws Exception {
+        String q = "?date=" + date + (brandId == null ? "" : "&business_id=" + brandId);
+        return get("/plans/due" + q, DueResponse.class);
+    }
+    public ExecuteResult executePlanItem(String pid, String iid) throws Exception {
+        return post("/plans/" + pid + "/items/" + iid + "/execute", new ExecutePlanItem(null), ExecuteResult.class);
+    }
 
     /** Stream SSE events until the task completes. */
     public void streamEvents(String id, Consumer<Map<String,Object>> onEvent) throws Exception {
@@ -843,3 +1048,40 @@ t = nr.review(id, new ReviewRequest(verdicts));   // status: "completed" (this c
 - Use a stable `business_id` (and `user_id`) per customer so the service learns their style over time. After the task is `completed`, call `/confirm-learning` (`{"learn": true}`) to persist what it learned from the run — both brand-voice rules and per-user preferences, in one step.
 - `pending[].needs_human_intervention: true` means the platform exhausted retries — show a special warning rather than a normal review prompt.
 - When a platform is rejected, it re-runs and its SSE events repeat — and the `reason` you send is **threaded into the re-draft** (together with the rejected copy), so a concrete reason ("too formal, add a customer stat") makes the next draft fix that specific point instead of rerolling blindly. Collect a short rejection comment in your review UI and pass it as `reason`. Key your UI by `task_id + platform + round` if you need to track per-round history.
+
+### Posting-plan flow + the daily scheduler
+
+```java
+// 1. Create a plan (synchronous) — the user reviews/edits the draft schedule, then confirms it.
+PostingPlan plan = nr.createPlan(new CreatePlan(
+    "Launch our new coffee subscription", List.of("linkedin", "instagram"),
+    "2026-08-01", "2026-08-21", "about 2 posts a week", "warm, confident",
+    "biz-123", "user-9", List.of("text")));
+// … show plan.items() in a calendar UI; PATCH /plans/{id}/items/{iid} to move a date or skip …
+nr.confirmPlan(plan.plan_id());                        // draft → active
+
+// 2. The daily cron (ONE per service instance) — this is the piece YOU own; the service never
+//    fires it. Run early morning in the user's timezone.
+@Scheduled(cron = "0 0 6 * * *", zone = "America/New_York")
+public void draftTodaysPosts() throws Exception {
+    String today = LocalDate.now(ZoneId.of("America/New_York")).toString();  // YOUR clock
+    for (String brandId : managedBrandIds()) {
+        DueResponse due = nr.duePlanItems(today, brandId);
+        for (DueItem d : due.items()) {
+            try {
+                ExecuteResult r = nr.executePlanItem(d.plan_id(), d.item().item_id());
+                // r.task().task_id() is now a normal run heading to the human gate —
+                // notify the user with a link to your review UI keyed on that task_id.
+                notifyUser(brandId, d.item().topic(), r.task().task_id());
+            } catch (RuntimeException alreadyStarted) {
+                // 409 = the item was already executed (double cron / retry). Safe to ignore.
+            }
+        }
+    }
+}
+```
+
+- The execute call spawns an **ordinary task** — from there it's the standard gate/review flow above (SSE → `POST /tasks/{id}/review`). A plan item is not special once executed.
+- **Idempotency is built in:** a repeated `execute` returns `409` (non-`planned` item / duplicate `task_id`); catch it and move on. Don't build your own dedupe.
+- **Missed days self-heal:** `due` returns overdue slots (`overdue: true`) as well as today's, so a skipped cron day is picked up on the next run.
+- **Nothing is auto-published.** `execute` only *drafts* the post to the gate; posting the approved copy to a social platform is a separate integration you'd build on the approved `outputs`.
