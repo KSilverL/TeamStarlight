@@ -1,0 +1,28 @@
+{
+  "brandName": "STARLIGHT",
+  "theme": "dark",
+  "primaryColor": "#0d1117",
+  "secondaryColor": "#2d4ed8",
+  "accentColor": "#f5c84c",
+  "paletteName": "ocean",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "slides": [
+    { "type": "bar_chart", "headline": "Revenue by region", "variant": "race", "highlightIndex": 1, "source": "Source: Q3 report", "bars": [
+      { "label": "EMEA", "value": 42 }, { "label": "AMER", "value": 58 }, { "label": "APAC", "value": 31 }, { "label": "LATAM", "value": 19 }
+    ], "durationFrames": 150 },
+    { "type": "bar_chart", "headline": "Adoption", "variant": "lollipop", "bars": [
+      { "label": "Q1", "value": 12 }, { "label": "Q2", "value": 28 }, { "label": "Q3", "value": 47 }
+    ], "durationFrames": 120 },
+    { "type": "line_chart", "headline": "Growth over time", "variant": "area_glow", "annotation": "All-time high", "source": "Source: internal", "xLabels": ["2021", "2022", "2023", "2024"], "series": [
+      { "label": "Users", "values": [10, 24, 51, 92] }
+    ], "durationFrames": 150 },
+    { "type": "pie_chart", "headline": "Market share", "variant": "donut", "slices": [
+      { "label": "Us", "value": 45 }, { "label": "Rival A", "value": 30 }, { "label": "Rival B", "value": 25 }
+    ], "calloutText": "45%", "durationFrames": 150 },
+    { "type": "pie_chart", "headline": "Budget split", "variant": "exploded", "paletteName": "vivid", "slices": [
+      { "label": "R&D", "value": 40 }, { "label": "Sales", "value": 35 }, { "label": "Ops", "value": 25 }
+    ], "durationFrames": 150 }
+  ]
+}

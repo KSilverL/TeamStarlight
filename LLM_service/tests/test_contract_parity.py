@@ -12,7 +12,10 @@ fully offline and deterministic.
 from __future__ import annotations
 
 import json
+import re
+import typing
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from agent_framework import ChatResponse, ChatResponseUpdate, Message
@@ -38,7 +41,7 @@ def azure_llm(reply: str) -> azure.AzureLLM:
     """An AzureLLM whose single chat seam returns a canned reply."""
     llm = azure.AzureLLM(get_settings())
 
-    async def _complete(messages, *, model=None):
+    async def _complete(messages, *, model=None, temperature=None, max_tokens=None):
         return reply
 
     llm._complete = _complete  # type: ignore[assignment]
@@ -182,6 +185,118 @@ async def test_generate_video_storyboard_parity():
         assert isinstance(out["slides"], list) and 2 <= len(out["slides"]) <= 8
         for slide in out["slides"]:
             assert "type" in slide
+
+
+_PLAN_KEYS = {"strategy_summary", "items"}
+_PLAN_ITEM_KEYS = {"planned_date", "time_of_day", "platforms", "topic", "angle", "rationale"}
+
+
+async def test_plan_campaign_parity():
+    kw = dict(goal="grow subscription signups", platforms=["linkedin", "instagram"],
+              start_date="2026-08-01", end_date="2026-08-14")
+    m = await mock.MockLLM().plan_campaign(**kw)
+    canned = json.dumps({
+        "strategy_summary": "Two weeks: educate first, convert last.",
+        "items": [
+            {"planned_date": "2026-08-03", "time_of_day": "morning",
+             "platforms": ["linkedin"], "topic": "Why subscriptions beat one-off buying",
+             "angle": "educate", "rationale": "Tuesday morning reach on LinkedIn."},
+            {"planned_date": "2026-08-12", "platforms": ["instagram"],
+             "topic": "Subscriber results in numbers", "angle": "proof",
+             "rationale": "Close the window with conversion proof."},
+        ],
+    })
+    a = await azure_llm(canned).plan_campaign(**kw)
+    for out in (m, a):
+        assert isinstance(out, dict) and set(out) == _PLAN_KEYS
+        assert isinstance(out["strategy_summary"], str)
+        assert isinstance(out["items"], list) and out["items"]
+        for item in out["items"]:
+            assert set(item) == _PLAN_ITEM_KEYS
+            assert isinstance(item["platforms"], list) and item["platforms"]
+
+
+# ── Cross-language slide-variant parity (Python spec ⟷ types.ts) ──────────────
+# The renderer's types.ts is hand-mirrored from video_schema.py with no automated
+# check on the TS side; this guards the `variant` Literal unions specifically, since
+# a drift there silently makes the LLM request a variant the renderer can't draw
+# (it would fall through to the default treatment with no error).
+
+_TYPES_TS = Path(__file__).resolve().parents[1] / ".." / "video_renderer" / "src" / "types.ts"
+
+
+# The "style-selector" fields whose Literal union the LLM picks from and the
+# renderer switches on — a drift here silently degrades to a default treatment.
+_STYLE_FIELDS = ("variant", "layout", "shape")
+
+
+def _ts_field_union(types_src: str, type_literal: str, field: str) -> set[str]:
+    """The set of `<field>` string literals on the types.ts interface whose
+    discriminant is `type: "<type_literal>"`. Empty set if the field is absent."""
+    block = re.search(
+        r"export interface \w+ \{[^}]*?type:\s*\"" + re.escape(type_literal) + r"\";[^}]*?\}",
+        types_src, re.DOTALL,
+    )
+    assert block, f"no types.ts interface found for type={type_literal!r}"
+    line = re.search(re.escape(field) + r"\??:\s*([^;]+);", block.group(0))
+    if not line:
+        return set()
+    return set(re.findall(r"\"([^\"]+)\"", line.group(1)))
+
+
+def _spec_style_unions():
+    """(type_literal, field, {literals}) for every style-selector field on a *SlideSpec."""
+    from LLM_service.core import video_schema
+
+    out = []
+    for name in dir(video_schema):
+        obj = getattr(video_schema, name)
+        if not (isinstance(obj, type) and name.endswith("SlideSpec")):
+            continue
+        fields = getattr(obj, "model_fields", {})
+        type_literal = typing.get_args(fields["type"].annotation)[0]
+        for field in _STYLE_FIELDS:
+            if field not in fields:
+                continue
+            literals = set(typing.get_args(fields[field].annotation))
+            if literals:  # a Literal[...] field, not e.g. an Optional[str]
+                out.append((type_literal, field, literals))
+    return out
+
+
+def test_slide_style_unions_match_types_ts():
+    types_src = _TYPES_TS.read_text(encoding="utf-8")
+    checked = _spec_style_unions()
+    assert checked, "expected at least one *SlideSpec with a style-selector field"
+    for type_literal, field, py_union in checked:
+        ts_union = _ts_field_union(types_src, type_literal, field)
+        assert py_union == ts_union, (
+            f"{field} drift for {type_literal!r}: Python has {sorted(py_union)}, "
+            f"types.ts has {sorted(ts_union)}"
+        )
+
+
+async def test_plan_scene_design_parity():
+    m = await mock.MockLLM().plan_scene_design(description="a rising-towers city stat", data={"a": 1})
+    a = await azure_llm("- centre the tallest tower\n- others rise in sequence").plan_scene_design(
+        description="a rising-towers city stat", data={"a": 1})
+    assert isinstance(m, str) and isinstance(a, str) and m and a
+
+
+async def test_review_scene_preview_parity_includes_fixes():
+    m = await mock.MockLLM().review_scene_preview(
+        description="a map of Ireland (off-brief)", image_bytes=b"png", attempt=1)
+    a = await azure_llm(
+        json.dumps({"approved": False, "feedback": "no map shown", "fixes": ["draw a real map outline"]})
+    ).review_scene_preview(description="a map", image_bytes=b"png", attempt=1)
+    for out in (m, a):
+        assert set(out.keys()) == {"approved", "feedback", "fixes"}
+        assert isinstance(out["approved"], bool)
+        assert isinstance(out["feedback"], str)
+        assert isinstance(out["fixes"], list) and all(isinstance(f, str) for f in out["fixes"])
+    # A rejection carries at least one actionable fix in both impls.
+    assert m["approved"] is False and m["fixes"]
+    assert a["approved"] is False and a["fixes"]
 
 
 async def test_distill_rules_parity():

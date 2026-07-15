@@ -19,6 +19,10 @@ by hand and watch it happen, all through the same `WorkflowService` the HTTP API
   • the learning loop: confirm whether to learn this conversation → the archivist distils
     brand rules + per-user preferences and writes them straight to the store, then we
     read them back so you can see they stuck
+  • posting plans: generate a multi-date campaign SCHEDULE (topics + timing + rationale,
+    never copy), confirm it, then play "the backend's daily cron" — pick a date, see which
+    slots are due, and execute one into an ordinary run that drafts the copy on that day
+    and waits at the human gate (the copy is generated on the planned day, not up front)
 
 Everything defaults to mock/offline (no network). Flip USE_MOCK_*=false in LLM_service/.env
 to drive the real Azure / Postgres backends instead — this harness is identical either way.
@@ -30,6 +34,7 @@ import asyncio
 import os
 import sys
 import uuid
+from datetime import date, timedelta
 from pathlib import Path
 
 if __name__ == "__main__":
@@ -302,6 +307,135 @@ async def _run_once() -> None:
     await _confirm_learning(svc, task_id, inputs)
 
 
+# ── 6. posting plans (schedule → confirm → daily cron → execute) ────────────────
+
+def _show_plan(plan: dict) -> None:
+    _section(f"PLAN {plan['plan_id']} · {plan['status']}")
+    print(f"  Goal:    {plan['goal']}")
+    print(f"  Window:  {plan['start_date']} → {plan['end_date']}   ({len(plan['items'])} slots)")
+    if plan.get("strategy_summary"):
+        print(f"  Strategy: {plan['strategy_summary']}")
+    print()
+    for it in plan["items"]:
+        when = f"{it['planned_date']}" + (f" · {it['time_of_day']}" if it.get("time_of_day") else "")
+        badge = "" if it["status"] == "planned" else f"   ⟨{it['status']}⟩"
+        print(f"  ◆ [{it['item_id']}] {when} · {', '.join(it['platforms'])}{badge}")
+        print(f"       topic: {it['topic']}")
+        if it.get("angle"):
+            print(f"       angle: {it['angle']}")
+        if it.get("rationale"):
+            print(f"       why:   {it['rationale']}")
+
+
+async def _wait_out_of_running(wf, task_id: str) -> dict:
+    """Poll the spawned task until it leaves 'running' — i.e. reaches the gate
+    (awaiting_review) or finishes (completed / error). Mirrors what the backend does
+    after POST …/execute: open SSE (or poll GET /tasks/{id}) on the returned task_id."""
+    snap = await wf.get(task_id)
+    for _ in range(400):
+        if snap["status"] != "running":
+            return snap
+        await asyncio.sleep(0.05)
+        snap = await wf.get(task_id)
+    return snap
+
+
+async def _execute_slot(plans, wf, plan_id: str, item_id: str) -> None:
+    """Play the backend's daily cron for ONE due slot: execute it → the run drafts the
+    copy NOW (on the 'planned day') and waits at the human gate like any other task."""
+    res = await plans.execute(plan_id, item_id)
+    task_id = res["task"]["task_id"]
+    print(f"\n  ▶ executing {item_id} → task {task_id}")
+    print("    (the copy is generated now, on the planned day — not when the plan was made)")
+    snapshot = await _wait_out_of_running(wf, task_id)
+    if snapshot["status"] == "awaiting_review":
+        snapshot = await _run_gate(wf, task_id, snapshot)
+    _show_finals(snapshot)
+    got = await plans.get(plan_id)
+    it = next(i for i in got["items"] if i["item_id"] == item_id)
+    print(f"\n  · plan item {item_id} is now: {it['status']}  (task {it.get('task_id')})")
+
+
+async def _run_posting_plan() -> None:
+    # Plan generation is a single LLM call; the EXECUTED slot is an ordinary run. Pin the
+    # roundtable off so the executed run takes the fast linear path (plans don't debate in v1).
+    from LLM_service.api import PlanService, WorkflowService
+
+    os.environ["ROUNDTABLE_ENABLED"] = "false"
+    reset_settings()
+    factory.reset_services()
+
+    _section("1 · POSTING PLAN — describe the campaign")
+    goal = await _ask("  Campaign goal", "Launch our new single-origin coffee subscription")
+    platforms = await _ask("  Platforms (comma-sep)", "linkedin, instagram")
+    plats = [p.strip() for p in platforms.split(",") if p.strip()] or ["linkedin"]
+    today = date.today()
+    start = await _ask("  Start date (YYYY-MM-DD)", today.isoformat())
+    end = await _ask("  End date (YYYY-MM-DD)", (today + timedelta(days=14)).isoformat())
+    cadence = await _ask("  Cadence hint", "about 2 posts a week")
+    business_id = (await _ask("  Brand id (blank = no-brand)", "biz_demo")) or None
+    user_id = (await _ask("  User id (blank = none)", "user_demo")) or None
+    picked = await _ask("  Content types per slot (comma-sep: text, brand, video)", "text")
+    content_types = [c.strip() for c in picked.split(",") if c.strip()] or ["text"]
+
+    wf = WorkflowService()
+    plans = PlanService(workflow=wf)
+
+    _section("2 · GENERATE — the planner proposes a dated schedule (strategy, not copy)")
+    plan = await plans.create({
+        "goal": goal,
+        "target_platforms": plats,
+        "start_date": start,
+        "end_date": end,
+        "cadence_hint": cadence,
+        "business_id": business_id,
+        "user_id": user_id,
+        "content_types": content_types,
+    })
+    _show_plan(plan)
+
+    if not await _yn("\n  Confirm (activate) this plan so its slots can become due?", default=True):
+        print("  · left as a draft — a draft's slots never show up in the daily due query.")
+        return
+    plan = await plans.confirm(plan["plan_id"])
+    print(f"  · plan {plan['plan_id']} is now {plan['status']}")
+
+    _section("3 · DAILY CRON — 'what should go out today?' (you play the backend's scheduler)")
+    print("  The service has no clock — YOU pass the date. Pick a date to see which slots are due,")
+    print("  then execute one (drafts it to the human gate). Re-run for other dates / more slots.")
+    default_date = plan["items"][0]["planned_date"]
+    while True:
+        on = await _ask("\n  Pretend today is (YYYY-MM-DD, blank to stop)", default_date)
+        if not on.strip():
+            break
+        default_date = ""  # only prefill the first time
+        try:
+            due = await plans.due(on, business_id=business_id)
+        except Exception as exc:  # bad date etc. — surface and re-ask
+            print(f"  ✗ {exc}")
+            continue
+        items = due["items"]
+        if not items:
+            print(f"  · nothing due on {on}.")
+        else:
+            print(f"  Due on {on}:")
+            for i, d in enumerate(items, 1):
+                it = d["item"]
+                flag = "  ⚠ OVERDUE" if d["overdue"] else ""
+                print(f"    {i}) [{it['item_id']}] {it['planned_date']} · {', '.join(it['platforms'])} · {it['topic']}{flag}")
+            pick = (await _ask("  Execute which? (number, blank = skip)", "1")).strip()
+            if pick.isdigit() and 1 <= int(pick) <= len(items):
+                chosen = items[int(pick) - 1]
+                await _execute_slot(plans, wf, chosen["plan_id"], chosen["item"]["item_id"])
+        if not await _yn("\n  Check another date / execute another slot?", default=True):
+            break
+
+    _section("PLAN — final state (executed slots reconciled)")
+    _show_plan(await plans.get(plan["plan_id"]))
+    print("\n  Tip: execute a LATER slot after an earlier one is done — its brief carries a")
+    print("       'series recap' of what already went out, so the campaign stays coherent.")
+
+
 def _cheat_sheet() -> None:
     """Which inputs trigger which flow. Each run drives ONE config; loop ('Run another?')
     to cover the rest — together these reach every path through the system."""
@@ -316,6 +450,7 @@ def _cheat_sheet() -> None:
         ("No-brand path",        "Brand id = blank (steers on tone only, never reads the store)"),
         ("Text / voice intake",  "Brief step → choose 2 or 3 (vs 1 = manual)"),
         ("Learning + read-back", "Set Brand id + User id, then 'Learn this conversation?' = Y"),
+        ("Posting plan",         "Top menu → 2: generate a schedule, confirm, then 'daily cron' a date → execute a slot"),
     ]
     for name, how in rows:
         print(f"  • {name:<21} {how}")
@@ -346,7 +481,13 @@ async def main() -> None:
     # Each run drives ONE config through the same WorkflowService the HTTP API uses; loop so you
     # can cover the rest of the cheat-sheet paths without restarting the harness.
     while True:
-        await _run_once()
+        _section("WHAT DO YOU WANT TO TEST?")
+        print("    1) a content run   — intake → newsroom → gate → media → learning")
+        print("    2) a posting plan  — schedule → confirm → daily cron → execute a slot to the gate")
+        if (await _ask("  Choose", "1")).strip().startswith("2"):
+            await _run_posting_plan()
+        else:
+            await _run_once()
         if not await _yn("\n  Run another?", default=False):
             break
     print("\n  bye.")
