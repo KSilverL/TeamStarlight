@@ -318,6 +318,36 @@ class Settings:
     # storyboard with several struggling slides could otherwise spend
     # max_attempts-per-slide x N-slides worth of real cost.
     codegen_max_total_attempts: int = 9
+    # Deployment for the scene-codegen LLM calls (generate_scene_component,
+    # plan_scene_design, review_scene_preview, convert_generated_to_template).
+    # None -> falls back to azure_chat_deployment, same pattern as
+    # roundtable_persona_model/preference_summary_model. Lets a separate/stronger
+    # (e.g. coding-tuned) deployment be swapped in later with no code change.
+    codegen_model: Optional[str] = None
+    # Reasoning effort for generate_scene_component/review_scene_preview/
+    # convert_generated_to_template on a gpt-5.x/o-series deployment. None -> model
+    # default. Unlike the roundtable personas (which use "minimal" for short, fast
+    # turns), codegen is correctness-critical and not latency-sensitive, so a
+    # higher effort is worth trying once it's actually wired (previously it silently
+    # was NOT being sent at all here, unlike the roundtable path).
+    codegen_reasoning_effort: Optional[str] = None
+    # generate_scene_component's max_completion_tokens. MUST have enough headroom
+    # for hidden reasoning tokens (gpt-5.x/o-series) PLUS a full compiling TSX
+    # component — the previous 4096 hardcoded cap left razor-thin margin once any
+    # reasoning is spent, the same failure mode documented for
+    # ROUNDTABLE_PERSONA_MAX_TOKENS ("keep >=512, else hidden reasoning eats the
+    # whole budget and turns come back EMPTY, finish_reason=length").
+    codegen_max_tokens: int = 12000
+    # plan_scene_design's max_completion_tokens. The old hardcoded 512 sat exactly
+    # at the documented danger threshold with no reasoning_effort steer — a prime
+    # suspect for the design plan silently coming back empty (swallowed by
+    # plan_scene_design's `except Exception: return ""`), degrading every
+    # subsequent generate_scene_component call for that slide.
+    codegen_plan_max_tokens: int = 1536
+    # plan_scene_design is a short creative brainstorm ("Do NOT write code"), not a
+    # deep-reasoning task — mirrors the roundtable personas' "minimal" so the
+    # budget goes to the visible bullets, not hidden reasoning tokens.
+    codegen_plan_reasoning_effort: Optional[str] = "minimal"
     # Visual QA pass for `map` slides (workflow/video/map_qa.py): preview-still +
     # vision review per map slide, with a bounded zoom-out repair on rejection.
     # Cost per attempt ≈ one `remotion still` (5-20s) + one vision call, so
@@ -549,6 +579,13 @@ def _load() -> Settings:
         remotion_lambda_site_name_prefix=os.getenv("REMOTION_LAMBDA_SITE_NAME_PREFIX", "storyboard-job"),
         remotion_lambda_output_bucket=os.getenv("REMOTION_LAMBDA_OUTPUT_BUCKET"),
         codegen_max_total_attempts=_env_int("CODEGEN_MAX_TOTAL_ATTEMPTS", 9),
+        codegen_model=os.getenv("CODEGEN_MODEL"),
+        codegen_reasoning_effort=(os.getenv("CODEGEN_REASONING_EFFORT") or "").strip() or None,
+        codegen_max_tokens=_env_int("CODEGEN_MAX_TOKENS", 12000),
+        codegen_plan_max_tokens=_env_int("CODEGEN_PLAN_MAX_TOKENS", 1536),
+        codegen_plan_reasoning_effort=(
+            os.getenv("CODEGEN_PLAN_REASONING_EFFORT", "minimal").strip() or None
+        ),
         map_qa_enabled=True if map_qa is None else map_qa,
         map_qa_max_attempts=_env_int("MAP_QA_MAX_ATTEMPTS", 2),
         webhook_url=os.getenv("WEBHOOK_URL", "http://localhost:9999/status"),

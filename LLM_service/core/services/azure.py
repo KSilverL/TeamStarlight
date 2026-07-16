@@ -105,21 +105,27 @@ def _read_scene_patterns() -> str:
         return ""
 
 
-def _read_scene_exemplar(settings: Settings) -> str:
-    """The checked-in reference scene (video_renderer/src/design/exemplars/
-    ExemplarScene.tsx), embedded verbatim as the codegen few-shot. It lives two
-    levels under src/ — the same depth as a real src/generated/<job>/ file — so its
-    `../../types` / `../../design` imports are exactly what the generated file needs.
-    Returns "" if the file is missing (older checkout); the prompt then falls back to
-    the inline skeleton, so codegen still works."""
-    path = (
-        settings.resolved_video_renderer_dir
-        / "src" / "design" / "exemplars" / "ExemplarScene.tsx"
-    )
-    try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
-        return ""
+# Both exemplars live at the same depth under src/ (same import-path shape a real
+# src/generated/<job>/ file uses). ExemplarScene demonstrates hand-rolled,
+# data-driven visuals; ExemplarChartScene demonstrates the `recharts` construction
+# style — the system prompt offers both `recharts` and hand-rolled SVG/CSS as
+# available imports, so the few-shot material should show both actually working.
+_EXEMPLAR_FILENAMES = ("ExemplarScene.tsx", "ExemplarChartScene.tsx")
+
+
+def _read_scene_exemplars(settings: Settings) -> List[str]:
+    """The checked-in reference scenes (video_renderer/src/design/exemplars/),
+    embedded verbatim as the codegen few-shot. Missing files (older checkout) are
+    skipped silently; an empty result falls back to the inline skeleton, so
+    codegen still works."""
+    base = settings.resolved_video_renderer_dir / "src" / "design" / "exemplars"
+    exemplars: List[str] = []
+    for name in _EXEMPLAR_FILENAMES:
+        try:
+            exemplars.append((base / name).read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    return exemplars
 
 
 # ── LLM (Azure OpenAI / Foundry chat) ─────────────────────────────────────────
@@ -150,6 +156,7 @@ class AzureLLM(LLMService):
     async def _complete(
         self, messages: List[dict], *, model: Optional[str] = None,
         temperature: Optional[float] = None, max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None, verbosity: Optional[str] = None,
     ) -> str:
         """Single seam through which all chat traffic flows (overridable in tests).
         `model` overrides the deployment for one call (e.g. the cheap summary tier);
@@ -157,13 +164,23 @@ class AzureLLM(LLMService):
         when explicitly set, keeping every existing call site byte-identical (and
         avoiding params a reasoning-tier deployment would reject unless a caller
         opts in). `max_tokens` maps to `max_completion_tokens` — the legacy name is
-        rejected by gpt-5.x/o-series (see AzureChatClient._complete)."""
+        rejected by gpt-5.x/o-series (see AzureChatClient._complete).
+        `reasoning_effort`/`verbosity` mirror AzureChatClient's handling for a
+        gpt-5.x reasoning-tier deployment. Critically: when `reasoning_effort` is
+        set, `temperature` is DROPPED even if the caller passed one — a reasoning
+        deployment rejects (or ignores) a custom temperature, which is exactly why
+        AzureChatClient (the roundtable path) never sends one; callers that opt
+        into reasoning_effort are asserting this is a reasoning-tier call."""
         client = self._ensure_client()
         kwargs: dict = {
             "model": model or self._settings.azure_chat_deployment,
             "messages": messages,
         }
-        if temperature is not None:
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
+        if verbosity:
+            kwargs["verbosity"] = verbosity
+        if temperature is not None and not reasoning_effort:
             kwargs["temperature"] = temperature
         if max_tokens is not None:
             kwargs["max_completion_tokens"] = max_tokens
@@ -470,7 +487,8 @@ class AzureLLM(LLMService):
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
         ]
         raw = await self._complete(
-            [{"role": "system", "content": system}, {"role": "user", "content": user_content}]
+            [{"role": "system", "content": system}, {"role": "user", "content": user_content}],
+            model=self._settings.codegen_model,
         )
         data = json.loads(_strip_fences(raw))
         fixes = data.get("fixes")
@@ -500,7 +518,9 @@ class AzureLLM(LLMService):
         try:
             raw = await self._complete(
                 [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                temperature=0.8, max_tokens=512,
+                model=self._settings.codegen_model,
+                reasoning_effort=self._settings.codegen_plan_reasoning_effort,
+                temperature=0.8, max_tokens=self._settings.codegen_plan_max_tokens,
             )
             return raw.strip()
         except Exception:
@@ -520,13 +540,17 @@ class AzureLLM(LLMService):
         prior_source: Optional[str] = None,
         design_plan: Optional[str] = None,
     ) -> str:
-        exemplar = _read_scene_exemplar(self._settings)
+        exemplars = _read_scene_exemplars(self._settings)
         pattern_block = (
-            "Study this EXEMPLARY scene from the same project and follow its shape, "
-            "imports, and quality (content entirely from slide.data, staggered "
-            "entrances, layered backdrop, counting numbers). Do NOT copy its content "
-            "— author a scene for YOUR brief:\n```tsx\n" + exemplar + "\n```\n\n"
-            if exemplar else
+            "Study these EXEMPLARY scenes from the same project and follow their "
+            "shape, imports, and quality (content entirely from slide.data, "
+            "staggered entrances, layered backdrop, counting numbers) — one shows "
+            "hand-rolled data-driven visuals, the other shows the `recharts` "
+            "construction style; use whichever construction fits your brief, or "
+            "neither if your brief calls for something else entirely. Do NOT copy "
+            "their content — author a scene for YOUR brief:\n\n"
+            + "\n\n".join(f"```tsx\n{ex}\n```" for ex in exemplars) + "\n\n"
+            if exemplars else
             # Fallback skeleton when the checked-in exemplar can't be read.
             "Your output must follow this structural pattern:\n```tsx\n"
             "import React from \"react\";\n"
@@ -588,12 +612,16 @@ class AzureLLM(LLMService):
         )
         # Low temperature for the correctness-critical first shot; slightly higher
         # on repairs so a retry can escape a repeated failure mode instead of
-        # re-emitting near-identical broken code. Token ceiling stops a runaway
-        # completion from stalling the whole codegen attempt.
+        # re-emitting near-identical broken code (dropped instead if
+        # codegen_reasoning_effort opts into a reasoning-tier deployment — see
+        # _complete). Token ceiling must have headroom for hidden reasoning tokens
+        # PLUS a full compiling TSX component, not just the component alone.
         raw = await self._complete(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model=self._settings.codegen_model,
+            reasoning_effort=self._settings.codegen_reasoning_effort,
             temperature=0.3 if attempt == 1 else 0.5,
-            max_tokens=4096,
+            max_tokens=self._settings.codegen_max_tokens,
         )
         return _strip_fences(raw)
 
@@ -624,6 +652,7 @@ class AzureLLM(LLMService):
         )
         raw = await self._complete(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model=self._settings.codegen_model,
             temperature=0.2,
         )
         return json.loads(_strip_fences(raw))
