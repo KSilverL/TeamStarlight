@@ -67,10 +67,6 @@ Built on **FastAPI** (ASGI, served by uvicorn). The Python LLM service is consum
 ```
 
 
-
-<!--
-todo: remove 'voice' introduction here later ! @Kai Li
--->
 | Field | Type | Required |
 |---|---|---|
 | `mode` | `"text"` or `"voice"` | ✅ — `"voice"` here is the **cascaded** fallback (STT then the same text pipeline); real speech-to-speech is [`WS /intake/{session_id}/voice`](#ws-intakesession_idvoice--native-speech-to-speech) below, which is independent of this endpoint |

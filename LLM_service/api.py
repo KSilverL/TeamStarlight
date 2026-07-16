@@ -804,10 +804,12 @@ class IntakeService:
         self, session_id: str, *, user_id: Optional[str] = None,
         target_platforms: Optional[list] = None, prior_context: Optional[dict] = None,
     ) -> tuple[RealtimeVoiceIntake, RealtimeVoiceSession]:
+        
         """Open a native speech-to-speech session for `session_id` (WS /intake/{sid}/voice's
         `start` frame) and register it so REST GET /intake/{sid}/brief can find it once
         finished. Returns (intake, realtime_session) — the WS handler pumps audio through
         the latter and events through `intake.handle_event`."""
+        
         prior = _prior_context_from_payload(prior_context)
         intake = RealtimeVoiceIntake()
         realtime_session = await intake.open(
@@ -820,6 +822,7 @@ class IntakeService:
         """The session's {role, content} message history, threaded into a task at start
         so per-user learning can summarize the whole conversation. Empty for an unknown
         session, so starting a task never fails on a stale intake session id."""
+        
         session = self._sessions.get(session_id)
         if session is not None:
             return session.transcript(session_id)

@@ -189,7 +189,7 @@ class BriefConversation:
         # once the goal is known, so the proposal is seeded by THEIR intent. Until then the
         # latched flag makes the clarifier ask for the goal instead of the topic; if the
         # goal never arrives, _force_complete's fallback suggestion still terminates intake.
-        if result.get("wants_topic_idea"):
+        if wants_topic_idea:
             state.wants_topic_idea = True
         if (
             state.wants_topic_idea

@@ -168,8 +168,8 @@ class Settings:
     azure_voicelive_model: str = "gpt-realtime"
     azure_voicelive_api_version: str = "2026-04-10"
     azure_voicelive_api_key: Optional[str] = None   # falls back to the OpenAI key (same resource)
-    # Preset voice for the realtime speech-to-speech bridge (must be one the deployment supports).
-    azure_voicelive_voice: str = "verse"
+    azure_voicelive_voice: str = "verse"            # Preset voice for the realtime speech-to-speech bridge,
+                                                      # (must be one the deployment supports).
 
     # ── Roundtable (multi-persona discussion stage) ────────────────────────────
     # ROUNDTABLE_ENABLED gates the drop-in replacement of `strategist` (wired in Phase 6);

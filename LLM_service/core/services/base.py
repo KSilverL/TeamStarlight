@@ -501,6 +501,89 @@ class VoiceService(ABC):
         """Turn a user audio turn into text. Contract keys: session_id, transcript."""
         ...
 
+
+# ── Realtime voice (native speech-to-speech bridge, GPT-Realtime) ─────────────
+# A second, DUPLEX voice contract alongside VoiceService above. VoiceService's
+# transcribe_turn is a cascaded request/response shape (audio in -> text out, then the
+# text pipeline runs); this one is a live, persistent, event-streamed session where the
+# model consumes and produces audio directly and decides tool calls itself — there is no
+# "transcribe first" step on the path that drives the conversation. Transcripts still
+# arrive as a side channel (captions/logging/per-user learning), never as the mechanism.
+
+@dataclass(frozen=True)
+class RealtimeEvent:
+    """One event out of a live realtime session. `type` discriminates which of the
+    other (mostly-None) fields are populated:
+      - "audio_delta"               -> audio_b64 (assistant speech chunk)
+      - "output_transcript_delta"   -> text (assistant's spoken words, as text)
+      - "input_transcript"          -> text (the user's words, as text)
+      - "tool_call"                 -> call_id, name, arguments
+      - "speech_started"            -> (barge-in: the user started talking)
+      - "response_done"             -> (one assistant turn finished)
+      - "error"                     -> message
+    """
+    type: str
+    audio_b64: Optional[str] = None
+    text: Optional[str] = None
+    call_id: Optional[str] = None
+    name: Optional[str] = None
+    arguments: Optional[dict] = None
+    message: Optional[str] = None
+
+
+class RealtimeVoiceSession(ABC):
+    """One live duplex speech-to-speech session bound to a single intake conversation.
+    Callers push audio in and read `events()` for everything the model produces
+    (speech, transcripts, tool calls); a tool call MUST be answered via
+    `send_tool_result` so the model can continue (its narration of a tool's result,
+    e.g. a suggested topic, only happens once the result is fed back)."""
+
+    @abstractmethod
+    async def send_audio(self, *, audio_b64: str) -> None:
+        """Append one chunk of base64 PCM16 user audio to the session's input buffer."""
+        ...
+
+    @abstractmethod
+    async def send_tool_result(self, *, call_id: str, output: dict) -> None:
+        """Answer a "tool_call" event so the model resumes (and, for a tool whose
+        result the user should hear, narrates it)."""
+        ...
+
+    @abstractmethod
+    async def nudge(self, *, text: str) -> None:
+        """Inject an out-of-band system instruction (not spoken by the user) and
+        prompt a response — used once, e.g., to tell the model the brief is now
+        complete (the MAX_INTAKE_FOLLOWUPS cap was hit) so it wraps up the
+        conversation out loud instead of the brief completing silently behind it."""
+        ...
+
+    @abstractmethod
+    def events(self) -> AsyncIterator[RealtimeEvent]:
+        """The session's event stream, in order, until `close()`."""
+        ...
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Tear down the session."""
+        ...
+
+
+class RealtimeVoiceService(ABC):
+    """Opens a RealtimeVoiceSession. Cheap/cached like the other service getters;
+    the actual connection is made fresh per intake conversation by `open_session`
+    (one session cannot be shared across conversations)."""
+
+    @abstractmethod
+    async def open_session(
+        self, *, session_id: str, instructions: str, tools: List[dict],
+    ) -> RealtimeVoiceSession:
+        """Open one live session. `instructions` is the system prompt (the shared
+        INTAKE_SYSTEM_PROMPT, optionally with a prior-context block folded in);
+        `tools` is BRIEF_TOOL_DEFS (Chat-Completions shape — the impl reshapes it to
+        whatever the wire format needs)."""
+        ...
+
+
 # ── Web research (Bing grounding via Azure AI Foundry agents) ─────────────────
 
 class WebSearchService(ABC):

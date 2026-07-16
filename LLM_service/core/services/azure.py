@@ -48,9 +48,6 @@ from .base import (
 
 
 def _voice_live_ws_url(settings: Settings) -> str:
-    """Normalise AZURE_VOICELIVE_ENDPOINT into the Voice Live realtime WS URL —
-    shared by the cascaded STT bridge (AzureVoice) and the native speech-to-speech
-    bridge (AzureRealtimeVoice), which both talk to the same endpoint/model."""
     endpoint = (settings.azure_voicelive_endpoint or "").rstrip("/")
     if endpoint.startswith("https://"):
         endpoint = "wss://" + endpoint[len("https://"):]
@@ -952,16 +949,17 @@ class AzureVoice(VoiceService):
 
     async def _transcribe(self, user_audio: str) -> str:
         """Send one audio turn to Voice Live and return its transcript. Overridable
-        seam for tests; `websockets` is lazy-imported so this module imports without
-        it. `user_audio` is a base64-encoded PCM16 chunk, supplied via the cascaded
-        REST intake path (`POST /intake` / `/turn`, `mode: "voice"`) — kept as a
-        fallback alongside the native speech-to-speech bridge (AzureRealtimeVoice
-        below), which is what `WS /intake/{sid}/voice` now uses.
+        seam for tests; 
+            `websockets` is lazy-imported so this module imports without it. 
+            `user_audio` is a base64-encoded PCM16 chunk, supplied via the cascaded
+                REST intake path (`POST /intake` / `/turn`, `mode: "voice"`) — kept as a
+                 fallback alongside the native speech-to-speech bridge (AzureRealtimeVoice
+                 below), which is what `WS /intake/{sid}/voice` now uses.
 
         Voice Live handles VAD / end-of-turn detection server-side; we append the
         audio buffer, commit it, and read back the input-audio transcription."""
+        
         import json
-
         import websockets  # lazy import
 
         s = self._settings
@@ -989,7 +987,7 @@ class AzureVoice(VoiceService):
         return {"session_id": session_id, "transcript": transcript}
 
 
-# ── Realtime voice (native speech-to-speech bridge, GPT-Realtime) ─────────────
+# ── Realtime voice (native speech-to-speech bridge) ─────────────
 
 def _to_realtime_tools(tools: List[dict]) -> List[dict]:
     """Reshape BRIEF_TOOL_DEFS' Chat-Completions shape

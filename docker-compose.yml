@@ -7,6 +7,10 @@ services:
     build:
       context: frontend_service
       dockerfile: Dockerfile
+      args:
+        # Build-time only (see Dockerfile) — the browser's direct WS to LLM_service's
+        # realtime voice endpoint (MVP; no Java WS proxy yet).
+        NEXT_PUBLIC_LLM_SERVICE_WS_URL: ${NEXT_PUBLIC_LLM_SERVICE_WS_URL}
     ports:
       - "3000:3000"
     environment:
