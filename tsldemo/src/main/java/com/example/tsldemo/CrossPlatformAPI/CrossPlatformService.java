@@ -113,9 +113,7 @@ public class CrossPlatformService {
 
         CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(requestDTO.getBusinessId(), PlatformEnum.LINKEDIN);
 
-        System.out.println("Checking if URN is null: " + crossPlatformOAuth.getUrn());
         if (crossPlatformOAuth.getUrn() == null) {
-            System.out.println("Getting URN for the first time.");
             LinkedInUserInfoDTO linkedInUserInfo = restClient.get()
                 .uri("https://api.linkedin.com/v2/userinfo")
                 .header("Authorization", "Bearer " + crossPlatformOAuth.getAccessToken())
@@ -128,12 +126,10 @@ public class CrossPlatformService {
 
         LinkedInIniMediaUpRespDTO mediaUploadResponse = new LinkedInIniMediaUpRespDTO(null);
 
-        System.out.println("Making Post request");
         LinkedInPostReqDTO requestBody = new LinkedInPostReqDTO(
             crossPlatformOAuth.getUrn(),
             requestDTO.getMessage()
         );
-        System.out.println("Created Post request");
 
         if (requestDTO.getMedia() != null && !requestDTO.getMedia().isEmpty()) {
             mediaUploadResponse = uploadMedia(requestDTO, crossPlatformOAuth);
@@ -175,18 +171,15 @@ public class CrossPlatformService {
             mime = tika.detect(requestDTO.getMedia().getInputStream());
 
             if (mime.startsWith("image/")) {
-                System.out.println("It's an image.");
                 url = "https://api.linkedin.com/rest/images?action=initializeUpload";
             }
             else if (mime.startsWith("video/")) {
-                System.out.println("It's a video.");
                 url = "https://api.linkedin.com/rest/videos?action=initializeUpload";
                 requestBody.getInitializeUploadRequest().setFileSize(requestDTO.getMedia().getSize());
                 requestBody.getInitializeUploadRequest().setUploadCaptions(false);
                 requestBody.getInitializeUploadRequest().setUploadThumbnail(false);
             }
 
-            System.out.println("Created Initialize Upload request");
 
             // Initialize Upload
             iniResponse = restClient.post()
@@ -219,7 +212,6 @@ public class CrossPlatformService {
             e.printStackTrace();
         }
 
-        System.out.println("Media uploaded successfully. Media URN: " + iniResponse.value().mediaUrn());
         return iniResponse;
     }
 
