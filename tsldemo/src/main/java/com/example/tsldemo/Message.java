@@ -24,6 +24,8 @@ public class Message {
 	private String content;
 	@JsonProperty
 	private String timestamp;
+	@JsonProperty
+	private static boolean scheduled = false;
 	
 	@ManyToOne
 	@JoinColumn(name = "session_id")
@@ -34,8 +36,16 @@ public class Message {
 		this.timestamp = LocalDateTime.now().toString();
 		this.role = role;
 		this.content = content;
-
 	}
+	
+	public Message(String role, String content, String timestamp) {
+		this.timestamp = timestamp;
+		this.role = role;
+		this.content = content;
+		scheduled = true;
+		
+	}
+	
 	
 	public Message() {}
 	
