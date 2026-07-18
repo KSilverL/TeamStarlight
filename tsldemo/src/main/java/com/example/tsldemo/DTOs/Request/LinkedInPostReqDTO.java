@@ -9,9 +9,6 @@ public record LinkedInPostReqDTO(
     @JsonProperty("message")
     String message,
     
-    @JsonProperty("business_id")
-    int businessId,
-    
     @JsonProperty("scheduled_time")
     LocalDateTime scheduledTime
 ) {}
