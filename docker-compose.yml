@@ -53,7 +53,7 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - USE_MOCK=false
+      - USE_MOCK=true
       - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
       - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
       - AZURE_OPENAI_CHAT_DEPLOYMENT=${AZURE_OPENAI_CHAT_DEPLOYMENT}
@@ -79,7 +79,7 @@ services:
       - USE_MOCK_SAFETY=true
       # Brand profiles + user skills come from the same Postgres DATABASE_URL above, so the
       # roundtable's brand_voice/user_advocate personas argue from real data, not mocks.
-      - USE_MOCK_STORE=false
+      - USE_MOCK_STORE=true
       # - SOUNDRAW_API_KEY=${SOUNDRAW_API_KEY}
       # Roundtable discussion stage (multi-persona debate before drafting) — see .env.example
       # for the full explanation of each knob. Manager stays on AZURE_OPENAI_CHAT_DEPLOYMENT;

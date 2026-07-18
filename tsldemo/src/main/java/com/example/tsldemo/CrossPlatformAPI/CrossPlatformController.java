@@ -88,11 +88,10 @@ public class CrossPlatformController {
 
         LinkedInPostReqDTO secureDto = new LinkedInPostReqDTO(
                 requestDTO.message(),
-                businessId,
                 requestDTO.scheduledTime()
         );
 
-        crossPlatformService.schedulePostToLinkedIn(secureDto);
+        crossPlatformService.schedulePostToLinkedIn(businessId, secureDto);
         return ResponseEntity.ok(Map.of("status", "scheduled"));
         
     }

@@ -4,11 +4,13 @@ import java.io.IOException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.ZoneId;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 import org.springframework.beans.factory.annotation.*;
 import org.springframework.http.HttpStatus;
@@ -22,11 +24,14 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.server.ResponseStatusException;
 
 import com.example.tsldemo.CrossPlatformOAuth;
+import com.example.tsldemo.Message;
+import com.example.tsldemo.Session;
 import com.example.tsldemo.DTOs.Request.LinkedInCredsReqDTO;
 import com.example.tsldemo.DTOs.Request.LinkedInPostReqDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInAuthRespDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInUserInfoDTO;
 import com.example.tsldemo.ENUMS.PlatformEnum;
+import com.example.tsldemo.SessionAPI.SessionService;
 
 import jakarta.servlet.http.HttpServletResponse;
 
@@ -35,6 +40,8 @@ public class CrossPlatformService {
 
     @Autowired
     private CrossPlatformRepository crossPlatformRepository;
+    
+    @Autowired SessionService sessionServ;
 
 	private final RestClient restClient;
 
@@ -170,9 +177,7 @@ public class CrossPlatformService {
         crossPlatformRepository.save(crossPlatformOAuth);
     }
     
-    public void schedulePostToLinkedIn(LinkedInPostReqDTO scheduledPost) {
-    	int businessId = scheduledPost.businessId();
-
+    public void schedulePostToLinkedIn(int businessId, LinkedInPostReqDTO scheduledPost) {
         Instant when = scheduledPost.scheduledTime()
                 .atZone(ZoneId.systemDefault())
                 .toInstant();
