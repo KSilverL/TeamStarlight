@@ -78,4 +78,22 @@ public class CrossPlatformController {
         crossPlatformService.saveLinkedInCredentials(businessId, requestDTO);
         return ResponseEntity.ok("LinkedIn company credentials added successfully.");
     }
+    
+    @PostMapping("/linkedin/schedule-post")
+    public ResponseEntity<?> linkedInSchedulePost(
+            @RequestBody LinkedInPostReqDTO requestDTO,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+
+    	int businessId = requireBusinessId(authHeader);
+
+        LinkedInPostReqDTO secureDto = new LinkedInPostReqDTO(
+                requestDTO.message(),
+                businessId,
+                requestDTO.scheduledTime()
+        );
+
+        crossPlatformService.schedulePostToLinkedIn(secureDto);
+        return ResponseEntity.ok(Map.of("status", "scheduled"));
+        
+    }
 }

@@ -4,6 +4,8 @@ import java.io.IOException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.time.LocalTime;
+import java.time.ZoneId;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -12,6 +14,7 @@ import org.springframework.beans.factory.annotation.*;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.scheduling.TaskScheduler;
 import org.springframework.stereotype.Service;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
@@ -40,9 +43,12 @@ public class CrossPlatformService {
 
     @Value("${frontend.base-url:http://localhost:3000}")
     private String frontendBaseUrl;
+    
+    private final TaskScheduler taskScheduler;
 
-    public CrossPlatformService(RestClient restClient) {
+    public CrossPlatformService(RestClient restClient, TaskScheduler taskScheduler) {
         this.restClient = restClient;
+        this.taskScheduler = taskScheduler;
     }
 
     public void authCodeLinkedIn(int businessId, HttpServletResponse response) throws IOException {
@@ -163,4 +169,18 @@ public class CrossPlatformService {
 
         crossPlatformRepository.save(crossPlatformOAuth);
     }
+    
+    public void schedulePostToLinkedIn(LinkedInPostReqDTO scheduledPost) {
+    	int businessId = scheduledPost.businessId();
+
+        Instant when = scheduledPost.scheduledTime()
+                .atZone(ZoneId.systemDefault())
+                .toInstant();
+
+        taskScheduler.schedule(() -> {
+            System.out.println("Scheduled LinkedIn post fired at " + Instant.now());
+            postToLinkedIn(businessId, scheduledPost);
+        }, when);
+    }
+    
 }
