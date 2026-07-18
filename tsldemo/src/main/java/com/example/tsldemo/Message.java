@@ -25,7 +25,7 @@ public class Message {
 	@JsonProperty
 	private String timestamp;
 	@JsonProperty
-	private static boolean scheduled = false;
+	private boolean scheduled = false;
 	
 	@ManyToOne
 	@JoinColumn(name = "session_id")
@@ -82,6 +82,9 @@ public class Message {
 		return session;
 	}
 	
+	public boolean isScheduled() {
+		return scheduled;
+	}
 	
 	public void setSession(Session session) {
 		this.session = session;
