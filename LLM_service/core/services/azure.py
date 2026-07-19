@@ -148,8 +148,13 @@ class AzureLLM(LLMService):
                 # scene-codegen loop in particular used to burn a whole retry
                 # attempt (a real compile + preview render) on one transient HTTP
                 # blip because nothing retried at this layer.
+                # 300s (not the old 120s): a reasoning-tier codegen call
+                # (CODEGEN_REASONING_EFFORT) can legitimately run past 120s, and at
+                # 120s a real slow-but-successful call was getting killed and
+                # retried up to max_retries times, compounding into a multi-minute
+                # timeout storm that surfaced as an uncaught exception.
                 max_retries=3,
-                timeout=120.0,
+                timeout=300.0,
             )
         return self._client
 
