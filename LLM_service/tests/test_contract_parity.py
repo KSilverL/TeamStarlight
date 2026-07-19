@@ -41,7 +41,10 @@ def azure_llm(reply: str) -> azure.AzureLLM:
     """An AzureLLM whose single chat seam returns a canned reply."""
     llm = azure.AzureLLM(get_settings())
 
-    async def _complete(messages, *, model=None, temperature=None, max_tokens=None):
+    async def _complete(
+        messages, *, model=None, temperature=None, max_tokens=None,
+        reasoning_effort=None, verbosity=None,
+    ):
         return reply
 
     llm._complete = _complete  # type: ignore[assignment]
@@ -185,6 +188,21 @@ async def test_generate_video_storyboard_parity():
         assert isinstance(out["slides"], list) and 2 <= len(out["slides"]) <= 8
         for slide in out["slides"]:
             assert "type" in slide
+
+
+async def test_generate_video_prompt_parity():
+    """Both impls return the VideoPromptSpec shape ({prompt, motion}) for the premium
+    Higgsfield path, with and without reference images (image-to-video vs text-to-video)."""
+    kw = dict(topic="coffee launch", draft="Our new single-origin is here.",
+              tone_hint="warm", platform="instagram_reels")
+    canned = json.dumps({"prompt": "a slow cinematic pour of fresh coffee", "motion": "slow dolly-in"})
+    for has_ref in (False, True):
+        m = await mock.MockLLM().generate_video_prompt(**kw, has_reference_images=has_ref)
+        a = await azure_llm(canned).generate_video_prompt(**kw, has_reference_images=has_ref)
+        for out in (m, a):
+            assert set(out.keys()) == {"prompt", "motion"}
+            assert isinstance(out["prompt"], str) and out["prompt"]
+            assert out["motion"] is None or isinstance(out["motion"], str)
 
 
 # ── Cross-language slide-variant parity (Python spec ⟷ types.ts) ──────────────

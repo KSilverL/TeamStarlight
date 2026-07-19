@@ -1,5 +1,4 @@
 services:
-
   # ---------------------------------------------------------------------------
   # Frontend — Next.js production build
   # ---------------------------------------------------------------------------
@@ -58,6 +57,11 @@ services:
       - "8080:8080"
     environment:
       - USE_MOCK=false
+      # "local" (default) -> the Remotion CLI pipeline (workflow/video/render.py +
+      # codegen.py's `generated`-slide self-repair loop). Set VIDEO_RENDER_BACKEND=higgsfield
+      # in .env to switch back to the premium generative-AI-video path — nothing else
+      # here needs to change either way (HIGGSFIELD_* stays wired below regardless).
+      - VIDEO_RENDER_BACKEND=${VIDEO_RENDER_BACKEND:-local}
       - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
       - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
       - AZURE_OPENAI_CHAT_DEPLOYMENT=${AZURE_OPENAI_CHAT_DEPLOYMENT}
@@ -107,17 +111,31 @@ services:
       - AZURE_PERSONA_ENDPOINT=${AZURE_PERSONA_ENDPOINT}
       - AZURE_PERSONA_API_KEY=${AZURE_PERSONA_API_KEY}
       - TREND_SCOUT_ENABLED=${TREND_SCOUT_ENABLED}
+      # Remotion `generated`-slide codegen deployment/tuning (workflow/video/codegen.py).
+      # CODEGEN_MAX_TOTAL_ATTEMPTS was never passed through compose either — added here too.
+      - CODEGEN_MAX_TOTAL_ATTEMPTS=${CODEGEN_MAX_TOTAL_ATTEMPTS}
+      - CODEGEN_MODEL=${CODEGEN_MODEL}
+      - CODEGEN_REASONING_EFFORT=${CODEGEN_REASONING_EFFORT}
+      - CODEGEN_MAX_TOKENS=${CODEGEN_MAX_TOKENS}
+      - CODEGEN_PLAN_MAX_TOKENS=${CODEGEN_PLAN_MAX_TOKENS}
+      - CODEGEN_PLAN_REASONING_EFFORT=${CODEGEN_PLAN_REASONING_EFFORT}
       # Voiceover (Azure Speech TTS) — off by default (mock), opt-in per render via
       # POST /tasks/{id}/render-video's narration_text field either way.
-      - USE_MOCK_VOICEOVER=true
       # - AZURE_SPEECH_KEY=${AZURE_SPEECH_KEY}
       # - AZURE_SPEECH_REGION=${AZURE_SPEECH_REGION}
       # Cloud (Remotion Lambda) video rendering — off by default (VIDEO_RENDER_BACKEND
       # defaults to "local", the subprocess path this image is already built for).
       # Uncomment once a function + stable site are deployed (see .env.example).
-      # - VIDEO_RENDER_BACKEND=lambda
       # - AWS_REGION=${AWS_REGION}
       # - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       # - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       # - REMOTION_LAMBDA_FUNCTION_NAME=${REMOTION_LAMBDA_FUNCTION_NAME}
       # - REMOTION_LAMBDA_SERVE_URL=${REMOTION_LAMBDA_SERVE_URL}
+
+      # Higgsfield credentials
+      - USE_MOCK_VIDEO_GENERATION=false
+      - HIGGSFIELD_API_KEY=${HIGGSFIELD_API_KEY}
+      - HIGGSFIELD_API_SECRET=${HIGGSFIELD_API_SECRET}
+      - HIGGSFIELD_IMAGE_MODEL=${HIGGSFIELD_IMAGE_MODEL}
+      - HIGGSFIELD_TEXT_MODEL=${HIGGSFIELD_TEXT_MODEL}
+      - HIGGSFIELD_MAX_DURATION_S=15

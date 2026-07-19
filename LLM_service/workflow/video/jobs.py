@@ -34,9 +34,27 @@ def _job_dir(settings: Settings, job_id: str) -> Path:
 async def _run_job(
     job_id: str, storyboard: StoryboardSpec, settings: Settings,
     *, narration_text: Optional[str] = None, narration_voice: Optional[str] = None,
+    reference_images: Optional[list[bytes]] = None,
 ) -> None:
     store = factory.get_store()
     job_dir = _job_dir(settings, job_id)
+
+    # Premium generative-AI path (Higgsfield): no Remotion, no asset/music/voiceover
+    # resolution — a single clip generated from a crafted prompt (+ optional user
+    # reference images), written to job_dir/output.mp4 (same output_path contract).
+    if settings.video_render_backend == "higgsfield":
+        from .higgsfield_render import generate_ai_video  # lazy: no httpx/Higgsfield surface for local dev
+
+        try:
+            output_path = await generate_ai_video(
+                storyboard, job_dir=job_dir, platform=storyboard.platform,
+                settings=settings, reference_images=reference_images,
+            )
+            await store.update_video_job(job_id=job_id, status="done", output_path=str(output_path), error=None)
+        except Exception as exc:  # any failure resolves the poll, never hangs it
+            await store.update_video_job(job_id=job_id, status="error", error=f"AI video generation failed: {exc}")
+        return
+
     # Reap generated-slide dirs orphaned by crashed/killed past processes BEFORE
     # this job writes its own (this call is why one old broken job can't degrade
     # this one — see codegen.py's module docstring on typecheck isolation).
@@ -73,6 +91,7 @@ async def _run_job(
 async def start_render_job(
     *, task_id: str, platform: str, storyboard: StoryboardSpec,
     narration_text: Optional[str] = None, narration_voice: Optional[str] = None,
+    reference_images: Optional[list[bytes]] = None,
 ) -> dict:
     """Create a `pending` video job row and kick off the render in the background.
     Returns the freshly created job document (id, task_id, platform, status=pending, ...).
@@ -80,7 +99,9 @@ async def start_render_job(
     voiceover track; omitted/None means no narration, the render is exactly as
     before. Never auto-generated from the approved draft in this pass — the caller
     supplies it, keeping this addition's blast radius small (no new content_type,
-    no schema change to FinalDraft/StoreService)."""
+    no schema change to FinalDraft/StoreService). `reference_images` (optional) are
+    the user's attached images, passed to the Higgsfield backend as image-to-video
+    references; ignored by the Remotion (local/lambda) backends."""
     store = factory.get_store()
     settings = get_settings()
     job_id = f"vid-{uuid.uuid4().hex[:12]}"
@@ -88,7 +109,11 @@ async def start_render_job(
         job_id=job_id, task_id=task_id, platform=platform, storyboard=storyboard.model_dump(),
     )
     asyncio.create_task(
-        _run_job(job_id, storyboard, settings, narration_text=narration_text, narration_voice=narration_voice)
+        _run_job(
+            job_id, storyboard, settings,
+            narration_text=narration_text, narration_voice=narration_voice,
+            reference_images=reference_images,
+        )
     )
     return doc
 

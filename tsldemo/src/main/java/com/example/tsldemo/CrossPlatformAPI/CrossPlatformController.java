@@ -2,6 +2,7 @@ package com.example.tsldemo.CrossPlatformAPI;
 
 import com.example.tsldemo.DTOs.Request.LinkedInCredsReqDTO;
 import com.example.tsldemo.DTOs.Request.LinkedInPostReqDTO;
+import com.example.tsldemo.DTOs.Request.LinkedInVideoPostReqDTO;
 import com.example.tsldemo.auth.JwtUtil;
 
 import jakarta.servlet.http.HttpServletResponse;
@@ -66,6 +67,16 @@ public class CrossPlatformController {
 
         int businessId = requireBusinessId(authHeader);
         String postId = crossPlatformService.postToLinkedIn(businessId, requestDTO);
+        return ResponseEntity.ok(Map.of("PostId", postId));
+    }
+
+    @PostMapping("/linkedin/post-video")
+    public ResponseEntity<?> linkedInPostVideo(
+            @RequestBody LinkedInVideoPostReqDTO requestDTO,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+
+        int businessId = requireBusinessId(authHeader);
+        String postId = crossPlatformService.postVideoToLinkedIn(businessId, requestDTO);
         return ResponseEntity.ok(Map.of("PostId", postId));
     }
 

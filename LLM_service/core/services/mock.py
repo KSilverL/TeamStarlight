@@ -45,6 +45,7 @@ from .base import (
     SafetyResult,
     SafetyService,
     StoreService,
+    VideoGenerationService,
     VoiceoverService,
     VoiceService,
     WebSearchService,
@@ -563,6 +564,28 @@ class MockLLM(LLMService):
     ) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
         return _mock_storyboard(topic, draft, tone_hint, platform)
+
+    async def generate_video_prompt(
+        self,
+        *,
+        topic: str,
+        draft: str,
+        tone_hint: Optional[str],
+        platform: str,
+        has_reference_images: bool = False,
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        subject = (topic or draft or "the brand story").strip()
+        tone = (tone_hint or "cinematic").strip()
+        if has_reference_images:
+            # Complement the user's reference images: describe motion/atmosphere only.
+            prompt = (
+                f"Bring the reference image to life with subtle, {tone} motion — "
+                f"gentle parallax and soft light shifts, staying true to the shot."
+            )
+        else:
+            prompt = f"A {tone} shot capturing {subject}, warm cinematic lighting, shallow depth of field."
+        return {"prompt": prompt, "motion": "slow dolly-in"}
 
     async def distill_rules(
         self,
@@ -1249,6 +1272,68 @@ class MockVoiceover(VoiceoverService):
         words = len(text.split())
         duration_seconds = max(1.0, (words / _MOCK_SPEAKING_RATE_WPM) * 60)
         return _silent_mp3(duration_seconds)
+
+
+# Minimal but structurally-valid MP4 container (ftyp + mdat), used as the offline
+# placeholder when no ffmpeg is on PATH. Real bytes with correct box headers so the
+# file is a genuine (if empty) .mp4, not a text stub — the higgsfield render path just
+# writes these to job_dir/output.mp4 and streams them back; nothing ffprobes it.
+_MINIMAL_MP4 = (
+    b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+    b"\x00\x00\x00\x08mdat"
+)
+
+
+def _placeholder_mp4(duration_seconds: float) -> bytes:
+    """Return real MP4 bytes for the offline video-generation stand-in. Prefers a
+    genuine playable clip via a system `ffmpeg` (lavfi colour source) when available
+    — useful for a dev eyeballing the pipeline — and falls back to a minimal valid
+    MP4 container otherwise, so tests never depend on ffmpeg being installed."""
+    import shutil
+    import subprocess
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        secs = max(1.0, min(duration_seconds, 15.0))
+        try:
+            proc = subprocess.run(
+                [
+                    ffmpeg, "-y", "-f", "lavfi",
+                    "-i", f"color=c=black:s=256x256:d={secs:.1f}:r=12",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    "-f", "mp4", "pipe:1",
+                ],
+                capture_output=True, timeout=30,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                return proc.stdout
+        except (OSError, subprocess.SubprocessError):
+            pass  # fall through to the static container
+    return _MINIMAL_MP4
+
+
+class MockVideoGeneration(VideoGenerationService):
+    """Offline stand-in for Higgsfield (core/services/higgsfield.py): returns a real
+    MP4 (a black clip via ffmpeg when present, else a minimal valid container) so the
+    premium render path — submit-less — writes job_dir/output.mp4 and the download
+    endpoint streams it, all without real credentials or network. `reference_images`
+    is accepted and ignored (the mock can't actually condition on them).
+
+    TODO: nothing to wire — the real path is HiggsfieldVideoGeneration; this only
+    proves the plumbing, not real generation (mirrors MockMusicGeneration)."""
+
+    async def generate_clip(
+        self,
+        *,
+        prompt: str,
+        reference_images: Optional[List[bytes]] = None,
+        model: str,
+        duration_seconds: float,
+        width: int,
+        height: int,
+    ) -> bytes:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return _placeholder_mp4(duration_seconds)
 
 
 # ── Web research (offline stand-in for the Foundry-agent-backed search) ───────

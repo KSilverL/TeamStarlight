@@ -902,6 +902,7 @@ class VideoService:
     async def start(
         self, task_id: str, platform: str, *,
         narration_text: Optional[str] = None, narration_voice: Optional[str] = None,
+        reference_images: Optional[list[str]] = None,
     ) -> dict:
         draft = self._workflow.get_final_draft(task_id, platform)
         if draft is None:
@@ -912,6 +913,7 @@ class VideoService:
         doc = await start_render_job(
             task_id=task_id, platform=platform, storyboard=StoryboardSpec(**storyboard),
             narration_text=narration_text, narration_voice=narration_voice,
+            reference_images=_decode_reference_images(reference_images),
         )
         return {"job_id": doc["id"], "status": doc["status"]}
 
@@ -937,6 +939,26 @@ class VideoService:
         if not path.is_file():
             raise ApiError(404, f"rendered file for job {job_id} is missing on disk")
         return str(path), False
+
+
+def _decode_reference_images(images: Optional[list[str]]) -> Optional[list[bytes]]:
+    """Decode up to 3 base64 reference images (accepting `data:image/...;base64,<b64>`
+    data URLs or raw base64) into bytes for the Higgsfield backend. A malformed entry is
+    a client error (400) — reference images are opt-in, so a bad one should surface, not
+    silently vanish. Returns None when none were supplied."""
+    if not images:
+        return None
+    import base64
+    import binascii
+
+    out: list[bytes] = []
+    for img in images[:3]:
+        b64 = img.split(",", 1)[1] if img.startswith("data:") else img
+        try:
+            out.append(base64.b64decode(b64, validate=True))
+        except (binascii.Error, ValueError):
+            raise ApiError(400, "reference_images must be valid base64 (optionally a data URL)")
+    return out or None
 
 
 def _verdict_from_payload(payload: dict) -> HumanVerdict:
@@ -1136,6 +1158,11 @@ class RenderVideoRequest(BaseModel):
         None, description="Provider voice id (e.g. an Azure Neural voice name). "
         "Omit to use VOICEOVER_DEFAULT_VOICE."
     )
+    reference_images: Optional[list[str]] = Field(
+        None, description="1-3 user-attached reference images as base64 data URLs "
+        "(or raw base64), passed to the Higgsfield backend for image-to-video. "
+        "Ignored by the Remotion (local/lambda) backends."
+    )
 
 
 # ── Dependencies: pull the per-app service singletons off app.state ───────────
@@ -1286,6 +1313,7 @@ async def render_video(request: Request, task_id: str, body: RenderVideoRequest)
     return await _video(request).start(
         task_id, body.platform,
         narration_text=body.narration_text, narration_voice=body.narration_voice,
+        reference_images=body.reference_images,
     )
 
 

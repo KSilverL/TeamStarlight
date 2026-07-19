@@ -39,6 +39,7 @@ __all__ = [
     "BackgroundRemovalService",
     "MusicGenerationService",
     "VoiceoverService",
+    "VideoGenerationService",
     "empty_profile",
 ]
 
@@ -209,6 +210,31 @@ class LLMService(ABC):
         the static spec (skills/brand_video_storyboard.md). `history` (optional) is the
         prior {role, content} conversation the caller assembled, folded in as context
         for a follow-up; None/empty = single-turn."""
+        ...
+
+    @abstractmethod
+    async def generate_video_prompt(
+        self,
+        *,
+        topic: str,
+        draft: str,
+        tone_hint: Optional[str],
+        platform: str,
+        has_reference_images: bool = False,
+    ) -> dict:
+        """Craft a single text prompt for a GENERATIVE AI video clip (Higgsfield —
+        workflow/video/higgsfield_render.py), the premium sibling of the templated
+        Remotion storyboard. Returns a JSON-friendly dict matching
+        core.video_schema.VideoPromptSpec: {"prompt": str, "motion": str|None}.
+        `prompt` is one cinematic shot description the video model renders directly
+        (subject, setting, lighting, mood — NOT a storyboard, NOT post copy); `motion`
+        is an optional short camera/motion cue (e.g. 'slow dolly-in'). `platform` gives
+        length/format context only (the aspect ratio is derived deterministically
+        downstream). `has_reference_images` is True when the user attached 1-3 reference
+        images the clip is generated FROM (image-to-video): in that case the prompt must
+        COMPLEMENT the images — describe motion, camera, and atmosphere — and must NOT
+        re-describe or contradict the subject the images already fix. False means pure
+        text-to-video, so the prompt fully specifies the subject."""
         ...
 
     @abstractmethod
@@ -668,4 +694,38 @@ class VoiceoverService(ABC):
         """Return audio bytes (mp3) speaking `text` in `voice` (a provider-specific
         voice id, e.g. an Azure Neural voice name). Raises on a hard failure (rate
         limit, bad voice id, network) — callers fall back to no narration."""
+        ...
+
+
+# ── Generative AI video (Higgsfield — premium render backend) ──────────────────
+
+class VideoGenerationService(ABC):
+    """Generative, cinematic AI video for the premium render backend (Higgsfield —
+    workflow/video/higgsfield_render.py), distinct from the free templated Remotion
+    path. Selected by VIDEO_RENDER_BACKEND=higgsfield, never used on the local/lambda
+    Remotion path. One generation produces ONE clip (the model's native per-generation
+    max, ~≤15s); multi-scene stitching is a later phase."""
+
+    @abstractmethod
+    async def generate_clip(
+        self,
+        *,
+        prompt: str,
+        reference_images: Optional[List[bytes]] = None,
+        model: str,
+        duration_seconds: float,
+        width: int,
+        height: int,
+    ) -> bytes:
+        """Return MP4 bytes for one generated clip. The submit → poll → download cycle
+        happens INSIDE the impl (the caller just awaits the finished bytes, mirroring
+        MusicGenerationService/VoiceoverService). `reference_images` empty/None →
+        text-to-video (the `prompt` fully specifies the subject); 1-3 images present →
+        image-to-video (the images are the visual reference the clip is generated from,
+        the `prompt` supplies motion/atmosphere). `model` is the provider model id
+        (a different one per input mode); `width`/`height` come from
+        core.video_schema.aspect_for_platform and are mapped to the provider's aspect
+        param; `duration_seconds` is clamped to the model's max by the caller. Raises on
+        a hard failure (rate limit, bad params, network, generation error) — the render
+        job marks itself `error`, exactly like a failed Remotion render."""
         ...
