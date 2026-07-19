@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect } from "react";
 import Link from "next/link";
+import { useRealtimeVoice, type VoiceBriefPartial } from "./useRealtimeVoice";
 
 type Platform = "x" | "instagram" | "tiktok" | "linkedin";
 
@@ -180,6 +181,10 @@ interface Message {
   roundtableConverged?: boolean;
   roundtableStrategy?: string;
   roundControlWaiting?: RoundControlPrompt | null;
+  // Set on voice turns (native speech-to-speech) once the clip is fully assembled —
+  // an object URL for a WAV blob built client-side from the raw PCM16 the session
+  // streamed, so the turn's audio can be replayed/downloaded from its bubble.
+  audioUrl?: string;
 }
 
 const PLATFORMS: {
@@ -289,6 +294,10 @@ export default function ChatPage() {
   const historyRef = useRef<{ role: "user" | "assistant"; content: string }[]>([]);
   // Registered once on the first send; null until then.
   const sessionIdRef = useRef<string | null>(null);
+  // The currently-growing assistant voice bubble (id + text-so-far), so streamed
+  // transcript deltas update ONE message in place instead of spawning a new bubble per
+  // fragment; cleared once the turn ends (persisted exactly once at that point).
+  const streamingAssistantRef = useRef<{ id: string; text: string } | null>(null);
   // Active EventSource for the MAF workflow SSE stream; replaced on each new workflow run.
   const workflowEsRef = useRef<EventSource | null>(null);
   // table_id -> the id of that table's RoundtableCard message, so later agent_utterance /
@@ -442,8 +451,15 @@ export default function ChatPage() {
     }, 350);
   }
 
-  function pushMessage(msg: Omit<Message, "id" | "timestamp">) {
-    setMessages((prev) => [...prev, { ...msg, id: newId(), timestamp: new Date() }]);
+  function pushMessage(msg: Omit<Message, "id" | "timestamp">, insertBeforeId?: string): string {
+    const id = newId();
+    const full: Message = { ...msg, id, timestamp: new Date() };
+    setMessages((prev) => {
+      const idx = insertBeforeId ? prev.findIndex((m) => m.id === insertBeforeId) : -1;
+      if (idx === -1) return [...prev, full];
+      return [...prev.slice(0, idx), full, ...prev.slice(idx)];
+    });
+    return id;
   }
 
   // ── Roundtable card helpers — one growing card per table_id ──────────────────
@@ -724,6 +740,74 @@ export default function ChatPage() {
     } catch {
       pushMessage({ role: "assistant", content: "Could not reach the brand backend." });
     }
+  }
+
+  // ── Voice (native speech-to-speech, direct WS to LLM_service) ────────────────
+  // MVP: bypasses the Java backend (no WS infra there yet). Registers/reuses the same
+  // session_id the typed-chat path uses, then hands the finished brief to genWorkflow —
+  // the exact same downstream pipeline a typed message drives.
+  const voice = useRealtimeVoice({
+    targetPlatforms: selectedPlatforms,
+    onTranscript: (role, fullText, isNewTurn, audioUrl) => {
+      if (role === "user") {
+        // The user's turn arrives as one complete transcript (Whisper delivers the
+        // whole segment at once, not deltas) — one bubble, persisted immediately.
+        // The model can start replying before this catches up (transcription is a
+        // side channel, never a gate on it), so if the assistant's bubble for this
+        // exchange is already open, insert the user's bubble BEFORE it — otherwise
+        // the conversation reads out of order despite arriving in this order.
+        pushMessage({ role: "user", content: fullText, audioUrl }, streamingAssistantRef.current?.id);
+        if (sessionIdRef.current) persistMessage(sessionIdRef.current, "user", fullText);
+        return;
+      }
+      // The assistant streams many small deltas per turn — grow ONE bubble in place
+      // instead of spawning a new one per fragment. Persisted once in onTurnEnd below.
+      if (isNewTurn || !streamingAssistantRef.current) {
+        const id = pushMessage({ role: "assistant", content: fullText });
+        streamingAssistantRef.current = { id, text: fullText };
+      } else {
+        const { id } = streamingAssistantRef.current;
+        streamingAssistantRef.current.text = fullText;
+        setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, content: fullText } : m)));
+      }
+    },
+    onTurnEnd: (audioUrl) => {
+      const streaming = streamingAssistantRef.current;
+      if (streaming) {
+        if (sessionIdRef.current) persistMessage(sessionIdRef.current, "assistant", streaming.text);
+        if (audioUrl) {
+          setMessages((prev) => prev.map((m) => (m.id === streaming.id ? { ...m, audioUrl } : m)));
+        }
+      }
+      streamingAssistantRef.current = null;
+    },
+    onComplete: (briefPartial: VoiceBriefPartial) => {
+      if (briefPartial.topic) {
+        void genWorkflow(briefPartial.topic);
+      }
+    },
+    onError: (message) => {
+      pushMessage({ role: "assistant", content: `Voice error: ${message}` });
+    },
+  });
+
+  async function handleMicToggle() {
+    if (voice.status === "recording" || voice.status === "connecting") {
+      voice.stop();
+      return;
+    }
+    let sessionId = sessionIdRef.current;
+    if (!sessionId) {
+      const newId = `sess-${crypto.randomUUID()}`;
+      sessionId = newId;
+      sessionIdRef.current = newId;
+      setActiveSessionId(newId);
+      setPastSessions((prev) => [
+        { id: newId, createdAt: new Date().toISOString(), status: "running", targetPlatforms: selectedPlatforms },
+        ...prev,
+      ]);
+    }
+    await voice.start(sessionId);
   }
 
   async function handleSend() {
@@ -1060,6 +1144,22 @@ export default function ChatPage() {
                   }`}
                 >
                   <p className="whitespace-pre-wrap">{msg.content}</p>
+                  {msg.audioUrl && (
+                    <div className="mt-2 flex items-center gap-2">
+                      <audio controls src={msg.audioUrl} className="h-8 max-w-[220px]" />
+                      <a
+                        href={msg.audioUrl}
+                        download={`voice-${msg.role}-${msg.id}.wav`}
+                        className={`text-xs underline flex-shrink-0 ${
+                          msg.role === "user" ? "text-[#FFCBB8] hover:text-white" : "text-[#9E9893] hover:text-[#1B1A17]"
+                        }`}
+                        aria-label="Download audio"
+                        title="Download audio"
+                      >
+                        Save
+                      </a>
+                    </div>
+                  )}
                   <p
                     className={`text-xs mt-2 ${
                       msg.role === "user" ? "text-[#FFCBB8]" : "text-[#9E9893]"
@@ -1091,6 +1191,35 @@ export default function ChatPage() {
               className="flex-1 bg-[#F8F5EE] border border-[#E8E3DA] rounded-xl px-4 py-3 text-sm text-[#1B1A17] placeholder:text-[#9E9893] resize-none focus:outline-none focus:border-[#FF4800] transition-colors"
               rows={1}
             />
+            <button
+              onClick={handleMicToggle}
+              disabled={isLoading || voice.status === "connecting"}
+              className={`p-3 rounded-xl transition-colors flex-shrink-0 disabled:opacity-40 disabled:cursor-not-allowed ${
+                voice.status === "recording"
+                  ? "bg-[#FF4800] text-white hover:bg-[#E03E00]"
+                  : "bg-[#F8F5EE] text-[#6B6561] border border-[#E8E3DA] hover:text-[#1B1A17] hover:bg-[#F2EDE4]"
+              }`}
+              aria-label={voice.status === "recording" ? "Stop recording" : "Record voice message"}
+              title={voice.status === "recording" ? "Stop recording" : "Record voice message"}
+            >
+              {voice.status === "recording" ? (
+                <span className="relative flex items-center justify-center w-4 h-4">
+                  <span className="absolute inline-flex h-full w-full rounded-full bg-white opacity-40 animate-ping" />
+                  <span className="relative inline-flex rounded-sm h-2.5 w-2.5 bg-white" />
+                </span>
+              ) : (
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <rect x="5.5" y="1" width="5" height="8" rx="2.5" fill="currentColor" />
+                  <path
+                    d="M3 7.5a5 5 0 0 0 10 0M8 12.5v2.5"
+                    stroke="currentColor"
+                    strokeWidth="1.3"
+                    strokeLinecap="round"
+                    fill="none"
+                  />
+                </svg>
+              )}
+            </button>
             <button
               onClick={handleSend}
               disabled={!input.trim() || isLoading}

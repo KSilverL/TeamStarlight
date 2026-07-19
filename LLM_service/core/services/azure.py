@@ -20,7 +20,7 @@ without real network access; a real run without the SDK/creds fails loudly.
 from __future__ import annotations
 
 import json
-from typing import List, Optional
+from typing import AsyncIterator, List, Optional
 
 from agent_framework import (
     BaseChatClient,
@@ -37,11 +37,28 @@ from ..skill_schema import SkillCandidate, SkillRule
 from ..video_schema import StoryboardSpec, TemplateSlideSpec
 from .base import (
     LLMService,
+    RealtimeEvent,
+    RealtimeVoiceService,
+    RealtimeVoiceSession,
     SafetyResult,
     SafetyService,
     VoiceoverService,
     VoiceService,
 )
+
+
+def _voice_live_ws_url(settings: Settings) -> str:
+    endpoint = (settings.azure_voicelive_endpoint or "").rstrip("/")
+    if endpoint.startswith("https://"):
+        endpoint = "wss://" + endpoint[len("https://"):]
+    elif endpoint.startswith("http://"):
+        endpoint = "ws://" + endpoint[len("http://"):]
+    if not endpoint.endswith("/voice-live/realtime"):
+        endpoint = f"{endpoint}/voice-live/realtime"
+    return (
+        f"{endpoint}"
+        f"?api-version={settings.azure_voicelive_api_version}&model={settings.azure_voicelive_model}"
+    )
 
 # Discriminated-union storyboard JSON is meaningfully harder for the model to nail
 # on the first try than the old fixed shape — bounded retry, re-prompting with the
@@ -928,32 +945,21 @@ class AzureVoice(VoiceService):
         self._settings = settings
 
     def _ws_url(self) -> str:
-        s = self._settings
-        # Voice Live is a WebSocket endpoint: normalise an https:// base to wss://
-        # (http:// → ws://) and ensure the /voice-live/realtime path is present, so
-        # either a bare resource host or a full wss URL in config connects correctly.
-        endpoint = (s.azure_voicelive_endpoint or "").rstrip("/")
-        if endpoint.startswith("https://"):
-            endpoint = "wss://" + endpoint[len("https://"):]
-        elif endpoint.startswith("http://"):
-            endpoint = "ws://" + endpoint[len("http://"):]
-        if not endpoint.endswith("/voice-live/realtime"):
-            endpoint = f"{endpoint}/voice-live/realtime"
-        return (
-            f"{endpoint}"
-            f"?api-version={s.azure_voicelive_api_version}&model={s.azure_voicelive_model}"
-        )
+        return _voice_live_ws_url(self._settings)
 
     async def _transcribe(self, user_audio: str) -> str:
         """Send one audio turn to Voice Live and return its transcript. Overridable
-        seam for tests; `websockets` is lazy-imported so this module imports without
-        it. `user_audio` is a base64-encoded PCM16 chunk forwarded from the browser
-        over WS /intake/{sid}/voice.
+        seam for tests; 
+            `websockets` is lazy-imported so this module imports without it. 
+            `user_audio` is a base64-encoded PCM16 chunk, supplied via the cascaded
+                REST intake path (`POST /intake` / `/turn`, `mode: "voice"`) — kept as a
+                 fallback alongside the native speech-to-speech bridge (AzureRealtimeVoice
+                 below), which is what `WS /intake/{sid}/voice` now uses.
 
         Voice Live handles VAD / end-of-turn detection server-side; we append the
         audio buffer, commit it, and read back the input-audio transcription."""
+        
         import json
-
         import websockets  # lazy import
 
         s = self._settings
@@ -979,6 +985,154 @@ class AzureVoice(VoiceService):
     async def transcribe_turn(self, *, session_id: str, user_audio: str) -> dict:
         transcript = await self._transcribe(user_audio)
         return {"session_id": session_id, "transcript": transcript}
+
+
+# ── Realtime voice (native speech-to-speech bridge) ─────────────
+
+def _to_realtime_tools(tools: List[dict]) -> List[dict]:
+    """Reshape BRIEF_TOOL_DEFS' Chat-Completions shape
+    (`{"type":"function","function":{"name",...,"parameters"}}`) into the flatter
+    Realtime API shape (`{"type":"function","name",...,"parameters"}`) — the same
+    tool definitions, one shared source (intake/base.py), two wire shapes."""
+    out: List[dict] = []
+    for t in tools:
+        fn = t.get("function", t)
+        out.append({
+            "type": "function",
+            "name": fn.get("name"),
+            "description": fn.get("description", ""),
+            "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+        })
+    return out
+
+
+class AzureRealtimeVoice(RealtimeVoiceService):
+    """Opens a native speech-to-speech session against GPT-Realtime (Azure AI
+    Foundry / Voice Live). Unlike AzureVoice above, the model consumes and produces
+    audio directly over one persistent duplex connection and decides tool calls
+    itself — there is no separate transcribe-then-chat step on the path that drives
+    the conversation."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    async def open_session(
+        self, *, session_id: str, instructions: str, tools: List[dict],
+    ) -> RealtimeVoiceSession:
+        import websockets  # lazy import
+
+        s = self._settings
+        api_key = s.azure_voicelive_api_key or s.azure_openai_api_key
+        headers = {"api-key": api_key} if api_key else {}
+
+        ws = await websockets.connect(_voice_live_ws_url(s), additional_headers=headers)
+        session = _AzureRealtimeSession(ws, session_id=session_id)
+        await session._configure(instructions=instructions, tools=tools, voice=s.azure_voicelive_voice)
+        return session
+
+
+class _AzureRealtimeSession(RealtimeVoiceSession):
+    """One live GPT-Realtime connection. `_send_json`/`_recv_raw` are the
+    overridable network seam (same pattern as AzureLLM._complete): tests can swap
+    in a fake transport and drive `events()`/`send_tool_result()` against scripted
+    JSON, with no real socket or credentials."""
+
+    def __init__(self, ws, *, session_id: str) -> None:
+        self._ws = ws
+        self._session_id = session_id
+
+    async def _send_json(self, payload: dict) -> None:
+        await self._ws.send(json.dumps(payload))
+
+    async def _recv_raw(self) -> AsyncIterator[dict]:
+        async for raw in self._ws:
+            yield json.loads(raw)
+
+    async def _configure(self, *, instructions: str, tools: List[dict], voice: str) -> None:
+        await self._send_json({
+            "type": "session.update",
+            "session": {
+                "modalities": ["audio", "text"],
+                "instructions": instructions,
+                "voice": voice,
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
+                # Side channel only (captions / logging / per-user learning transcript) —
+                # never on the path that decides brief content; the model reasons over
+                # audio directly and calls tools itself.
+                "input_audio_transcription": {"model": "whisper-1"},
+                # Server-side VAD drives end-of-turn AND barge-in detection, so the client
+                # never needs to manually commit the input buffer.
+                "turn_detection": {"type": "server_vad"},
+                "tools": _to_realtime_tools(tools),
+                "tool_choice": "auto",
+            },
+        })
+
+    async def send_audio(self, *, audio_b64: str) -> None:
+        await self._send_json({"type": "input_audio_buffer.append", "audio": audio_b64})
+
+    async def send_tool_result(self, *, call_id: str, output: dict) -> None:
+        await self._send_json({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": json.dumps(output),
+            },
+        })
+        # Prompt the model to continue — this is what makes it actually SPEAK a
+        # tool's result (e.g. narrate a suggested topic) rather than stay silent.
+        await self._send_json({"type": "response.create"})
+
+    async def nudge(self, *, text: str) -> None:
+        await self._send_json({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        })
+        await self._send_json({"type": "response.create"})
+
+    async def events(self) -> AsyncIterator[RealtimeEvent]:
+        async for event in self._recv_raw():
+            translated = self._translate(event)
+            if translated is None:
+                continue
+            yield translated
+            if translated.type == "speech_started":
+                # Barge-in: stop the model's in-flight generation server-side too
+                # (the caller is responsible for flushing local audio playback).
+                await self._send_json({"type": "response.cancel"})
+
+    @staticmethod
+    def _translate(event: dict) -> Optional[RealtimeEvent]:
+        etype = event.get("type")
+        if etype == "response.audio.delta":
+            return RealtimeEvent(type="audio_delta", audio_b64=event.get("delta"))
+        if etype == "response.audio_transcript.delta":
+            return RealtimeEvent(type="output_transcript_delta", text=event.get("delta"))
+        if etype == "conversation.item.input_audio_transcription.completed":
+            return RealtimeEvent(type="input_transcript", text=(event.get("transcript") or "").strip())
+        if etype == "response.function_call_arguments.done":
+            return RealtimeEvent(
+                type="tool_call",
+                call_id=event.get("call_id"),
+                name=event.get("name"),
+                arguments=json.loads(event.get("arguments") or "{}"),
+            )
+        if etype == "input_audio_buffer.speech_started":
+            return RealtimeEvent(type="speech_started")
+        if etype == "response.done":
+            return RealtimeEvent(type="response_done")
+        if etype == "error":
+            return RealtimeEvent(type="error", message=str(event.get("error")))
+        return None
+
+    async def close(self) -> None:
+        await self._ws.close()
 
 
 # ── Voiceover (Azure Speech text-to-speech) ────────────────────────────────────

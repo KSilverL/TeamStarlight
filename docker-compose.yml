@@ -7,6 +7,10 @@ services:
     build:
       context: frontend_service
       dockerfile: Dockerfile
+      args:
+        # Build-time only (see Dockerfile) — the browser's direct WS to LLM_service's
+        # realtime voice endpoint (MVP; no Java WS proxy yet).
+        NEXT_PUBLIC_LLM_SERVICE_WS_URL: ${NEXT_PUBLIC_LLM_SERVICE_WS_URL}
     ports:
       - "3000:3000"
     environment:
@@ -77,6 +81,14 @@ services:
       - GEOAPIFY_MAP_STYLE=${GEOAPIFY_MAP_STYLE}
       - USE_MOCK_MUSIC_GENERATION=true
       - USE_MOCK_SAFETY=true
+      # for voice
+      - USE_MOCK_VOICE=${USE_MOCK_VOICE}
+      - AZURE_VOICELIVE_ENDPOINT=${AZURE_VOICELIVE_ENDPOINT}
+      - AZURE_VOICELIVE_MODEL=${AZURE_VOICELIVE_MODEL}
+      - AZURE_VOICELIVE_API_VERSION=${AZURE_VOICELIVE_API_VERSION}
+      - AZURE_VOICELIVE_API_KEY=${AZURE_VOICELIVE_API_KEY}
+      - AZURE_VOICELIVE_VOICE=${AZURE_VOICELIVE_VOICE}
+
       # Brand profiles + user skills come from the same Postgres DATABASE_URL above, so the
       # roundtable's brand_voice/user_advocate personas argue from real data, not mocks.
       - USE_MOCK_STORE=false

@@ -168,6 +168,8 @@ class Settings:
     azure_voicelive_model: str = "gpt-realtime"
     azure_voicelive_api_version: str = "2026-04-10"
     azure_voicelive_api_key: Optional[str] = None   # falls back to the OpenAI key (same resource)
+    azure_voicelive_voice: str = "verse"            # Preset voice for the realtime speech-to-speech bridge,
+                                                      # (must be one the deployment supports).
 
     # ── Roundtable (multi-persona discussion stage) ────────────────────────────
     # ROUNDTABLE_ENABLED gates the drop-in replacement of `strategist` (wired in Phase 6);
@@ -469,6 +471,7 @@ def _load() -> Settings:
         azure_voicelive_model=os.getenv("AZURE_VOICELIVE_MODEL", "gpt-realtime"),
         azure_voicelive_api_version=os.getenv("AZURE_VOICELIVE_API_VERSION", "2026-04-10"),
         azure_voicelive_api_key=os.getenv("AZURE_VOICELIVE_API_KEY"),
+        azure_voicelive_voice=os.getenv("AZURE_VOICELIVE_VOICE", "verse"),
         roundtable_enabled=bool(_env_bool("ROUNDTABLE_ENABLED")),
         roundtable_max_rounds=_env_int("ROUNDTABLE_MAX_ROUNDS", 12),
         roundtable_persona_max_tokens=(
