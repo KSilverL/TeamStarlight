@@ -4,10 +4,9 @@ import java.io.IOException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 
+import org.apache.tika.Tika;
 import org.springframework.beans.factory.annotation.*;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -17,9 +16,15 @@ import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestClient;
 
 import com.example.tsldemo.CrossPlatformOAuth;
-import com.example.tsldemo.DTOs.Request.LinkedInCredsReqDTO;
-import com.example.tsldemo.DTOs.Request.LinkedInPostReqDTO;
+import com.example.tsldemo.DTOs.Request.CrossPlatPostReqDTO;
+import com.example.tsldemo.DTOs.Request.LinkedIn.ContentMediaDetails;
+import com.example.tsldemo.DTOs.Request.LinkedIn.ContentMedia;
+import com.example.tsldemo.DTOs.Request.LinkedIn.ContentMediaDetails;
+import com.example.tsldemo.DTOs.Request.LinkedIn.LinkedInCredsReqDTO;
+import com.example.tsldemo.DTOs.Request.LinkedIn.LinkedInIniUpReqDTO;
+import com.example.tsldemo.DTOs.Request.LinkedIn.LinkedInPostReqDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInAuthRespDTO;
+import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInIniMediaUpRespDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInUserInfoDTO;
 import com.example.tsldemo.ENUMS.PlatformEnum;
 
@@ -37,7 +42,8 @@ public class CrossPlatformService {
         this.restClient = restClient;
     }
 	
-    public void authCodeLinkedIn(LinkedInPostReqDTO requestDTO, HttpServletResponse response) throws IOException {
+    //////////////////////////////////////////////////////// LINKEDIN METHODS ////////////////////////////////////////////////////////
+    public void authCodeLinkedIn(LinkedInCredsReqDTO requestDTO, HttpServletResponse response) throws IOException {
         String state = UUID.randomUUID().toString();
 
         CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(requestDTO.businessId(), PlatformEnum.LINKEDIN);
@@ -86,28 +92,49 @@ public class CrossPlatformService {
         return token;
     }
 
-    public String postToLinkedIn(LinkedInPostReqDTO requestDTO) {
+    public String postToLinkedIn(CrossPlatPostReqDTO requestDTO) {
 
-        CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(requestDTO.businessId(), PlatformEnum.LINKEDIN);
+        // Message reediting [Temp stop making given not our problem]
+        // if (requestDTO.getMessage().contains("(") || requestDTO.getMessage().contains(")")) {
+        //     // Case if have {} []
+        //     if (requestDTO.getMessage().contains("{") || requestDTO.getMessage().contains("}") || requestDTO.getMessage().contains("[") || requestDTO.getMessage().contains("]")) {
+        //         String result = requestDTO.getMessage().replaceAll("[^()\\[\\]{}]", "");
+        //         if (result.substring(0, 1) == "(" || result.substring(0, 1) == ")") {
+        //             requestDTO.setMessage(requestDTO.getMessage().replace("(", "\\("));
+        //             requestDTO.setMessage(requestDTO.getMessage().replace(")", "\\)"));
+        //         }
+        //     }
+        //     // Case if no {} []
+        //     else {
+        //         requestDTO.setMessage(requestDTO.getMessage().replace("(", "\\("));
+        //         requestDTO.setMessage(requestDTO.getMessage().replace(")", "\\)"));
+        //     }
+        // }
 
-        LinkedInUserInfoDTO linkedInUserInfo = restClient.get()
+        CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(requestDTO.getBusinessId(), PlatformEnum.LINKEDIN);
+
+        if (crossPlatformOAuth.getUrn() == null) {
+            LinkedInUserInfoDTO linkedInUserInfo = restClient.get()
                 .uri("https://api.linkedin.com/v2/userinfo")
                 .header("Authorization", "Bearer " + crossPlatformOAuth.getAccessToken())
                 .retrieve()
                 .body(LinkedInUserInfoDTO.class);
 
-        Map<String, Object> requestBody = Map.of(
-                "author", "urn:li:person:" + linkedInUserInfo.sub(),
-                "commentary", requestDTO.message(),
-                "visibility", "PUBLIC",
-                "distribution", Map.of(
-                        "feedDistribution", "MAIN_FEED",
-                        "targetEntities", List.of(),
-                        "thirdPartyDistributionChannels", List.of()
-                ),
-                "lifecycleState", "PUBLISHED",
-                "isReshareDisabledByAuthor", false
+            crossPlatformOAuth.setUrn("urn:li:person:" + linkedInUserInfo.sub());
+            crossPlatformRepository.save(crossPlatformOAuth);
+        }
+
+        LinkedInIniMediaUpRespDTO mediaUploadResponse = new LinkedInIniMediaUpRespDTO(null);
+
+        LinkedInPostReqDTO requestBody = new LinkedInPostReqDTO(
+            crossPlatformOAuth.getUrn(),
+            requestDTO.getMessage()
         );
+
+        if (requestDTO.getMedia() != null && !requestDTO.getMedia().isEmpty()) {
+            mediaUploadResponse = uploadMedia(requestDTO, crossPlatformOAuth);
+            requestBody.setContent(new ContentMedia(new ContentMediaDetails(mediaUploadResponse.value().mediaUrn())));
+        }
 
         ResponseEntity<Void> response = restClient.post()
                 .uri("https://api.linkedin.com/rest/posts")
@@ -132,4 +159,60 @@ public class CrossPlatformService {
 
         crossPlatformRepository.save(crossPlatformOAuth);
     }
+
+    public LinkedInIniMediaUpRespDTO uploadMedia(CrossPlatPostReqDTO requestDTO, CrossPlatformOAuth crossPlatformOAuth) {
+
+        Tika tika = new Tika();
+        String mime = "";
+        LinkedInIniMediaUpRespDTO iniResponse = null;
+        String url = "";
+        LinkedInIniUpReqDTO requestBody = new LinkedInIniUpReqDTO(crossPlatformOAuth.getUrn(), null, null, null);
+        try {
+            mime = tika.detect(requestDTO.getMedia().getInputStream());
+
+            if (mime.startsWith("image/")) {
+                url = "https://api.linkedin.com/rest/images?action=initializeUpload";
+            }
+            else if (mime.startsWith("video/")) {
+                url = "https://api.linkedin.com/rest/videos?action=initializeUpload";
+                requestBody.getInitializeUploadRequest().setFileSize(requestDTO.getMedia().getSize());
+                requestBody.getInitializeUploadRequest().setUploadCaptions(false);
+                requestBody.getInitializeUploadRequest().setUploadThumbnail(false);
+            }
+
+
+            // Initialize Upload
+            iniResponse = restClient.post()
+                .uri(url)
+                .contentType(MediaType.APPLICATION_JSON)
+                .header("Authorization", "Bearer " + crossPlatformOAuth.getAccessToken())
+                .header("LinkedIn-Version", "202606")
+                .body(requestBody)
+                .retrieve()
+                .body(LinkedInIniMediaUpRespDTO.class);
+            
+            // Upload Media
+            if (mime.startsWith("image/")) {
+                restClient.put()
+                    .uri(iniResponse.value().uploadUrl())
+                    .contentType(MediaType.parseMediaType(requestDTO.getMedia().getContentType()))
+                    .body(requestDTO.getMedia().getBytes())
+                    .retrieve()
+                    .toBodilessEntity();
+            }
+            else {
+                restClient.put()
+                    .uri(iniResponse.value().uploadInstructions().uploadUrl())
+                    .contentType(MediaType.parseMediaType(requestDTO.getMedia().getContentType()))
+                    .body(requestDTO.getMedia().getBytes())
+                    .retrieve()
+                    .toBodilessEntity();
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        return iniResponse;
+    }
+
 }

@@ -1,4 +1,4 @@
-package com.example.tsldemo.DTOs.Request;
+package com.example.tsldemo.DTOs.Request.LinkedIn;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 

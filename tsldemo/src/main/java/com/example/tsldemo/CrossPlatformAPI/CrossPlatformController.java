@@ -1,12 +1,14 @@
 package com.example.tsldemo.CrossPlatformAPI;
 
-import com.example.tsldemo.DTOs.Request.LinkedInCredsReqDTO;
-import com.example.tsldemo.DTOs.Request.LinkedInPostReqDTO;
+import com.example.tsldemo.DTOs.Request.CrossPlatPostReqDTO;
+import com.example.tsldemo.DTOs.Request.LinkedIn.LinkedInCredsReqDTO;
 
 import jakarta.servlet.http.HttpServletResponse;
 
+import org.apache.tika.Tika;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.util.Map;
@@ -20,8 +22,9 @@ public class CrossPlatformController {
         this.crossPlatformService = crossPlatformService;
     }
 
+    //////////////////////////////////////////////////////// LINKEDIN METHODS ////////////////////////////////////////////////////////
     @PostMapping("/linkedin/auth")
-    public void linkedInAuth(HttpServletResponse response, @RequestBody LinkedInPostReqDTO requestDTO) throws IOException{
+    public void linkedInAuth(HttpServletResponse response, @RequestBody LinkedInCredsReqDTO requestDTO) throws IOException{
 
         crossPlatformService.authCodeLinkedIn(requestDTO, response);
 
@@ -37,7 +40,7 @@ public class CrossPlatformController {
     }
 
     @PostMapping("/linkedin/post")
-    public ResponseEntity<?> linkedInPost(@RequestBody LinkedInPostReqDTO requestDTO) {
+    public ResponseEntity<?> linkedInPost(@ModelAttribute CrossPlatPostReqDTO requestDTO) {
 
         String postId = crossPlatformService.postToLinkedIn(requestDTO);
         return ResponseEntity.ok(Map.of("PostId", postId));
@@ -49,4 +52,23 @@ public class CrossPlatformController {
         crossPlatformService.saveLinkedInCredentials(requestDTO);
         return ResponseEntity.ok("LinkedIn company credentials added successfully.");
     }
+
+    // @PostMapping("/MultipartFileTest")
+    // public ResponseEntity<?> testMultipartFile(@RequestBody MultipartFile media) {
+        
+    //     System.out.println("Detected Content Type: ");
+    //     Tika tika = new Tika();
+
+    //     String mime = null;
+    //     try {
+    //         mime = tika.detect(media.getInputStream());
+    //     } catch (IOException e) {
+    //         // TODO Auto-generated catch block
+    //         e.printStackTrace();
+    //     }
+
+    //     System.out.println(mime);
+        
+    //     return ResponseEntity.ok("File uploaded successfully.");
+    // }
 }
