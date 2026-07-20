@@ -4,7 +4,7 @@ The four end-to-end user scenarios (M4 acceptance).
 Each is a complete run-through of one kind of user, fully mocked/offline:
   1. Branded user      — learned brand rules are injected into the copy.
   2. No-brand user     — steers on tone_hint ONLY, never reads the store.
-  3. Vague idea        — copilot_mode voice intake → scout proposes a topic → workflow.
+  3. Vague idea        — copilot_mode voice intake → a topic is suggested → workflow.
   4. Brand training    — the self-evolving profile: edit → distil → keep → next run reflects.
 
 Together they exercise: voice/text dual entry, the circuit-breaker transparency flag,
@@ -14,7 +14,12 @@ the self-evolving brand profile, and the post-approval animated HTML card + vide
 from __future__ import annotations
 
 from LLM_service.api import WorkflowService
+from LLM_service.core.config import reset_settings
 from LLM_service.core.services import factory
+from LLM_service.core.services.mock import (
+    ROUNDTABLE_FIXTURE_BUSINESS_ID,
+    ROUNDTABLE_FIXTURE_USER_ID,
+)
 from LLM_service.intake import build_intake
 from LLM_service.workflow import HumanVerdict, build_workflow
 
@@ -71,53 +76,142 @@ async def test_scenario_no_brand_user_skips_store(make_brief, monkeypatch):
 
 async def test_scenario_vague_idea_copilot_voice():
     session = build_intake("voice")
-    started = await session.start("Help me think of what to post on LinkedIn to promote our launch")
-    assert started["complete"] is True                    # scout fills the topic in one turn
+    started = await session.start("sess-copilot", "Help me think of what to post on LinkedIn to promote our launch")
+    assert started["complete"] is True                    # suggest_topic fills the topic in one turn
 
     brief = await session.get_brief(started["session_id"])
     assert brief.intake_mode == "voice"
-    assert brief.route == "copilot_mode" and brief.topic  # scout proposed a topic
+    assert brief.route == "copilot_mode" and brief.topic  # a topic was suggested
 
-    # the brief feeds the workflow unchanged
+    # the brief feeds the workflow unchanged (asking for all three deliverables here)
     svc = WorkflowService()
-    snapshot = await svc.start(brief.model_dump(), task_id="copilot-1")
+    snapshot = await svc.start(
+        {**brief.model_dump(), "content_types": ["text", "brand", "video"]}, task_id="copilot-1")
     assert snapshot["status"] == "awaiting_review"
-    # approving each platform produces the animated card + video spec on the final event
+    # approving each platform produces the animated card + video storyboard on the final event
     await svc.review("copilot-1", {p: {"decision": "approve"} for p in brief.target_platforms})
     finals = [e for e in svc.buffered_events("copilot-1")
               if e["type"] == "result" and e["status"] == "final"]
     assert finals and finals[0]["html_preview"].startswith("<!DOCTYPE html>")
-    assert finals[0]["video_props"] and len(finals[0]["video_props"]["stats"]) == 3
+    assert finals[0]["video_storyboard"] and 2 <= len(finals[0]["video_storyboard"]["slides"]) <= 8
 
 
 # ── 4. Brand training — the self-evolving profile ─────────────────────────────
 
 async def test_scenario_brand_training_self_evolves(make_brief):
     biz = "biz_training_demo"
+    svc = WorkflowService()
 
-    # First run, the user edits the draft → archivist distils rules.
-    wf1 = build_workflow()
-    result = await wf1.run(make_brief(platforms=("linkedin",), business_id=biz, route="brand_training"))
-    rid = result.get_request_info_events()[0].request_id
-    edited = "Lead with a striking single-origin statistic that earns the scroll."
-    out = (await wf1.run(responses={
-        rid: HumanVerdict(decision="approve_after_edit", edited_draft=edited)
-    })).get_outputs()[0]
-    must_do = [r for r in out.proposed_rules if r.kind == "must_do"]
-    assert must_do, "an edit should propose a must_do rule"
-
-    # User keeps it → written to the profile (self-evolution).
-    store = factory.get_store()
-    profile = await store.get_profile(business_id=biz)
-    profile["must_do"].append(must_do[0].rule)
-    await store.upsert_profile(business_id=biz, profile=profile)
+    # First run: the user edits the draft, then CONFIRMS learning → brand rules proposed.
+    await svc.start(
+        {"topic": "harvest", "target_platforms": ["linkedin"], "business_id": biz, "route": "direct_generation"},
+        task_id="bt1",
+    )
+    await svc.review("bt1", {"linkedin": {
+        "decision": "approve_after_edit",
+        "edited_draft": "Lead with a striking single-origin statistic that earns the scroll.",
+    }})
+    res = await svc.confirm_learning("bt1", learn=True)
+    must_do = [r for r in res["brand_rules"] if r["kind"] == "must_do"]
+    assert must_do, "an edit should distil a must_do rule"
+    # The archivist wrote it straight to the profile on confirm (self-evolution, no tagging).
 
     # Next run reflects the newly learned rule.
     wf2 = build_workflow()
     draft2 = (await wf2.run(
-        make_brief(platforms=("linkedin",), business_id=biz, route="brand_training")
+        make_brief(platforms=("linkedin",), business_id=biz, route="direct_generation")
     )).get_request_info_events()[0].data.draft
-    assert must_do[0].rule in draft2
+    assert any(r["rule"] in draft2 for r in must_do)
+
+
+# ── 5. Roundtable drops in for strategist (Phase 6, end-to-end) ───────────────
+
+async def test_scenario_roundtable_end_to_end(monkeypatch):
+    """ROUNDTABLE_ENABLED=true: brief → multi-persona discussion (per platform) → drafts →
+    review → final + media. The discussion replaces the strategist; the creator and downstream are
+    unchanged."""
+    monkeypatch.setenv("ROUNDTABLE_ENABLED", "true")
+    reset_settings()
+
+    svc = WorkflowService()
+    snap = await svc.start(
+        {
+            "topic": "spring single-origin coffee launch",
+            "target_platforms": ["linkedin", "instagram"],
+            "business_id": ROUNDTABLE_FIXTURE_BUSINESS_ID,
+            "user_id": ROUNDTABLE_FIXTURE_USER_ID,
+            "content_types": ["text", "brand", "video"],
+        },
+        task_id="rt-e2e",
+    )
+    assert snap["status"] == "awaiting_review"
+    assert {p["platform"] for p in snap["pending"]} == {"linkedin", "instagram"}
+
+    events = svc.buffered_events("rt-e2e")
+    # The discussion ran (per-table) and bypassed strategist/dispatcher, then went to the creator.
+    assert {e["table_id"] for e in events if e.get("status") == "discussion_consensus"} == {"linkedin", "instagram"}
+    assert any(e["type"] == "agent_utterance" for e in events)
+    assert any(e.get("node") == "creator" for e in events)
+    assert not any(e.get("node") in ("dispatcher", "strategist") for e in events)
+
+    final = await svc.review("rt-e2e", {
+        "linkedin": {"decision": "approve"},
+        "instagram": {"decision": "approve"},
+    })
+    assert final["status"] == "completed"
+    finals = [e for e in svc.buffered_events("rt-e2e") if e["type"] == "result" and e["status"] == "final"]
+    assert {e["platform"] for e in finals} == {"linkedin", "instagram"}
+    for e in finals:
+        assert e["html_preview"].startswith("<!DOCTYPE html>")
+        assert e["video_storyboard"] and len(e["video_storyboard"]["slides"]) >= 2
+
+
+async def test_scenario_roundtable_media_only_skips_text_and_gate(monkeypatch):
+    """Case 4 with the roundtable on: brand/video but no text. The discussion still runs (the
+    table debates the media), but the create → review → gate path is skipped — the consensus
+    feeds the media_producer directly and the task completes without a review gate."""
+    monkeypatch.setenv("ROUNDTABLE_ENABLED", "true")
+    reset_settings()
+
+    svc = WorkflowService()
+    snap = await svc.start(
+        {
+            "topic": "spring single-origin coffee launch",
+            "target_platforms": ["linkedin"],
+            "business_id": ROUNDTABLE_FIXTURE_BUSINESS_ID,
+            "user_id": ROUNDTABLE_FIXTURE_USER_ID,
+            "content_types": ["brand", "video"],
+        },
+        task_id="rt-media-only",
+    )
+    # No gate (nothing to approve) — the run completed straight away.
+    assert snap["status"] == "completed" and snap["pending"] == []
+
+    events = svc.buffered_events("rt-media-only")
+    assert any(e["type"] == "agent_utterance" for e in events)        # the table still discussed
+    assert not any(e.get("node") in ("creator", "reviewer", "human_gate", "strategist", "dispatcher")
+                   for e in events)                                   # create/review/gate skipped
+    out = snap["outputs"][0]
+    assert out["draft"] == "" and out["content_types"] == ["brand", "video"]
+    assert out["html_card"].startswith("<!DOCTYPE html>")
+    assert out["video_storyboard"] and len(out["video_storyboard"]["slides"]) >= 2
+
+
+async def test_scenario_roundtable_disabled_uses_strategist(monkeypatch):
+    """Regression guard: with the flag OFF the front of the pipeline is the original
+    dispatcher → strategist (no discussion events), unchanged from before Phase 6."""
+    monkeypatch.setenv("ROUNDTABLE_ENABLED", "false")
+    reset_settings()
+
+    svc = WorkflowService()
+    await svc.start(
+        {"topic": "harvest", "target_platforms": ["linkedin"], "business_id": "biz_off"},
+        task_id="rt-off",
+    )
+    events = svc.buffered_events("rt-off")
+    nodes = {e.get("node") for e in events}
+    assert "strategist" in nodes and "dispatcher" in nodes
+    assert not any(e["type"] == "agent_utterance" for e in events)
 
 
 # ── Circuit-breaker transparency carries through to the preview ───────────────

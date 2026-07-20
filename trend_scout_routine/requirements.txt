@@ -1,0 +1,8 @@
+# Trend Scout routine — standalone deps (never installed into / imported by LLM_service).
+# The offline paths (--from-file / --dry-run / --print-instructions) need only the stdlib;
+# --verify and the real write need asyncpg; the live agent path needs the azure packages
+# (>=2.1.0 for get_openai_client + agent_reference) and the openai client they drive.
+azure-ai-projects>=2.1.0
+azure-identity>=1.20.0
+openai>=2.0.0
+asyncpg>=0.30.0

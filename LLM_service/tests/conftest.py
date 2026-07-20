@@ -22,13 +22,17 @@ from agent_framework import InMemoryCheckpointStorage
 from LLM_service.core.config import reset_settings
 from LLM_service.core.services.factory import reset_services
 from LLM_service.workflow import Brief, build_workflow
+from LLM_service.workflow.roundtable import reset_controls, reset_gates
 
-_TOGGLE_VARS = ("USE_MOCK", "USE_MOCK_LLM", "USE_MOCK_SAFETY", "USE_MOCK_STORE", "USE_MOCK_VOICE")
+_TOGGLE_VARS = ("USE_MOCK", "USE_MOCK_LLM", "USE_MOCK_SAFETY", "USE_MOCK_STORE", "USE_MOCK_VOICE",
+                "USE_MOCK_WEB_SEARCH", "TREND_SCOUT_ENABLED")
 _CRED_VARS = (
     "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_CHAT_DEPLOYMENT",
     "AZURE_CONTENTSAFETY_ENDPOINT", "AZURE_CONTENTSAFETY_KEY",
     "POSTGRES_DSN", "DATABASE_URL",
     "AZURE_VOICELIVE_ENDPOINT",
+    "FOUNDRY_PROJECT_ENDPOINT", "WEB_SEARCH_AGENT_NAME", "WEB_SEARCH_AGENT_VERSION",
+    "REVIEW_SEARCH_AGENT_NAME", "REVIEW_SEARCH_AGENT_VERSION",
 )
 
 
@@ -40,9 +44,13 @@ def _reset_caches():
     test so env/toggle/store changes made by one test never leak into the next."""
     reset_settings()
     reset_services()
+    reset_gates()
+    reset_controls()
     yield
     reset_settings()
     reset_services()
+    reset_gates()
+    reset_controls()
 
 
 @pytest.fixture(autouse=True)
@@ -75,6 +83,8 @@ def make_brief():
             user_id=over.get("user_id"),
             tone_hint=over.get("tone_hint", "warm, authentic"),
             route=over.get("route", "direct_generation"),
+            # Default to text only (brand/video are opt-in); media tests pass all three.
+            content_types=over.get("content_types", ["text"]),
         )
 
     return _make

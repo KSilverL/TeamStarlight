@@ -85,6 +85,28 @@ def load_dotenv(path: Union[str, Path, None] = None, *, override: bool = False) 
     return True
 
 
+def _env_int(name: str, default: int) -> int:
+    """Parse an int env var, falling back to `default` when unset or malformed."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Parse a float env var, falling back to `default` when unset or malformed."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return default
+
+
 def _env_bool(name: str) -> Optional[bool]:
     """
     Parse a boolean env var. Returns None when the var is unset, blank, or
@@ -109,13 +131,18 @@ class Settings:
     use_mock_safety: Optional[bool] = None
     use_mock_store: Optional[bool] = None
     use_mock_voice: Optional[bool] = None
+    use_mock_image_search: Optional[bool] = None
+    use_mock_background_removal: Optional[bool] = None
+    use_mock_music_generation: Optional[bool] = None
+    use_mock_web_search: Optional[bool] = None
+    use_mock_voiceover: Optional[bool] = None
+    use_mock_video_generation: Optional[bool] = None
 
     # ── Azure OpenAI / Foundry (chat + structured output + copywriting) ────────
     azure_openai_endpoint: Optional[str] = None
     azure_openai_api_key: Optional[str] = None
     azure_openai_api_version: str = "2024-02-01"
     azure_chat_deployment: str = "gpt-4o"
-    foundry_project_endpoint: Optional[str] = None
 
     # ── Azure AI Content Safety (reviewer) ─────────────────────────────────────
     azure_content_safety_endpoint: Optional[str] = None
@@ -130,12 +157,205 @@ class Settings:
     postgres_profiles_table: str = "brand_profiles"
     postgres_user_skills_table: str = "user_skills"
     postgres_checkpoints_table: str = "workflow_checkpoints"
+    # libpq-style sslmode. Unset → let the DSN decide (Supabase works without it).
+    # Azure Cosmos DB for PostgreSQL *requires* SSL, so set POSTGRES_SSLMODE=require
+    # there. Honoured by PostgresStore._pool / PostgresCheckpointStorage._pool.
+    postgres_sslmode: Optional[str] = None
+    postgres_video_jobs_table: str = "video_jobs"
+    postgres_trends_table: str = "trends"
 
     # ── Voice Live API (voice intake) ──────────────────────────────────────────
     azure_voicelive_endpoint: Optional[str] = None
     azure_voicelive_model: str = "gpt-realtime"
     azure_voicelive_api_version: str = "2026-04-10"
     azure_voicelive_api_key: Optional[str] = None   # falls back to the OpenAI key (same resource)
+    azure_voicelive_voice: str = "verse"            # Preset voice for the realtime speech-to-speech bridge,
+                                                      # (must be one the deployment supports).
+
+    # ── Roundtable (multi-persona discussion stage) ────────────────────────────
+    # ROUNDTABLE_ENABLED gates the drop-in replacement of `strategist` (wired in Phase 6);
+    # off → the pipeline behaves exactly as today. max_rounds is the per-table hard cap
+    # that stops an infinite debate. The two model tiers (cheap personas / stronger
+    # manager) are read in the production path (Phase 2); the mock path ignores them.
+    roundtable_enabled: bool = False
+    # Each persona turn is now a short, single-point contribution (see roundtable/personas.py),
+    # so the table can afford MANY more short exchanges — the cap is raised accordingly. It is
+    # still the per-table hard stop on the debate.
+    roundtable_max_rounds: int = 12
+    # Hard backstop on how long a single persona turn may be (None → no cap, rely on the prompt).
+    # Keeps turns short like a real discussion; passed to the persona chat clients as
+    # `max_completion_tokens`. The LLM manager is NOT capped (it needs room for the final strategy).
+    roundtable_persona_max_tokens: Optional[int] = None
+    # Reasoning effort for the persona seats (gpt-5.x are reasoning models). A persona turn is
+    # one short spoken point, so it needs NO hidden reasoning — and at a small max_tokens cap the
+    # reasoning pass would eat the whole budget, returning EMPTY content (finish_reason=length).
+    # "minimal" → reasoning_tokens=0, so the cap is spent on the visible answer and turns are ~2x
+    # faster. Blank/None → omit the param (use for a non-reasoning persona model). Manager unaffected.
+    roundtable_persona_reasoning_effort: Optional[str] = "minimal"
+    # Output verbosity for the persona seats (gpt-5.x). "low" keeps a turn to one short spoken
+    # point (a sentence or two) instead of an essay — faster turns + the intended discussion feel.
+    # Blank/None → omit (use for a non-gpt-5 persona model). Manager unaffected.
+    roundtable_persona_verbosity: Optional[str] = "low"
+    # The personas run on a cheaper, rate-limit-friendlier model; only the LLM manager keeps
+    # the main (gpt-5.4) deployment. The personas may live on a SEPARATE Azure resource
+    # (its own endpoint + key); when those are unset they fall back to the main resource and
+    # only the deployment name (roundtable_persona_model) differs.
+    roundtable_persona_model: Optional[str] = None
+    roundtable_manager_model: Optional[str] = None
+    roundtable_persona_endpoint: Optional[str] = None
+    roundtable_persona_api_key: Optional[str] = None
+    # How long the table waits for a user who raised a hand to actually send their message
+    # before proceeding without them (seconds) — bounds the "stop and wait for the user" pause.
+    roundtable_user_turn_timeout: float = 300.0
+    # Step mode (roundtable_mode: "manual" on POST /tasks|/roundtable[s]): how long each round's
+    # 4-way prompt (next / speak / enough / auto) waits for POST /tasks/{id}/round-control before
+    # the table goes hands-off (sticky auto) — an absent user degrades to the normal flow, never
+    # a hung table. The default mode is "auto" (no prompts), so this only bites when the caller
+    # explicitly asked to be prompted.
+    roundtable_control_timeout: float = 300.0
+    # Per-user learning write-back from the roundtable (transcript + interjections + verdict).
+    # LEARNING_ENABLED=false still READS stored skills but writes none (regression/isolation).
+    learning_enabled: bool = True
+    # ── Trend scout (the roundtable's fifth seat; docs/TREND_SCOUT_IMPLEMENTATION.md) ──
+    # TREND_SCOUT_ENABLED adds the `trend_scout` persona to every table, fed from the daily
+    # trends snapshot an EXTERNAL Foundry routine writes to the store. Off (default) → the
+    # roster stays the current four seats and no trends read happens. The read degrades to
+    # [] on any store failure — trends are an enhancement, never a dependency.
+    trend_scout_enabled: bool = False
+    # How many trends are injected per run, chosen category-diverse at read time.
+    trend_scout_limit: int = 6
+    # Staleness safety net: a trend with no explicit expires_at is dropped this many days
+    # after captured_at (covers ~2-3 missed daily routine runs before degrading to "no trends").
+    trend_scout_ttl_days: int = 3
+    # Cheap tier for the prod per-user preference summary call. Defaults to the same
+    # rate-limit-friendly deployment as the roundtable personas (ROUNDTABLE_PERSONA_MODEL);
+    # PREFERENCE_SUMMARY_MODEL overrides it. None → fall back to the main chat deployment.
+    preference_summary_model: Optional[str] = None
+    # ── Pexels (stock photo search) + Remove.bg (cut-out backgrounds) ──────────
+    pexels_api_key: Optional[str] = None
+    removebg_api_key: Optional[str] = None
+
+    # ── Geoapify (static maps + geocoding for `map` slides) ─────────────────────
+    # No key → map slides render the bundled vector outline instead; never blocking.
+    geoapify_api_key: Optional[str] = None
+    # Explicit basemap-style override. None (default) → the style is picked from the
+    # storyboard's theme (workflow/video/assets.py _MAP_STYLE_BY_THEME). See
+    # https://apidocs.geoapify.com/docs/maps/map-tiles/ for the preset names.
+    geoapify_map_style: Optional[str] = "osm-liberty"
+
+    # ── Soundraw (background music generation) ──────────────────────────────────
+    soundraw_api_key: Optional[str] = None
+
+    # ── Azure Speech (voiceover text-to-speech) ─────────────────────────────────
+    azure_speech_key: Optional[str] = None
+    azure_speech_region: Optional[str] = None
+    # Default Neural voice when a caller doesn't specify one (POST /tasks/{id}/render-video).
+    voiceover_default_voice: str = "en-US-JennyNeural"
+
+    # ── Higgsfield (premium generative AI video render backend) ─────────────────
+    # Used only when video_render_backend == "higgsfield" (see below). Auth + upload +
+    # polling go through the official `higgsfield-client` SDK (base URL
+    # platform.higgsfield.ai). The model ids are catalog paths passed to the SDK's
+    # subscribe(): the image id (DoP image-to-video) is confirmed against the docs;
+    # the text-to-video id is NOT — set HIGGSFIELD_TEXT_MODEL to the catalog path from
+    # your cloud.higgsfield.ai dashboard before using the no-reference-image path.
+    # Duration is clamped to the model's per-generation max (~15s for v1's single clip).
+    higgsfield_api_key: Optional[str] = None
+    higgsfield_api_secret: Optional[str] = None
+    higgsfield_text_model: str = ""  # unverified — set from the dashboard for text-to-video
+    higgsfield_image_model: str = "higgsfield-ai/dop/standard"
+    higgsfield_max_duration_s: float = 15.0
+
+    # ── Web research (Bing grounding via Azure AI Foundry agents) ──────────────
+    # Reuses the same "Grounding with Bing Search" mechanism as
+    # trend_scout_routine/run_scan.py (a portal-defined Foundry agent, called
+    # through the OpenAI-compatible responses API) rather than a new search vendor.
+    # Two separate agents because their portal instructions differ (general web
+    # research vs. review-quote mining); both live on the same project endpoint.
+    foundry_project_endpoint: Optional[str] = None
+    web_search_agent_name: Optional[str] = None
+    web_search_agent_version: Optional[str] = None
+    review_search_agent_name: Optional[str] = None
+    review_search_agent_version: Optional[str] = None
+
+    # ── Video render pipeline (local Remotion CLI, or Remotion Lambda) ──────────
+    # Path to the video_renderer/ Node project (repo-root sibling of LLM_service/).
+    video_renderer_dir: Optional[str] = None
+    # Per-job working directory: resolved images + the final MP4 (local backend
+    # only — the lambda backend never writes an MP4 to local disk). Not git-tracked.
+    video_jobs_dir: str = ".video_jobs"
+    # "local" (default): the original `npx remotion render` subprocess, output on
+    # local disk. "lambda": workflow/video/lambda_render.py — compiles + renders on
+    # AWS Lambda, output in S3; render_storyboard() returns an https:// URL instead
+    # of a Path either way, so jobs.py/api.py don't need to know which ran.
+    # "higgsfield": the premium generative-AI-video path (workflow/video/higgsfield_render.py)
+    # — no Remotion; a single cinematic clip generated from a crafted prompt (+ optional
+    # user reference images for image-to-video), written to job_dir/output.mp4. This is
+    # the intended fee-paying-tier product; the free tier stays on "local"/"lambda".
+    video_render_backend: str = "local"
+    # ── Remotion Lambda (workflow/video/lambda_render.py) ───────────────────────
+    # Required when video_render_backend == "lambda". These name resources YOU
+    # deploy yourself first via the Remotion Lambda CLI (`npx remotion lambda
+    # functions deploy`, `npx remotion lambda sites create`) — this service only
+    # ever TRIGGERS renders against them, it never provisions them. AWS credentials
+    # are resolved the standard way (env vars / shared config / IAM role) by the
+    # AWS SDK the Node trigger scripts use — nothing AWS-specific is read from this
+    # Settings object beyond the region.
+    aws_region: Optional[str] = None
+    remotion_lambda_function_name: Optional[str] = None
+    # A STABLE, pre-deployed site's serve URL, used for any storyboard with no
+    # `generated` slides (the common, fast case — no per-job site deploy needed).
+    remotion_lambda_serve_url: Optional[str] = None
+    # A storyboard WITH `generated` slide(s) needs its own bespoke component(s)
+    # bundled in, so lambda_render.py deploys a fresh, job-scoped "site" instead of
+    # reusing remotion_lambda_serve_url — named "<prefix>-<job_id>".
+    remotion_lambda_site_name_prefix: str = "storyboard-job"
+    # S3 output location. None (default) → Remotion Lambda picks its own
+    # auto-created bucket in `aws_region` (its documented default behaviour).
+    remotion_lambda_output_bucket: Optional[str] = None
+    # Cross-slide attempt budget for one render job's WHOLE `generated`-slide
+    # codegen pass (workflow/video/codegen.CodegenBudget) — bounds total LLM calls
+    # + compiles + preview-renders across every bespoke slide in one storyboard,
+    # not just per-slide (codegen.DEFAULT_MAX_ATTEMPTS already bounds that). A
+    # storyboard with several struggling slides could otherwise spend
+    # max_attempts-per-slide x N-slides worth of real cost.
+    codegen_max_total_attempts: int = 9
+    # Deployment for the scene-codegen LLM calls (generate_scene_component,
+    # plan_scene_design, review_scene_preview, convert_generated_to_template).
+    # None -> falls back to azure_chat_deployment, same pattern as
+    # roundtable_persona_model/preference_summary_model. Lets a separate/stronger
+    # (e.g. coding-tuned) deployment be swapped in later with no code change.
+    codegen_model: Optional[str] = None
+    # Reasoning effort for generate_scene_component/review_scene_preview/
+    # convert_generated_to_template on a gpt-5.x/o-series deployment. None -> model
+    # default. Unlike the roundtable personas (which use "minimal" for short, fast
+    # turns), codegen is correctness-critical and not latency-sensitive, so a
+    # higher effort is worth trying once it's actually wired (previously it silently
+    # was NOT being sent at all here, unlike the roundtable path).
+    codegen_reasoning_effort: Optional[str] = None
+    # generate_scene_component's max_completion_tokens. MUST have enough headroom
+    # for hidden reasoning tokens (gpt-5.x/o-series) PLUS a full compiling TSX
+    # component — the previous 4096 hardcoded cap left razor-thin margin once any
+    # reasoning is spent, the same failure mode documented for
+    # ROUNDTABLE_PERSONA_MAX_TOKENS ("keep >=512, else hidden reasoning eats the
+    # whole budget and turns come back EMPTY, finish_reason=length").
+    codegen_max_tokens: int = 12000
+    # plan_scene_design's max_completion_tokens. The old hardcoded 512 sat exactly
+    # at the documented danger threshold with no reasoning_effort steer — a prime
+    # suspect for the design plan silently coming back empty (swallowed by
+    # plan_scene_design's `except Exception: return ""`), degrading every
+    # subsequent generate_scene_component call for that slide.
+    codegen_plan_max_tokens: int = 1536
+    # plan_scene_design is a short creative brainstorm ("Do NOT write code"), not a
+    # deep-reasoning task — mirrors the roundtable personas' "minimal" so the
+    # budget goes to the visible bullets, not hidden reasoning tokens.
+    codegen_plan_reasoning_effort: Optional[str] = "minimal"
+    # Visual QA pass for `map` slides (workflow/video/map_qa.py): preview-still +
+    # vision review per map slide, with a bounded zoom-out repair on rejection.
+    # Cost per attempt ≈ one `remotion still` (5-20s) + one vision call, so
+    # MAP_QA_ENABLED=false is the latency/cost kill switch.
+    map_qa_enabled: bool = True
+    map_qa_max_attempts: int = 2
 
     # ── Backend status webhook (legacy transport; SSE replaces it in M2) ───────
     webhook_url: str = "http://localhost:9999/status"
@@ -153,6 +373,24 @@ class Settings:
 
     def mock_voice(self) -> bool:
         return self.use_mock if self.use_mock_voice is None else self.use_mock_voice
+
+    def mock_image_search(self) -> bool:
+        return self.use_mock if self.use_mock_image_search is None else self.use_mock_image_search
+
+    def mock_background_removal(self) -> bool:
+        return self.use_mock if self.use_mock_background_removal is None else self.use_mock_background_removal
+
+    def mock_music_generation(self) -> bool:
+        return self.use_mock if self.use_mock_music_generation is None else self.use_mock_music_generation
+
+    def mock_web_search(self) -> bool:
+        return self.use_mock if self.use_mock_web_search is None else self.use_mock_web_search
+
+    def mock_voiceover(self) -> bool:
+        return self.use_mock if self.use_mock_voiceover is None else self.use_mock_voiceover
+
+    def mock_video_generation(self) -> bool:
+        return self.use_mock if self.use_mock_video_generation is None else self.use_mock_video_generation
 
     def notify_via_webhook(self) -> bool:
         """Whether status events are POSTed to the backend webhook. Defaults to
@@ -176,6 +414,67 @@ class Settings:
     def has_voice(self) -> bool:
         return bool(self.azure_voicelive_endpoint)
 
+    @property
+    def has_pexels(self) -> bool:
+        return bool(self.pexels_api_key)
+
+    @property
+    def has_removebg(self) -> bool:
+        return bool(self.removebg_api_key)
+
+    @property
+    def has_geoapify(self) -> bool:
+        return bool(self.geoapify_api_key)
+
+    @property
+    def has_soundraw(self) -> bool:
+        return bool(self.soundraw_api_key)
+
+    @property
+    def has_web_search(self) -> bool:
+        return bool(self.foundry_project_endpoint and self.web_search_agent_name)
+
+    @property
+    def has_azure_speech(self) -> bool:
+        return bool(self.azure_speech_key and self.azure_speech_region)
+
+    @property
+    def has_higgsfield(self) -> bool:
+        return bool(self.higgsfield_api_key and self.higgsfield_api_secret)
+
+    @property
+    def has_remotion_lambda(self) -> bool:
+        """Whether enough is configured to attempt a Lambda render: a function to
+        invoke, and a stable serve URL for the (common) no-`generated`-slide case.
+        A `generated`-slide job additionally needs `resolved_video_renderer_dir` to
+        exist locally (it deploys a fresh site from that project), checked at
+        render time, not here."""
+        return bool(self.remotion_lambda_function_name and self.remotion_lambda_serve_url)
+
+    @property
+    def resolved_video_renderer_dir(self) -> Path:
+        """Absolute path to the video_renderer/ Node project. VIDEO_RENDERER_DIR
+        overrides; otherwise defaults to the repo-root sibling of LLM_service/ (this
+        file is core/config.py, so parent.parent.parent is the repo root).
+        `.resolve()` on the override matters: render.py/codegen.py pass paths
+        derived from this property as subprocess args while also setting the
+        subprocess's `cwd` to this same directory — a RELATIVE VIDEO_RENDERER_DIR
+        left unresolved would have the subprocess reinterpret that relative path
+        against its own cwd (this directory), silently writing/reading a
+        double-nested path instead of the intended one."""
+        if self.video_renderer_dir:
+            return Path(self.video_renderer_dir).resolve()
+        return Path(__file__).resolve().parent.parent.parent / "video_renderer"
+
+    @property
+    def resolved_video_jobs_dir(self) -> Path:
+        """Absolute path to the per-job working directory (resolved images + the
+        final MP4). Relative `video_jobs_dir` values resolve under LLM_service/."""
+        path = Path(self.video_jobs_dir)
+        if path.is_absolute():
+            return path
+        return Path(__file__).resolve().parent.parent / path
+
     def mode_banner(self) -> str:
         """Human-readable one-liner describing the resolved mode of each service."""
         def tag(is_mock: bool) -> str:
@@ -184,18 +483,32 @@ class Settings:
         return (
             f"MODE: {overall}  "
             f"[llm={tag(self.mock_llm())} safety={tag(self.mock_safety())} "
-            f"store={tag(self.mock_store())} voice={tag(self.mock_voice())}]"
+            f"store={tag(self.mock_store())} voice={tag(self.mock_voice())} "
+            f"image_search={tag(self.mock_image_search())} "
+            f"background_removal={tag(self.mock_background_removal())} "
+            f"music_generation={tag(self.mock_music_generation())} "
+            f"web_search={tag(self.mock_web_search())} "
+            f"voiceover={tag(self.mock_voiceover())} "
+            f"video_generation={tag(self.mock_video_generation())}]"
         )
 
 
 def _load() -> Settings:
     use_mock = _env_bool("USE_MOCK")
+    learning = _env_bool("LEARNING_ENABLED")
+    map_qa = _env_bool("MAP_QA_ENABLED")
     return Settings(
         use_mock=True if use_mock is None else use_mock,
         use_mock_llm=_env_bool("USE_MOCK_LLM"),
         use_mock_safety=_env_bool("USE_MOCK_SAFETY"),
         use_mock_store=_env_bool("USE_MOCK_STORE"),
         use_mock_voice=_env_bool("USE_MOCK_VOICE"),
+        use_mock_image_search=_env_bool("USE_MOCK_IMAGE_SEARCH"),
+        use_mock_background_removal=_env_bool("USE_MOCK_BACKGROUND_REMOVAL"),
+        use_mock_music_generation=_env_bool("USE_MOCK_MUSIC_GENERATION"),
+        use_mock_web_search=_env_bool("USE_MOCK_WEB_SEARCH"),
+        use_mock_voiceover=_env_bool("USE_MOCK_VOICEOVER"),
+        use_mock_video_generation=_env_bool("USE_MOCK_VIDEO_GENERATION"),
         azure_openai_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
         azure_openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
@@ -209,10 +522,75 @@ def _load() -> Settings:
         postgres_profiles_table=os.getenv("POSTGRES_PROFILES_TABLE", "brand_profiles"),
         postgres_user_skills_table=os.getenv("POSTGRES_USER_SKILLS_TABLE", "user_skills"),
         postgres_checkpoints_table=os.getenv("POSTGRES_CHECKPOINTS_TABLE", "workflow_checkpoints"),
+        postgres_sslmode=os.getenv("POSTGRES_SSLMODE"),
+        postgres_video_jobs_table=os.getenv("POSTGRES_VIDEO_JOBS_TABLE", "video_jobs"),
+        postgres_trends_table=os.getenv("POSTGRES_TRENDS_TABLE", "trends"),
         azure_voicelive_endpoint=os.getenv("AZURE_VOICELIVE_ENDPOINT"),
         azure_voicelive_model=os.getenv("AZURE_VOICELIVE_MODEL", "gpt-realtime"),
         azure_voicelive_api_version=os.getenv("AZURE_VOICELIVE_API_VERSION", "2026-04-10"),
         azure_voicelive_api_key=os.getenv("AZURE_VOICELIVE_API_KEY"),
+        azure_voicelive_voice=os.getenv("AZURE_VOICELIVE_VOICE", "verse"),
+        roundtable_enabled=bool(_env_bool("ROUNDTABLE_ENABLED")),
+        roundtable_max_rounds=_env_int("ROUNDTABLE_MAX_ROUNDS", 12),
+        roundtable_persona_max_tokens=(
+            _env_int("ROUNDTABLE_PERSONA_MAX_TOKENS", 0) or None
+        ),
+        roundtable_persona_reasoning_effort=(
+            os.getenv("ROUNDTABLE_PERSONA_REASONING_EFFORT", "minimal").strip() or None
+        ),
+        roundtable_persona_verbosity=(
+            os.getenv("ROUNDTABLE_PERSONA_VERBOSITY", "low").strip() or None
+        ),
+        roundtable_persona_model=os.getenv("ROUNDTABLE_PERSONA_MODEL"),
+        roundtable_manager_model=os.getenv("ROUNDTABLE_MANAGER_MODEL"),
+        roundtable_persona_endpoint=os.getenv("AZURE_PERSONA_ENDPOINT"),
+        roundtable_persona_api_key=os.getenv("AZURE_PERSONA_API_KEY"),
+        roundtable_user_turn_timeout=_env_float("ROUNDTABLE_USER_TURN_TIMEOUT", 300.0),
+        roundtable_control_timeout=_env_float("ROUNDTABLE_CONTROL_TIMEOUT", 300.0),
+        learning_enabled=True if learning is None else learning,
+        trend_scout_enabled=bool(_env_bool("TREND_SCOUT_ENABLED")),
+        trend_scout_limit=_env_int("TREND_SCOUT_LIMIT", 6),
+        trend_scout_ttl_days=_env_int("TREND_SCOUT_TTL_DAYS", 3),
+        # The per-user summary call reuses the cheap persona deployment by default
+        # (ROUNDTABLE_PERSONA_MODEL); PREFERENCE_SUMMARY_MODEL overrides if set.
+        preference_summary_model=(
+            os.getenv("PREFERENCE_SUMMARY_MODEL") or os.getenv("ROUNDTABLE_PERSONA_MODEL")
+        ),
+        pexels_api_key=os.getenv("PEXELS_API_KEY"),
+        removebg_api_key=os.getenv("REMOVEBG_API_KEY"),
+        geoapify_api_key=os.getenv("GEOAPIFY_API_KEY"),
+        geoapify_map_style=os.getenv("GEOAPIFY_MAP_STYLE") or None,
+        soundraw_api_key=os.getenv("SOUNDRAW_API_KEY"),
+        azure_speech_key=os.getenv("AZURE_SPEECH_KEY"),
+        azure_speech_region=os.getenv("AZURE_SPEECH_REGION"),
+        voiceover_default_voice=os.getenv("VOICEOVER_DEFAULT_VOICE", "en-US-JennyNeural"),
+        higgsfield_api_key=os.getenv("HIGGSFIELD_API_KEY"),
+        higgsfield_api_secret=os.getenv("HIGGSFIELD_API_SECRET"),
+        higgsfield_text_model=os.getenv("HIGGSFIELD_TEXT_MODEL", ""),
+        higgsfield_image_model=os.getenv("HIGGSFIELD_IMAGE_MODEL", "higgsfield-ai/dop/standard"),
+        higgsfield_max_duration_s=_env_float("HIGGSFIELD_MAX_DURATION_S", 15.0),
+        web_search_agent_name=os.getenv("WEB_SEARCH_AGENT_NAME"),
+        web_search_agent_version=os.getenv("WEB_SEARCH_AGENT_VERSION"),
+        review_search_agent_name=os.getenv("REVIEW_SEARCH_AGENT_NAME"),
+        review_search_agent_version=os.getenv("REVIEW_SEARCH_AGENT_VERSION"),
+        video_renderer_dir=os.getenv("VIDEO_RENDERER_DIR"),
+        video_jobs_dir=os.getenv("VIDEO_JOBS_DIR", ".video_jobs"),
+        video_render_backend=os.getenv("VIDEO_RENDER_BACKEND", "local").strip().lower(),
+        aws_region=os.getenv("AWS_REGION"),
+        remotion_lambda_function_name=os.getenv("REMOTION_LAMBDA_FUNCTION_NAME"),
+        remotion_lambda_serve_url=os.getenv("REMOTION_LAMBDA_SERVE_URL"),
+        remotion_lambda_site_name_prefix=os.getenv("REMOTION_LAMBDA_SITE_NAME_PREFIX", "storyboard-job"),
+        remotion_lambda_output_bucket=os.getenv("REMOTION_LAMBDA_OUTPUT_BUCKET"),
+        codegen_max_total_attempts=_env_int("CODEGEN_MAX_TOTAL_ATTEMPTS", 9),
+        codegen_model=os.getenv("CODEGEN_MODEL"),
+        codegen_reasoning_effort=(os.getenv("CODEGEN_REASONING_EFFORT") or "").strip() or None,
+        codegen_max_tokens=_env_int("CODEGEN_MAX_TOKENS", 12000),
+        codegen_plan_max_tokens=_env_int("CODEGEN_PLAN_MAX_TOKENS", 1536),
+        codegen_plan_reasoning_effort=(
+            os.getenv("CODEGEN_PLAN_REASONING_EFFORT", "minimal").strip() or None
+        ),
+        map_qa_enabled=True if map_qa is None else map_qa,
+        map_qa_max_attempts=_env_int("MAP_QA_MAX_ATTEMPTS", 2),
         webhook_url=os.getenv("WEBHOOK_URL", "http://localhost:9999/status"),
         webhook_enabled=_env_bool("WEBHOOK_ENABLED"),
     )

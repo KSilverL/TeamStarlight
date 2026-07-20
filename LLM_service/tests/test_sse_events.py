@@ -3,7 +3,7 @@ SSE progress stream + the api surface (replaces test_status_events / test_api).
 
 Covers the §7.2 event envelope bridged from the MAF workflow to SSE
 (`GET /tasks/{id}/events`), the RequestPort resume endpoint (`POST /review`), the
-archivist tagging endpoint (`POST /archive-tags`), and the durability guarantee:
+confirm-learning archivist (`POST /confirm-learning`), and the durability guarantee:
 the workflow's checkpoint persists on the RequestPort pause and a fresh workflow
 instance resumes from it after a simulated process restart.
 
@@ -14,6 +14,7 @@ in-process test HTTP server on localhost.
 from __future__ import annotations
 
 import json
+import time
 
 import httpx
 import pytest
@@ -23,8 +24,10 @@ from LLM_service.core.services import factory, mock, postgres
 from LLM_service.tests.conftest import run_app
 from LLM_service.workflow import HumanVerdict, build_workflow
 from LLM_service.workflow.builder import WORKFLOW_NAME
+from LLM_service.workflow.roundtable import push_utterance
 
-_START = {"topic": "ethiopia harvest", "target_platforms": ["linkedin", "instagram"], "business_id": "biz_sse"}
+_START = {"topic": "ethiopia harvest", "target_platforms": ["linkedin", "instagram"],
+          "business_id": "biz_sse", "content_types": ["text", "brand", "video"]}
 _ENVELOPE_KEYS = {"type", "node", "phase", "platform", "status", "ts"}
 
 
@@ -36,7 +39,7 @@ async def test_start_emits_progress_for_every_executor():
     events = svc.buffered_events("t1")
 
     progressed = {(e["node"], e["status"]) for e in events if e["type"] == "progress"}
-    for node in ("dispatcher", "scout", "creator", "reviewer"):
+    for node in ("dispatcher", "strategist", "creator", "reviewer"):
         assert (node, "running") in progressed
         assert (node, "done") in progressed
     # the gate interrupts (awaiting human) for each platform
@@ -79,10 +82,10 @@ async def test_review_approves_all_and_completes():
 
     finals = [e for e in svc.buffered_events("t1") if e["type"] == "result" and e["status"] == "final"]
     assert {e["platform"] for e in finals} == {"linkedin", "instagram"}
-    # the media_producer enriched each final with the animated card + video spec
+    # the media_producer enriched each final with the animated card + video storyboard
     for e in finals:
         assert e["html_preview"].startswith("<!DOCTYPE html>")
-        assert e["video_props"] and len(e["video_props"]["stats"]) == 3
+        assert e["video_storyboard"] and 2 <= len(e["video_storyboard"]["slides"]) <= 8
 
 
 async def test_partial_review_keeps_other_platform_pending():
@@ -105,20 +108,18 @@ async def test_events_generator_drains_when_done():
     assert any(e["type"] == "result" and e["status"] == "final" for e in streamed)
 
 
-# ── C. Archive-tags writes the kept rules to the store (get_store) ───────────
+# ── C. Learning: the confirm-learning archivist writes straight to the store ─────────────
 
-async def test_archive_tags_persists_kept_rules_to_profile():
+async def test_confirm_learning_writes_brand_rules_to_profile():
+    """The archivist (behind confirm-learning) distils the conversation and writes brand rules
+    STRAIGHT into the Brand_Voice_Profile — no separate per-rule tagging step."""
     svc = WorkflowService()
     await svc.start({"topic": "harvest", "target_platforms": ["linkedin"], "business_id": "biz_tag"}, task_id="t1")
-    snap = await svc.review("t1", {
+    await svc.review("t1", {
         "linkedin": {"decision": "approve_after_edit", "edited_draft": "Striking microlot statistic upfront."}
     })
-    rules = snap["proposed_rules"]
-    assert rules, "an edit should propose rules"
-
-    tags = [{**r, "keep": r["kind"] == "must_do"} for r in rules]
-    res = await svc.archive_tags("t1", tags)
-    assert res["rules_kept"] >= 1
+    rules = (await svc.confirm_learning("t1", learn=True))["brand_rules"]
+    assert rules, "an edit should distil brand rules"
 
     profile = await factory.get_store().get_profile(business_id="biz_tag")
     assert any(r["rule"] in profile["must_do"] for r in rules if r["kind"] == "must_do")
@@ -157,6 +158,199 @@ async def test_api_start_persists_a_workflow_checkpoint():
     assert checkpoints
 
 
+# ── D2. Roundtable discussion streams over the same SSE channel (Phase 4) ─────
+
+_RT_START = {
+    "topic": "spring single-origin coffee launch",
+    "target_platforms": ["linkedin"],
+    "business_id": mock.ROUNDTABLE_FIXTURE_BUSINESS_ID,
+    "user_id": mock.ROUNDTABLE_FIXTURE_USER_ID,
+}
+
+
+async def test_roundtable_streams_utterances_then_consensus():
+    svc = WorkflowService()
+    await svc.run_roundtable(_RT_START, "linkedin", task_id="rt1", max_rounds=4)
+    events = svc.buffered_events("rt1")
+
+    utterances = [e for e in events if e["type"] == "agent_utterance"]
+    consensus = [e for e in events if e["type"] == "result" and e["status"] == "discussion_consensus"]
+    assert utterances, "expected a stream of agent utterances"
+    assert len(consensus) == 1
+
+    # Ordering: every utterance precedes the single consensus, which is the last event.
+    assert events[-1]["status"] == "discussion_consensus"
+    rounds = [e["round_index"] for e in utterances]
+    assert rounds == sorted(rounds)
+
+    # Envelope completeness + the utterance-specific fields.
+    for e in events:
+        assert _ENVELOPE_KEYS <= set(e)
+        assert isinstance(e["ts"], float)
+    for e in utterances:
+        assert e["platform"] == "linkedin" and e["table_id"] == "linkedin"
+        assert e["speaker"] and e["agent_id"] == e["speaker"] and e["role"] and e["text"]
+    assert consensus[0]["strategy"]["linkedin"] and consensus[0]["converged"] is True
+
+
+async def test_roundtable_announces_each_speaker_before_their_turn():
+    """The manager's mic handoff streams as a `speaker_scheduled` event BEFORE that
+    speaker's `agent_utterance` — the live "who has the floor" signal for the UI."""
+    svc = WorkflowService()
+    await svc.run_roundtable(_RT_START, "linkedin", task_id="rt_sched", max_rounds=4)
+    events = svc.buffered_events("rt_sched")
+
+    scheduled = [e for e in events if e["type"] == "speaker_scheduled"]
+    assert scheduled, "expected the manager to announce each upcoming speaker"
+    for e in scheduled:
+        assert _ENVELOPE_KEYS <= set(e)
+        assert e["table_id"] == "linkedin" and e["speaker"] and e["agent_id"] == e["speaker"]
+
+    # Every persona turn was announced first: a matching (speaker, round) scheduled event
+    # appears in the stream strictly before the utterance itself.
+    for i, e in enumerate(events):
+        if e["type"] != "agent_utterance":
+            continue
+        assert any(
+            s["type"] == "speaker_scheduled"
+            and s["speaker"] == e["speaker"]
+            and s["round_index"] == e["round_index"]
+            for s in events[:i]
+        ), f"utterance by {e['speaker']} (round {e['round_index']}) was never announced"
+
+
+async def test_roundtable_user_utterance_appears_in_the_stream():
+    """A queued user 'raise hand' shows up as a user-role agent_utterance in the SSE stream."""
+    await push_utterance(factory.get_store(), task_id="rt2", table_id="linkedin",
+                         text="please mention fair-trade sourcing")
+    svc = WorkflowService()
+    await svc.run_roundtable(_RT_START, "linkedin", task_id="rt2", max_rounds=4)
+
+    user_utts = [e for e in svc.buffered_events("rt2")
+                 if e["type"] == "agent_utterance" and e["role"] == "user"]
+    assert any("fair-trade" in e["text"] for e in user_utts)
+
+
+async def test_roundtable_events_generator_drains_in_order():
+    svc = WorkflowService()
+    await svc.run_roundtable(_RT_START, "linkedin", task_id="rt3", max_rounds=4)
+    streamed = [ev async for ev in svc.events("rt3")]
+    assert streamed and streamed[-1]["status"] == "discussion_consensus"
+    assert any(e["type"] == "agent_utterance" for e in streamed)
+
+
+# ── D3. A run that raises never hangs SSE subscribers (error path) ────────────
+
+class _BoomWorkflow:
+    """A workflow whose event stream raises immediately, standing in for an executor
+    that blows up mid-run — so the error-handling path is exercised without a real fault."""
+
+    def run(self, message=None, *, stream=False, **kwargs):
+        async def gen():
+            raise RuntimeError("boom in the newsroom")
+            yield  # unreachable; makes gen an async generator
+
+        return gen()
+
+
+async def test_run_error_marks_task_and_closes_subscribers():
+    svc = WorkflowService(workflow_factory=lambda **kw: _BoomWorkflow())
+    with pytest.raises(RuntimeError):
+        await svc.start({"topic": "x", "target_platforms": ["linkedin"]}, task_id="boom")
+
+    snap = await svc.get("boom")
+    assert snap["status"] == "error" and "boom" in snap["error"]
+
+    # The SSE generator drains (a terminal workflow-error event) instead of blocking forever.
+    streamed = [ev async for ev in svc.events("boom")]
+    assert any(e["node"] == "workflow" and e["status"] == "error" for e in streamed)
+
+
+# ── D4. Standalone roundtable routes (single + fan-out) ───────────────────────
+
+def _await_completed(client, base_url, task_id):
+    for _ in range(200):
+        snap = client.get(f"{base_url}/tasks/{task_id}").json()
+        if snap["status"] in ("completed", "error"):
+            return snap
+        time.sleep(0.02)
+    return client.get(f"{base_url}/tasks/{task_id}").json()
+
+
+def test_http_roundtable_single_and_fanout(http_server):
+    with httpx.Client(timeout=10) as client:
+        # Single table: POST /roundtable returns immediately (running), converges over SSE.
+        started = client.post(f"{http_server}/roundtable", json={
+            "topic": "spring single-origin harvest", "target_platforms": ["linkedin"],
+            "max_rounds": 4,
+        })
+        assert started.status_code == 200
+        body = started.json()
+        assert body["status"] == "running" and body["platform"] == "linkedin"
+        snap = _await_completed(client, http_server, body["task_id"])
+        assert snap["status"] == "completed"
+        assert [o["platform"] for o in snap["outputs"]] == ["linkedin"]
+
+        # Fan-out: POST /roundtables runs one table per target platform.
+        fan = client.post(f"{http_server}/roundtables", json={
+            "topic": "spring single-origin harvest",
+            "target_platforms": ["linkedin", "instagram"], "max_rounds": 4,
+        })
+        assert fan.status_code == 200 and fan.json()["status"] == "running"
+        snap2 = _await_completed(client, http_server, fan.json()["task_id"])
+        assert snap2["status"] == "completed"
+        assert {o["platform"] for o in snap2["outputs"]} == {"linkedin", "instagram"}
+
+        # A discussion streamed at least one utterance over the shared SSE channel.
+        events = []
+        with client.stream("GET", f"{http_server}/tasks/{fan.json()['task_id']}/events") as stream:
+            for line in stream.iter_lines():
+                if line.startswith("data: "):
+                    events.append(json.loads(line[6:]))
+        assert any(e["type"] == "agent_utterance" for e in events)
+
+
+def test_http_round_control_steers_a_manual_roundtable(http_server):
+    """Step mode over plain HTTP: `roundtable_mode: "manual"` on POST /roundtable makes the
+    table pause each round and emit a `round_control` "waiting" event; the client answers via
+    POST /tasks/{id}/round-control — here "next" (advance one round) then "enough" (converge
+    now). Also the endpoint's validation: unknown task → 404, unknown action → 400."""
+    with httpx.Client(timeout=10) as client:
+        assert client.post(f"{http_server}/tasks/nope/round-control",
+                           json={"table_id": "linkedin", "action": "next"}).status_code == 404
+
+        started = client.post(f"{http_server}/roundtable", json={
+            "topic": "spring single-origin harvest", "target_platforms": ["linkedin"],
+            "max_rounds": 4, "roundtable_mode": "manual",
+        })
+        assert started.status_code == 200 and started.json()["status"] == "running"
+        task_id = started.json()["task_id"]
+
+        assert client.post(f"{http_server}/tasks/{task_id}/round-control",
+                           json={"table_id": "linkedin", "action": "dance"}).status_code == 400
+
+        # Follow the live stream and answer each prompt as it lands.
+        answers = ["next", "enough"]
+        events = []
+        with client.stream("GET", f"{http_server}/tasks/{task_id}/events") as stream:
+            for line in stream.iter_lines():
+                if not line.startswith("data: "):
+                    continue
+                ev = json.loads(line[6:])
+                events.append(ev)
+                if ev.get("type") == "round_control" and ev.get("status") == "waiting":
+                    res = client.post(f"{http_server}/tasks/{task_id}/round-control",
+                                      json={"table_id": "linkedin", "action": answers.pop(0)})
+                    assert res.status_code == 200 and res.json()["accepted"] is True
+
+        assert not answers                                   # both prompts asked and answered
+        # "next" advanced exactly one more persona turn before "enough" converged the table.
+        assert len([e for e in events if e["type"] == "agent_utterance"]) == 2
+        consensus = [e for e in events if e.get("status") == "discussion_consensus"]
+        assert len(consensus) == 1 and consensus[0]["converged"] is True
+        assert _await_completed(client, http_server, task_id)["status"] == "completed"
+
+
 # ── E. Offline guarantee: under USE_MOCK every service is a mock (no Azure) ───
 
 def test_no_real_backends_selected_in_mock_mode():
@@ -182,15 +376,27 @@ def test_http_sse_round_trip(http_server):
         })
         assert started.status_code == 200
         task_id = started.json()["task_id"]
-        assert started.json()["status"] == "awaiting_review"
+        # POST /tasks is non-blocking now: it returns a `running` snapshot and drives in the
+        # background so progress streams live. Poll until the gate before resuming.
+        assert started.json()["status"] == "running"
+        snap = started.json()
+        for _ in range(200):
+            snap = client.get(f"{http_server}/tasks/{task_id}").json()
+            if snap["status"] == "awaiting_review":
+                break
+            time.sleep(0.02)
+        assert snap["status"] == "awaiting_review"
 
         reviewed = client.post(f"{http_server}/tasks/{task_id}/review", json={
             "verdicts": {"linkedin": {"decision": "approve_after_edit",
                                       "edited_draft": "Striking microlot statistic upfront."}}
         })
         assert reviewed.status_code == 200 and reviewed.json()["status"] == "completed"
-        proposed = reviewed.json()["proposed_rules"]
-        assert proposed
+
+        # The extra confirmation round: the user opts in → the archivist distils + stores.
+        confirmed = client.post(f"{http_server}/tasks/{task_id}/confirm-learning", json={"learn": True})
+        assert confirmed.status_code == 200 and confirmed.json()["learned"] is True
+        assert confirmed.json()["brand_rules"]  # distilled brand rules, written straight to the store
 
         # SSE: task is done, so the stream replays the buffer and closes.
         events = []
@@ -201,12 +407,9 @@ def test_http_sse_round_trip(http_server):
                     events.append(json.loads(line[6:]))
 
         assert any(e["type"] == "progress" and e["node"] == "reviewer" for e in events)
-        assert any(e["type"] == "result" and e["status"] == "final" and e["node"] == "archivist" for e in events)
+        # The final result now comes from the gate (no in-graph archivist node).
+        assert any(e["type"] == "result" and e["status"] == "final" and e["node"] == "human_gate" for e in events)
         assert all(_ENVELOPE_KEYS <= set(e) for e in events)
-
-        tags = [{**r, "keep": True} for r in proposed]
-        tagged = client.post(f"{http_server}/tasks/{task_id}/archive-tags", json={"tags": tags})
-        assert tagged.status_code == 200 and tagged.json()["rules_kept"] >= 1
 
 
 def test_http_validation_and_not_found(http_server):
@@ -232,18 +435,129 @@ def test_http_media_endpoints(http_server):
         assert html_res.status_code == 200
         assert html_res.json()["html"].startswith("<!DOCTYPE html>")
 
-        # Brand video → a job that resolves to a structured spec (no MP4).
-        started = client.post(f"{http_server}/generate-video", json={"brief": "Luna Skincare — minimalist"})
-        assert started.status_code == 200
-        job_id = started.json()["job_id"]
-        job = client.get(f"{http_server}/jobs/{job_id}").json()
-        assert job["status"] == "done"
-        assert len(job["props"]["stats"]) == 3
-
-        # Validation + unknown job.
+        # Validation.
         assert client.post(f"{http_server}/generate", json={"prompt": ""}).status_code == 400
         assert client.post(f"{http_server}/generate-text", json={"prompt": ""}).status_code == 400
+
+        # The old standalone "generate-video"/"jobs/{id}" routes are retired — video
+        # storyboard generation is now workflow-only (media_producer's role); see
+        # test_http_video_render_trigger for the real render-video/video-jobs flow.
+        assert client.post(f"{http_server}/generate-video", json={"brief": "x"}).status_code == 404
         assert client.get(f"{http_server}/jobs/nope").status_code == 404
+
+
+def test_http_video_render_trigger(http_server, monkeypatch):
+    """The render-video endpoint reads the storyboard media_producer already
+    attached to a finished platform draft (never a free-text brief) and kicks off
+    a separately-tracked, polled job. `render_storyboard` (the actual `npx remotion
+    render` subprocess) is faked here so this stays in the suite's fast/offline
+    style — it doesn't depend on Node/headless Chromium being installed wherever
+    pytest runs. The real subprocess is exercised directly in
+    workflow/video/render.py's own usage (verified manually end-to-end)."""
+    import LLM_service.workflow.video.assets as assets_module
+    import LLM_service.workflow.video.jobs as jobs_module
+
+    async def _fake_render_storyboard(renderable, *, job_dir, settings, timeout_s=240.0):
+        job_dir.mkdir(parents=True, exist_ok=True)
+        output_path = job_dir / "output.mp4"
+        output_path.write_bytes(b"fake-mp4-bytes")
+        return output_path
+
+    # The mock image search yields placeholder `mock.pexels.local` URLs; without faking the
+    # download the render job spends ~5s on real (failing) HTTP fetches before it settles,
+    # overrunning the poll below. Fake it to keep this fully offline (like render_storyboard).
+    async def _no_download(url):
+        return None
+
+    monkeypatch.setattr(jobs_module, "render_storyboard", _fake_render_storyboard)
+    monkeypatch.setattr(assets_module, "_download", _no_download)
+
+    with httpx.Client(timeout=10) as client:
+        started = client.post(f"{http_server}/tasks", json={
+            "topic": "harvest", "target_platforms": ["linkedin"], "business_id": "biz_render",
+            "content_types": ["text", "video"],  # a storyboard must exist for render-video to trigger
+        })
+        task_id = started.json()["task_id"]
+        client.post(f"{http_server}/tasks/{task_id}/review",
+                    json={"verdicts": {"linkedin": {"decision": "approve"}}})
+
+        # Unknown task / unfinished platform both fail before any job is created.
+        missing_task = client.post(f"{http_server}/tasks/nope/render-video", json={"platform": "linkedin"})
+        assert missing_task.status_code == 404
+        wrong_platform = client.post(f"{http_server}/tasks/{task_id}/render-video",
+                                      json={"platform": "tiktok"})
+        assert wrong_platform.status_code == 404
+
+        triggered = client.post(f"{http_server}/tasks/{task_id}/render-video",
+                                 json={"platform": "linkedin"})
+        assert triggered.status_code == 200
+        job_id = triggered.json()["job_id"]
+        assert triggered.json()["status"] == "pending"
+
+        # The render runs as a detached background task; poll briefly for it to
+        # finish (the faked render above is near-instant, so this settles fast).
+        job = None
+        for _ in range(50):
+            job = client.get(f"{http_server}/video-jobs/{job_id}").json()
+            if job["status"] != "pending":
+                break
+            time.sleep(0.05)
+        assert job is not None and job["status"] == "done", job
+
+        download = client.get(f"{http_server}/video-jobs/{job_id}/download")
+        assert download.status_code == 200
+        assert download.content == b"fake-mp4-bytes"
+
+        assert client.get(f"{http_server}/video-jobs/nope").status_code == 404
+
+
+def test_http_video_download_redirects_for_a_remote_lambda_url(http_server, monkeypatch):
+    """When render_storyboard (workflow/video/render.py) returns an https:// URL
+    (the VIDEO_RENDER_BACKEND=lambda path — the output lives in S3, never on this
+    process's disk), the download route 307-redirects to it instead of trying to
+    FileResponse a local path. Local-backend behaviour (the Path case) is covered
+    by test_http_video_render_trigger above; this is the same trigger/poll flow
+    with only the faked render's return value changed."""
+    import LLM_service.workflow.video.assets as assets_module
+    import LLM_service.workflow.video.jobs as jobs_module
+
+    remote_url = "https://bucket.s3.amazonaws.com/renders/job-xyz/output.mp4"
+
+    async def _fake_remote_render(renderable, *, job_dir, settings, timeout_s=240.0):
+        return remote_url
+
+    async def _no_download(url):
+        return None
+
+    monkeypatch.setattr(jobs_module, "render_storyboard", _fake_remote_render)
+    monkeypatch.setattr(assets_module, "_download", _no_download)
+
+    with httpx.Client(timeout=10) as client:
+        started = client.post(f"{http_server}/tasks", json={
+            "topic": "harvest", "target_platforms": ["linkedin"], "business_id": "biz_render_remote",
+            "content_types": ["text", "video"],
+        })
+        task_id = started.json()["task_id"]
+        client.post(f"{http_server}/tasks/{task_id}/review",
+                    json={"verdicts": {"linkedin": {"decision": "approve"}}})
+
+        triggered = client.post(f"{http_server}/tasks/{task_id}/render-video",
+                                 json={"platform": "linkedin"})
+        job_id = triggered.json()["job_id"]
+
+        job = None
+        for _ in range(50):
+            job = client.get(f"{http_server}/video-jobs/{job_id}").json()
+            if job["status"] != "pending":
+                break
+            time.sleep(0.05)
+        assert job is not None and job["status"] == "done", job
+        assert job["output_path"] == remote_url
+
+        download = client.get(f"{http_server}/video-jobs/{job_id}/download", follow_redirects=False)
+        assert download.status_code == 307
+        assert download.headers["location"] == remote_url
+        assert client.get(f"{http_server}/video-jobs/nope/download").status_code == 404
 
 
 def test_http_media_accepts_conversation_history(http_server):

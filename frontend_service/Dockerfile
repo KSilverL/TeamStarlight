@@ -24,6 +24,14 @@ RUN npm ci
 # node_modules come from the cached deps stage, not re-installed here.
 # =============================================================================
 FROM base AS builder
+# NEXT_PUBLIC_* vars are inlined into the client bundle at `next build` time (this stage),
+# not read at container start — must arrive as a build ARG, not just a runtime env var.
+# The browser connects DIRECTLY to LLM_service's realtime voice WS (MVP: no Java WS proxy
+# yet), so this needs to be reachable from the browser's own network vantage point (e.g.
+# ws://localhost:8080 for local dev — NOT the in-network ws://llm:8080, which only resolves
+# from other containers, never from the host browser).
+ARG NEXT_PUBLIC_LLM_SERVICE_WS_URL
+ENV NEXT_PUBLIC_LLM_SERVICE_WS_URL=$NEXT_PUBLIC_LLM_SERVICE_WS_URL
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 # Ensure public/ exists — Next.js doesn't require it but the runner COPY expects it.

@@ -1,8 +1,10 @@
-"""dispatcher (总编导) — the workflow's start executor.
+"""
+dispatcher (总编导) — the workflow's start executor.
 
 Validates the incoming brief and confirms the route (copilot_mode /
-direct_generation / brand_training). When the intake layer (M3) already produced a
-complete brief, this is mostly a confirmation step — it does not re-collect input.
+direct_generation). When the intake layer (M3) already produced a complete brief,
+this is mostly a confirmation step — it does not re-collect input. Whether to learn
+from the run is a separate, confirmation-gated service step, not a route here.
 """
 
 from agent_framework import Executor, WorkflowContext, handler

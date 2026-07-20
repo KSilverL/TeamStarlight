@@ -7,27 +7,37 @@ state machine, the **same** system prompt + function definitions, and produce th
 audio). Downstream the workflow (M1/M2) is completely unaware of which entry was used.
 
     build_intake("text")  → TextIntake
-    build_intake("voice") → MockVoiceIntake (offline) | VoiceIntake (Voice Live)
+    build_intake("voice") → MockVoiceIntake (offline) | VoiceIntake (Voice Live, cascaded STT)
 
 The shared state machine lives in `base.BriefConversation`; the subclasses override
 only `_ingest` (the transport that turns a raw turn into user text).
+
+`RealtimeVoiceIntake` (realtime_voice.py) is a third, separate entry: native
+speech-to-speech over GPT-Realtime, driven directly by `WS /intake/{sid}/voice`
+(not by `build_intake`, since it has no text `_ingest` step at all). It shares the
+same brief-completion state/rules via `BriefConversation`, just not the `_ingest`
+transport shape — see its module docstring.
 """
 
 from __future__ import annotations
 
 from ..core.config import get_settings
 from .base import BriefConversation, IntakeSession
-from .brief_schema import CreativeBrief
+from .brief_schema import CreativeBrief, PriorSessionContext
+from .realtime_voice import RealtimeVoiceIntake
 from .text_intake import TextIntake
 from .voice_intake import MockVoiceIntake, VoiceIntake
 
+
 __all__ = [
     "CreativeBrief",
+    "PriorSessionContext",
     "IntakeSession",
     "BriefConversation",
     "TextIntake",
     "VoiceIntake",
     "MockVoiceIntake",
+    "RealtimeVoiceIntake",
     "build_intake",
 ]
 

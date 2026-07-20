@@ -1,0 +1,6 @@
+node_modules/
+out/
+.remotion/
+# Per-job scratch components written by workflow/video/codegen.py's self-repair
+# loop (bespoke `generated` slides + their preview-render entry points/outputs).
+src/generated/

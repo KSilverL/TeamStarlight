@@ -268,3 +268,29 @@ def test_load_dotenv_handles_comments_quotes_and_blanks(tmp_path, monkeypatch):
 
 def test_load_dotenv_missing_file_is_noop(tmp_path):
     assert load_dotenv(tmp_path / "does-not-exist.env") is False
+
+
+# ── resolved_video_renderer_dir is always absolute ────────────────────────────
+# Regression: a RELATIVE VIDEO_RENDERER_DIR used to come back unresolved, even
+# though the docstring promised "absolute" — render.py/codegen.py pass paths
+# derived from it as subprocess args while ALSO setting the subprocess's `cwd` to
+# this same directory, so a left-relative path got silently reinterpreted against
+# its own cwd (writing/reading a double-nested path) instead of raising or working
+# correctly. Caught by codegen.py's own file-existence check surfacing a
+# "remotion still exited 0 but produced no output file" failure in practice.
+
+def test_resolved_video_renderer_dir_is_absolute_with_relative_override():
+    from LLM_service.core.config import Settings
+    assert Settings(video_renderer_dir="video_renderer").resolved_video_renderer_dir.is_absolute()
+
+
+def test_resolved_video_renderer_dir_is_absolute_with_absolute_override(tmp_path):
+    from LLM_service.core.config import Settings
+    s = Settings(video_renderer_dir=str(tmp_path))
+    assert s.resolved_video_renderer_dir.is_absolute()
+    assert s.resolved_video_renderer_dir == tmp_path.resolve()
+
+
+def test_resolved_video_renderer_dir_is_absolute_by_default():
+    from LLM_service.core.config import Settings
+    assert Settings().resolved_video_renderer_dir.is_absolute()

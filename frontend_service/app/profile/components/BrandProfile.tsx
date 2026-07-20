@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { DEFAULT_BRAND } from "../data";
 
 interface FieldProps {
@@ -123,7 +123,66 @@ export default function BrandProfile() {
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [pptFile, setPptFile] = useState<File | null>(null);
 
+  // LinkedIn connect — client id/secret entry + the connect/post-OAuth status banner.
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
+  const [connecting, setConnecting] = useState(false);
+  const [connectError, setConnectError] = useState<string | null>(null);
+  const [linkedInStatus, setLinkedInStatus] = useState<"connected" | "error" | null>(null);
+
   const totalSources = (websiteAdded ? 1 : 0) + (pdfFile ? 1 : 0) + (pptFile ? 1 : 0);
+
+  // The LinkedIn OAuth round-trip redirects the browser back here with ?linkedin=connected
+  // (or =error) — surface it once, then strip the param so a refresh doesn't re-show it. A
+  // lazy useState initializer would avoid the extra render but reads `window` during the
+  // component's first render, which mismatches the server-rendered HTML on this SSR-capable
+  // (output: "standalone") app — safer to read it in an effect, client-only, after mount.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const status = params.get("linkedin");
+    if (status === "connected" || status === "error") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time client-only URL read on mount, not a state sync loop
+      setLinkedInStatus(status);
+      window.history.replaceState(null, "", window.location.pathname);
+    }
+  }, []);
+
+  async function handleConnectLinkedIn() {
+    if (!clientId.trim() || !clientSecret.trim()) {
+      setConnectError("Enter both the client ID and client secret from your LinkedIn Developer app.");
+      return;
+    }
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setConnectError("You need to be logged in to connect LinkedIn.");
+      return;
+    }
+
+    setConnecting(true);
+    setConnectError(null);
+    try {
+      const res = await fetch("/api/linkedin/creds", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ clientId: clientId.trim(), clientSecret: clientSecret.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setConnectError(data.error ?? "Failed to save LinkedIn credentials.");
+        setConnecting(false);
+        return;
+      }
+      // Hand the browser a real top-level navigation so it can follow the OAuth
+      // redirect chain — a fetch() here would just follow it silently and go nowhere.
+      window.location.href = `/api/linkedin/connect?token=${encodeURIComponent(token)}`;
+    } catch {
+      setConnectError("Could not reach the backend.");
+      setConnecting(false);
+    }
+  }
 
   function handleChange(field: keyof typeof DEFAULT_BRAND, value: string) {
     setBrand((prev) => ({ ...prev, [field]: value }));
@@ -141,6 +200,63 @@ export default function BrandProfile() {
         This information is passed to the AI as context when generating content.
         Keep it accurate to improve output quality.
       </p>
+
+      <div className="border border-[#E8E3DA] rounded-2xl p-5 mb-8 bg-white">
+        <div className="flex items-center justify-between mb-1">
+          <h2 className="text-sm font-semibold text-[#1B1A17]">Connected Accounts</h2>
+          {linkedInStatus === "connected" && (
+            <span className="text-xs bg-green-50 text-green-700 border border-green-200 px-2 py-0.5 rounded-full font-medium">
+              ✓ LinkedIn connected
+            </span>
+          )}
+        </div>
+        <p className="text-xs text-[#9E9893] mb-4">
+          Connect a LinkedIn Developer app so approved drafts can post directly to LinkedIn.
+        </p>
+
+        {linkedInStatus === "error" && (
+          <div className="mb-4 bg-red-50 border border-red-200 rounded-xl px-4 py-3 text-xs text-red-700">
+            LinkedIn connection failed. Double-check your client ID/secret and try again.
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-4 mb-3">
+          <div>
+            <label className="block text-xs font-semibold text-[#1B1A17] mb-1">Client ID</label>
+            <input
+              type="text"
+              value={clientId}
+              onChange={(e) => setClientId(e.target.value)}
+              placeholder="From your LinkedIn Developer app"
+              className="w-full bg-white border border-[#E8E3DA] rounded-xl px-4 py-2.5 text-sm text-[#1B1A17] placeholder:text-[#C8C2BA] focus:outline-none focus:border-[#FF4800] transition-colors"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-[#1B1A17] mb-1">Client Secret</label>
+            <input
+              type="password"
+              value={clientSecret}
+              onChange={(e) => setClientSecret(e.target.value)}
+              placeholder="••••••••••••"
+              className="w-full bg-white border border-[#E8E3DA] rounded-xl px-4 py-2.5 text-sm text-[#1B1A17] placeholder:text-[#C8C2BA] focus:outline-none focus:border-[#FF4800] transition-colors"
+            />
+          </div>
+        </div>
+
+        {connectError && <p className="text-xs text-red-600 mb-3">{connectError}</p>}
+
+        <button
+          onClick={handleConnectLinkedIn}
+          disabled={connecting}
+          className="bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-semibold px-5 py-2.5 rounded-lg transition-colors"
+        >
+          {connecting
+            ? "Connecting…"
+            : linkedInStatus === "connected"
+              ? "Reconnect LinkedIn"
+              : "Connect LinkedIn"}
+        </button>
+      </div>
 
       <div className="grid grid-cols-2 gap-x-8 gap-y-6 mb-8">
         <Field label="Brand Name" hint="Your business or brand name"

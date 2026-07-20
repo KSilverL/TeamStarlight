@@ -1,0 +1,16 @@
+{
+  "brandName": "STARLIGHT",
+  "theme": "dark",
+  "primaryColor": "#0d1117",
+  "secondaryColor": "#2d4ed8",
+  "accentColor": "#f5c84c",
+  "transition": "fade",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "slides": [
+    { "type": "hook", "headline": "The future is bright", "variant": "poster", "durationFrames": 90 },
+    { "type": "bar_chart", "headline": "Revenue", "bars": [{ "label": "Q1", "value": 20 }, { "label": "Q2", "value": 45 }], "durationFrames": 90 },
+    { "type": "outro", "brandName": "STARLIGHT", "ctaLabel": "Get Started", "durationFrames": 90 }
+  ]
+}

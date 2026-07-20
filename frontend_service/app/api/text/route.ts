@@ -5,7 +5,7 @@ import { NextRequest } from "next/server";
 const TEXT_AGENT_URL =
   process.env.TEXT_AGENT_URL ??
   process.env.BRAND_AGENT_URL ??
-  "http://localhost:8080";
+  "http://localhost:8081";
 
 export async function POST(request: NextRequest) {
   const body = await request.json();
