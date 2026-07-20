@@ -63,7 +63,7 @@ public class CrossPlatformService {
     private static final RestClient.ResponseSpec.ErrorHandler LINKEDIN_ERROR_HANDLER =
             (request, response) -> {
                 String body = StreamUtils.copyToString(response.getBody(), StandardCharsets.UTF_8);
-                String diagnostics = response.getHeaders().entrySet().stream()
+                String diagnostics = response.getHeaders().headerSet().stream()
                         .filter(e -> e.getKey().toLowerCase().startsWith("x-li-"))
                         .map(e -> e.getKey() + "=" + String.join(",", e.getValue()))
                         .collect(Collectors.joining("; "));

@@ -19,8 +19,8 @@ public class RestClientConfig {
                     // Copy before masking — request.getHeaders() is the live outgoing map, so
                     // redacting in place would strip the credential off the actual request.
                     HttpHeaders safeHeaders = new HttpHeaders();
-                    safeHeaders.putAll(request.getHeaders());
-                    if (safeHeaders.containsKey(HttpHeaders.AUTHORIZATION)) {
+                    request.getHeaders().forEach(safeHeaders::addAll);
+                    if (safeHeaders.containsHeader(HttpHeaders.AUTHORIZATION)) {
                         safeHeaders.set(HttpHeaders.AUTHORIZATION, "Bearer <redacted>");
                     }
                     System.out.println("HEADERS: " + safeHeaders);
