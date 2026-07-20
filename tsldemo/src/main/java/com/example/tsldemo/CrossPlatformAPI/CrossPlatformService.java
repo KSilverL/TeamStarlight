@@ -1,6 +1,7 @@
 package com.example.tsldemo.CrossPlatformAPI;
 
 import java.io.IOException;
+import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -13,6 +14,8 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 
 import org.apache.tika.Tika;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.*;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
@@ -43,6 +46,8 @@ import jakarta.servlet.http.HttpServletResponse;
 @Service
 public class CrossPlatformService {
 
+    private static final Logger log = LoggerFactory.getLogger(CrossPlatformService.class);
+
     // Every LinkedIn REST call (posts, images, videos, oauth userinfo) is versioned the same way.
     private static final String LINKEDIN_API_VERSION = "202606";
 
@@ -68,10 +73,15 @@ public class CrossPlatformService {
                         .map(e -> e.getKey() + "=" + String.join(",", e.getValue()))
                         .collect(Collectors.joining("; "));
 
-                throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,
-                        "LinkedIn " + response.getStatusCode() + " on " + request.getURI().getPath()
+                String reason = "LinkedIn " + response.getStatusCode() + " on " + request.getURI().getPath()
                         + (body.isBlank() ? "" : " — " + body)
-                        + (diagnostics.isBlank() ? "" : " [" + diagnostics + "]"));
+                        + (diagnostics.isBlank() ? "" : " [" + diagnostics + "]");
+
+                // Spring logs a ResponseStatusException's reason at DEBUG and (without
+                // server.error.include-message) strips it from the response body, so the cause
+                // vanishes at both ends. Log it here or it is lost.
+                log.error("{}", reason);
+                throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, reason);
             };
 
     @Autowired
@@ -273,11 +283,14 @@ public class CrossPlatformService {
         // interceptor logs every request body as a String, which would try to stringify the
         // raw image bytes.
         RestClient uploadClient = RestClient.create();
+        // See the note in initializeVideoUpload — this URL is signed the same way, so it must
+        // not go through RestClient's URI-template encoding.
         uploadClient.put()
-                .uri(initResp.value().uploadUrl())
+                .uri(URI.create(initResp.value().uploadUrl()))
                 .contentType(MediaType.parseMediaType(contentType))
                 .body(imageBytes)
                 .retrieve()
+                .onStatus(HttpStatusCode::isError, LINKEDIN_ERROR_HANDLER)
                 .toBodilessEntity();
 
         return initResp.value().image();
@@ -329,6 +342,13 @@ public class CrossPlatformService {
         byte[] videoBytes = videoClient.get()
                 .uri(llmServiceBaseUrl + "/video-jobs/" + requestDTO.jobId() + "/download")
                 .retrieve()
+                // Not a LinkedIn call — labelling it as one would send anyone debugging a
+                // failed render off hunting for an auth problem that isn't there.
+                .onStatus(HttpStatusCode::isError, (request, response) -> {
+                    throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,
+                            "LLM service returned " + response.getStatusCode()
+                            + " downloading the rendered video for job " + requestDTO.jobId());
+                })
                 .body(byte[].class);
         if (videoBytes == null) {
             throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,
@@ -366,10 +386,18 @@ public class CrossPlatformService {
                 .onStatus(HttpStatusCode::isError, LINKEDIN_ERROR_HANDLER)
                 .body(LinkedInVideoInitializeUploadRespDTO.class);
         if (initResp == null || initResp.value() == null) {
+            log.error("initializeUpload returned no value block: {}", initResp);
             throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, "LinkedIn did not return upload instructions.");
         }
         String videoUrn = initResp.value().video();
         String uploadToken = initResp.value().uploadToken();
+
+        if (videoUrn == null || uploadToken == null || initResp.value().uploadInstructions() == null) {
+            log.error("initializeUpload response incomplete — video={}, uploadToken={}, uploadInstructions={}",
+                    videoUrn, uploadToken == null ? "null" : "present", initResp.value().uploadInstructions());
+            throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,
+                    "LinkedIn's initializeUpload response was missing the video URN, upload token, or upload instructions.");
+        }
 
         List<String> uploadedPartIds = new ArrayList<>();
         for (LinkedInVideoUploadInstructionDTO part : initResp.value().uploadInstructions()) {
@@ -377,15 +405,22 @@ public class CrossPlatformService {
             int to = (int) Math.min(part.lastByte(), videoBytes.length - 1);
             byte[] chunk = Arrays.copyOfRange(videoBytes, from, to + 1);
 
+            // URI.create, not the String overload: RestClient treats a String uri as a URI
+            // template and re-encodes it, which corrupts the base64 signature LinkedIn puts in
+            // this URL's query string and gets the upload rejected as unsigned (401). No
+            // Authorization header either — the URL carries its own signature.
             ResponseEntity<Void> putResponse = videoClient.put()
-                    .uri(part.uploadUrl())
+                    .uri(URI.create(part.uploadUrl()))
                     .contentType(MediaType.APPLICATION_OCTET_STREAM)
                     .body(chunk)
                     .retrieve()
+                    .onStatus(HttpStatusCode::isError, LINKEDIN_ERROR_HANDLER)
                     .toBodilessEntity();
 
             String etag = putResponse.getHeaders().getFirst("ETag");
             if (etag == null) {
+                log.error("No ETag on video part upload (bytes {}-{}); response headers were {}",
+                        from, to, putResponse.getHeaders().headerNames());
                 throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,
                         "LinkedIn did not return an ETag for an uploaded video part.");
             }
@@ -407,6 +442,7 @@ public class CrossPlatformService {
                 .header("X-Restli-Protocol-Version", "2.0.0")
                 .body(finalizeBody)
                 .retrieve()
+                .onStatus(HttpStatusCode::isError, LINKEDIN_ERROR_HANDLER)
                 .toBodilessEntity();
 
         return videoUrn;
@@ -420,12 +456,16 @@ public class CrossPlatformService {
         Instant deadline = Instant.now().plus(VIDEO_PROCESSING_TIMEOUT);
 
         while (true) {
+            // URI.create keeps the URN encoded exactly once — the String overload would treat
+            // the already-encoded value as a template and turn every '%' into '%25', which
+            // LinkedIn rejects as an invalid key parameter.
             LinkedInVideoStatusRespDTO status = restClient.get()
-                    .uri("https://api.linkedin.com/rest/videos/" + encodedUrn)
+                    .uri(URI.create("https://api.linkedin.com/rest/videos/" + encodedUrn))
                     .header("Authorization", "Bearer " + accessToken)
                     .header("LinkedIn-Version", LINKEDIN_API_VERSION)
                     .header("X-Restli-Protocol-Version", "2.0.0")
                     .retrieve()
+                    .onStatus(HttpStatusCode::isError, LINKEDIN_ERROR_HANDLER)
                     .body(LinkedInVideoStatusRespDTO.class);
 
             if (status != null && "AVAILABLE".equals(status.status())) {
