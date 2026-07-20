@@ -14,9 +14,10 @@ reject path (and thus the circuit breaker) without any randomness to pin.
 from __future__ import annotations
 
 import asyncio
+import copy
 import html as _html
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 from agent_framework import (
@@ -30,6 +31,7 @@ from agent_framework._types import ResponseStream
 
 from ...skills import parse_char_limit
 from ..config import get_settings
+from ..plan_schema import PlanItemSpec, PostingPlanSpec
 from ..skill_schema import SkillCandidate, SkillRule, UserSkillDoc
 from ..trend_schema import Trend, select_current_trends
 from ..video_schema import StoryboardSpec
@@ -476,6 +478,64 @@ class MockLLM(LLMService):
         if first:
             topic += f", riding {first}"
         return topic
+
+    async def plan_campaign(
+        self,
+        *,
+        goal: str,
+        platforms: List[str],
+        start_date: str,
+        end_date: str,
+        cadence_hint: str = "",
+        tone_hint: Optional[str] = None,
+        brand_block: str = "",
+        user_block: str = "",
+        trends: str = "",
+        skill: str = "",
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        lo, hi = date.fromisoformat(start_date), date.fromisoformat(end_date)
+        # Deterministic schedule: one slot every 3 days from the window start, capped
+        # at 8 — enough spread to exercise due-date logic without a fixture per test.
+        slot_dates: List[date] = []
+        d = lo
+        while d <= hi and len(slot_dates) < 8:
+            slot_dates.append(d)
+            d += timedelta(days=3)
+        plats = platforms or ["linkedin"]
+        # Same deterministic trend lever as plan_strategy / suggest_topic: the block's
+        # FIRST trend line lands verbatim (in the first slot's rationale); an empty
+        # block leaves the plan byte-identical. Brand/user blocks are presence levers.
+        first = next((ln[2:] for ln in trends.splitlines() if ln.startswith("- ")), "")
+        items = []
+        for i, slot in enumerate(slot_dates):
+            platform = plats[i % len(plats)]
+            rationale = f"Slot {i + 1}: steady cadence toward '{goal}' on {platform}."
+            if first and i == 0:
+                rationale += f" Rides current trend: {first}"
+            items.append(
+                PlanItemSpec(
+                    planned_date=slot.isoformat(),
+                    time_of_day="morning" if i % 2 == 0 else "18:00",
+                    platforms=[platform],
+                    topic=f"{goal} — {_focus(platform)} angle",
+                    angle=_focus(platform),
+                    rationale=rationale,
+                )
+            )
+        summary = (
+            f"Campaign plan for '{goal}': {len(items)} posts from {start_date} "
+            f"to {end_date}, rotating {', '.join(plats)}."
+        )
+        if cadence_hint:
+            summary += f" Cadence: {cadence_hint}."
+        if brand_block:
+            summary += " Aligned with the brand voice profile."
+        if user_block:
+            summary += " Tuned to this user's learned preferences."
+        if first:
+            summary += f" Trend anchor: {first}"
+        return PostingPlanSpec(strategy_summary=summary, items=items).model_dump()
 
     async def write_copy(
         self,
@@ -928,6 +988,7 @@ class MockStore(StoreService):
         self._user_skills: Dict[str, dict] = {}
         self._video_jobs: Dict[str, dict] = {}
         self._trends: Optional[dict] = None  # the rolling `current` snapshot; None → fixture
+        self._posting_plans: Dict[str, dict] = {}
 
     async def get_profile(self, *, business_id: Optional[str]) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
@@ -1017,6 +1078,36 @@ class MockStore(StoreService):
         await asyncio.sleep(_MOCK_LATENCY)
         stored = self._video_jobs.get(job_id)
         return dict(stored) if stored is not None else None
+
+    async def upsert_posting_plan(self, *, plan: dict) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        # deepcopy, not dict(): plan docs nest an items list, and a shared reference
+        # would let a caller mutate the "stored" doc after the fact.
+        self._posting_plans[plan["plan_id"]] = copy.deepcopy(plan)
+
+    async def get_posting_plan(self, *, plan_id: str) -> Optional[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        stored = self._posting_plans.get(plan_id)
+        return copy.deepcopy(stored) if stored is not None else None
+
+    async def list_posting_plans(
+        self,
+        *,
+        business_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        out: List[dict] = []
+        for doc in self._posting_plans.values():
+            if business_id is not None and doc.get("business_id") != business_id:
+                continue
+            if user_id is not None and doc.get("user_id") != user_id:
+                continue
+            if status is not None and doc.get("status") != status:
+                continue
+            out.append(copy.deepcopy(doc))
+        return out
 
 
 # ── Voice ──────────────────────────────────────────────────────────────────────

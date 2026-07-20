@@ -121,6 +121,34 @@ class LLMService(ABC):
         ...
 
     @abstractmethod
+    async def plan_campaign(
+        self,
+        *,
+        goal: str,
+        platforms: List[str],
+        start_date: str,
+        end_date: str,
+        cadence_hint: str = "",
+        tone_hint: Optional[str] = None,
+        brand_block: str = "",
+        user_block: str = "",
+        trends: str = "",
+        skill: str = "",
+    ) -> dict:
+        """Propose a multi-date posting plan (strategy + schedule, NOT copy) for the
+        [start_date, end_date] window: which topic/angle to post on which date, on
+        which platforms, and WHY that timing — as a JSON-friendly dict matching
+        core.plan_schema.PostingPlanSpec (strategy_summary + items). The LLM produces
+        DATA only: dates are clamped into the window downstream (`clamp_item_dates`),
+        never trusted. `brand_block` / `user_block` / `trends` are pre-rendered prompt
+        blocks (render_brand_profile / render_user_skills / render_trends) — empty
+        blocks MUST leave the plan unchanged (degrade-to-empty rule, same as
+        plan_strategy). `skill` is the static planning spec
+        (skills/posting_plan.md); `cadence_hint` is the caller's free-text pacing
+        wish (e.g. "2 posts a week")."""
+        ...
+
+    @abstractmethod
     async def write_copy(
         self,
         *,
@@ -483,6 +511,33 @@ class StoreService(ABC):
     @abstractmethod
     async def get_video_job(self, *, job_id: str) -> Optional[dict]:
         """Return the video job document, or None if `job_id` is unknown."""
+        ...
+
+    @abstractmethod
+    async def upsert_posting_plan(self, *, plan: dict) -> None:
+        """Write a whole posting-plan document (core.plan_schema.PostingPlan shape),
+        keyed by its `plan_id` — one call for both create and update (the service
+        layer does read-modify-write on the full doc, like upsert_profile)."""
+        ...
+
+    @abstractmethod
+    async def get_posting_plan(self, *, plan_id: str) -> Optional[dict]:
+        """Return the posting-plan document, or None if `plan_id` is unknown."""
+        ...
+
+    @abstractmethod
+    async def list_posting_plans(
+        self,
+        *,
+        business_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[dict]:
+        """Return posting-plan documents matching every given filter (None = no
+        filter on that field). The backend's daily job calls this with
+        status='active' before running the shared due-item selection
+        (core.plan_schema.select_due_items — due-ness itself is computed by the
+        caller, never in the store)."""
         ...
 
 

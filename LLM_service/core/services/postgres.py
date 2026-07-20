@@ -98,6 +98,18 @@ def _trends_ddl(table: str) -> str:
     )
 
 
+def _posting_plans_ddl(table: str) -> str:
+    # One row per posting plan (core.plan_schema.PostingPlan), whole doc in JSONB.
+    # business_id/user_id/status are pulled out as plain columns (kept in sync on
+    # every upsert) so the daily "list active plans for this brand" query filters
+    # without a JSONB index — same rationale as video_jobs' promoted columns.
+    return (
+        f"CREATE TABLE IF NOT EXISTS {table} ("
+        f"id TEXT PRIMARY KEY, business_id TEXT, user_id TEXT, status TEXT, "
+        f"doc JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+    )
+
+
 class PostgresStore(StoreService):
     """brand_profiles + the StoreService checkpoint KV, on PostgreSQL."""
 
@@ -118,6 +130,7 @@ class PostgresStore(StoreService):
                 await conn.execute(_checkpoints_ddl(s.postgres_checkpoints_table))
                 await conn.execute(_video_jobs_ddl(s.postgres_video_jobs_table))
                 await conn.execute(_trends_ddl(s.postgres_trends_table))
+                await conn.execute(_posting_plans_ddl(s.postgres_posting_plans_table))
         return self._pool_obj
 
     async def _read(self, table: str, key: str) -> Optional[dict]:
@@ -232,6 +245,43 @@ class PostgresStore(StoreService):
         async with pool.acquire() as conn:
             row = await conn.fetchrow(f"SELECT doc FROM {table} WHERE id = $1", job_id)
         return json.loads(row["doc"]) if row else None
+
+    async def upsert_posting_plan(self, *, plan: dict) -> None:
+        pool = await self._pool()
+        table = self._settings.postgres_posting_plans_table
+        async with pool.acquire() as conn:
+            await conn.execute(
+                f"INSERT INTO {table} (id, business_id, user_id, status, doc) "
+                f"VALUES ($1, $2, $3, $4, $5::jsonb) "
+                f"ON CONFLICT (id) DO UPDATE SET business_id = EXCLUDED.business_id, "
+                f"user_id = EXCLUDED.user_id, status = EXCLUDED.status, "
+                f"doc = EXCLUDED.doc, updated_at = now()",
+                plan["plan_id"], plan.get("business_id"), plan.get("user_id"),
+                plan.get("status", "draft"), json.dumps(plan),
+            )
+
+    async def get_posting_plan(self, *, plan_id: str) -> Optional[dict]:
+        return await self._read(self._settings.postgres_posting_plans_table, plan_id)
+
+    async def list_posting_plans(
+        self,
+        *,
+        business_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[dict]:
+        clauses, args = [], []
+        for column, value in (("business_id", business_id), ("user_id", user_id),
+                              ("status", status)):
+            if value is not None:
+                args.append(value)
+                clauses.append(f"{column} = ${len(args)}")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        pool = await self._pool()
+        table = self._settings.postgres_posting_plans_table
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(f"SELECT doc FROM {table}{where} ORDER BY updated_at", *args)
+        return [json.loads(row["doc"]) for row in rows]
 
 
 class PostgresCheckpointStorage(CheckpointStorage):

@@ -162,6 +162,7 @@ class Settings:
     postgres_sslmode: Optional[str] = None
     postgres_video_jobs_table: str = "video_jobs"
     postgres_trends_table: str = "trends"
+    postgres_posting_plans_table: str = "posting_plans"
 
     # ── Voice Live API (voice intake) ──────────────────────────────────────────
     azure_voicelive_endpoint: Optional[str] = None
@@ -236,9 +237,11 @@ class Settings:
     # No key → map slides render the bundled vector outline instead; never blocking.
     geoapify_api_key: Optional[str] = None
     # Explicit basemap-style override. None (default) → the style is picked from the
-    # storyboard's theme (workflow/video/assets.py _MAP_STYLE_BY_THEME). See
+    # storyboard's theme (media_assets.MAP_STYLE_BY_THEME: light→osm-bright, dark→dark-matter).
+    # Kept in sync with _load()'s `GEOAPIFY_MAP_STYLE or None`, so a directly-constructed
+    # Settings follows the theme exactly like a loaded one. See
     # https://apidocs.geoapify.com/docs/maps/map-tiles/ for the preset names.
-    geoapify_map_style: Optional[str] = "osm-liberty"
+    geoapify_map_style: Optional[str] = None
 
     # ── Soundraw (background music generation) ──────────────────────────────────
     soundraw_api_key: Optional[str] = None
@@ -465,6 +468,7 @@ def _load() -> Settings:
         postgres_sslmode=os.getenv("POSTGRES_SSLMODE"),
         postgres_video_jobs_table=os.getenv("POSTGRES_VIDEO_JOBS_TABLE", "video_jobs"),
         postgres_trends_table=os.getenv("POSTGRES_TRENDS_TABLE", "trends"),
+        postgres_posting_plans_table=os.getenv("POSTGRES_POSTING_PLANS_TABLE", "posting_plans"),
         azure_voicelive_endpoint=os.getenv("AZURE_VOICELIVE_ENDPOINT"),
         azure_voicelive_model=os.getenv("AZURE_VOICELIVE_MODEL", "gpt-realtime"),
         azure_voicelive_api_version=os.getenv("AZURE_VOICELIVE_API_VERSION", "2026-04-10"),
