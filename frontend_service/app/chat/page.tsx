@@ -2393,6 +2393,49 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
   const approval = message.approval;
   const [postStatus, setPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
   const [postError, setPostError] = useState<string | null>(null);
+  // Image posting is tracked separately from the text post so the two buttons don't clobber
+  // each other's status. The user attaches a real image file; it's uploaded as multipart.
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [imagePostStatus, setImagePostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
+  const [imagePostError, setImagePostError] = useState<string | null>(null);
+
+  // The caption used for both text and image posts: the draft body plus any hashtags.
+  const captionText =
+    draft.hashtags && draft.hashtags.length > 0
+      ? `${draft.text}\n\n${draft.hashtags.join(" ")}`
+      : draft.text;
+
+  async function handlePostImageToLinkedIn() {
+    if (!imageFile) return;
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setImagePostStatus("error");
+      setImagePostError("Log in, then connect LinkedIn from your Brand Profile before posting.");
+      return;
+    }
+    setImagePostStatus("posting");
+    setImagePostError(null);
+    try {
+      const form = new FormData();
+      form.append("image", imageFile);
+      form.append("message", captionText);
+      const res = await fetch("/api/linkedin/post-image", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setImagePostStatus("error");
+        setImagePostError(data.error ?? "Failed to post image to LinkedIn.");
+        return;
+      }
+      setImagePostStatus("posted");
+    } catch {
+      setImagePostStatus("error");
+      setImagePostError("Could not reach the backend.");
+    }
+  }
 
   async function handlePostToLinkedIn() {
     const token = localStorage.getItem("starlight_token");
@@ -2403,10 +2446,7 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
     }
     setPostStatus("posting");
     setPostError(null);
-    const text =
-      draft.hashtags && draft.hashtags.length > 0
-        ? `${draft.text}\n\n${draft.hashtags.join(" ")}`
-        : draft.text;
+    const text = captionText;
     try {
       const res = await fetch("/api/linkedin/post", {
         method: "POST",
@@ -2516,6 +2556,38 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
             {postStatus === "error" && postError && (
               <p className="text-xs text-red-600 mt-2 text-center">{postError}</p>
             )}
+
+            {/* Optional: attach an image and publish it with this caption as an image post. */}
+            <div className="mt-3 pt-3 border-t border-[#E8E3DA]">
+              {imagePostStatus === "posted" ? (
+                <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+                  ✓ Image posted to LinkedIn
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => {
+                      setImageFile(e.target.files?.[0] ?? null);
+                      setImagePostStatus("idle");
+                      setImagePostError(null);
+                    }}
+                    className="block w-full text-xs text-[#6B6561] file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border file:border-[#E8E3DA] file:bg-[#F2EDE4] file:text-[#1B1A17] file:text-xs file:font-medium hover:file:bg-[#E8E3DA]"
+                  />
+                  <button
+                    onClick={handlePostImageToLinkedIn}
+                    disabled={!imageFile || imagePostStatus === "posting"}
+                    className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                  >
+                    {imagePostStatus === "posting" ? "Uploading & posting…" : "Post Image to LinkedIn"}
+                  </button>
+                </div>
+              )}
+              {imagePostStatus === "error" && imagePostError && (
+                <p className="text-xs text-red-600 mt-2 text-center">{imagePostError}</p>
+              )}
+            </div>
           </div>
         )}
 
