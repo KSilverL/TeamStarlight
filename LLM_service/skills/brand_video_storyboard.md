@@ -95,6 +95,24 @@ enumerates them via the `type` discriminator. Never invent a new slide type.
   `description` with `data: {"cities": [{"name": "Dublin", "pop": 1200000},
   {"name": "Cork", "pop": 220000}]}`.
 
+  Two more worked examples for the "signature moment" shapes this is meant for:
+
+  - **Timeline.** Bad: `description: "show our journey from 2021 startup to
+    2026 category leader"` with `data: {}` — nothing for the component to
+    actually render. Good: `description: "a horizontal timeline sweeping
+    left-to-right, each milestone's dot popping in with its year and one-line
+    caption, the line itself drawing on as it goes"` with `data: {"milestones":
+    [{"year": "2021", "caption": "Founded in a garage"}, {"year": "2023",
+    "caption": "10,000th customer"}, {"year": "2026", "caption": "Category
+    leader"}]}`.
+  - **Process / metaphor animation.** Bad: `description: "show how our
+    recycling process works"` with `data: {"summary": "collect, sort,
+    reprocess"}` (a single opaque string the component would have to invent
+    structure from). Good: `description: "three connected stages left-to-right,
+    each with an icon and a short label, an arrow animating between each as it
+    completes"` with `data: {"stages": [{"label": "Collect", "icon": "♻"},
+    {"label": "Sort", "icon": "▤"}, {"label": "Reprocess", "icon": "✦"}]}`.
+
 ## Ordering conventions
 
 - Start with `hook` (it's the reason someone keeps watching).

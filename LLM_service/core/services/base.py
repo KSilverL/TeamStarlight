@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import AsyncIterator, List, Optional
 
 from ..skill_schema import SkillCandidate, SkillRule, UserSkillDoc
 from ..trend_schema import Trend
@@ -31,11 +31,15 @@ __all__ = [
     "SafetyService",
     "StoreService",
     "VoiceService",
+    "RealtimeEvent",
+    "RealtimeVoiceSession",
+    "RealtimeVoiceService",
     "WebSearchService",
     "ImageSearchService",
     "BackgroundRemovalService",
     "MusicGenerationService",
     "VoiceoverService",
+    "VideoGenerationService",
     "empty_profile",
 ]
 
@@ -234,6 +238,31 @@ class LLMService(ABC):
         the static spec (skills/brand_video_storyboard.md). `history` (optional) is the
         prior {role, content} conversation the caller assembled, folded in as context
         for a follow-up; None/empty = single-turn."""
+        ...
+
+    @abstractmethod
+    async def generate_video_prompt(
+        self,
+        *,
+        topic: str,
+        draft: str,
+        tone_hint: Optional[str],
+        platform: str,
+        has_reference_images: bool = False,
+    ) -> dict:
+        """Craft a single text prompt for a GENERATIVE AI video clip (Higgsfield —
+        workflow/video/higgsfield_render.py), the premium sibling of the templated
+        Remotion storyboard. Returns a JSON-friendly dict matching
+        core.video_schema.VideoPromptSpec: {"prompt": str, "motion": str|None}.
+        `prompt` is one cinematic shot description the video model renders directly
+        (subject, setting, lighting, mood — NOT a storyboard, NOT post copy); `motion`
+        is an optional short camera/motion cue (e.g. 'slow dolly-in'). `platform` gives
+        length/format context only (the aspect ratio is derived deterministically
+        downstream). `has_reference_images` is True when the user attached 1-3 reference
+        images the clip is generated FROM (image-to-video): in that case the prompt must
+        COMPLEMENT the images — describe motion, camera, and atmosphere — and must NOT
+        re-describe or contradict the subject the images already fix. False means pure
+        text-to-video, so the prompt fully specifies the subject."""
         ...
 
     @abstractmethod
@@ -554,6 +583,88 @@ class VoiceService(ABC):
         ...
 
 
+# ── Realtime voice (native speech-to-speech bridge, GPT-Realtime) ─────────────
+# A second, DUPLEX voice contract alongside VoiceService above. VoiceService's
+# transcribe_turn is a cascaded request/response shape (audio in -> text out, then the
+# text pipeline runs); this one is a live, persistent, event-streamed session where the
+# model consumes and produces audio directly and decides tool calls itself — there is no
+# "transcribe first" step on the path that drives the conversation. Transcripts still
+# arrive as a side channel (captions/logging/per-user learning), never as the mechanism.
+
+@dataclass(frozen=True)
+class RealtimeEvent:
+    """One event out of a live realtime session. `type` discriminates which of the
+    other (mostly-None) fields are populated:
+      - "audio_delta"               -> audio_b64 (assistant speech chunk)
+      - "output_transcript_delta"   -> text (assistant's spoken words, as text)
+      - "input_transcript"          -> text (the user's words, as text)
+      - "tool_call"                 -> call_id, name, arguments
+      - "speech_started"            -> (barge-in: the user started talking)
+      - "response_done"             -> (one assistant turn finished)
+      - "error"                     -> message
+    """
+    type: str
+    audio_b64: Optional[str] = None
+    text: Optional[str] = None
+    call_id: Optional[str] = None
+    name: Optional[str] = None
+    arguments: Optional[dict] = None
+    message: Optional[str] = None
+
+
+class RealtimeVoiceSession(ABC):
+    """One live duplex speech-to-speech session bound to a single intake conversation.
+    Callers push audio in and read `events()` for everything the model produces
+    (speech, transcripts, tool calls); a tool call MUST be answered via
+    `send_tool_result` so the model can continue (its narration of a tool's result,
+    e.g. a suggested topic, only happens once the result is fed back)."""
+
+    @abstractmethod
+    async def send_audio(self, *, audio_b64: str) -> None:
+        """Append one chunk of base64 PCM16 user audio to the session's input buffer."""
+        ...
+
+    @abstractmethod
+    async def send_tool_result(self, *, call_id: str, output: dict) -> None:
+        """Answer a "tool_call" event so the model resumes (and, for a tool whose
+        result the user should hear, narrates it)."""
+        ...
+
+    @abstractmethod
+    async def nudge(self, *, text: str) -> None:
+        """Inject an out-of-band system instruction (not spoken by the user) and
+        prompt a response — used once, e.g., to tell the model the brief is now
+        complete (the MAX_INTAKE_FOLLOWUPS cap was hit) so it wraps up the
+        conversation out loud instead of the brief completing silently behind it."""
+        ...
+
+    @abstractmethod
+    def events(self) -> AsyncIterator[RealtimeEvent]:
+        """The session's event stream, in order, until `close()`."""
+        ...
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Tear down the session."""
+        ...
+
+
+class RealtimeVoiceService(ABC):
+    """Opens a RealtimeVoiceSession. Cheap/cached like the other service getters;
+    the actual connection is made fresh per intake conversation by `open_session`
+    (one session cannot be shared across conversations)."""
+
+    @abstractmethod
+    async def open_session(
+        self, *, session_id: str, instructions: str, tools: List[dict],
+    ) -> RealtimeVoiceSession:
+        """Open one live session. `instructions` is the system prompt (the shared
+        INTAKE_SYSTEM_PROMPT, optionally with a prior-context block folded in);
+        `tools` is BRIEF_TOOL_DEFS (Chat-Completions shape — the impl reshapes it to
+        whatever the wire format needs)."""
+        ...
+
+
 # ── Web research (Bing grounding via Azure AI Foundry agents) ─────────────────
 
 class WebSearchService(ABC):
@@ -638,4 +749,38 @@ class VoiceoverService(ABC):
         """Return audio bytes (mp3) speaking `text` in `voice` (a provider-specific
         voice id, e.g. an Azure Neural voice name). Raises on a hard failure (rate
         limit, bad voice id, network) — callers fall back to no narration."""
+        ...
+
+
+# ── Generative AI video (Higgsfield — premium render backend) ──────────────────
+
+class VideoGenerationService(ABC):
+    """Generative, cinematic AI video for the premium render backend (Higgsfield —
+    workflow/video/higgsfield_render.py), distinct from the free templated Remotion
+    path. Selected by VIDEO_RENDER_BACKEND=higgsfield, never used on the local/lambda
+    Remotion path. One generation produces ONE clip (the model's native per-generation
+    max, ~≤15s); multi-scene stitching is a later phase."""
+
+    @abstractmethod
+    async def generate_clip(
+        self,
+        *,
+        prompt: str,
+        reference_images: Optional[List[bytes]] = None,
+        model: str,
+        duration_seconds: float,
+        width: int,
+        height: int,
+    ) -> bytes:
+        """Return MP4 bytes for one generated clip. The submit → poll → download cycle
+        happens INSIDE the impl (the caller just awaits the finished bytes, mirroring
+        MusicGenerationService/VoiceoverService). `reference_images` empty/None →
+        text-to-video (the `prompt` fully specifies the subject); 1-3 images present →
+        image-to-video (the images are the visual reference the clip is generated from,
+        the `prompt` supplies motion/atmosphere). `model` is the provider model id
+        (a different one per input mode); `width`/`height` come from
+        core.video_schema.aspect_for_platform and are mapped to the provider's aspect
+        param; `duration_seconds` is clamped to the model's max by the caller. Raises on
+        a hard failure (rate limit, bad params, network, generation error) — the render
+        job marks itself `error`, exactly like a failed Remotion render."""
         ...

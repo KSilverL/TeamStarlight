@@ -120,11 +120,15 @@ def build_roundtable(
         # The manager stays on the MAIN Azure resource + the main (gpt-5.4) deployment; the
         # personas already use the rate-limit-friendlier persona resource via get_chat_client's
         # defaults. `rounds` is the live termination cap (set on the manager).
+        # ROUNDTABLE_MANAGER_REASONING_EFFORT (default unset = full reasoning) can dial the
+        # moderator's hidden reasoning down ("low") to shrink the silent plan phase before the
+        # first turn and every between-turn ledger call.
         manager_client = factory.get_chat_client(
             agent_name="moderator",
             model=settings.roundtable_manager_model or settings.azure_chat_deployment,
             endpoint=settings.azure_openai_endpoint,
             api_key=settings.azure_openai_api_key,
+            reasoning_effort=settings.roundtable_manager_reasoning_effort,
         )
         manager = build_interactive_manager(
             manager_client, platform=platform, max_rounds=rounds,

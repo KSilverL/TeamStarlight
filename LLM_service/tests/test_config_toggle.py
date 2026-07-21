@@ -124,6 +124,15 @@ def test_unset_per_service_override_inherits(env):
     assert s.mock_llm() is False
 
 
+def test_manager_reasoning_effort_env(env, monkeypatch):
+    """ROUNDTABLE_MANAGER_REASONING_EFFORT: the project default is 'low' (fast roundtable
+    launch), so an unset OR blank env var resolves to 'low'; an explicit value overrides it."""
+    monkeypatch.delenv("ROUNDTABLE_MANAGER_REASONING_EFFORT", raising=False)
+    assert env().roundtable_manager_reasoning_effort == "low"
+    assert env(ROUNDTABLE_MANAGER_REASONING_EFFORT="medium").roundtable_manager_reasoning_effort == "medium"
+    assert env(ROUNDTABLE_MANAGER_REASONING_EFFORT="   ").roundtable_manager_reasoning_effort == "low"
+
+
 # ── Cache / reset semantics ───────────────────────────────────────────────────
 
 def test_settings_are_cached_until_reset(env, monkeypatch):

@@ -20,7 +20,7 @@ without real network access; a real run without the SDK/creds fails loudly.
 from __future__ import annotations
 
 import json
-from typing import List, Optional
+from typing import AsyncIterator, List, Optional
 
 from agent_framework import (
     BaseChatClient,
@@ -35,14 +35,31 @@ from pydantic import TypeAdapter, ValidationError
 from ..config import Settings
 from ..plan_schema import PostingPlanSpec
 from ..skill_schema import SkillCandidate, SkillRule
-from ..video_schema import StoryboardSpec, TemplateSlideSpec
+from ..video_schema import StoryboardSpec, TemplateSlideSpec, VideoPromptSpec
 from .base import (
     LLMService,
+    RealtimeEvent,
+    RealtimeVoiceService,
+    RealtimeVoiceSession,
     SafetyResult,
     SafetyService,
     VoiceoverService,
     VoiceService,
 )
+
+
+def _voice_live_ws_url(settings: Settings) -> str:
+    endpoint = (settings.azure_voicelive_endpoint or "").rstrip("/")
+    if endpoint.startswith("https://"):
+        endpoint = "wss://" + endpoint[len("https://"):]
+    elif endpoint.startswith("http://"):
+        endpoint = "ws://" + endpoint[len("http://"):]
+    if not endpoint.endswith("/voice-live/realtime"):
+        endpoint = f"{endpoint}/voice-live/realtime"
+    return (
+        f"{endpoint}"
+        f"?api-version={settings.azure_voicelive_api_version}&model={settings.azure_voicelive_model}"
+    )
 
 # Discriminated-union storyboard JSON is meaningfully harder for the model to nail
 # on the first try than the old fixed shape — bounded retry, re-prompting with the
@@ -107,21 +124,27 @@ def _read_scene_patterns() -> str:
         return ""
 
 
-def _read_scene_exemplar(settings: Settings) -> str:
-    """The checked-in reference scene (video_renderer/src/design/exemplars/
-    ExemplarScene.tsx), embedded verbatim as the codegen few-shot. It lives two
-    levels under src/ — the same depth as a real src/generated/<job>/ file — so its
-    `../../types` / `../../design` imports are exactly what the generated file needs.
-    Returns "" if the file is missing (older checkout); the prompt then falls back to
-    the inline skeleton, so codegen still works."""
-    path = (
-        settings.resolved_video_renderer_dir
-        / "src" / "design" / "exemplars" / "ExemplarScene.tsx"
-    )
-    try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
-        return ""
+# Both exemplars live at the same depth under src/ (same import-path shape a real
+# src/generated/<job>/ file uses). ExemplarScene demonstrates hand-rolled,
+# data-driven visuals; ExemplarChartScene demonstrates the `recharts` construction
+# style — the system prompt offers both `recharts` and hand-rolled SVG/CSS as
+# available imports, so the few-shot material should show both actually working.
+_EXEMPLAR_FILENAMES = ("ExemplarScene.tsx", "ExemplarChartScene.tsx")
+
+
+def _read_scene_exemplars(settings: Settings) -> List[str]:
+    """The checked-in reference scenes (video_renderer/src/design/exemplars/),
+    embedded verbatim as the codegen few-shot. Missing files (older checkout) are
+    skipped silently; an empty result falls back to the inline skeleton, so
+    codegen still works."""
+    base = settings.resolved_video_renderer_dir / "src" / "design" / "exemplars"
+    exemplars: List[str] = []
+    for name in _EXEMPLAR_FILENAMES:
+        try:
+            exemplars.append((base / name).read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    return exemplars
 
 
 # ── LLM (Azure OpenAI / Foundry chat) ─────────────────────────────────────────
@@ -144,14 +167,20 @@ class AzureLLM(LLMService):
                 # scene-codegen loop in particular used to burn a whole retry
                 # attempt (a real compile + preview render) on one transient HTTP
                 # blip because nothing retried at this layer.
+                # 300s (not the old 120s): a reasoning-tier codegen call
+                # (CODEGEN_REASONING_EFFORT) can legitimately run past 120s, and at
+                # 120s a real slow-but-successful call was getting killed and
+                # retried up to max_retries times, compounding into a multi-minute
+                # timeout storm that surfaced as an uncaught exception.
                 max_retries=3,
-                timeout=120.0,
+                timeout=300.0,
             )
         return self._client
 
     async def _complete(
         self, messages: List[dict], *, model: Optional[str] = None,
         temperature: Optional[float] = None, max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None, verbosity: Optional[str] = None,
     ) -> str:
         """Single seam through which all chat traffic flows (overridable in tests).
         `model` overrides the deployment for one call (e.g. the cheap summary tier);
@@ -159,13 +188,23 @@ class AzureLLM(LLMService):
         when explicitly set, keeping every existing call site byte-identical (and
         avoiding params a reasoning-tier deployment would reject unless a caller
         opts in). `max_tokens` maps to `max_completion_tokens` — the legacy name is
-        rejected by gpt-5.x/o-series (see AzureChatClient._complete)."""
+        rejected by gpt-5.x/o-series (see AzureChatClient._complete).
+        `reasoning_effort`/`verbosity` mirror AzureChatClient's handling for a
+        gpt-5.x reasoning-tier deployment. Critically: when `reasoning_effort` is
+        set, `temperature` is DROPPED even if the caller passed one — a reasoning
+        deployment rejects (or ignores) a custom temperature, which is exactly why
+        AzureChatClient (the roundtable path) never sends one; callers that opt
+        into reasoning_effort are asserting this is a reasoning-tier call."""
         client = self._ensure_client()
         kwargs: dict = {
             "model": model or self._settings.azure_chat_deployment,
             "messages": messages,
         }
-        if temperature is not None:
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
+        if verbosity:
+            kwargs["verbosity"] = verbosity
+        if temperature is not None and not reasoning_effort:
             kwargs["temperature"] = temperature
         if max_tokens is not None:
             kwargs["max_completion_tokens"] = max_tokens
@@ -447,6 +486,60 @@ class AzureLLM(LLMService):
                 ]
         raise last_error
 
+    async def generate_video_prompt(
+        self,
+        *,
+        topic: str,
+        draft: str,
+        tone_hint: Optional[str],
+        platform: str,
+        has_reference_images: bool = False,
+    ) -> dict:
+        schema = json.dumps(VideoPromptSpec.model_json_schema())
+        if has_reference_images:
+            mode_note = (
+                "The user attached 1-3 REFERENCE IMAGES the clip is generated FROM "
+                "(image-to-video). Your prompt must COMPLEMENT them — describe camera "
+                "movement, motion, lighting and atmosphere ONLY. Do NOT re-describe or "
+                "contradict the subject the images already fix."
+            )
+        else:
+            mode_note = (
+                "There are NO reference images (text-to-video), so your prompt must fully "
+                "specify the subject, setting, lighting and mood of the shot."
+            )
+        system = (
+            "You are a cinematographer writing a prompt for a generative video model. "
+            "Given a brand topic, the approved post copy, and the platform, write ONE "
+            "single cinematic shot description (subject/setting/lighting/mood as needed) "
+            "— not a storyboard, not post copy, not a list of scenes. " + mode_note +
+            " Return ONLY valid JSON (no markdown fences, no prose) matching this schema "
+            f"exactly:\n{schema}"
+        )
+        user = (
+            f"Brand topic: {topic}\n"
+            f"Approved post copy:\n{draft}\n"
+            f"Tone: {tone_hint or 'brand voice'}\n"
+            f"Target platform: {platform}"
+        )
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        last_error: Exception = ValueError("generate_video_prompt: no attempts made")
+        for _ in range(_VIDEO_STORYBOARD_MAX_ATTEMPTS):
+            raw = await self._complete(messages)
+            try:
+                data = json.loads(_strip_fences(raw))
+                return VideoPromptSpec(**data).model_dump()
+            except (json.JSONDecodeError, ValidationError) as exc:
+                last_error = exc
+                messages = messages + [
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content": (
+                        f"Your previous JSON was invalid: {exc}. Return corrected JSON "
+                        "only, matching the schema exactly."
+                    )},
+                ]
+        raise last_error
+
     async def review_scene_preview(
         self, *, description: str, image_bytes: bytes, attempt: int = 1,
     ) -> dict:
@@ -480,7 +573,8 @@ class AzureLLM(LLMService):
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
         ]
         raw = await self._complete(
-            [{"role": "system", "content": system}, {"role": "user", "content": user_content}]
+            [{"role": "system", "content": system}, {"role": "user", "content": user_content}],
+            model=self._settings.codegen_model,
         )
         data = json.loads(_strip_fences(raw))
         fixes = data.get("fixes")
@@ -510,7 +604,9 @@ class AzureLLM(LLMService):
         try:
             raw = await self._complete(
                 [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                temperature=0.8, max_tokens=512,
+                model=self._settings.codegen_model,
+                reasoning_effort=self._settings.codegen_plan_reasoning_effort,
+                temperature=0.8, max_tokens=self._settings.codegen_plan_max_tokens,
             )
             return raw.strip()
         except Exception:
@@ -530,13 +626,17 @@ class AzureLLM(LLMService):
         prior_source: Optional[str] = None,
         design_plan: Optional[str] = None,
     ) -> str:
-        exemplar = _read_scene_exemplar(self._settings)
+        exemplars = _read_scene_exemplars(self._settings)
         pattern_block = (
-            "Study this EXEMPLARY scene from the same project and follow its shape, "
-            "imports, and quality (content entirely from slide.data, staggered "
-            "entrances, layered backdrop, counting numbers). Do NOT copy its content "
-            "— author a scene for YOUR brief:\n```tsx\n" + exemplar + "\n```\n\n"
-            if exemplar else
+            "Study these EXEMPLARY scenes from the same project and follow their "
+            "shape, imports, and quality (content entirely from slide.data, "
+            "staggered entrances, layered backdrop, counting numbers) — one shows "
+            "hand-rolled data-driven visuals, the other shows the `recharts` "
+            "construction style; use whichever construction fits your brief, or "
+            "neither if your brief calls for something else entirely. Do NOT copy "
+            "their content — author a scene for YOUR brief:\n\n"
+            + "\n\n".join(f"```tsx\n{ex}\n```" for ex in exemplars) + "\n\n"
+            if exemplars else
             # Fallback skeleton when the checked-in exemplar can't be read.
             "Your output must follow this structural pattern:\n```tsx\n"
             "import React from \"react\";\n"
@@ -598,12 +698,16 @@ class AzureLLM(LLMService):
         )
         # Low temperature for the correctness-critical first shot; slightly higher
         # on repairs so a retry can escape a repeated failure mode instead of
-        # re-emitting near-identical broken code. Token ceiling stops a runaway
-        # completion from stalling the whole codegen attempt.
+        # re-emitting near-identical broken code (dropped instead if
+        # codegen_reasoning_effort opts into a reasoning-tier deployment — see
+        # _complete). Token ceiling must have headroom for hidden reasoning tokens
+        # PLUS a full compiling TSX component, not just the component alone.
         raw = await self._complete(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model=self._settings.codegen_model,
+            reasoning_effort=self._settings.codegen_reasoning_effort,
             temperature=0.3 if attempt == 1 else 0.5,
-            max_tokens=4096,
+            max_tokens=self._settings.codegen_max_tokens,
         )
         return _strip_fences(raw)
 
@@ -634,6 +738,7 @@ class AzureLLM(LLMService):
         )
         raw = await self._complete(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model=self._settings.codegen_model,
             temperature=0.2,
         )
         return json.loads(_strip_fences(raw))
@@ -992,32 +1097,21 @@ class AzureVoice(VoiceService):
         self._settings = settings
 
     def _ws_url(self) -> str:
-        s = self._settings
-        # Voice Live is a WebSocket endpoint: normalise an https:// base to wss://
-        # (http:// → ws://) and ensure the /voice-live/realtime path is present, so
-        # either a bare resource host or a full wss URL in config connects correctly.
-        endpoint = (s.azure_voicelive_endpoint or "").rstrip("/")
-        if endpoint.startswith("https://"):
-            endpoint = "wss://" + endpoint[len("https://"):]
-        elif endpoint.startswith("http://"):
-            endpoint = "ws://" + endpoint[len("http://"):]
-        if not endpoint.endswith("/voice-live/realtime"):
-            endpoint = f"{endpoint}/voice-live/realtime"
-        return (
-            f"{endpoint}"
-            f"?api-version={s.azure_voicelive_api_version}&model={s.azure_voicelive_model}"
-        )
+        return _voice_live_ws_url(self._settings)
 
     async def _transcribe(self, user_audio: str) -> str:
         """Send one audio turn to Voice Live and return its transcript. Overridable
-        seam for tests; `websockets` is lazy-imported so this module imports without
-        it. `user_audio` is a base64-encoded PCM16 chunk forwarded from the browser
-        over WS /intake/{sid}/voice.
+        seam for tests; 
+            `websockets` is lazy-imported so this module imports without it. 
+            `user_audio` is a base64-encoded PCM16 chunk, supplied via the cascaded
+                REST intake path (`POST /intake` / `/turn`, `mode: "voice"`) — kept as a
+                 fallback alongside the native speech-to-speech bridge (AzureRealtimeVoice
+                 below), which is what `WS /intake/{sid}/voice` now uses.
 
         Voice Live handles VAD / end-of-turn detection server-side; we append the
         audio buffer, commit it, and read back the input-audio transcription."""
+        
         import json
-
         import websockets  # lazy import
 
         s = self._settings
@@ -1043,6 +1137,154 @@ class AzureVoice(VoiceService):
     async def transcribe_turn(self, *, session_id: str, user_audio: str) -> dict:
         transcript = await self._transcribe(user_audio)
         return {"session_id": session_id, "transcript": transcript}
+
+
+# ── Realtime voice (native speech-to-speech bridge) ─────────────
+
+def _to_realtime_tools(tools: List[dict]) -> List[dict]:
+    """Reshape BRIEF_TOOL_DEFS' Chat-Completions shape
+    (`{"type":"function","function":{"name",...,"parameters"}}`) into the flatter
+    Realtime API shape (`{"type":"function","name",...,"parameters"}`) — the same
+    tool definitions, one shared source (intake/base.py), two wire shapes."""
+    out: List[dict] = []
+    for t in tools:
+        fn = t.get("function", t)
+        out.append({
+            "type": "function",
+            "name": fn.get("name"),
+            "description": fn.get("description", ""),
+            "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+        })
+    return out
+
+
+class AzureRealtimeVoice(RealtimeVoiceService):
+    """Opens a native speech-to-speech session against GPT-Realtime (Azure AI
+    Foundry / Voice Live). Unlike AzureVoice above, the model consumes and produces
+    audio directly over one persistent duplex connection and decides tool calls
+    itself — there is no separate transcribe-then-chat step on the path that drives
+    the conversation."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    async def open_session(
+        self, *, session_id: str, instructions: str, tools: List[dict],
+    ) -> RealtimeVoiceSession:
+        import websockets  # lazy import
+
+        s = self._settings
+        api_key = s.azure_voicelive_api_key or s.azure_openai_api_key
+        headers = {"api-key": api_key} if api_key else {}
+
+        ws = await websockets.connect(_voice_live_ws_url(s), additional_headers=headers)
+        session = _AzureRealtimeSession(ws, session_id=session_id)
+        await session._configure(instructions=instructions, tools=tools, voice=s.azure_voicelive_voice)
+        return session
+
+
+class _AzureRealtimeSession(RealtimeVoiceSession):
+    """One live GPT-Realtime connection. `_send_json`/`_recv_raw` are the
+    overridable network seam (same pattern as AzureLLM._complete): tests can swap
+    in a fake transport and drive `events()`/`send_tool_result()` against scripted
+    JSON, with no real socket or credentials."""
+
+    def __init__(self, ws, *, session_id: str) -> None:
+        self._ws = ws
+        self._session_id = session_id
+
+    async def _send_json(self, payload: dict) -> None:
+        await self._ws.send(json.dumps(payload))
+
+    async def _recv_raw(self) -> AsyncIterator[dict]:
+        async for raw in self._ws:
+            yield json.loads(raw)
+
+    async def _configure(self, *, instructions: str, tools: List[dict], voice: str) -> None:
+        await self._send_json({
+            "type": "session.update",
+            "session": {
+                "modalities": ["audio", "text"],
+                "instructions": instructions,
+                "voice": voice,
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
+                # Side channel only (captions / logging / per-user learning transcript) —
+                # never on the path that decides brief content; the model reasons over
+                # audio directly and calls tools itself.
+                "input_audio_transcription": {"model": "whisper-1"},
+                # Server-side VAD drives end-of-turn AND barge-in detection, so the client
+                # never needs to manually commit the input buffer.
+                "turn_detection": {"type": "server_vad"},
+                "tools": _to_realtime_tools(tools),
+                "tool_choice": "auto",
+            },
+        })
+
+    async def send_audio(self, *, audio_b64: str) -> None:
+        await self._send_json({"type": "input_audio_buffer.append", "audio": audio_b64})
+
+    async def send_tool_result(self, *, call_id: str, output: dict) -> None:
+        await self._send_json({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": json.dumps(output),
+            },
+        })
+        # Prompt the model to continue — this is what makes it actually SPEAK a
+        # tool's result (e.g. narrate a suggested topic) rather than stay silent.
+        await self._send_json({"type": "response.create"})
+
+    async def nudge(self, *, text: str) -> None:
+        await self._send_json({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        })
+        await self._send_json({"type": "response.create"})
+
+    async def events(self) -> AsyncIterator[RealtimeEvent]:
+        async for event in self._recv_raw():
+            translated = self._translate(event)
+            if translated is None:
+                continue
+            yield translated
+            if translated.type == "speech_started":
+                # Barge-in: stop the model's in-flight generation server-side too
+                # (the caller is responsible for flushing local audio playback).
+                await self._send_json({"type": "response.cancel"})
+
+    @staticmethod
+    def _translate(event: dict) -> Optional[RealtimeEvent]:
+        etype = event.get("type")
+        if etype == "response.audio.delta":
+            return RealtimeEvent(type="audio_delta", audio_b64=event.get("delta"))
+        if etype == "response.audio_transcript.delta":
+            return RealtimeEvent(type="output_transcript_delta", text=event.get("delta"))
+        if etype == "conversation.item.input_audio_transcription.completed":
+            return RealtimeEvent(type="input_transcript", text=(event.get("transcript") or "").strip())
+        if etype == "response.function_call_arguments.done":
+            return RealtimeEvent(
+                type="tool_call",
+                call_id=event.get("call_id"),
+                name=event.get("name"),
+                arguments=json.loads(event.get("arguments") or "{}"),
+            )
+        if etype == "input_audio_buffer.speech_started":
+            return RealtimeEvent(type="speech_started")
+        if etype == "response.done":
+            return RealtimeEvent(type="response_done")
+        if etype == "error":
+            return RealtimeEvent(type="error", message=str(event.get("error")))
+        return None
+
+    async def close(self) -> None:
+        await self._ws.close()
 
 
 # ── Voiceover (Azure Speech text-to-speech) ────────────────────────────────────

@@ -270,6 +270,19 @@ _REPAIR_HINTS: Tuple[Tuple[re.Pattern, str], ...] = (
     (re.compile(r"Rendered more hooks|Rendered fewer hooks|Invalid hook call|conditionally", re.IGNORECASE),
      "React hooks (useCurrentFrame, useVideoConfig, useMemo, ...) must be called unconditionally "
      "at the top level of the component — never inside conditions, loops, or callbacks."),
+    (re.compile(r"ResponsiveContainer", re.IGNORECASE),
+     "Never use recharts' ResponsiveContainer — it depends on a resize observer that doesn't "
+     "fire reliably in a headless-Chromium still/frame render. Give BarChart/LineChart/etc. "
+     "explicit numeric width/height props derived from useVideoConfig() instead."),
+    (re.compile(r"recharts|Property '.*' does not exist on type '(Bar|Line|Area|Pie)", re.IGNORECASE),
+     "Match recharts' real prop shapes exactly (dataKey, isAnimationActive={false}, explicit "
+     "numeric width/height on the chart container) — see the recharts exemplar scene for the "
+     "proven pattern; do not invent props recharts doesn't have."),
+    (re.compile(r"is of type 'unknown'|Property '.*' does not exist on type '\{\}'", re.IGNORECASE),
+     "slide.data is typed Record<string, unknown> — every field must be narrowed before use "
+     "(e.g. `typeof slide.data.x === \"string\" ? slide.data.x : \"\"`, or `Array.isArray(...)` "
+     "for lists), exactly like the exemplar scenes do. Never access a slide.data field directly "
+     "without narrowing first."),
     (re.compile(r"\bTS\d{4,5}\b"),
      "Fix ONLY the reported type error(s), keeping the visual design identical; where a chart/"
      "topojson library's types fight you, cast the data with `as any` rather than restructuring."),
