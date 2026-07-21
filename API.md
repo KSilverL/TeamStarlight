@@ -67,9 +67,10 @@ Built on **FastAPI** (ASGI, served by uvicorn). The Python LLM service is consum
   "opening_input": "Post about our autumn cold brew launch to drive newsletter signups" }
 ```
 
+
 | Field | Type | Required |
 |---|---|---|
-| `mode` | `"text"` or `"voice"` | ✅ |
+| `mode` | `"text"` or `"voice"` | ✅ — `"voice"` here is the **cascaded** fallback (STT then the same text pipeline); real speech-to-speech is [`WS /intake/{session_id}/voice`](#ws-intakesession_idvoice--native-speech-to-speech) below, which is independent of this endpoint |
 | `session_id` | string | ✅ — the conversation id you reuse at `POST /tasks` (one conversation = one session) |
 | `target_platforms` | string[] | recommended — the platforms the user already picked in the UI. **Seeded into the brief so intake never asks about platforms.** |
 | `opening_input` | string | optional (but recommended — it's what the LLM analyses) |
@@ -134,7 +135,51 @@ Call once `complete: true`. Returns the `CreativeBrief` to post to `/tasks`.
 ```
 
 `user_id` and `prior_context` are always present (both `null` unless supplied at `/intake`).
-Returns `409` if the brief is not complete yet.
+Returns `409` if the brief is not complete yet. Works the same for a brief finished over the
+realtime voice socket below — it's registered under the same `session_id`.
+
+### `WS /intake/{session_id}/voice` — native speech-to-speech
+
+Real speech-to-speech (GPT-Realtime on Azure AI Foundry): the client streams the user's own
+audio in and gets the model's own spoken audio back — there is **no** "transcribe this turn to
+text first" step on the path that drives the conversation. The model reasons over audio directly
+and decides tool calls itself, the same way the text engine's `update_brief`/`suggest_topic`
+tools work; transcripts still come through, but only as a **side channel** (captions/logging/the
+per-user learning transcript), never as the mechanism. This is a separate transport from
+`POST /intake` (`mode: "voice"`) above — it doesn't need that endpoint called first.
+
+**Client → server frames:**
+
+```json
+{ "type": "start", "target_platforms": ["linkedin", "instagram"], "user_id": "u1", "prior_context": null }
+{ "type": "audio", "audio": "<base64 PCM16, 24kHz mono>" }
+```
+
+Send one `start` frame first (fields mirror `POST /intake`'s `target_platforms` / `user_id` /
+`prior_context`, all optional), then `audio` frames as the user speaks. Server-side VAD handles
+end-of-turn *and* barge-in detection — there's no explicit "end of turn" frame to send.
+
+**Server → client frames:**
+
+```json
+{ "type": "audio", "audio": "<base64 PCM16>" }
+{ "type": "transcript", "role": "user" | "assistant", "text": "..." }
+{ "type": "brief_update", "brief_partial": { "...": "..." }, "complete": false }
+{ "type": "interrupted" }
+{ "type": "error", "message": "..." }
+```
+
+`audio` is the assistant's spoken reply. `transcript` is caption/logging only — a side channel,
+never what decides the brief. `brief_update` arrives after each assistant turn; once
+`complete: true`, fetch the finished brief from `GET /intake/{session_id}/brief` as usual.
+`interrupted` means the user started talking over the assistant — stop local playback
+immediately (the service also cancels the model's in-flight generation server-side).
+An invalid first frame (not `{"type": "start", ...}`) gets `{"error": ..., "status": 400}` and
+the socket closes.
+
+The **cascaded** STT-only voice path (`VoiceService`/`AzureVoice`, driven behind the scenes by
+`POST /intake` + `/turn` with `mode: "voice"`) is unaffected by this and stays available as a
+fallback.
 
 ### `POST /summarize-handoff` — distil a finished session into a prior-context recap
 
@@ -854,9 +899,10 @@ just a task. Practical rules:
 | `422` | FastAPI request-body validation (malformed JSON / wrong field types); standard FastAPI `detail` payload |
 | `500` | Unexpected error on a **synchronous** call (e.g. `POST /review`). A failure during a **background** run (`POST /tasks` / `/roundtable[s]`, which already returned `running`) is **not** a `500` — the task goes `status: "error"` (with an `error` message) and the SSE stream closes on a `workflow`/`error` event. |
 
-`WS /intake/{sid}/voice` is now a real WebSocket endpoint (FastAPI native): send one
-`{"user_input": "..."}` JSON frame per turn and receive the assistant turn back; an unknown
-session is reported as `{"error": …, "status": 404}` and the socket closes.
+`WS /intake/{sid}/voice` bridges native speech-to-speech (see
+[the section above](#ws-intakesession_idvoice--native-speech-to-speech)): send a `start` control
+frame then base64 PCM16 `audio` frames; an invalid first frame is reported as
+`{"error": …, "status": 400}` and the socket closes.
 
 ---
 

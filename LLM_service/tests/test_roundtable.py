@@ -598,6 +598,93 @@ def _context_with_user():
     )
 
 
+def test_manager_reasoning_effort_reaches_only_the_moderator_client(monkeypatch):
+    """The ROUNDTABLE_MANAGER_REASONING_EFFORT knob lands on the moderator's chat client at
+    build time — and only there: persona seats keep their own (`minimal`) setting. The project
+    default is `low` (fast roundtable launch), so an unset env var still dials the moderator to
+    low; an explicit value overrides it."""
+    from LLM_service.core.services.base import empty_profile
+    from LLM_service.core.services.mock import MockChatClient
+    from LLM_service.workflow.roundtable import builder as rt_builder
+    from LLM_service.workflow.roundtable.context import PersonaContext
+
+    monkeypatch.setenv("USE_MOCK_LLM", "false")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com/openai/v1")
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "fake-key")
+
+    calls: dict = {}
+
+    def spy(**kwargs):
+        calls[kwargs["agent_name"]] = kwargs
+        return MockChatClient(agent_name=kwargs["agent_name"])
+
+    monkeypatch.setattr(rt_builder.factory, "get_chat_client", spy)
+    ctx = PersonaContext(brand_profile=empty_profile(None), user_skills=None)
+
+    monkeypatch.setenv("ROUNDTABLE_MANAGER_REASONING_EFFORT", "medium")  # explicit override
+    reset_settings()
+    rt_builder.build_roundtable(PLATFORM, _brief(), context=ctx)
+    assert calls["moderator"]["reasoning_effort"] == "medium"
+    assert calls[PLATFORM_EDITOR]["reasoning_effort"] == "minimal"  # persona knob untouched
+
+    monkeypatch.delenv("ROUNDTABLE_MANAGER_REASONING_EFFORT")
+    reset_settings()
+    calls.clear()
+    rt_builder.build_roundtable(PLATFORM, _brief(), context=ctx)
+    assert calls["moderator"]["reasoning_effort"] == "low"  # project default (fast launch)
+
+
+async def test_llm_manager_plan_uses_a_single_combined_call():
+    """Latency lever #1: the production manager's plan() makes ONE combined facts+plan LLM
+    call (not StandardMagenticManager's two), still populating the task_ledger the framework +
+    replan() expect and grounding chat_history for later ledger calls."""
+    from agent_framework import Message
+
+    mgr = _interactive_manager("rt_plan1")
+    calls: list = []
+
+    async def fake_complete(messages):
+        calls.append(messages)
+        return Message(
+            role="assistant",
+            contents=["GIVEN OR VERIFIED FACTS\n- launch is in spring\n"
+                      "===PLAN===\n- open with the native hook"],
+        )
+
+    mgr._complete = fake_complete
+    ctx = _context_with_user()
+    rendered = await mgr.plan(ctx)
+
+    assert len(calls) == 1                                    # ONE call, not two
+    assert mgr.task_ledger is not None                        # ledger populated (replan baseline)
+    assert "spring" in mgr.task_ledger.facts.text             # facts section split out
+    assert "native hook" in mgr.task_ledger.plan.text         # plan section split out
+    assert "spring" in rendered.text and "native hook" in rendered.text  # rendered full ledger
+    assert ctx.chat_history                                   # grounded for later ledger calls
+
+
+async def test_llm_manager_plan_degrades_when_marker_absent():
+    """If the model omits the split marker, plan() still makes exactly one call and puts the
+    whole response in BOTH ledger slots — real content, never an empty/None ledger."""
+    from agent_framework import Message
+
+    mgr = _interactive_manager("rt_plan2")
+    calls: list = []
+
+    async def fake_complete(messages):
+        calls.append(messages)
+        return Message(role="assistant", contents=["a fact sheet and a plan, but no marker"])
+
+    mgr._complete = fake_complete
+    ctx = _context_with_user()
+    await mgr.plan(ctx)
+
+    assert len(calls) == 1
+    assert mgr.task_ledger is not None
+    assert "no marker" in mgr.task_ledger.facts.text
+    assert "no marker" in mgr.task_ledger.plan.text
+
+
 async def test_llm_manager_hides_user_from_roster_and_never_selects_them():
     """Idle user (no raised hand / no queued message): the LLM moderator must not even SEE the
     user seat in the roster it picks from, and — even if the model hallucinated the name — the

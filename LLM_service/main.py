@@ -161,6 +161,10 @@ def _print_event(e: dict) -> None:
         print(f"\n    💬 [{e.get('table_id')} · r{e.get('round_index')}] {who}:")
         for line in (e.get("text", "") or "").splitlines() or [""]:
             print(f"       {line}")
+    elif etype == "speaker_scheduled" and e.get("speaker") == "moderator":
+        # The round-0 convening announcement — fills the silent gap while the (production)
+        # manager runs its plan phase before the first real mic handoff.
+        print(f"\n    🪑 [{e.get('table_id')}] the table convenes — the moderator is planning the discussion…")
     elif etype == "result" and e.get("status") == "discussion_consensus":
         print(f"\n    🟢 consensus · {e.get('table_id')} ({'converged' if e.get('converged') else 'capped'})")
     elif etype == "result" and e.get("status") == "draft_ready":

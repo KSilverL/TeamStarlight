@@ -16,6 +16,7 @@ from typing import Awaitable, Callable, List, Optional
 
 from agent_framework import Agent, Message
 from agent_framework.orchestrations import (
+    MAGENTIC_MANAGER_NAME,
     MagenticContext,
     MagenticManagerBase,
     MagenticProgressLedger,
@@ -196,6 +197,60 @@ def build_manager_agent(chat_client, *, name: str = "Moderator") -> Agent:
     return Agent(chat_client, instructions=MANAGER_PROMPT, name=name)
 
 
+# ── Combined facts+plan (roundtable-launch latency lever #1) ───────────────────
+# StandardMagenticManager.plan() makes TWO sequential LLM calls before the first persona
+# speaks — a fact sheet, then a plan conditioned on it — which are two of the three silent
+# pre-turn calls on a slow reasoning manager. We ask for BOTH in one response (split on a
+# marker), which halves the plan phase while producing the SAME task_ledger the framework
+# and replan() expect. See InteractiveMagenticManager.plan below.
+
+_PLAN_MARKER = "===PLAN==="
+
+_COMBINED_LEDGER_PROMPT = (
+    "Below is a request. Before the roundtable begins, produce a brief fact sheet AND a short "
+    "plan in ONE response.\n\n"
+    "Request:\n{task}\n\n"
+    "Team assembled to address it:\n{team}\n\n"
+    "Respond in EXACTLY two sections separated by a line containing only {marker}\n"
+    "1) Above {marker}: a short fact sheet under the headings GIVEN OR VERIFIED FACTS / "
+    "FACTS TO LOOK UP / FACTS TO DERIVE / EDUCATED GUESSES (facts are specific names, dates, "
+    "statistics; a heading may be empty).\n"
+    "2) Below {marker}: a short bullet-point plan for addressing the request given the team and "
+    "the facts. There is no requirement to involve every team member.\n"
+    "Output nothing else."
+)
+
+
+def _team_block(participants: dict) -> str:
+    """Render participant descriptions as the plan prompt's team roster — mirrors the
+    framework's private `_team_block` so the moderator reads the same team text."""
+    return "\n".join(f"- {name}: {desc}" for name, desc in participants.items())
+
+
+def _split_ledger(text: str) -> tuple[str, str]:
+    """Split the combined response into (facts, plan) on `_PLAN_MARKER`. If the model omitted
+    the marker, put the whole response in BOTH slots — the ledger still carries real content
+    (grounding + replan stay meaningful), just un-split — never an empty ledger."""
+    if _PLAN_MARKER in text:
+        facts, _, plan = text.partition(_PLAN_MARKER)
+        facts, plan = facts.strip(), plan.strip()
+        if facts and plan:
+            return facts, plan
+    stripped = text.strip()
+    return stripped, stripped
+
+
+def _resolve_ledger_cls():
+    """The framework's private task-ledger dataclass (`plan()` populates it so `replan()` has a
+    baseline). Imported lazily + defensively: if a framework upgrade moves the symbol, `plan()`
+    degrades to the stock two-call path rather than crashing."""
+    try:
+        from agent_framework_orchestrations._magentic import _MagenticTaskLedger
+        return _MagenticTaskLedger
+    except Exception:
+        return None
+
+
 class InteractiveMagenticManager(StandardMagenticManager):
     """The production LLM manager (StandardMagenticManager) with a per-round user-interjection
     hook. Each round, BEFORE the LLM picks the next persona, `before_round` runs (a harness/UI
@@ -230,6 +285,43 @@ class InteractiveMagenticManager(StandardMagenticManager):
         self._store = store
         self._user = user_name
         self._before_round = before_round
+
+    async def plan(self, magentic_context: MagenticContext) -> Message:
+        """One combined facts+plan call instead of StandardMagenticManager's two sequential
+        round trips (latency lever #1). The stock manager calls the LLM once for a fact sheet
+        then AGAIN for a plan conditioned on those facts, before the first persona speaks — two
+        of the three silent pre-turn calls on a slow reasoning manager. We ask for both in a
+        single response (split on `_PLAN_MARKER`), populate the SAME `task_ledger` the framework
+        expects, and ground `chat_history` identically — so speaker selection, `replan()`, and
+        the rendered ledger are unchanged; only the round-trip count drops (2 → 1). If the
+        framework's private ledger type can't be resolved (an upgrade moved it), degrade to the
+        stock two-call `plan()`."""
+        ledger_cls = _resolve_ledger_cls()
+        if ledger_cls is None:  # framework moved the symbol — fall back to the stock 2-call plan
+            return await super().plan(magentic_context)
+
+        team_text = _team_block(magentic_context.participant_descriptions)
+        user_msg = Message(
+            role="user",
+            contents=[_COMBINED_LEDGER_PROMPT.format(
+                task=magentic_context.task, team=team_text, marker=_PLAN_MARKER)],
+        )
+        response = await self._complete([*magentic_context.chat_history, user_msg])
+
+        facts_text, plan_text = _split_ledger(response.text)
+        facts_msg = Message(role="assistant", contents=[facts_text])
+        plan_msg = Message(role="assistant", contents=[plan_text])
+        self.task_ledger = ledger_cls(facts=facts_msg, plan=plan_msg)
+
+        # Ground later progress-ledger calls exactly as the stock manager does — the facts+plan
+        # content lives in chat_history (here as the single combined exchange).
+        magentic_context.chat_history.extend([user_msg, response])
+
+        combined = self.task_ledger_full_prompt.format(
+            task=magentic_context.task, team=team_text,
+            facts=facts_msg.text, plan=plan_msg.text,
+        )
+        return Message(role="assistant", contents=[combined], author_name=MAGENTIC_MANAGER_NAME)
 
     async def _user_pending(self) -> bool:
         """The user has the floor iff a seat is wired and they raised a hand or queued a message."""

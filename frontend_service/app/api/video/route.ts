@@ -6,6 +6,11 @@ export async function POST(request: NextRequest) {
   const body = await request.json();
   const taskId: string = body.taskId ?? "";
   const platform: string = body.platform ?? "";
+  // Optional user-attached reference images (base64 data URLs), forwarded to the
+  // Higgsfield backend for image-to-video. Ignored by the Remotion backends.
+  const referenceImages: string[] = Array.isArray(body.referenceImages)
+    ? body.referenceImages.filter((s: unknown): s is string => typeof s === "string").slice(0, 3)
+    : [];
 
   if (!taskId.trim() || !platform.trim()) {
     return Response.json(
@@ -18,7 +23,10 @@ export async function POST(request: NextRequest) {
     const upstream = await fetch(`${LLM_URL}/tasks/${taskId}/render-video`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ platform }),
+      body: JSON.stringify({
+        platform,
+        ...(referenceImages.length > 0 ? { reference_images: referenceImages } : {}),
+      }),
     });
 
     if (!upstream.ok) {

@@ -6,7 +6,8 @@ fans that out: one table per target platform, run concurrently, summarised into 
 `list[RoundtableConsensus]`.
 
 Event mapping is per the Phase 0 probe (docs/roundtable_api_notes.md):
-  - `group_chat` / GroupChatRequestSentEvent  → the round index of the upcoming turn.
+  - `group_chat` / GroupChatRequestSentEvent  → the round index + participant of the upcoming
+    turn; re-emitted to callers as a `speaker_scheduled` event (the moderator's announcement).
   - `executor_invoked` / AgentExecutorResponse → a persona's spoken text (executor_id +
     agent_response.text); this is the transcript source.
   - `output` / AgentResponseUpdate            → the manager's final consensus text.
@@ -18,7 +19,11 @@ import asyncio
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
-from ...core.events import agent_utterance_event, discussion_consensus_event
+from ...core.events import (
+    agent_utterance_event,
+    discussion_consensus_event,
+    speaker_scheduled_event,
+)
 from ..messages import Brief, CreativeStrategy
 from .builder import RoundtableBuild, build_roundtable
 from .context import build_persona_context
@@ -54,6 +59,12 @@ def _task_prompt(brief: Brief, platform: str) -> str:
         f"Discuss and converge on the best content strategy for {platform} about "
         f"'{brief.topic}'. Goal: {intent}."
     )
+
+
+# The speaker name on the round-0 convening announcement (a `speaker_scheduled` event emitted
+# the moment a table starts, before the manager's plan phase). It is NOT a persona seat — it is
+# the moderator's own voice, and the frontend keys its moderator avatar on exactly this string.
+MODERATOR_SPEAKER = "moderator"
 
 
 # The Magentic orchestrator yields this sentinel (not a synthesized answer) when a table hits
@@ -107,6 +118,15 @@ async def run_table(
     consensus_text = ""
     current_round = 0
 
+    if on_event is not None:
+        # Convening announcement (round 0, the moderator): the LLM manager's plan phase and
+        # its first progress ledger run BEFORE any real mic handoff, so this is the client's
+        # only signal that the table exists during that window — without it the stream shows
+        # nothing between task start and the first speaker_scheduled.
+        on_event(speaker_scheduled_event(
+            table_id=platform, speaker=MODERATOR_SPEAKER, round_index=0,
+        ))
+
     async for ev in build.workflow.run(_task_prompt(brief, platform), stream=True):
         etype = getattr(ev, "type", None)
         data = getattr(ev, "data", None)
@@ -114,6 +134,16 @@ async def run_table(
 
         if etype == "group_chat" and dname == "GroupChatRequestSentEvent":
             current_round = getattr(data, "round_index", current_round)
+            # The manager just handed the mic over — announce who holds the floor NOW,
+            # so the UI can show the upcoming speaker before their turn completes.
+            scheduled = getattr(data, "participant_name", "")
+            if scheduled in persona_names and on_event is not None:
+                key = ("scheduled", scheduled, current_round)
+                if key not in seen:
+                    seen.add(key)
+                    on_event(speaker_scheduled_event(
+                        table_id=platform, speaker=scheduled, round_index=current_round,
+                    ))
         elif etype == "executor_invoked" and dname == "AgentExecutorResponse":
             speaker = getattr(data, "executor_id", "")
             if speaker not in persona_names:

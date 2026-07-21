@@ -498,6 +498,27 @@ class StoryboardSpec(BaseModel):
     )
 
 
+# ── Generative AI video prompt (Higgsfield premium backend) ─────────────────
+# NOT part of the Remotion storyboard union — this is the tiny spec the LLM produces
+# (LLMService.generate_video_prompt) for the VIDEO_RENDER_BACKEND=higgsfield path,
+# where a single cinematic clip is generated from a text prompt (+ optional user
+# reference images), not composited from typed slides. Kept deliberately minimal.
+
+
+class VideoPromptSpec(BaseModel):
+    """The crafted prompt for one generative AI video clip. `prompt` is a single
+    cinematic shot description the video model renders directly (subject/setting/
+    lighting/mood — not a storyboard, not post copy). `motion` is an optional short
+    camera/motion cue folded into the generation request. When the user attached
+    reference images the prompt describes motion/atmosphere that COMPLEMENTS them
+    rather than re-specifying the subject (see generate_video_prompt's contract)."""
+
+    prompt: str = Field(description="One cinematic shot description for the video model")
+    motion: Optional[str] = Field(
+        None, description="Optional short camera/motion cue, e.g. 'slow dolly-in', 'handheld pan'"
+    )
+
+
 # ── Renderable (post-asset-resolution) shapes ───────────────────────────────
 
 class ResolvedImage(BaseModel):

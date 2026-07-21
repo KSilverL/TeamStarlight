@@ -35,6 +35,7 @@ Run it:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import uuid
@@ -57,7 +58,8 @@ from .core.events import (
     round_control_event,
 )
 from .core.services import factory
-from .intake import IntakeSession, PriorSessionContext, build_intake
+from .core.services.base import RealtimeVoiceSession
+from .intake import IntakeSession, PriorSessionContext, RealtimeVoiceIntake, build_intake
 from .skills import load_skill
 from .workflow import Brief, HumanVerdict, build_workflow
 from .workflow.builder import WORKFLOW_NAME
@@ -774,11 +776,18 @@ class WorkflowService:
 
 class IntakeService:
     """Async wrapper over the intake layer (§4 / §7.1). Holds the live intake
-    sessions; both voice and text run the same shared conversation, so this code is
-    transport-agnostic — it just routes turns by session id."""
+    sessions; text and cascaded voice run the same shared conversation, so this code
+    is transport-agnostic — it just routes turns by session id.
+
+    Native speech-to-speech (RealtimeVoiceIntake, WS /intake/{sid}/voice) is a
+    separate transport with no meaningful "turn"/"assistant_message" REST shape, so
+    it lives in its own `_realtime_sessions` map; `transcript`/`get_brief` check
+    both so the REST `GET /intake/{sid}/brief` keeps working regardless of which
+    transport produced the finished brief."""
 
     def __init__(self) -> None:
         self._sessions: dict[str, IntakeSession] = {}
+        self._realtime_sessions: dict[str, RealtimeVoiceIntake] = {}
 
     def _require(self, session_id: str) -> IntakeSession:
         session = self._sessions.get(session_id)
@@ -802,12 +811,34 @@ class IntakeService:
         self._sessions[session_id] = session
         return {"intake_mode": mode, **result}
 
+    async def open_realtime_voice(
+        self, session_id: str, *, user_id: Optional[str] = None,
+        target_platforms: Optional[list] = None, prior_context: Optional[dict] = None,
+    ) -> tuple[RealtimeVoiceIntake, RealtimeVoiceSession]:
+        
+        """Open a native speech-to-speech session for `session_id` (WS /intake/{sid}/voice's
+        `start` frame) and register it so REST GET /intake/{sid}/brief can find it once
+        finished. Returns (intake, realtime_session) — the WS handler pumps audio through
+        the latter and events through `intake.handle_event`."""
+        
+        prior = _prior_context_from_payload(prior_context)
+        intake = RealtimeVoiceIntake()
+        realtime_session = await intake.open(
+            session_id, user_id=user_id, target_platforms=target_platforms, prior_context=prior,
+        )
+        self._realtime_sessions[session_id] = intake
+        return intake, realtime_session
+
     def transcript(self, session_id: str) -> list:
         """The session's {role, content} message history, threaded into a task at start
         so per-user learning can summarize the whole conversation. Empty for an unknown
         session, so starting a task never fails on a stale intake session id."""
+        
         session = self._sessions.get(session_id)
-        return session.transcript(session_id) if session is not None else []
+        if session is not None:
+            return session.transcript(session_id)
+        realtime = self._realtime_sessions.get(session_id)
+        return realtime.transcript() if realtime is not None else []
 
     async def turn(self, session_id: str, user_input: str) -> dict:
         session = self._require(session_id)
@@ -816,7 +847,14 @@ class IntakeService:
         return await session.send_user_turn(session_id, user_input)
 
     async def get_brief(self, session_id: str) -> dict:
-        session = self._require(session_id)
+        session = self._sessions.get(session_id)
+        if session is None:
+            realtime = self._realtime_sessions.get(session_id)
+            if realtime is None:
+                raise ApiError(404, f"unknown intake session: {session_id}")
+            if not realtime.is_complete():
+                raise ApiError(409, "brief is not complete yet")
+            return realtime.get_brief().model_dump()
         try:
             brief = await session.get_brief(session_id)
         except ValueError as exc:
@@ -875,6 +913,7 @@ class VideoService:
     async def start(
         self, task_id: str, platform: str, *,
         narration_text: Optional[str] = None, narration_voice: Optional[str] = None,
+        reference_images: Optional[list[str]] = None,
     ) -> dict:
         draft = self._workflow.get_final_draft(task_id, platform)
         if draft is None:
@@ -885,6 +924,7 @@ class VideoService:
         doc = await start_render_job(
             task_id=task_id, platform=platform, storyboard=StoryboardSpec(**storyboard),
             narration_text=narration_text, narration_voice=narration_voice,
+            reference_images=_decode_reference_images(reference_images),
         )
         return {"job_id": doc["id"], "status": doc["status"]}
 
@@ -1152,6 +1192,24 @@ class PlanService:
         item["task_id"] = task_id
         await self._save(plan)
         return {"plan_id": plan_id, "item": item, "task": snapshot}
+def _decode_reference_images(images: Optional[list[str]]) -> Optional[list[bytes]]:
+    """Decode up to 3 base64 reference images (accepting `data:image/...;base64,<b64>`
+    data URLs or raw base64) into bytes for the Higgsfield backend. A malformed entry is
+    a client error (400) — reference images are opt-in, so a bad one should surface, not
+    silently vanish. Returns None when none were supplied."""
+    if not images:
+        return None
+    import base64
+    import binascii
+
+    out: list[bytes] = []
+    for img in images[:3]:
+        b64 = img.split(",", 1)[1] if img.startswith("data:") else img
+        try:
+            out.append(base64.b64decode(b64, validate=True))
+        except (binascii.Error, ValueError):
+            raise ApiError(400, "reference_images must be valid base64 (optionally a data URL)")
+    return out or None
 
 
 def _verdict_from_payload(payload: dict) -> HumanVerdict:
@@ -1350,6 +1408,11 @@ class RenderVideoRequest(BaseModel):
     narration_voice: Optional[str] = Field(
         None, description="Provider voice id (e.g. an Azure Neural voice name). "
         "Omit to use VOICEOVER_DEFAULT_VOICE."
+    )
+    reference_images: Optional[list[str]] = Field(
+        None, description="1-3 user-attached reference images as base64 data URLs "
+        "(or raw base64), passed to the Higgsfield backend for image-to-video. "
+        "Ignored by the Remotion (local/lambda) backends."
     )
 
 
@@ -1554,6 +1617,7 @@ async def render_video(request: Request, task_id: str, body: RenderVideoRequest)
     return await _video(request).start(
         task_id, body.platform,
         narration_text=body.narration_text, narration_voice=body.narration_voice,
+        reference_images=body.reference_images,
     )
 
 
@@ -1580,27 +1644,84 @@ async def intake_brief(request: Request, session_id: str) -> dict:
 
 @intake_router.websocket("/{session_id}/voice")
 async def intake_voice(websocket: WebSocket, session_id: str) -> None:
-    """Real-time voice intake bridge. The Java backend relays the browser's audio/turns
-    over this socket; each inbound `{"user_input": "..."}` frame runs one turn on the
-    shared intake engine and the assistant reply is sent back. (The Voice Live audio
-    transcription itself is the VoiceService's concern, behind USE_MOCK_VOICE.)"""
+    """Native speech-to-speech voice intake bridge (GPT-Realtime). NOT a
+    transcribe-then-chat cascade: the client streams raw audio in and the model's
+    own audio streams back out, with the model deciding tool calls directly — there
+    is no "turn this into text first" step on the path that drives the conversation.
+
+    Protocol (client -> server): one `{"type":"start", "target_platforms"?,
+    "user_id"?, "prior_context"?}` frame, then `{"type":"audio","audio":"<base64
+    pcm16>"}` frames as the user speaks (server-side VAD handles end-of-turn/barge-in,
+    so the client never needs to signal a turn boundary itself).
+
+    Protocol (server -> client): `{"type":"audio","audio":...}` (assistant speech),
+    `{"type":"transcript","role":"user"|"assistant","text":...}` (captions/logging —
+    a side channel, never what decides the brief), `{"type":"brief_update",
+    "brief_partial":{...},"complete":bool}` (after each assistant turn),
+    `{"type":"interrupted"}` (the user barged in — stop local playback),
+    `{"type":"error","message":...}`.
+
+    The cascaded STT-only path (VoiceService/AzureVoice) is unaffected and stays
+    reachable via the REST `POST /intake` (`mode: "voice"`) flow."""
     svc: IntakeService = websocket.app.state.intake
     await websocket.accept()
+
+    try:
+        start_msg = await websocket.receive_json()
+    except WebSocketDisconnect:
+        return
+    if start_msg.get("type") != "start":
+        await websocket.send_json({"error": "first frame must be {'type': 'start', ...}", "status": 400})
+        await websocket.close()
+        return
+
+    try:
+        intake, session = await svc.open_realtime_voice(
+            session_id,
+            user_id=start_msg.get("user_id"),
+            target_platforms=start_msg.get("target_platforms"),
+            prior_context=start_msg.get("prior_context"),
+        )
+    except ApiError as exc:
+        await websocket.send_json({"error": exc.message, "status": exc.status})
+        await websocket.close()
+        return
+
+    async def _pump_model_events() -> None:
+        """Relay every event the model produces to the client, and feed each one
+        into the shared brief-completion state machine (intake.handle_event)."""
+        async for event in session.events():
+            await intake.handle_event(event)
+            if event.type == "audio_delta" and event.audio_b64:
+                await websocket.send_json({"type": "audio", "audio": event.audio_b64})
+            elif event.type == "input_transcript" and event.text:
+                await websocket.send_json({"type": "transcript", "role": "user", "text": event.text})
+            elif event.type == "output_transcript_delta" and event.text:
+                await websocket.send_json({"type": "transcript", "role": "assistant", "text": event.text})
+            elif event.type == "speech_started":
+                await websocket.send_json({"type": "interrupted"})
+            elif event.type == "error":
+                await websocket.send_json({"type": "error", "message": event.message})
+            elif event.type == "response_done":
+                await websocket.send_json({
+                    "type": "brief_update",
+                    "brief_partial": intake.brief_partial(),
+                    "complete": intake.is_complete(),
+                })
+
+    pump_task = asyncio.create_task(_pump_model_events())
     try:
         while True:
             msg = await websocket.receive_json()
-            try:
-                result = await svc.turn(session_id, msg.get("user_input", ""))
-                await websocket.send_json(result)
-                if result.get("complete"):
-                    break
-            except ApiError as exc:
-                await websocket.send_json({"error": exc.message, "status": exc.status})
-                if exc.status == 404:
-                    break
+            if msg.get("type") == "audio" and msg.get("audio"):
+                await session.send_audio(audio_b64=msg["audio"])
     except WebSocketDisconnect:
-        return
-    await websocket.close()
+        pass
+    finally:
+        pump_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pump_task
+        await session.close()
 
 
 @media_router.post("/generate-text", summary="Generate platform-native post copy from a brief")

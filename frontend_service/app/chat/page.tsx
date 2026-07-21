@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect } from "react";
 import Link from "next/link";
+import { useRealtimeVoice, type VoiceBriefPartial } from "./useRealtimeVoice";
 
 type Platform = "x" | "instagram" | "tiktok" | "linkedin";
 
@@ -153,6 +154,18 @@ interface RoundtableTurn {
   roundIndex: number;
 }
 
+// The discussion feed interleaves completed turns with the moderator's mic handoffs
+// (speaker_scheduled events) so the transcript reads like meeting minutes.
+type RoundtableFeedItem =
+  | { kind: "turn"; turn: RoundtableTurn }
+  | { kind: "announcement"; speaker: string; roundIndex: number };
+
+// Who holds the mic right now (speaker_scheduled arrived, their utterance hasn't yet).
+interface RoundtableFloor {
+  speaker: string;
+  roundIndex: number;
+}
+
 // Step-mode's per-round prompt (round_control "waiting" event) — null once resolved/auto.
 interface RoundControlPrompt {
   roundIndex: number;
@@ -173,13 +186,23 @@ interface Message {
   workflowTaskId?: string;
   needsHumanIntervention?: boolean;
   videoStoryboard?: VideoStoryboard;
-  // Roundtable-specific fields (variant === "roundtable") — one card grows in place as
-  // agent_utterance / discussion_consensus / round_control events land for its table.
+  // User-attached reference images (base64 data URLs) for image-to-video generation
+  // (Higgsfield backend). Threaded from the compose box onto the storyboard message so
+  // the render trigger can forward them; the free Remotion backend ignores them.
+  referenceImages?: string[];
+  // Roundtable-specific fields (variant === "roundtable") — one stage grows in place as
+  // speaker_scheduled / agent_utterance / discussion_consensus / round_control events land
+  // for its table.
   roundtableTableId?: string;
-  roundtableTurns?: RoundtableTurn[];
+  roundtableFeed?: RoundtableFeedItem[];
+  roundtableFloor?: RoundtableFloor | null;
   roundtableConverged?: boolean;
   roundtableStrategy?: string;
   roundControlWaiting?: RoundControlPrompt | null;
+  // Set on voice turns (native speech-to-speech) once the clip is fully assembled —
+  // an object URL for a WAV blob built client-side from the raw PCM16 the session
+  // streamed, so the turn's audio can be replayed/downloaded from its bubble.
+  audioUrl?: string;
 }
 
 const PLATFORMS: {
@@ -247,18 +270,152 @@ const NODE_LABELS: Record<string, string> = {
   media_producer: "Generating brand assets…",
 };
 
-// Display name + badge colour for each roundtable persona (workflow/roundtable/personas.py).
-const SPEAKER_LABELS: Record<string, { label: string; badge: string }> = {
-  platform_editor: { label: "Platform Editor", badge: "bg-sky-600" },
-  brand_voice: { label: "Brand Voice", badge: "bg-purple-600" },
-  user_advocate: { label: "User Advocate", badge: "bg-emerald-600" },
-  audience_advocate: { label: "Audience Advocate", badge: "bg-amber-600" },
-  trend_scout: { label: "Trend Scout", badge: "bg-rose-600" },
-  user: { label: "You", badge: "bg-[#FF4800]" },
+// ── Roundtable persona metadata ───────────────────────────────────────────────
+// One entry per seat (workflow/roundtable/personas.py). `color` tints the avatar +
+// transcript accents; `glyph` is the seat's distinguishing SVG icon (24×24 viewBox,
+// stroked in currentColor).
+
+const MODERATOR = "moderator";
+
+interface PersonaMeta {
+  label: string;
+  color: string;
+  glyph: React.ReactNode;
+}
+
+const PERSONA_META: Record<string, PersonaMeta> = {
+  [MODERATOR]: {
+    label: "Moderator",
+    color: "#E8E3DA",
+    // Gavel — the chair of the meeting.
+    glyph: (
+      <>
+        <path d="M8.5 5.5l5 5" strokeLinecap="round" />
+        <path d="M11 3l6.5 6.5" strokeLinecap="round" />
+        <path d="M12.5 7l-2 2L4 15.5 6.5 18l6.5-6.5 2-2" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M13 20h8" strokeLinecap="round" />
+      </>
+    ),
+  },
+  platform_editor: {
+    label: "Platform Editor",
+    color: "#38BDF8",
+    // Browser window with a cursor line — platform mechanics.
+    glyph: (
+      <>
+        <rect x="3.5" y="4.5" width="17" height="15" rx="2" />
+        <path d="M3.5 9h17" />
+        <path d="M7 13.5h6M7 16.5h4" strokeLinecap="round" />
+      </>
+    ),
+  },
+  brand_voice: {
+    label: "Brand Voice",
+    color: "#C084FC",
+    // Shield — guardian of the brand rules.
+    glyph: (
+      <>
+        <path d="M12 3.5l7 2.8v5.2c0 4.4-2.9 7.3-7 8.9-4.1-1.6-7-4.5-7-8.9V6.3z" strokeLinejoin="round" />
+        <path d="M9.2 12l2 2 3.6-4" strokeLinecap="round" strokeLinejoin="round" />
+      </>
+    ),
+  },
+  user_advocate: {
+    label: "User Advocate",
+    color: "#34D399",
+    // Fountain-pen nib — the author's personal editor.
+    glyph: (
+      <>
+        <path d="M14 5.5l4.5 4.5L9 19.5 4 20l.5-5z" strokeLinejoin="round" />
+        <path d="M12.5 7l4.5 4.5" />
+        <circle cx="9.5" cy="14.5" r="1" />
+      </>
+    ),
+  },
+  audience_advocate: {
+    label: "Audience Advocate",
+    color: "#FBBF24",
+    // Eye — the reader scrolling past.
+    glyph: (
+      <>
+        <path d="M2.5 12S6 5.8 12 5.8 21.5 12 21.5 12 18 18.2 12 18.2 2.5 12 2.5 12z" strokeLinejoin="round" />
+        <circle cx="12" cy="12" r="3" />
+      </>
+    ),
+  },
+  trend_scout: {
+    label: "Trend Scout",
+    color: "#FB7185",
+    // Trend line — today's cultural radar.
+    glyph: (
+      <>
+        <path d="M3 17l5.5-5.5 3.5 3.5L20 7" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M15 7h5v5" strokeLinecap="round" strokeLinejoin="round" />
+      </>
+    ),
+  },
+  user: {
+    label: "You",
+    color: "#FF7A45",
+    // Person — the human seat.
+    glyph: (
+      <>
+        <circle cx="12" cy="8" r="3.5" />
+        <path d="M5 20c.8-3.6 3.6-5.5 7-5.5s6.2 1.9 7 5.5" strokeLinecap="round" />
+      </>
+    ),
+  },
 };
 
-function speakerInfo(speaker: string) {
-  return SPEAKER_LABELS[speaker] ?? { label: speaker, badge: "bg-[#6B6561]" };
+function personaMeta(speaker: string): PersonaMeta {
+  return (
+    PERSONA_META[speaker] ?? {
+      label: speaker,
+      color: "#9E9893",
+      glyph: <circle cx="12" cy="12" r="6" />,
+    }
+  );
+}
+
+// ── Disagreement gauge ────────────────────────────────────────────────────────
+// The seats are charted to disagree openly (personas.py DISCUSSION_STYLE), so each
+// turn's language is a usable signal. A lexical read of the seat's LATEST turn maps to
+// a four-step temperature: aligned (green) → cautious (yellow) → pushing back (orange)
+// → strongly opposed (red). Seats that haven't spoken yet read as idle.
+
+type Stance = "idle" | "aligned" | "cautious" | "pushback" | "opposed";
+
+const STANCE_META: Record<Stance, { label: string; color: string }> = {
+  idle: { label: "Hasn't spoken", color: "#57534E" },
+  aligned: { label: "Aligned", color: "#4ADE80" },
+  cautious: { label: "Cautious", color: "#FACC15" },
+  pushback: { label: "Pushing back", color: "#FB923C" },
+  opposed: { label: "Strongly opposed", color: "#F87171" },
+};
+
+const OPPOSED_RE =
+  /strongly disagree|veto|must not|won't work|will not work|reject|non-negotiable|hard no|dealbreaker|deal-breaker|unacceptable|violates/i;
+const PUSHBACK_RE =
+  /\bdisagree\b|push back|pushback|\bobject\b|\binstead\b|that's wrong|off-brand|off brand|breaks the|\bno[,.]|doesn't work|does not work|cut th|drop th|scrap/i;
+const CAUTIOUS_RE =
+  /\bbut\b|however|\bconcern|not sure|careful|\brisk|\bthough\b|worried|caveat|hesitant|only if|as long as/i;
+
+function stanceOf(text: string): Stance {
+  if (OPPOSED_RE.test(text)) return "opposed";
+  if (PUSHBACK_RE.test(text)) return "pushback";
+  if (CAUTIOUS_RE.test(text)) return "cautious";
+  return "aligned";
+}
+
+/** Each seat's current stance = the read of their most recent turn (idle before that). */
+function seatStances(feed: RoundtableFeedItem[]): Record<string, Stance> {
+  const stances: Record<string, Stance> = {};
+  for (const item of feed) {
+    if (item.kind === "turn") {
+      stances[item.turn.speaker] = stanceOf(item.turn.text);
+    }
+  }
+  return stances;
 }
 
 // Monotonic message ids — several generators append concurrently when multiple
@@ -282,16 +439,26 @@ export default function ChatPage() {
   const [roundtableMode, setRoundtableMode] = useState<"auto" | "manual">("auto");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
+  // Up to 3 reference images the user attaches to the current turn (image-to-video).
+  const [attachments, setAttachments] = useState<{ name: string; dataUrl: string }[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  // The attachments captured at send time, carried to the storyboard message produced
+  // by this run's `final` event (one workflow run == one send, so a ref is enough).
+  const pendingRefsRef = useRef<string[]>([]);
   // Conversation history persisted for the lifetime of this page mount so each
   // request continues the same thread rather than starting a new LLM session.
   const historyRef = useRef<{ role: "user" | "assistant"; content: string }[]>([]);
   // Registered once on the first send; null until then.
   const sessionIdRef = useRef<string | null>(null);
+  // The currently-growing assistant voice bubble (id + text-so-far), so streamed
+  // transcript deltas update ONE message in place instead of spawning a new bubble per
+  // fragment; cleared once the turn ends (persisted exactly once at that point).
+  const streamingAssistantRef = useRef<{ id: string; text: string } | null>(null);
   // Active EventSource for the MAF workflow SSE stream; replaced on each new workflow run.
   const workflowEsRef = useRef<EventSource | null>(null);
-  // table_id -> the id of that table's RoundtableCard message, so later agent_utterance /
+  // table_id -> the id of that table's RoundtableStage message, so later agent_utterance /
   // round_control events for the same table update the SAME card instead of spawning new ones.
   const roundtableMsgIdRef = useRef<Map<string, string>>(new Map());
 
@@ -404,6 +571,33 @@ export default function ChatPage() {
     );
   }
 
+  function readFileAsDataUrl(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    });
+  }
+
+  // Attach up to 3 images total; used as image-to-video reference images on the render.
+  async function handleAttachFiles(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(e.target.files ?? []).filter((f) => f.type.startsWith("image/"));
+    if (files.length === 0) return;
+    const room = Math.max(0, 3 - attachments.length);
+    const chosen = files.slice(0, room);
+    const added = await Promise.all(
+      chosen.map(async (f) => ({ name: f.name, dataUrl: await readFileAsDataUrl(f) }))
+    );
+    setAttachments((prev) => [...prev, ...added].slice(0, 3));
+    // Reset so re-selecting the same file fires change again.
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  function removeAttachment(index: number) {
+    setAttachments((prev) => prev.filter((_, i) => i !== index));
+  }
+
   function handleApproval(messageId: string, approval: ApprovalStatus) {
     const msg = messages.find((m) => m.id === messageId);
     const platformLabel = platformMap[msg?.platform ?? ""]?.label ?? "platform";
@@ -442,39 +636,68 @@ export default function ChatPage() {
     }, 350);
   }
 
-  function pushMessage(msg: Omit<Message, "id" | "timestamp">) {
-    setMessages((prev) => [...prev, { ...msg, id: newId(), timestamp: new Date() }]);
+  function pushMessage(msg: Omit<Message, "id" | "timestamp">, insertBeforeId?: string): string {
+    const id = newId();
+    const full: Message = { ...msg, id, timestamp: new Date() };
+    setMessages((prev) => {
+      const idx = insertBeforeId ? prev.findIndex((m) => m.id === insertBeforeId) : -1;
+      if (idx === -1) return [...prev, full];
+      return [...prev.slice(0, idx), full, ...prev.slice(idx)];
+    });
+    return id;
   }
 
-  // ── Roundtable card helpers — one growing card per table_id ──────────────────
+  // ── Roundtable stage helpers — one growing stage per table_id ────────────────
 
-  /** Appends one turn to a table's card, creating the card on the first turn. */
-  function upsertRoundtableTurn(taskId: string, tableId: string, turn: RoundtableTurn) {
+  /** Applies `patch` to a table's stage message, creating the stage on first contact
+   *  (usually the moderator's opening speaker_scheduled announcement). */
+  function upsertRoundtable(
+    taskId: string,
+    tableId: string,
+    patch: (m: Message) => Partial<Message>
+  ) {
     setMessages((prev) => {
       const existingId = roundtableMsgIdRef.current.get(tableId);
       if (existingId) {
-        return prev.map((m) =>
-          m.id === existingId
-            ? { ...m, roundtableTurns: [...(m.roundtableTurns ?? []), turn] }
-            : m
-        );
+        return prev.map((m) => (m.id === existingId ? { ...m, ...patch(m) } : m));
       }
       const id = newId();
       roundtableMsgIdRef.current.set(tableId, id);
-      const msg: Message = {
+      const base: Message = {
         id,
         role: "assistant",
-        content: `Roundtable discussion — ${tableId}:`,
+        content: `The roundtable convenes — ${tableId}:`,
         variant: "roundtable",
         platform: tableId as Platform,
         workflowTaskId: taskId,
         roundtableTableId: tableId,
-        roundtableTurns: [turn],
+        roundtableFeed: [],
+        roundtableFloor: null,
         roundtableConverged: false,
         timestamp: new Date(),
       };
-      return [...prev, msg];
+      return [...prev, { ...base, ...patch(base) }];
     });
+  }
+
+  /** speaker_scheduled: the moderator hands the mic over — announce it and mark the floor. */
+  function scheduleRoundtableSpeaker(taskId: string, tableId: string, floor: RoundtableFloor) {
+    upsertRoundtable(taskId, tableId, (m) => ({
+      roundtableFeed: [
+        ...(m.roundtableFeed ?? []),
+        { kind: "announcement", speaker: floor.speaker, roundIndex: floor.roundIndex },
+      ],
+      roundtableFloor: floor,
+    }));
+  }
+
+  /** agent_utterance: the turn completed — append it and return the floor to the moderator. */
+  function appendRoundtableTurn(taskId: string, tableId: string, turn: RoundtableTurn) {
+    upsertRoundtable(taskId, tableId, (m) => ({
+      roundtableFeed: [...(m.roundtableFeed ?? []), { kind: "turn", turn }],
+      roundtableFloor:
+        m.roundtableFloor?.speaker === turn.speaker ? null : m.roundtableFloor ?? null,
+    }));
   }
 
   function finalizeRoundtable(tableId: string, strategy: Record<string, unknown> | undefined) {
@@ -488,7 +711,13 @@ export default function ChatPage() {
     setMessages((prev) =>
       prev.map((m) =>
         m.id === existingId
-          ? { ...m, roundtableConverged: true, roundtableStrategy: summary, roundControlWaiting: null }
+          ? {
+              ...m,
+              roundtableConverged: true,
+              roundtableStrategy: summary,
+              roundtableFloor: null,
+              roundControlWaiting: null,
+            }
           : m
       )
     );
@@ -589,10 +818,28 @@ export default function ChatPage() {
         }
       }
 
-      // agent_utterance: one roundtable persona (or the user) spoke — grow that table's card.
+      // speaker_scheduled: the moderator handed the mic over — announce the upcoming
+      // speaker on the stage (this is also what creates the stage, before anyone speaks).
+      // The round-0 "moderator" event is the convening announcement (emitted the moment the
+      // table starts, while the manager is still planning): create the stage so it shows
+      // "The moderator is convening the table…" instead of dead air, but give nobody the floor.
+      if (type === "speaker_scheduled") {
+        const tableId = event.table_id as string;
+        const speaker = event.speaker as string;
+        if (speaker === MODERATOR) {
+          upsertRoundtable(taskId, tableId, () => ({}));
+        } else {
+          scheduleRoundtableSpeaker(taskId, tableId, {
+            speaker,
+            roundIndex: event.round_index as number,
+          });
+        }
+      }
+
+      // agent_utterance: one roundtable persona (or the user) spoke — grow that table's stage.
       if (type === "agent_utterance") {
         const tableId = event.table_id as string;
-        upsertRoundtableTurn(taskId, tableId, {
+        appendRoundtableTurn(taskId, tableId, {
           speaker: event.speaker as string,
           role: event.role as string,
           text: event.text as string,
@@ -677,6 +924,7 @@ export default function ChatPage() {
             platform: platform as Platform,
             workflowTaskId: taskId,
             approval: "approved",
+            referenceImages: pendingRefsRef.current.length ? pendingRefsRef.current : undefined,
           });
         }
       }
@@ -726,13 +974,86 @@ export default function ChatPage() {
     }
   }
 
+  // ── Voice (native speech-to-speech, direct WS to LLM_service) ────────────────
+  // MVP: bypasses the Java backend (no WS infra there yet). Registers/reuses the same
+  // session_id the typed-chat path uses, then hands the finished brief to genWorkflow —
+  // the exact same downstream pipeline a typed message drives.
+  const voice = useRealtimeVoice({
+    targetPlatforms: selectedPlatforms,
+    onTranscript: (role, fullText, isNewTurn, audioUrl) => {
+      if (role === "user") {
+        // The user's turn arrives as one complete transcript (Whisper delivers the
+        // whole segment at once, not deltas) — one bubble, persisted immediately.
+        // The model can start replying before this catches up (transcription is a
+        // side channel, never a gate on it), so if the assistant's bubble for this
+        // exchange is already open, insert the user's bubble BEFORE it — otherwise
+        // the conversation reads out of order despite arriving in this order.
+        pushMessage({ role: "user", content: fullText, audioUrl }, streamingAssistantRef.current?.id);
+        if (sessionIdRef.current) persistMessage(sessionIdRef.current, "user", fullText);
+        return;
+      }
+      // The assistant streams many small deltas per turn — grow ONE bubble in place
+      // instead of spawning a new one per fragment. Persisted once in onTurnEnd below.
+      if (isNewTurn || !streamingAssistantRef.current) {
+        const id = pushMessage({ role: "assistant", content: fullText });
+        streamingAssistantRef.current = { id, text: fullText };
+      } else {
+        const { id } = streamingAssistantRef.current;
+        streamingAssistantRef.current.text = fullText;
+        setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, content: fullText } : m)));
+      }
+    },
+    onTurnEnd: (audioUrl) => {
+      const streaming = streamingAssistantRef.current;
+      if (streaming) {
+        if (sessionIdRef.current) persistMessage(sessionIdRef.current, "assistant", streaming.text);
+        if (audioUrl) {
+          setMessages((prev) => prev.map((m) => (m.id === streaming.id ? { ...m, audioUrl } : m)));
+        }
+      }
+      streamingAssistantRef.current = null;
+    },
+    onComplete: (briefPartial: VoiceBriefPartial) => {
+      if (briefPartial.topic) {
+        void genWorkflow(briefPartial.topic);
+      }
+    },
+    onError: (message) => {
+      pushMessage({ role: "assistant", content: `Voice error: ${message}` });
+    },
+  });
+
+  async function handleMicToggle() {
+    if (voice.status === "recording" || voice.status === "connecting") {
+      voice.stop();
+      return;
+    }
+    let sessionId = sessionIdRef.current;
+    if (!sessionId) {
+      const newId = `sess-${crypto.randomUUID()}`;
+      sessionId = newId;
+      sessionIdRef.current = newId;
+      setActiveSessionId(newId);
+      setPastSessions((prev) => [
+        { id: newId, createdAt: new Date().toISOString(), status: "running", targetPlatforms: selectedPlatforms },
+        ...prev,
+      ]);
+    }
+    await voice.start(sessionId);
+  }
+
   async function handleSend() {
     const trimmed = input.trim();
     if (!trimmed || isLoading || contentTypes.length === 0) return;
 
-    pushMessage({ role: "user", content: trimmed });
+    // Snapshot the turn's reference images, then clear the compose tray. They ride
+    // the user message and are carried (pendingRefsRef) to this run's storyboard card.
+    const refImages = attachments.map((a) => a.dataUrl);
+    pendingRefsRef.current = refImages;
+    pushMessage({ role: "user", content: trimmed, referenceImages: refImages.length ? refImages : undefined });
     historyRef.current = [...historyRef.current, { role: "user", content: trimmed }];
     setInput("");
+    setAttachments([]);
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
@@ -1002,7 +1323,7 @@ export default function ChatPage() {
             }
 
             if (msg.variant === "roundtable") {
-              return <RoundtableCard key={msg.id} message={msg} formatTime={formatTime} />;
+              return <RoundtableStage key={msg.id} message={msg} formatTime={formatTime} />;
             }
 
             if (msg.variant === "html-preview" && msg.html) {
@@ -1060,6 +1381,22 @@ export default function ChatPage() {
                   }`}
                 >
                   <p className="whitespace-pre-wrap">{msg.content}</p>
+                  {msg.audioUrl && (
+                    <div className="mt-2 flex items-center gap-2">
+                      <audio controls src={msg.audioUrl} className="h-8 max-w-[220px]" />
+                      <a
+                        href={msg.audioUrl}
+                        download={`voice-${msg.role}-${msg.id}.wav`}
+                        className={`text-xs underline flex-shrink-0 ${
+                          msg.role === "user" ? "text-[#FFCBB8] hover:text-white" : "text-[#9E9893] hover:text-[#1B1A17]"
+                        }`}
+                        aria-label="Download audio"
+                        title="Download audio"
+                      >
+                        Save
+                      </a>
+                    </div>
+                  )}
                   <p
                     className={`text-xs mt-2 ${
                       msg.role === "user" ? "text-[#FFCBB8]" : "text-[#9E9893]"
@@ -1076,7 +1413,50 @@ export default function ChatPage() {
 
         {/* Input */}
         <div className="px-6 py-4 border-t border-[#E8E3DA] bg-white flex-shrink-0">
+          {attachments.length > 0 && (
+            <div className="flex flex-wrap gap-2 mb-3">
+              {attachments.map((a, i) => (
+                <div key={i} className="relative group">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={a.dataUrl}
+                    alt={a.name}
+                    className="w-14 h-14 object-cover rounded-lg border border-[#E8E3DA]"
+                  />
+                  <button
+                    onClick={() => removeAttachment(i)}
+                    aria-label={`Remove ${a.name}`}
+                    className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-[#1B1A17] text-white text-xs flex items-center justify-center shadow hover:bg-[#FF4800] transition-colors"
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+              <span className="self-center text-[10px] text-[#9E9893]">
+                Reference image{attachments.length !== 1 ? "s" : ""} for video · {attachments.length}/3
+              </span>
+            </div>
+          )}
           <div className="flex gap-3 items-end">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              onChange={handleAttachFiles}
+              className="hidden"
+            />
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={attachments.length >= 3}
+              aria-label="Attach reference image"
+              title="Attach reference image (for AI video)"
+              className="text-[#9E9893] hover:text-[#FF4800] disabled:opacity-40 disabled:cursor-not-allowed p-3 rounded-xl border border-[#E8E3DA] hover:border-[#FFCBB8] transition-colors flex-shrink-0"
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <path d="M21.44 11.05l-9.19 9.19a5 5 0 0 1-7.07-7.07l9.19-9.19a3 3 0 0 1 4.24 4.24l-9.2 9.19a1 1 0 0 1-1.41-1.41l8.49-8.49" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
             <textarea
               ref={textareaRef}
               value={input}
@@ -1091,6 +1471,35 @@ export default function ChatPage() {
               className="flex-1 bg-[#F8F5EE] border border-[#E8E3DA] rounded-xl px-4 py-3 text-sm text-[#1B1A17] placeholder:text-[#9E9893] resize-none focus:outline-none focus:border-[#FF4800] transition-colors"
               rows={1}
             />
+            <button
+              onClick={handleMicToggle}
+              disabled={isLoading || voice.status === "connecting"}
+              className={`p-3 rounded-xl transition-colors flex-shrink-0 disabled:opacity-40 disabled:cursor-not-allowed ${
+                voice.status === "recording"
+                  ? "bg-[#FF4800] text-white hover:bg-[#E03E00]"
+                  : "bg-[#F8F5EE] text-[#6B6561] border border-[#E8E3DA] hover:text-[#1B1A17] hover:bg-[#F2EDE4]"
+              }`}
+              aria-label={voice.status === "recording" ? "Stop recording" : "Record voice message"}
+              title={voice.status === "recording" ? "Stop recording" : "Record voice message"}
+            >
+              {voice.status === "recording" ? (
+                <span className="relative flex items-center justify-center w-4 h-4">
+                  <span className="absolute inline-flex h-full w-full rounded-full bg-white opacity-40 animate-ping" />
+                  <span className="relative inline-flex rounded-sm h-2.5 w-2.5 bg-white" />
+                </span>
+              ) : (
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <rect x="5.5" y="1" width="5" height="8" rx="2.5" fill="currentColor" />
+                  <path
+                    d="M3 7.5a5 5 0 0 0 10 0M8 12.5v2.5"
+                    stroke="currentColor"
+                    strokeWidth="1.3"
+                    strokeLinecap="round"
+                    fill="none"
+                  />
+                </svg>
+              )}
+            </button>
             <button
               onClick={handleSend}
               disabled={!input.trim() || isLoading}
@@ -1175,6 +1584,43 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  const [caption, setCaption] = useState("");
+  const [postStatus, setPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
+  const [postError, setPostError] = useState<string | null>(null);
+  // Reference images carried from the compose box; the user can drop any before rendering.
+  const [refs, setRefs] = useState<string[]>(message.referenceImages ?? []);
+
+  async function handlePostVideoToLinkedIn() {
+    if (!jobId || !caption.trim()) return;
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setPostStatus("error");
+      setPostError("Log in, then connect LinkedIn from your Brand Profile before posting.");
+      return;
+    }
+    setPostStatus("posting");
+    setPostError(null);
+    try {
+      const res = await fetch("/api/linkedin/post-video", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ jobId, message: caption.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setPostStatus("error");
+        setPostError(data.error ?? "Failed to post video to LinkedIn.");
+        return;
+      }
+      setPostStatus("posted");
+    } catch {
+      setPostStatus("error");
+      setPostError("Could not reach the backend.");
+    }
+  }
 
   async function startRender() {
     if (!message.workflowTaskId || !message.platform) return;
@@ -1185,7 +1631,11 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
       const res = await fetch("/api/video", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ taskId: message.workflowTaskId, platform: message.platform }),
+        body: JSON.stringify({
+          taskId: message.workflowTaskId,
+          platform: message.platform,
+          ...(refs.length > 0 ? { referenceImages: refs } : {}),
+        }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
@@ -1261,12 +1711,69 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
 
         {(renderState === "idle" || renderState === "error") && (
           <div className="px-4 pt-1 pb-4">
+            {refs.length > 0 && (
+              <div className="mb-2">
+                <p className="text-[10px] text-[#9E9893] mb-1.5">
+                  Reference image{refs.length !== 1 ? "s" : ""} — the video is generated from these:
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {refs.map((src, i) => (
+                    <div key={i} className="relative group">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={src}
+                        alt={`reference ${i + 1}`}
+                        className="w-12 h-12 object-cover rounded-md border border-[#E8E3DA]"
+                      />
+                      <button
+                        onClick={() => setRefs((prev) => prev.filter((_, j) => j !== i))}
+                        aria-label={`Remove reference ${i + 1}`}
+                        className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-[#1B1A17] text-white text-[10px] flex items-center justify-center shadow hover:bg-[#FF4800] transition-colors"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             <button
               onClick={startRender}
               className="w-full bg-[#FF4800] hover:bg-[#E03E00] text-white text-sm font-medium py-2 rounded-lg transition-colors"
             >
               {renderState === "error" ? "Retry Render" : "Render Video"}
             </button>
+          </div>
+        )}
+
+        {renderState === "done" && message.platform === "linkedin" && (
+          <div className="px-4 pb-4 pt-1 border-t border-[#E8E3DA] space-y-2">
+            {postStatus === "posted" ? (
+              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+                ✓ Posted to LinkedIn
+              </div>
+            ) : (
+              <>
+                <textarea
+                  value={caption}
+                  onChange={(e) => setCaption(e.target.value)}
+                  placeholder="Write a caption for this video…"
+                  rows={2}
+                  disabled={postStatus === "posting"}
+                  className="w-full bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-2 text-xs text-[#1B1A17] placeholder:text-[#9E9893] resize-none focus:outline-none focus:border-[#FF4800] disabled:opacity-60"
+                />
+                <button
+                  onClick={handlePostVideoToLinkedIn}
+                  disabled={postStatus === "posting" || !caption.trim()}
+                  className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                >
+                  {postStatus === "posting" ? "Uploading & posting…" : "Post Video to LinkedIn"}
+                </button>
+              </>
+            )}
+            {postStatus === "error" && postError && (
+              <p className="text-xs text-red-600 text-center">{postError}</p>
+            )}
           </div>
         )}
 
@@ -1278,30 +1785,171 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
   );
 }
 
-// ── Roundtable Card ───────────────────────────────────────────────────────────
+// ── Roundtable Stage ──────────────────────────────────────────────────────────
 
-interface RoundtableCardProps {
+interface RoundtableStageProps {
   message: Message;
   formatTime: (d: Date) => string;
 }
 
+// The always-present AI seats; trend_scout joins only when it actually appears in the
+// stream (the backend seats it behind TREND_SCOUT_ENABLED).
+const CORE_SEATS = ["platform_editor", "brand_voice", "user_advocate", "audience_advocate"];
+
+/** Seat order around the table: the moderator chairs from the head (top), the user
+ *  sits at the foot (bottom), and the AI seats split evenly along the two sides. */
+function seatOrder(aiSeats: string[]): string[] {
+  const total = aiSeats.length + 2; // + moderator + user
+  const foot = Math.floor(total / 2); // the index that lands at the foot of the table
+  return [
+    MODERATOR,
+    ...aiSeats.slice(0, foot - 1),
+    "user",
+    ...aiSeats.slice(foot - 1),
+  ];
+}
+
+/** Evenly spaces `total` seats on the table's ellipse; index 0 lands at the head. */
+function seatPosition(index: number, total: number): { left: string; top: string } {
+  const angle = ((-90 + (index * 360) / total) * Math.PI) / 180;
+  return {
+    left: `${50 + 40 * Math.cos(angle)}%`,
+    top: `${50 + 37 * Math.sin(angle)}%`,
+  };
+}
+
+function Seat({
+  speaker,
+  stance,
+  speaking,
+  deliberating,
+  position,
+}: {
+  speaker: string;
+  stance: Stance;
+  speaking: boolean;
+  deliberating: boolean;
+  position: { left: string; top: string };
+}) {
+  const meta = personaMeta(speaker);
+  const isModerator = speaker === MODERATOR;
+  // The ring is the disagreement gauge; the moderator stays neutral by design.
+  const ringColor = isModerator ? "rgba(232,227,218,0.55)" : STANCE_META[stance].color;
+  return (
+    <div
+      className="absolute flex flex-col items-center -translate-x-1/2 -translate-y-1/2 w-24 text-center"
+      style={position}
+    >
+      <div className="relative">
+        {speaking && (
+          <span
+            className="absolute -inset-1.5 rounded-full animate-pulse"
+            style={{ background: `${meta.color}40` }}
+          />
+        )}
+        <div
+          className="relative w-12 h-12 rounded-full flex items-center justify-center transition-shadow"
+          style={{
+            background: `${meta.color}22`,
+            border: `2.5px solid ${ringColor}`,
+            boxShadow: speaking ? `0 0 20px ${meta.color}90` : "0 2px 10px rgba(0,0,0,0.45)",
+          }}
+        >
+          <svg
+            width="22"
+            height="22"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke={meta.color}
+            strokeWidth="1.8"
+            aria-hidden="true"
+          >
+            {meta.glyph}
+          </svg>
+        </div>
+      </div>
+      <span
+        className={`mt-1.5 text-[10px] font-medium leading-tight ${
+          speaking ? "text-white" : "text-white/60"
+        }`}
+      >
+        {meta.label}
+      </span>
+      {speaking && (
+        <span
+          className="text-[9px] font-semibold uppercase tracking-widest animate-pulse"
+          style={{ color: meta.color }}
+        >
+          speaking
+        </span>
+      )}
+      {deliberating && (
+        <span className="text-[9px] font-semibold uppercase tracking-widest text-white/45 animate-pulse">
+          deliberating
+        </span>
+      )}
+    </div>
+  );
+}
+
+const CLAMP_3: React.CSSProperties = {
+  display: "-webkit-box",
+  WebkitLineClamp: 3,
+  WebkitBoxOrient: "vertical",
+  overflow: "hidden",
+};
+
 /**
- * One growing card per discussion table: renders every agent_utterance turn so far,
- * in order, and — while roundtable_mode is "manual" — the step-mode 4-way prompt
- * (next / speak / enough / auto) whenever the table pauses at a round boundary. A
- * "raise hand" control is always available regardless of mode, letting the user
- * inject a message into an otherwise hands-off ("auto") discussion.
+ * One full-width boardroom per discussion table. The dark stage seats every participant
+ * around an elliptical table — moderator at the head, user at the foot — with each seat's
+ * ring showing its current disagreement temperature and a pulse on whoever holds the mic
+ * (speaker_scheduled announces the handoff before the turn completes). The minutes panel
+ * keeps the full transcript, moderator announcements included; below it live the step-mode
+ * round controls (manual mode) and the always-available raise-hand seat.
  */
-function RoundtableCard({ message, formatTime }: RoundtableCardProps) {
+function RoundtableStage({ message, formatTime }: RoundtableStageProps) {
   const [handRaised, setHandRaised] = useState(false);
   const [sayText, setSayText] = useState("");
   const [speakText, setSpeakText] = useState("");
   const [busy, setBusy] = useState(false);
+  const feedEndRef = useRef<HTMLDivElement>(null);
 
   const taskId = message.workflowTaskId;
   const tableId = message.roundtableTableId;
-  const turns = message.roundtableTurns ?? [];
+  const feed = message.roundtableFeed ?? [];
+  const floor = message.roundtableFloor;
   const waiting = message.roundControlWaiting;
+  const converged = message.roundtableConverged;
+
+  // Keep the minutes pinned to the latest entry as the discussion streams in.
+  useEffect(() => {
+    feedEndRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [feed.length]);
+
+  const speakersSeen = new Set(
+    feed.map((f) => (f.kind === "turn" ? f.turn.speaker : f.speaker))
+  );
+  const aiSeats = [...CORE_SEATS];
+  if (speakersSeen.has("trend_scout")) aiSeats.push("trend_scout");
+  for (const s of speakersSeen) {
+    if (!aiSeats.includes(s) && s !== "user" && s !== MODERATOR) aiSeats.push(s);
+  }
+  const seats = seatOrder(aiSeats);
+  const stances = seatStances(feed);
+
+  let lastTurn: RoundtableTurn | null = null;
+  for (let i = feed.length - 1; i >= 0; i--) {
+    const item = feed[i];
+    if (item.kind === "turn") {
+      lastTurn = item.turn;
+      break;
+    }
+  }
+  const round = feed.reduce(
+    (r, f) => Math.max(r, f.kind === "turn" ? f.turn.roundIndex : f.roundIndex),
+    0
+  );
+  const turnCount = feed.filter((f) => f.kind === "turn").length;
 
   async function postJson(url: string, body: unknown) {
     try {
@@ -1343,44 +1991,184 @@ function RoundtableCard({ message, formatTime }: RoundtableCardProps) {
     setBusy(false);
   }
 
+  // What the centre of the table shows: the consensus, the moderator's handoff, or the
+  // latest spoken point — the "who is talking right now" anchor.
+  let centre: React.ReactNode;
+  if (converged) {
+    centre = (
+      <>
+        <p className="text-sm font-semibold text-green-400">✓ Consensus reached</p>
+        {message.roundtableStrategy && (
+          <p className="mt-1 text-[11px] text-white/60 leading-relaxed" style={CLAMP_3}>
+            {message.roundtableStrategy}
+          </p>
+        )}
+      </>
+    );
+  } else if (floor) {
+    const meta = personaMeta(floor.speaker);
+    centre = (
+      <p className="text-xs text-white/60 leading-relaxed">
+        The moderator gives the floor to{" "}
+        <span className="font-semibold" style={{ color: meta.color }}>
+          {meta.label}
+        </span>
+      </p>
+    );
+  } else if (lastTurn) {
+    const meta = personaMeta(lastTurn.speaker);
+    centre = (
+      <>
+        <p className="text-[10px] font-semibold uppercase tracking-widest mb-1" style={{ color: meta.color }}>
+          {meta.label}
+        </p>
+        <p className="text-[11px] text-white/75 leading-relaxed" style={CLAMP_3}>
+          {lastTurn.text}
+        </p>
+      </>
+    );
+  } else {
+    centre = (
+      <p className="text-xs text-white/40 italic">The moderator is convening the table…</p>
+    );
+  }
+
   return (
-    <div className="w-full max-w-lg">
+    <div className="w-full">
       <p className="text-sm text-[#6B6561] mb-2">{message.content}</p>
       <div className="bg-white border border-[#E8E3DA] rounded-2xl overflow-hidden shadow-sm">
+        {/* Header */}
         <div className="flex items-center justify-between px-4 py-2.5 bg-[#1B1A17] text-white">
-          <span className="text-sm font-semibold">🗣️ Roundtable — {tableId}</span>
-          {message.roundtableConverged && (
+          <div className="flex items-baseline gap-2.5">
+            <span className="text-sm font-semibold">
+              Roundtable — {platformMap[tableId ?? ""]?.label ?? tableId}
+            </span>
+            {round > 0 && !converged && (
+              <span className="text-[10px] text-white/50 font-medium">Round {round}</span>
+            )}
+          </div>
+          {converged ? (
             <span className="text-xs bg-green-500 text-white px-2 py-0.5 rounded-full font-medium">
-              Converged
+              Consensus reached
+            </span>
+          ) : (
+            <span className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-widest text-white/70">
+              <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+              Live
             </span>
           )}
         </div>
 
-        <div className="max-h-72 overflow-y-auto p-4 space-y-3 bg-[#F8F5EE]">
-          {turns.length === 0 && (
-            <p className="text-xs text-[#9E9893] italic">Waiting for the first speaker…</p>
-          )}
-          {turns.map((turn, i) => {
-            const info = speakerInfo(turn.speaker);
-            return (
-              <div key={i} className="bg-white border border-[#E8E3DA] rounded-xl px-3 py-2">
-                <div className="flex items-center gap-2 mb-1">
-                  <span
-                    className={`text-[10px] font-bold text-white px-1.5 py-0.5 rounded ${info.badge}`}
-                  >
-                    {info.label}
-                  </span>
-                  <span className="text-[10px] text-[#9E9893]">round {turn.roundIndex}</span>
-                </div>
-                <p className="text-sm text-[#1B1A17] whitespace-pre-wrap leading-relaxed">
-                  {turn.text}
+        <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+          {/* The boardroom */}
+          <div className="relative h-[340px] sm:h-[400px] bg-[#161411] overflow-hidden">
+            {/* Spotlight over the table */}
+            <div
+              className="absolute inset-0"
+              style={{
+                background:
+                  "radial-gradient(ellipse 62% 52% at 50% 46%, rgba(255,240,220,0.10), transparent 70%)",
+              }}
+            />
+            {/* The table itself */}
+            <div
+              className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-[50%]"
+              style={{
+                width: "60%",
+                height: "44%",
+                background: "linear-gradient(165deg, #3B372F 0%, #27231e 70%)",
+                border: "1px solid rgba(255,255,255,0.09)",
+                boxShadow:
+                  "inset 0 2px 16px rgba(255,255,255,0.05), 0 20px 44px rgba(0,0,0,0.55)",
+              }}
+            />
+            {/* Centre of the table: who has the floor / the latest point / the consensus */}
+            <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[42%] text-center">
+              {centre}
+            </div>
+            {seats.map((s, i) => (
+              <Seat
+                key={s}
+                speaker={s}
+                position={seatPosition(i, seats.length)}
+                stance={stances[s] ?? "idle"}
+                speaking={floor?.speaker === s}
+                deliberating={
+                  s === MODERATOR && !converged && !floor && feed.length > 0
+                }
+              />
+            ))}
+          </div>
+
+          {/* Minutes: the full transcript, announcements included */}
+          <div className="flex flex-col h-[280px] lg:h-auto lg:max-h-[400px] border-t lg:border-t-0 lg:border-l border-[#E8E3DA] bg-[#FBF9F4]">
+            <div className="flex items-center justify-between px-3 py-2 border-b border-[#E8E3DA] flex-shrink-0">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-[#9E9893]">
+                Minutes
+              </span>
+              <span className="text-[10px] text-[#BDB6AE]">
+                {turnCount} {turnCount === 1 ? "turn" : "turns"}
+              </span>
+            </div>
+            <div className="flex-1 overflow-y-auto p-3 space-y-2">
+              {feed.length === 0 && (
+                <p className="text-xs text-[#9E9893] italic">
+                  The table is being seated…
                 </p>
-              </div>
-            );
-          })}
+              )}
+              {feed.map((item, i) => {
+                if (item.kind === "announcement") {
+                  const meta = personaMeta(item.speaker);
+                  return (
+                    <p key={i} className="text-[10px] text-[#9E9893] italic text-center py-0.5">
+                      {item.speaker === "user"
+                        ? "The moderator invites you to speak"
+                        : `The moderator gives the floor to ${meta.label}`}{" "}
+                      · round {item.roundIndex}
+                    </p>
+                  );
+                }
+                const meta = personaMeta(item.turn.speaker);
+                const stance = STANCE_META[stanceOf(item.turn.text)];
+                return (
+                  <div key={i} className="bg-white border border-[#E8E3DA] rounded-lg px-2.5 py-2">
+                    <div className="flex items-center gap-1.5 mb-1">
+                      <span
+                        className="w-2 h-2 rounded-full flex-shrink-0"
+                        style={{ background: meta.color }}
+                      />
+                      <span className="text-[10px] font-bold text-[#1B1A17]">{meta.label}</span>
+                      <span
+                        className="w-1.5 h-1.5 rounded-full ml-auto flex-shrink-0"
+                        title={stance.label}
+                        style={{ background: stance.color }}
+                      />
+                    </div>
+                    <p className="text-xs text-[#1B1A17] whitespace-pre-wrap leading-relaxed">
+                      {item.turn.text}
+                    </p>
+                  </div>
+                );
+              })}
+              <div ref={feedEndRef} />
+            </div>
+          </div>
         </div>
 
-        {waiting && !message.roundtableConverged && (
+        {/* Disagreement legend */}
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 px-4 py-2 border-t border-[#E8E3DA] bg-white">
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-[#9E9893]">
+            Seat rings
+          </span>
+          {(["aligned", "cautious", "pushback", "opposed"] as Stance[]).map((s) => (
+            <span key={s} className="flex items-center gap-1.5 text-[10px] text-[#6B6561]">
+              <span className="w-2 h-2 rounded-full" style={{ background: STANCE_META[s].color }} />
+              {STANCE_META[s].label}
+            </span>
+          ))}
+        </div>
+
+        {waiting && !converged && (
           <div className="px-4 pt-2 pb-3 border-t border-[#E8E3DA] space-y-2">
             <p className="text-xs text-[#9E9893]">
               The table is waiting for your call — round {waiting.roundIndex}
@@ -1427,7 +2215,7 @@ function RoundtableCard({ message, formatTime }: RoundtableCardProps) {
           </div>
         )}
 
-        {!message.roundtableConverged && !waiting && (
+        {!converged && !waiting && (
           <div className="px-4 pt-2 pb-3 border-t border-[#E8E3DA]">
             {!handRaised ? (
               <button
@@ -1457,8 +2245,8 @@ function RoundtableCard({ message, formatTime }: RoundtableCardProps) {
           </div>
         )}
 
-        {message.roundtableConverged && message.roundtableStrategy && (
-          <div className="px-4 pb-3 pt-1 text-xs text-[#6B6561] border-t border-[#E8E3DA]">
+        {converged && message.roundtableStrategy && (
+          <div className="px-4 pb-3 pt-2 text-xs text-[#6B6561] border-t border-[#E8E3DA]">
             <span className="text-[#9E9893]">Strategy: </span>
             {message.roundtableStrategy}
           </div>
@@ -1613,6 +2401,49 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
   const approval = message.approval;
   const [postStatus, setPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
   const [postError, setPostError] = useState<string | null>(null);
+  // Image posting is tracked separately from the text post so the two buttons don't clobber
+  // each other's status. The user attaches a real image file; it's uploaded as multipart.
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [imagePostStatus, setImagePostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
+  const [imagePostError, setImagePostError] = useState<string | null>(null);
+
+  // The caption used for both text and image posts: the draft body plus any hashtags.
+  const captionText =
+    draft.hashtags && draft.hashtags.length > 0
+      ? `${draft.text}\n\n${draft.hashtags.join(" ")}`
+      : draft.text;
+
+  async function handlePostImageToLinkedIn() {
+    if (!imageFile) return;
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setImagePostStatus("error");
+      setImagePostError("Log in, then connect LinkedIn from your Brand Profile before posting.");
+      return;
+    }
+    setImagePostStatus("posting");
+    setImagePostError(null);
+    try {
+      const form = new FormData();
+      form.append("image", imageFile);
+      form.append("message", captionText);
+      const res = await fetch("/api/linkedin/post-image", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setImagePostStatus("error");
+        setImagePostError(data.error ?? "Failed to post image to LinkedIn.");
+        return;
+      }
+      setImagePostStatus("posted");
+    } catch {
+      setImagePostStatus("error");
+      setImagePostError("Could not reach the backend.");
+    }
+  }
 
   async function handlePostToLinkedIn() {
     const token = localStorage.getItem("starlight_token");
@@ -1623,10 +2454,7 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
     }
     setPostStatus("posting");
     setPostError(null);
-    const text =
-      draft.hashtags && draft.hashtags.length > 0
-        ? `${draft.text}\n\n${draft.hashtags.join(" ")}`
-        : draft.text;
+    const text = captionText;
     try {
       const res = await fetch("/api/linkedin/post", {
         method: "POST",
@@ -1736,6 +2564,38 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
             {postStatus === "error" && postError && (
               <p className="text-xs text-red-600 mt-2 text-center">{postError}</p>
             )}
+
+            {/* Optional: attach an image and publish it with this caption as an image post. */}
+            <div className="mt-3 pt-3 border-t border-[#E8E3DA]">
+              {imagePostStatus === "posted" ? (
+                <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+                  ✓ Image posted to LinkedIn
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => {
+                      setImageFile(e.target.files?.[0] ?? null);
+                      setImagePostStatus("idle");
+                      setImagePostError(null);
+                    }}
+                    className="block w-full text-xs text-[#6B6561] file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border file:border-[#E8E3DA] file:bg-[#F2EDE4] file:text-[#1B1A17] file:text-xs file:font-medium hover:file:bg-[#E8E3DA]"
+                  />
+                  <button
+                    onClick={handlePostImageToLinkedIn}
+                    disabled={!imageFile || imagePostStatus === "posting"}
+                    className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                  >
+                    {imagePostStatus === "posting" ? "Uploading & posting…" : "Post Image to LinkedIn"}
+                  </button>
+                </div>
+              )}
+              {imagePostStatus === "error" && imagePostError && (
+                <p className="text-xs text-red-600 mt-2 text-center">{imagePostError}</p>
+              )}
+            </div>
           </div>
         )}
 
