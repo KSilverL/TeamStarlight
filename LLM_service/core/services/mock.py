@@ -92,6 +92,7 @@ _PLATFORM_FOCUS: Dict[str, str] = {
     "x": "emotional resonance and brevity",
     "instagram": "visual storytelling and lifestyle",
     "tiktok": "playful, trend-native hooks",
+    "facebook": "community connection and shareable storytelling",
 }
 
 _MOCK_LATENCY = 0.0  # bump for demos; kept 0 so tests are instant
@@ -99,6 +100,13 @@ _MOCK_LATENCY = 0.0  # bump for demos; kept 0 so tests are instant
 
 def _focus(platform: str) -> str:
     return _PLATFORM_FOCUS.get(platform.lower(), "general audience engagement")
+
+
+def _first_bullet(block: str) -> str:
+    """The first "- " bullet in a pre-rendered prompt block, or "" — the deterministic
+    lever the mock uses to prove a context block (trends / brand / user) was injected;
+    an empty block yields "" so the output stays byte-identical (degrade-to-empty)."""
+    return next((ln[2:] for ln in block.splitlines() if ln.startswith("- ")), "")
 
 
 def _alias(platform: str) -> str:
@@ -405,7 +413,7 @@ def _mock_scene_component(*, broken: bool) -> str:
 
 
 def _mock_storyboard(topic: str, draft: str, tone_hint: Optional[str], platform: str) -> dict:
-    """A deterministic 4-slide StoryboardSpec-shaped dict — one of each Phase 1 slide
+    """A deterministic 4-slide StoryboardSpec-shaped dict — one of each core slide
     type, in a typical order (hook -> collage -> counter_stat -> outro), so
     contract-parity / shape tests have something stable to assert on."""
     primary, secondary, accent = _MEDIA_PALETTE
@@ -455,7 +463,15 @@ class MockLLM(LLMService):
         }
 
     async def plan_strategy(
-        self, *, topic: str, platform: str, user_intent: str, trends: str = ""
+        self,
+        *,
+        topic: str,
+        platform: str,
+        user_intent: str,
+        trends: str = "",
+        skill: str = "",
+        brand_block: str = "",
+        user_block: str = "",
     ) -> str:
         await asyncio.sleep(_MOCK_LATENCY)
         intent = user_intent or "raise awareness"
@@ -463,11 +479,19 @@ class MockLLM(LLMService):
             f"On {platform}, lead with {_focus(platform)}. "
             f"Anchor it to '{topic}' and aim to {intent}."
         )
-        # Deterministic trend fusion: weave the block's FIRST trend line in verbatim, so
-        # tests can assert the injection; empty block leaves the strategy byte-identical.
-        first = next((ln[2:] for ln in trends.splitlines() if ln.startswith("- ")), "")
-        if first:
-            strategy += f" If it genuinely fits, ride this current trend: {first}"
+        # Deterministic context fusion (same lever for every block): weave each block's
+        # FIRST bullet in verbatim so tests can assert the injection; an empty block leaves
+        # the strategy byte-identical (degrade-to-empty). `skill` is free-form house style,
+        # not a bulleted block, so it steers the (real) prompt but not the mock's fixed text.
+        brand_first = _first_bullet(brand_block)
+        if brand_first:
+            strategy += f" Honour the brand voice: {brand_first}."
+        user_first = _first_bullet(user_block)
+        if user_first:
+            strategy += f" Reflect this user's preference: {user_first}."
+        trend_first = _first_bullet(trends)
+        if trend_first:
+            strategy += f" If it genuinely fits, ride this current trend: {trend_first}"
         return strategy
 
     async def suggest_topic(
@@ -875,8 +899,8 @@ class MockLLM(LLMService):
 # The roundtable runs real MAF Magentic agents; each persona is an `Agent` backed by a
 # chat client. This mock implements the installed `BaseChatClient` contract and returns
 # deterministic, scripted text keyed by (agent_name, call_index) — so a discussion is
-# fully reproducible offline (the production counterpart, an OpenAIChatClient, lands in
-# Phase 2). The agent name encodes the persona role; `call_index` advances each turn.
+# fully reproducible offline (the production counterpart is AzureChatClient).
+# The agent name encodes the persona role; `call_index` advances each turn.
 
 _ROUNDTABLE_PERSONA_LINES: Dict[str, List[str]] = {
     "platform_editor": [
@@ -1144,7 +1168,7 @@ class MockVoice(VoiceService):
         await asyncio.sleep(_MOCK_LATENCY)
         # Deterministic "transcription": the offline script provides the spoken words,
         # so a faithful transcript is the verbatim text. This makes a voice intake
-        # produce a CreativeBrief identical to the same words typed (§4.4).
+        # produce a CreativeBrief identical to the same words typed.
         return {"session_id": session_id, "transcript": user_audio.strip()}
 
 

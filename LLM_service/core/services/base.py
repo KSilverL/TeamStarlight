@@ -4,12 +4,15 @@ honor. The return shapes declared here ARE the contract: a Mock* and its Azure*
 counterpart must produce structurally identical results (verified by
 tests/test_contract_parity.py).
 
-The MAF "virtual newsroom" needs four services (MIGRATION_PLAN §6):
+The core services backing the "virtual newsroom":
 
     LLMService     chat / structured output / copywriting   (Azure OpenAI / Foundry)
     SafetyService  content-safety screening                 (Azure AI Content Safety)
     StoreService   brand profiles + workflow checkpoints     (PostgreSQL)
     VoiceService   voice-intake transport bridge             (Voice Live API)
+
+plus the render-pipeline asset services (image search / background removal / music /
+voiceover / video generation), realtime voice, and web research — see __all__ below.
 
 Executors never construct Mock*/Azure* directly — they go through
 core.services.factory, which maps the feature toggle to a concrete impl. That
@@ -64,6 +67,24 @@ def empty_profile(business_id: Optional[str]) -> dict:
     }
 
 
+def render_brand_profile(profile: dict) -> str:
+    """Render a Brand_Voice_Profile as a prompt block (empty string when cold-start).
+    Lives in core so both the roundtable's `brand_voice` seat AND the linear strategist /
+    plan layer share ONE renderer (like `render_trends`); `workflow/roundtable/personas.py`
+    re-exports it for back-compat."""
+    must_do = profile.get("must_do") or []
+    must_avoid = profile.get("must_avoid") or []
+    examples = [e.get("text", "") for e in (profile.get("examples") or []) if e.get("text")]
+    parts: List[str] = []
+    if must_do:
+        parts.append("BRAND MUST DO:\n" + "\n".join(f"- {x}" for x in must_do))
+    if must_avoid:
+        parts.append("BRAND MUST AVOID:\n" + "\n".join(f"- {x}" for x in must_avoid))
+    if examples:
+        parts.append("BRAND EXAMPLES:\n" + "\n".join(f"- {x}" for x in examples))
+    return "\n\n".join(parts)
+
+
 # ── LLM ───────────────────────────────────────────────────────────────────────
 
 class LLMService(ABC):
@@ -97,14 +118,25 @@ class LLMService(ABC):
         platform: str,
         user_intent: str,
         trends: str = "",
+        skill: str = "",
+        brand_block: str = "",
+        user_block: str = "",
     ) -> str:
         """Return a platform-differentiated *strategy* (not copy) — the angle the
         creator should take on this platform. `trends` is a pre-rendered CURRENT TRENDS
-        block (`core.trend_schema.render_trends` — the Phase 4 spread of the daily
-        snapshot beyond the roundtable): when non-empty an impl offers to fuse ONE
+        block (`core.trend_schema.render_trends`, from the daily
+        snapshot): when non-empty an impl offers to fuse ONE
         genuinely-fitting trend into the angle, with explicit permission to use none —
-        a forced trend is worse than none. Empty means no trends available/enabled and
-        MUST leave the strategy exactly as before (degrade-to-empty rule)."""
+        a forced trend is worse than none.
+
+        `skill` / `brand_block` / `user_block` are the same context the roundtable brings
+        to bear, so a NON-roundtable run reasons with the platform style guide
+        (`skills/<platform>.md`), the brand voice profile (`render_brand_profile`), and
+        this user's learned rules (`render_user_skills`) rather than from the topic alone —
+        making the linear strategist as informed as a discussion table would be. Every one
+        of these blocks is optional and follows the degrade-to-empty rule: an empty block
+        MUST leave the strategy exactly as it would be without it (so the pre-Phase-4
+        topic-only call is byte-identical)."""
         ...
 
     @abstractmethod
@@ -205,15 +237,14 @@ class LLMService(ABC):
         history: Optional[List[dict]] = None,
     ) -> str:
         """Generate a SINGLE, self-contained animated HTML document from an approved
-        post (the "生成 HTML" idea, ported from demos/brand_agent). Returns a complete
-        9:16 brand "video card" — inline CSS keyframes + SVG, auto-advancing scenes, no
-        external assets — ready to drop straight into the frontend. `skill` is the
-        static brand-animation style guide (skills/brand_animation.md): production folds
-        it into the prompt, the mock renders a deterministic offline card. The output
-        starts with `<!DOCTYPE html>` and embeds no raw user copy (the draft is escaped),
-        replacing the old template preview card. `history` (optional) is the prior
-        {role, content} conversation the caller assembled, folded in as context so a
-        follow-up card request can build on the thread; None/empty = single-turn."""
+        post. Returns a complete 9:16 brand "video card" — inline CSS keyframes + SVG,
+        auto-advancing scenes, no external assets — ready to drop straight into the
+        frontend. `skill` is the static brand-animation style guide
+        (skills/brand_animation.md): production folds it into the prompt, the mock
+        renders a deterministic offline card. The output starts with `<!DOCTYPE html>`
+        and embeds no raw user copy (the draft is escaped). `history` (optional) is the
+        prior {role, content} conversation the caller assembled, folded in as context so
+        a follow-up card request can build on the thread; None/empty = single-turn."""
         ...
 
     @abstractmethod
@@ -385,7 +416,7 @@ class LLMService(ABC):
 
     @abstractmethod
     async def plan_scene_design(self, *, description: str, data: dict) -> str:
-        """Stage 1 of two-stage `generated`-slide codegen (video-agent Phase 5): a
+        """Stage 1 of two-stage `generated`-slide codegen: a
         short visual concept (5-8 plain-text bullets — layout, dominant element,
         motion beats, backdrop/palette) produced BEFORE any code, then passed to
         every generate_scene_component call for that slide as `design_plan` so the
@@ -397,8 +428,8 @@ class LLMService(ABC):
     async def review_scene_preview(
         self, *, description: str, image_bytes: bytes, attempt: int = 1,
     ) -> dict:
-        """Multimodal visual QA for a `generated` slide (Phase 3 of the video-agent
-        plan): given the ORIGINAL creative brief (`description`) and a still frame
+        """Multimodal visual QA for a `generated` slide:
+        given the ORIGINAL creative brief (`description`) and a still frame
         (PNG bytes) rendered from the just-typechecked, just-rendered candidate
         component, judge whether it actually looks right — not just "did it compile
         and render without throwing" (workflow/video/codegen.py's typecheck +
@@ -408,7 +439,7 @@ class LLMService(ABC):
         is contextual only (which retry this is), mirroring `generate_scene_component`.
 
         Returns {"approved": bool, "feedback": str, "fixes": list[str]}. `feedback`
-        is empty when approved; `fixes` (Phase 5) is 1-3 concrete, imperative repair
+        is empty when approved; `fixes` is 1-3 concrete, imperative repair
         instructions when NOT approved (empty when approved), which codegen.py folds
         into the next attempt's `prior_error` (e.g. "move the caption above y=1700",
         not "looks bad"). Called only after typecheck + preview-render both already
@@ -469,7 +500,7 @@ class SafetyService(ABC):
 
 class StoreService(ABC):
     """Brand_Voice_Profile reads/writes plus workflow checkpoint persistence.
-    The vector RAG line is gone — preferences are human-readable, taggable rules
+    There is no vector RAG — preferences are human-readable, taggable rules
     (must_do / must_avoid / examples)."""
 
     @abstractmethod
@@ -573,9 +604,8 @@ class StoreService(ABC):
 # ── Voice (Voice Live bridge) ─────────────────────────────────────────────────
 
 class VoiceService(ABC):
-    """Transport bridge for the voice intake entry point. The full voice
-    conversation state machine lands in M3; M1 only fixes the contract so the
-    factory + parity tests cover all four services."""
+    """Transport bridge for the voice intake entry point: one spoken turn in,
+    its transcript out. The conversation state machine lives in intake/."""
 
     @abstractmethod
     async def transcribe_turn(self, *, session_id: str, user_audio: str) -> dict:
@@ -737,8 +767,8 @@ class MusicGenerationService(ABC):
 # ── Voiceover (Azure Speech text-to-speech) ────────────────────────────────────
 
 class VoiceoverService(ABC):
-    """Narration text-to-speech for an optional voiceover track (Phase 3 of the
-    video-agent plan) — distinct from VoiceService above, which bridges SPOKEN
+    """Narration text-to-speech for an optional voiceover track
+    — distinct from VoiceService above, which bridges SPOKEN
     input during intake (speech-to-text); this is spoken OUTPUT for a rendered
     video. `workflow/video/voiceover.py` sizes/mixes the result; callers there
     treat a hard failure as "no voiceover" (mirrors MusicGenerationService), never

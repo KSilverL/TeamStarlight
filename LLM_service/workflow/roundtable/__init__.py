@@ -1,8 +1,7 @@
 """
 The roundtable discussion stage: a multi-persona, manager-moderated debate (one table per
 platform) that converges on a `CreativeStrategy` — a drop-in replacement for the strategist's
-output (see CLAUDE.md / docs/ROUNDTABLE_IMPLEMENTATION.md). Phase 1 ships the deterministic,
-fully-mocked single-table path.
+output (see CLAUDE.md / docs/ROUNDTABLE_IMPLEMENTATION.md).
 """
 
 from __future__ import annotations

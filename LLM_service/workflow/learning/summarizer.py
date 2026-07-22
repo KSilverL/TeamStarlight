@@ -1,12 +1,12 @@
 """
-Per-user preference summariser — the single user-side distiller (§6.5 write side).
+Per-user preference summariser — the single user-side distiller.
 
 `summarize_preferences` runs through `LLMService` (mock = deterministic; production uses the
 cheap `PREFERENCE_SUMMARY_MODEL` tier) to distil the user's preferences from whatever user
 signal a run produced — the discussion transcript and/or the user's intake turns (the archivist
 merges both into one transcript), plus their final verdict — returning a `PreferenceSummary`
 with `evidence` that traces each learned skill back to the turn/edit it came from. This is the
-only per-user distiller (the legacy `summarize_session` intake-only path is gone).
+only per-user distiller.
 
 `preference_candidates` adapts that summary to the existing per-user learning types
 (`SkillCandidate`), so the write-back can reuse `consolidate_skills` + `upsert_user_skills`

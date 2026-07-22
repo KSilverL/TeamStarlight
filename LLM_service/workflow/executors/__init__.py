@@ -6,7 +6,7 @@ core.services.factory (so it stays mock/prod-agnostic), and emits the next typed
 message. They hold no per-run state, so MAF can checkpoint and resume them across
 the RequestPort pause.
 
-Brand-voice rule distillation is no longer an in-graph executor: it runs at the service
+Brand-voice rule distillation is not an in-graph executor: it runs at the service
 layer after the user confirms learning (see api.py confirm_learning + workflow/learning/).
 """
 

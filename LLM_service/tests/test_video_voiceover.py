@@ -1,5 +1,5 @@
 """
-Voiceover resolution (Phase 3 of the autonomous video-agent plan) —
+Voiceover resolution —
 workflow/video/voiceover.py's degrade-gracefully shape (mirrors test_video_music.py
 for the music-resolution step): opt-in (no narration_text -> no-op), a real
 (silent) decodable MP3 in mock mode, and a failure that never aborts the render.

@@ -124,7 +124,7 @@ async def test_scenario_brand_training_self_evolves(make_brief):
     assert any(r["rule"] in draft2 for r in must_do)
 
 
-# ── 5. Roundtable drops in for strategist (Phase 6, end-to-end) ───────────────
+# ── 5. Roundtable drops in for strategist (end-to-end) ────────────────────────
 
 async def test_scenario_roundtable_end_to_end(monkeypatch):
     """ROUNDTABLE_ENABLED=true: brief → multi-persona discussion (per platform) → drafts →
@@ -199,7 +199,7 @@ async def test_scenario_roundtable_media_only_skips_text_and_gate(monkeypatch):
 
 async def test_scenario_roundtable_disabled_uses_strategist(monkeypatch):
     """Regression guard: with the flag OFF the front of the pipeline is the original
-    dispatcher → strategist (no discussion events), unchanged from before Phase 6."""
+    dispatcher → strategist (no discussion events)."""
     monkeypatch.setenv("ROUNDTABLE_ENABLED", "false")
     reset_settings()
 

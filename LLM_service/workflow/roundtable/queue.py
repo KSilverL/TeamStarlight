@@ -1,5 +1,5 @@
 """
-Persisted user-utterance queue for the roundtable (§1 decision 4 / Phase 3).
+Persisted user-utterance queue for the roundtable.
 
 The user "raises a hand" any time by enqueuing an utterance (POST /tasks/{id}/say); at a
 round boundary the manager checks this queue and, if non-empty, hands the mic to the user

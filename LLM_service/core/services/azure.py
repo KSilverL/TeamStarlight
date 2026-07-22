@@ -1,7 +1,7 @@
 """
 Azure-backed production implementations (LLM / Safety / Voice).
 
-All three are wired to real backends (M4): `AzureLLM` → Azure OpenAI / Foundry chat
+All three are wired to real backends: `AzureLLM` → Azure OpenAI / Foundry chat
 (the dispatcher/strategist/creator prompt-building lives here so executors stay
 logic-free); `AzureSafety` → Azure AI Content Safety `analyze_text`; `AzureVoice` →
 the Voice Live API WebSocket (STT for one spoken turn). The factory refuses to hand
@@ -61,16 +61,15 @@ def _voice_live_ws_url(settings: Settings) -> str:
         f"?api-version={settings.azure_voicelive_api_version}&model={settings.azure_voicelive_model}"
     )
 
-# Discriminated-union storyboard JSON is meaningfully harder for the model to nail
-# on the first try than the old fixed shape — bounded retry, re-prompting with the
-# validation error, before failing loudly.
+# Discriminated-union storyboard JSON is hard for the model to nail on the first
+# try — bounded retry, re-prompting with the validation error, before failing loudly.
 _VIDEO_STORYBOARD_MAX_ATTEMPTS = 3
 _PLAN_CAMPAIGN_MAX_ATTEMPTS = 3
 
 
 def _strip_fences(text: str) -> str:
     """Drop an accidental ```html / ```json … ``` wrapper the model may add around a
-    raw HTML document or JSON object (ported from demos/brand_agent's post-processing)."""
+    raw HTML document or JSON object."""
     s = text.strip()
     if s.startswith("```"):
         newline = s.find("\n")
@@ -80,7 +79,7 @@ def _strip_fences(text: str) -> str:
     return s.strip()
 
 
-# ── Scene-codegen prompt assets (video-agent Phase 5) ─────────────────────────
+# ── Scene-codegen prompt assets ───────────────────────────────────────────────
 
 # The design-system exports a generated scene may import — mirrors the barrel at
 # video_renderer/src/design/index.ts. Using them yields consistent, on-brand motion
@@ -167,11 +166,10 @@ class AzureLLM(LLMService):
                 # scene-codegen loop in particular used to burn a whole retry
                 # attempt (a real compile + preview render) on one transient HTTP
                 # blip because nothing retried at this layer.
-                # 300s (not the old 120s): a reasoning-tier codegen call
-                # (CODEGEN_REASONING_EFFORT) can legitimately run past 120s, and at
-                # 120s a real slow-but-successful call was getting killed and
-                # retried up to max_retries times, compounding into a multi-minute
-                # timeout storm that surfaced as an uncaught exception.
+                # 300s: a reasoning-tier codegen call (CODEGEN_REASONING_EFFORT)
+                # can legitimately run past 120s; a tighter timeout kills a
+                # slow-but-successful call, and the SDK then retries it up to
+                # max_retries times — compounding into a multi-minute timeout storm.
                 max_retries=3,
                 timeout=300.0,
             )
@@ -247,12 +245,48 @@ class AzureLLM(LLMService):
         }
 
     async def plan_strategy(
-        self, *, topic: str, platform: str, user_intent: str, trends: str = ""
+        self,
+        *,
+        topic: str,
+        platform: str,
+        user_intent: str,
+        trends: str = "",
+        skill: str = "",
+        brand_block: str = "",
+        user_block: str = "",
     ) -> str:
+        # A senior strategist brief, not a one-liner: the creator drafts straight off this,
+        # so it must carry a real point of view. Still STRATEGY (the angle), never the copy.
         system = (
-            f"You are a content strategist. Produce a short {platform} content *strategy* "
-            "(the angle, not the copy)."
+            f"You are a senior {platform} content strategist. Produce a sharp, opinionated "
+            f"content *strategy* for this brief (the angle and plan, NOT the finished copy). "
+            "Keep it tight — a few lines, no preamble — and cover:\n"
+            "- AUDIENCE: who this is for on this platform and their state of mind.\n"
+            "- ANGLE: the single most compelling hook/entry point (commit to ONE).\n"
+            "- KEY MESSAGE: the one thing they should remember.\n"
+            "- DIFFERENTIATION: why this beats the obvious, generic take.\n"
+            "- FORMAT: the native structure that fits this platform (and a CTA direction).\n"
+            "Do not write the actual post. Be specific to THIS topic and goal — no filler."
         )
+        if skill:
+            # The same platform style guide the creator writes against, so the strategy is
+            # already shaped to the platform's format/length/tone conventions.
+            system += (
+                "\n\nRespect this platform's house style when shaping the angle and format:\n\n"
+                + skill
+            )
+        if brand_block:
+            # Dynamic layer (branded users): steer the angle by the brand's learned voice.
+            system += (
+                "\n\nThis brand has a learned voice. Let it steer the angle (honour MUST DO, "
+                "steer clear of MUST AVOID):\n\n" + brand_block
+            )
+        if user_block:
+            # Per-user layer: this user's learned preferences from past runs.
+            system += (
+                "\n\nThis user has learned preferences from past posts. Favour them:\n\n"
+                + user_block
+            )
         if trends:
             # Same fusion-with-rejection-permission framing as the roundtable's trend_scout
             # seat — a forced trend is worse than none.
@@ -585,7 +619,7 @@ class AzureLLM(LLMService):
         }
 
     async def plan_scene_design(self, *, description: str, data: dict) -> str:
-        """Stage 1 of two-stage codegen (video-agent Phase 5): a short visual concept
+        """Stage 1 of two-stage codegen: a short visual concept
         for a `generated` scene BEFORE any code is written. Returns 5-8 plain-text
         bullets (layout regions, motion beats, palette/backdrop choice) that ride
         along in every generate/repair call for the slide — so repairs fix code
@@ -928,7 +962,7 @@ class AzureLLM(LLMService):
 class AzureChatClient(BaseChatClient):
     """Production chat client for one roundtable seat (a persona, or the LLM manager),
     backed by the Azure OpenAI v1 surface — the same plain `AsyncOpenAI(base_url=…)` as
-    AzureLLM (the M4 endpoint gotcha in CLAUDE.md: do NOT use AsyncAzureOpenAI). The
+    AzureLLM (the endpoint gotcha in CLAUDE.md: do NOT use AsyncAzureOpenAI). The
     `model` is the deployment for this seat's tier (persona = mini, manager = stronger).
 
     Like the other Azure impls, the network call goes through one overridable seam
@@ -1292,7 +1326,7 @@ class _AzureRealtimeSession(RealtimeVoiceSession):
 # when this was written) — same caveat SoundrawMusic (media_assets.py) carries for
 # the same reason. The REST TTS endpoint/SSML/header shape below matches Azure
 # Speech's documented v1 API; confirm with one real call before trusting it in
-# production (see the implementation plan's Phase 3 verification steps).
+# production.
 
 class AzureSpeechVoiceover(VoiceoverService):
     """Text-to-speech via Azure Speech's REST endpoint (not the Voice Live

@@ -1,11 +1,8 @@
 """
-Roundtable builder (§6). Assembles ONE table for ONE platform as a real MAF Magentic
-workflow (the proven Phase 0 shape): personas as participants + a manager. Per
-docs/roundtable_api_notes.md this is a keyword-arg `MagenticBuilder(...)`, not a fluent
-`GroupChatBuilder().set_manager()` chain; the mock/prod split is `manager=` (deterministic)
-vs `manager_agent=` (LLM, Phase 2).
-
-Phase 1 wires only the mock branch.
+Roundtable builder. Assembles ONE table for ONE platform as a real MAF Magentic
+workflow: personas as participants + a manager. Per docs/roundtable_api_notes.md this
+is a keyword-arg `MagenticBuilder(...)`, not a fluent `GroupChatBuilder().set_manager()`
+chain; the mock/prod split is `manager=` (deterministic) vs `manager_agent=` (LLM).
 """
 
 from __future__ import annotations
@@ -67,8 +64,8 @@ def build_roundtable(
     before_round: Optional[BeforeRound] = None,
 ) -> RoundtableBuild:
     """Build a single-platform table. Mock manager + offline personas when USE_MOCK_LLM is
-    on (the default); the production LLM-manager branch (Phase 2) uses an Azure-backed
-    manager_agent. When `task_id` is given, a user seat (Phase 3) joins the table so the
+    on (the default); the production LLM-manager branch uses an Azure-backed
+    manager_agent. When `task_id` is given, a user seat joins the table so the
     human can raise a hand and the table waits up to `user_turn_timeout` for their message.
     `before_round` (the harness/UI hook) is called once per round before the manager assigns
     the next persona, so the user can interject; see manager.BeforeRound."""
@@ -87,7 +84,7 @@ def build_roundtable(
     ai_names = [p.name for p in personas]
 
     # The user seat is a real participant, fed from the store-backed utterance queue + the
-    # raise-hand gate; added only when a task_id anchors them (the no-user Phase 1/2 path is
+    # raise-hand gate; added only when a task_id anchors them (the no-user path is
     # unchanged).
     store = factory.get_store()
     if task_id is not None:

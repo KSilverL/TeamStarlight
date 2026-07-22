@@ -11,7 +11,7 @@ Three layers:
   - Service layer — `WorkflowService` / `IntakeService` / `MediaService`: pure async
     wrappers over the workflow / intake / media generators. Directly unit-testable;
     this is where the contract lives. `WorkflowService` bridges the MAF event stream
-    to the §7.2 event envelope.
+    to the SSE event envelope (core/events.py).
   - Schema layer — pydantic request models, so the OpenAPI schema documents every
     request body. Field-level validation that must return HTTP 400 (not FastAPI's
     422) stays in the service layer (`_brief_from_inputs` / `_verdict_from_payload`).
@@ -21,8 +21,8 @@ Three layers:
     voice intake gets a real WebSocket endpoint (FastAPI native).
 
 Durability: the workflow's checkpoints persist to `factory.get_checkpoint_storage()`
-(PostgreSQL in production), so a RequestPort pause survives a process restart —
-replacing the old in-process MemorySaver. This server keeps each task's workflow
+(PostgreSQL in production), so a RequestPort pause survives a process restart.
+This server keeps each task's workflow
 object in memory for fast resume; full rehydration-from-checkpoint after a restart
 builds on the same CheckpointStorage.
 
@@ -43,7 +43,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Body, FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -81,7 +81,6 @@ from .core.plan_schema import (
     clamp_item_dates,
     select_due_items,
 )
-from .core.skill_schema import SkillCandidate
 from .core.trend_schema import render_trends
 from .core.video_schema import StoryboardSpec
 
@@ -129,7 +128,7 @@ def _prior_context_from_payload(raw) -> Optional[PriorSessionContext]:
     continues). `None` → fresh conversation. A malformed object (not a dict, missing the required
     `parent_session_id`) is a client error → HTTP 400 (not FastAPI's 422, since it arrives as a
     free-form key). A well-formed but content-free recap (only `parent_session_id`) degrades back
-    to `None` — the fresh path (Phase 5) — so an empty recap never changes intake behaviour."""
+    to `None` — the fresh path — so an empty recap never changes intake behaviour."""
     if raw is None:
         return None
     if not isinstance(raw, dict):
@@ -245,7 +244,7 @@ class WorkflowService:
             raise ApiError(404, f"unknown task_id: {task_id}")
         return task
 
-    # ── Event translation (MAF event → §7.2 envelope) + publish ───────────────
+    # ── Event translation (MAF event → SSE envelope) + publish ────────────────
 
     def _publish(self, task: _Task, event: dict) -> None:
         # A stable, monotonic per-task index baked into the stored event, so a client that
@@ -261,7 +260,7 @@ class WorkflowService:
 
     @staticmethod
     def _translate(ev) -> list[dict]:
-        """Map one MAF workflow event to zero or more §7.2 envelope dicts (pure)."""
+        """Map one MAF workflow event to zero or more SSE envelope dicts (pure)."""
         platform = getattr(getattr(ev, "data", None), "platform", None)
         etype = ev.type
         if etype == "executor_invoked":
@@ -350,6 +349,17 @@ class WorkflowService:
                 q.put_nowait(_STREAM_DONE)
         return self._snapshot(task)
 
+    async def _dispatch(self, task: _Task, coro, *, background: bool, running: dict) -> dict:
+        """Run `coro` (a start/roundtable segment) either inline — returning its final
+        snapshot and re-raising any failure as HTTP 500 — or as a detached background task,
+        returning `running` immediately while the run streams over SSE. Centralizes the
+        non-blocking split so the strong `task.runner` reference (asyncio holds tasks only
+        weakly) and the `_run_guarded` wiring live in exactly one place."""
+        if background:
+            task.runner = asyncio.create_task(self._run_guarded(task, coro, reraise=False))
+            return running
+        return await self._run_guarded(task, coro, reraise=True)
+
     async def _run_guarded(self, task: _Task, coro, *, reraise: bool) -> dict:
         """Drive `coro` (a start/resume/roundtable segment) to its next pause/end, but never let
         an executor exception leave SSE subscribers hung: on failure mark the task errored, emit a
@@ -416,7 +426,7 @@ class WorkflowService:
         #  • text + roundtable → creator entry (the discussion already produced the strategy);
         #  • text, no roundtable → the original dispatcher → strategist → creator path.
         # The roundtable stage (when enabled) still runs FIRST here (its own checkpoints + user
-        # pauses) for both the text and media-only paths — stage-chaining (§1).
+        # pauses) for both the text and media-only paths — stage-chaining.
         if not text_requested:
             build_kwargs = {"media_only": True}
         elif roundtable:
@@ -442,10 +452,8 @@ class WorkflowService:
             task, brief, roundtable=roundtable, text_requested=text_requested,
             before_round=before_round, rt_sequential=rt_sequential,
         )
-        if background:
-            task.runner = asyncio.create_task(self._run_guarded(task, coro, reraise=False))
-            return self._snapshot(task)  # status == "running"; watch GET /tasks/{id}/events
-        return await self._run_guarded(task, coro, reraise=True)
+        # background → returns a "running" snapshot; watch GET /tasks/{id}/events for progress.
+        return await self._dispatch(task, coro, background=background, running=self._snapshot(task))
 
     async def _execute(
         self, task: _Task, brief: Brief, *, roundtable: bool, text_requested: bool, before_round,
@@ -469,7 +477,7 @@ class WorkflowService:
                     before_round=before_round,
                 )
                 # Keep the full discussion transcript so the per-user learning loop can distil
-                # preferences from the user's interjections after the gate (§6.5 write side).
+                # preferences from the user's interjections after the gate.
                 task.roundtable_transcript = [
                     t.model_dump() for r in results for t in r.consensus.transcript
                 ]
@@ -570,11 +578,10 @@ class WorkflowService:
         return PriorSessionContext(parent_session_id=parent_session_id, **content).model_dump()
 
     async def say(self, task_id: str, table_id: str, text: str, interrupt: bool = False) -> dict:
-        """Enqueue one user "raise hand" utterance for a roundtable table (§1 decision 4).
+        """Enqueue one user "raise hand" utterance for a roundtable table.
         Keyed by (task_id, table_id) and persisted via the store, so a runner — even in
-        another process — picks it up at the next round boundary. The roundtable stage is
-        not yet driven from this service (Phase 6), so this only enqueues; it does not
-        require a registered task here."""
+        another process — picks it up at the next round boundary. This only enqueues;
+        it does not require a registered task here."""
         if not (text or "").strip():
             raise ApiError(400, "'text' is required")
         if not (table_id or "").strip():
@@ -586,7 +593,7 @@ class WorkflowService:
         return {"task_id": task_id, "table_id": table_id, "queued": True, "pending": pending}
 
     async def raise_hand(self, task_id: str, table_id: str) -> dict:
-        """The user reserves the next turn on a table (§ Phase 3 refinement). Before each round
+        """The user reserves the next turn on a table. Before each round
         the manager sees the raised hand and makes the table WAIT for the user's message
         (up to ROUNDTABLE_USER_TURN_TIMEOUT) instead of converging without them."""
         if not (table_id or "").strip():
@@ -681,10 +688,10 @@ class WorkflowService:
             return {"task_id": task_id, "platform": platform,
                     "consensus": result.consensus.model_dump()}
 
-        if background:
-            task.runner = asyncio.create_task(self._run_guarded(task, _go(), reraise=False))
-            return {"task_id": task_id, "platform": platform, "status": "running"}
-        return await self._run_guarded(task, _go(), reraise=True)
+        return await self._dispatch(
+            task, _go(), background=background,
+            running={"task_id": task_id, "platform": platform, "status": "running"},
+        )
 
     async def run_roundtables(
         self, inputs: dict, *, task_id: Optional[str] = None, max_rounds=None,
@@ -721,10 +728,10 @@ class WorkflowService:
             return {"task_id": task_id,
                     "consensuses": [r.consensus.model_dump() for r in results]}
 
-        if background:
-            task.runner = asyncio.create_task(self._run_guarded(task, _go(), reraise=False))
-            return {"task_id": task_id, "status": "running"}
-        return await self._run_guarded(task, _go(), reraise=True)
+        return await self._dispatch(
+            task, _go(), background=background,
+            running={"task_id": task_id, "status": "running"},
+        )
 
     async def get(self, task_id: str) -> dict:
         return self._snapshot(self._require(task_id))
@@ -737,12 +744,12 @@ class WorkflowService:
         return self._require(task_id).outputs.get(platform)
 
     def buffered_events(self, task_id: str) -> list[dict]:
-        """Non-blocking snapshot of the §7.2 event log so far (the SSE replay
+        """Non-blocking snapshot of the event log so far (the SSE replay
         buffer). Unlike `events()`, this never waits for future events."""
         return list(self._require(task_id).events)
 
     async def events(self, task_id: str):
-        """Async generator of §7.2 events for SSE: replays the buffer, then follows
+        """Async generator of events for SSE: replays the buffer, then follows
         live until the task completes. Yields `None` (a heartbeat) every 15s of
         inactivity so the route can keep the connection alive — an idle proxy/browser
         timeout would otherwise force a reconnect, which replays the whole buffer and
@@ -775,7 +782,7 @@ class WorkflowService:
 
 
 class IntakeService:
-    """Async wrapper over the intake layer (§4 / §7.1). Holds the live intake
+    """Async wrapper over the intake layer. Holds the live intake
     sessions; text and cascaded voice run the same shared conversation, so this code
     is transport-agnostic — it just routes turns by session id.
 
@@ -1353,8 +1360,8 @@ class IntakeStartRequest(BaseModel):
     prior_context: Optional[dict] = Field(
         None, description="Recap of an earlier session this conversation continues (a "
         "PriorSessionContext from POST /summarize-handoff). Its presence means 'continue that "
-        "thread' — it folds a 前情提要 block into the intake prompt; absent (or content-free) is a "
-        "fresh conversation. Must carry a `parent_session_id`; malformed → 400.")
+        "thread' — it folds a prior-session recap block into the intake prompt; absent (or "
+        "content-free) is a fresh conversation. Must carry a `parent_session_id`; malformed → 400.")
 
 
 class SummarizeHandoffRequest(BaseModel):
@@ -1390,7 +1397,7 @@ _HISTORY_FIELD = Field(
 
 class GenerateTextRequest(BaseModel):
     prompt: str = Field(..., description="Brief to turn into platform-native post copy")
-    platform: Optional[str] = Field("linkedin", description="Target platform style (linkedin | instagram | twitter | x | …)")
+    platform: Optional[str] = Field("linkedin", description="Target platform style (linkedin | instagram | twitter | x | facebook | …)")
     history: Optional[list] = _HISTORY_FIELD
 
 
@@ -1403,7 +1410,7 @@ class RenderVideoRequest(BaseModel):
     platform: str = Field(..., description="Which finished platform draft's storyboard to render")
     narration_text: Optional[str] = Field(
         None, description="Optional voiceover script to synthesize and mix into the render "
-        "(Phase 3: TTS via Azure Speech, or a silent mock). Omit for no narration."
+        "(TTS via Azure Speech, or a silent mock). Omit for no narration."
     )
     narration_voice: Optional[str] = Field(
         None, description="Provider voice id (e.g. an Azure Neural voice name). "
@@ -1520,7 +1527,7 @@ async def get_task(request: Request, task_id: str) -> dict:
     return await _workflow(request).get(task_id)
 
 
-@tasks_router.get("/{task_id}/events", summary="Stream §7.2 progress/result events (SSE)")
+@tasks_router.get("/{task_id}/events", summary="Stream progress/result events (SSE)")
 async def task_events(request: Request, task_id: str) -> StreamingResponse:
     svc = _workflow(request)
     await svc.get(task_id)  # 404 early if the task is unknown (before we start streaming)

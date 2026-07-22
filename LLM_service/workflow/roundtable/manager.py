@@ -1,12 +1,13 @@
 """
-Roundtable manager (§5). Per docs/roundtable_api_notes.md the installed framework has NO
+Roundtable manager. Per docs/roundtable_api_notes.md the installed framework has NO
 `set_select_speakers_func` / `ManagerSelectionResponse`; the manager IS a
 `MagenticManagerBase` subclass, and its `create_progress_ledger` (which fills `next_speaker`
 and `is_request_satisfied`) is the selection + termination lever.
 
-Phase 1 ships only the deterministic mock manager: it rotates speakers round-robin over the
-roster and converges at `max_rounds`, so a discussion is fully reproducible. The production
-LLM manager (`manager_agent=` on the builder) lands in Phase 2.
+Two managers live here: the deterministic `MockRoundtableManager` (rotates speakers
+round-robin over the roster and converges at `max_rounds`, so a discussion is fully
+reproducible) and the production `InteractiveMagenticManager` (an LLM moderator with the
+same per-round user hook).
 """
 
 from __future__ import annotations
@@ -162,7 +163,7 @@ def build_mock_manager(
 
 
 # ── Production manager (LLM-moderated) ─────────────────────────────────────────
-# The §5 doc imagined a GroupChatBuilder with `response_format=ManagerSelectionResponse`;
+# The original design imagined a GroupChatBuilder with `response_format=ManagerSelectionResponse`;
 # that surface does not exist in the installed framework (docs/roundtable_api_notes.md).
 # The Magentic equivalent is `manager_agent=<Agent>` on the builder: the framework wraps it
 # in a StandardMagenticManager that plans, selects the next speaker, tracks progress, and

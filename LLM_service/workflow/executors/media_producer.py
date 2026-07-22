@@ -1,22 +1,20 @@
-"""media_producer (媒体制作人) — the post-approval media generator.
+"""media_producer — the post-approval media generator.
 
-Every approved draft (plain approve, or approve_after_edit via the archivist) arrives
-here as an ApprovedDraft. The producer derives two on-brand artifacts from the approved
-copy via the LLM service (Azure OpenAI in production, deterministic offline in mock):
+Every approved draft (plain approve or approve_after_edit) arrives here as an
+ApprovedDraft. The producer derives two on-brand artifacts from the approved copy
+via the LLM service (Azure OpenAI in production, deterministic offline in mock):
 
-  - an animated, self-contained HTML "brand card" (`render_html_card`) — replaces the
-    old static platform preview card;
-  - a dynamic, composable video storyboard (`generate_video_storyboard`,
-    StoryboardSpec) — an ordered list of typed slides drawn from the slide registry
-    (not a fixed scene count). This stays DATA only; actually rendering an MP4 from it
-    (Remotion + headless Chromium, asset resolution) is a separate, explicitly-
-    triggered job (workflow/video/), kept out of this executor because it's slow
-    (45+ seconds) and this node must stay fast — it's the workflow's sole output node.
+  - an animated, self-contained HTML "brand card" (`render_html_card`);
+  - a composable video storyboard (`generate_video_storyboard`, StoryboardSpec) —
+    an ordered list of typed slides drawn from the slide registry. This stays DATA
+    only; rendering an MP4 from it is a separate, explicitly-triggered job
+    (workflow/video/), kept out of this executor because it's slow (45+ seconds)
+    and this node — the workflow's sole output node — must stay fast.
 
-It emits the FinalDraft (the workflow output), passing the archivist's `proposed_rules`
-straight through. Both static style guides come from the skills layer
-(skills/brand_animation.md, skills/brand_video_storyboard.md) so the look/spec retunes
-without code changes — mirroring how the creator injects the per-platform skill.
+It emits the FinalDraft (the workflow output). Both static style guides come from
+the skills layer (skills/brand_animation.md, skills/brand_video_storyboard.md) so
+the look/spec retunes without code changes — mirroring how the creator injects
+the per-platform skill.
 """
 
 import asyncio
