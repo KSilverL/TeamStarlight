@@ -1,11 +1,10 @@
-"""reviewer (红队审核员) — screens each draft and reports a verdict.
+"""reviewer — screens each draft and reports a verdict.
 
-Two checks: Azure AI Content Safety (sensitive/hateful content) and a brand check
-against the user's Must-Avoid rules. It returns a structured ReviewOutcome with
+Two checks: content safety (sensitive/hateful content) and a brand check against
+the user's Must-Avoid rules. It returns a structured ReviewOutcome with
 `approved` and the running `retry_count` (= this draft's attempt number) — but it
 does NOT decide routing. The circuit breaker is an *edge condition* on the
-reviewer's outgoing edge (builder.py), never a cross-service state read here
-(MIGRATION_PLAN §5.5 / §11.4).
+reviewer's outgoing edge (builder.py), never a state read inside an executor.
 """
 
 from agent_framework import Executor, WorkflowContext, handler

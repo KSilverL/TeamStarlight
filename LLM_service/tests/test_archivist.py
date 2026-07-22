@@ -1,5 +1,5 @@
 """
-Archivist + the learning loop (replaces test_rag_feedback).
+Archivist + the brand-voice learning loop.
 
 On approve_after_edit the archivist distils 1-3 brand-voice rules from the AI-vs-human
 diff (via get_llm), reading the existing profile (via get_store) so it does not
@@ -16,7 +16,7 @@ from __future__ import annotations
 from LLM_service.api import WorkflowService
 from LLM_service.core.services import factory
 from LLM_service.core.services.mock import MockLLM
-from LLM_service.workflow import HumanVerdict, build_workflow
+from LLM_service.workflow import build_workflow
 
 
 async def _run_to_gate(workflow, brief):

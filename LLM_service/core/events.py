@@ -1,12 +1,12 @@
 """
-Backend status-event schema (the SSE wire format, MIGRATION_PLAN §7.2).
+Backend status-event schema (the SSE wire format).
 
 As the MAF workflow runs, the api.py SSE bridge emits a **progress** event for
 every executor (running → done, or interrupted/error) so the frontend can render
 the "editorial newsroom live" — "the red-team reviewer is checking your content…".
 When a draft is ready (and again as a FinalDraft lands) a **result** event carries
-the produced content. The §7.2 envelope is reused verbatim; only the phase taxonomy
-follows the new executors.
+the produced content. Every event shares one envelope (type/node/phase/platform/
+status/ts); the phase taxonomy follows the executors.
 
     GET /tasks/{id}/events   (text/event-stream)
     data: <event dict defined here>
@@ -33,13 +33,13 @@ ERROR = "error"              # executor raised an exception
 
 # ── executor id → newsroom phase ──────────────────────────────────────────────
 NODE_PHASE: dict[str, str] = {
-    "dispatcher": "dispatch",   # 总编导
-    "strategist": "strategist", # 内容策略师
-    "creator": "create",        # 人格创作者 (per-platform fan-out)
-    "reviewer": "review",       # 红队审核员
-    "human_gate": "review",     # RequestPort 人工审批
-    "archivist": "archive",     # 品牌档案馆长
-    "media_producer": "produce",  # 媒体制作人 (animated card + video spec)
+    "dispatcher": "dispatch",
+    "strategist": "strategist",
+    "creator": "create",         # per-platform fan-out
+    "reviewer": "review",
+    "human_gate": "review",      # RequestPort human approval
+    "archivist": "archive",
+    "media_producer": "produce",  # animated card + video storyboard
 }
 
 
@@ -82,10 +82,10 @@ def result_event(
     return event
 
 
-# ── Roundtable discussion events (Phase 4) ────────────────────────────────────
-# One table == one platform, so `table_id` and `platform` carry the same value. Both
-# builders keep the §7.2 envelope keys (type/node/phase/platform/status/ts) so the SSE
-# stream stays uniform, and add the discussion-specific fields on top.
+# ── Roundtable discussion events ──────────────────────────────────────────────
+# One table == one platform, so `table_id` and `platform` carry the same value. The
+# builders keep the shared envelope keys (type/node/phase/platform/status/ts) so the
+# SSE stream stays uniform, and add the discussion-specific fields on top.
 
 def agent_utterance_event(
     *,

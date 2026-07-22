@@ -102,7 +102,7 @@ async def test_plan_strategy_parity():
 
 
 async def test_plan_strategy_trends_parity():
-    """Phase 4: both impls accept the pre-rendered trends block and still return a str;
+    """Both impls accept the pre-rendered trends block and still return a str;
     the mock weaves the block's first trend line in verbatim (the testable lever), and
     an empty block leaves the strategy byte-identical to the no-trends call."""
     block = render_trends([Trend(
@@ -568,7 +568,7 @@ async def test_trends_ttl_and_variety_parity():
         assert texts == ["news one", "meme one"]
 
 
-# ── Roundtable chat client + build parity (Phase 2) ───────────────────────────
+# ── Roundtable chat client + build parity ─────────────────────────────────────
 
 def azure_chat_client(reply: str) -> azure.AzureChatClient:
     """An AzureChatClient whose single completion seam returns a canned reply."""

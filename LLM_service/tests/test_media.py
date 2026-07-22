@@ -1,9 +1,9 @@
 """
-Post-approval media generation (the "生成 HTML / 生成视频" ideas, ported from the demos).
+Post-approval media generation.
 
 The media_producer turns an approved draft into two on-brand artifacts via the LLM
-service: a self-contained animated HTML card (replacing the old static preview card)
-and a dynamic, composable video storyboard (StoryboardSpec) — an ordered list of typed
+service: a self-contained animated HTML card and a composable video storyboard
+(StoryboardSpec) — an ordered list of typed
 slides drawn from the slide registry, not a fixed scene count. These tests cover the
 mock generators in isolation and end-to-end through the workflow (approve and
 approve_after_edit). Fully mocked / offline.

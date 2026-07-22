@@ -32,7 +32,7 @@ from LLM_service.core.plan_schema import (
     clamp_item_dates,
     select_due_items,
 )
-from LLM_service.core.services import factory, mock
+from LLM_service.core.services import mock
 from LLM_service.tests.conftest import run_app
 
 _CREATE = {

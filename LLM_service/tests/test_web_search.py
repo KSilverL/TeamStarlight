@@ -1,5 +1,5 @@
 """
-Web research tooling (Phase 0 of the autonomous-video-agent plan): WebSearchService
+Web research tooling: WebSearchService
 (search_web / fetch_url_text / search_reviews), LiveImageSearch (the live-web
 counterpart to Pexels' ImageSearchService), the factory getters, and the
 RESEARCH_TOOL_DEFS dispatcher (core/agent_tools.py).
@@ -173,7 +173,7 @@ async def test_call_tool_rejects_unknown_tool():
         await agent_tools.call_tool("delete_everything", {})
 
 
-# ── Phase 3: safety-screening of agent-fetched web content ────────────────────
+# ── Safety-screening of agent-fetched web content ─────────────────────────────
 # MockSafety flags any text containing the substring "unsafe" (core/services/mock.py's
 # UNSAFE_MARKER) — MockWebSearch's canned text/quotes embed the query/URL/subject
 # verbatim, so a value containing that substring is enough to drive the filter

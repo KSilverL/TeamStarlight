@@ -1,10 +1,10 @@
 """
-Phase 1 acceptance for the roundtable stage (docs/ROUNDTABLE_IMPLEMENTATION.md): a single
+Roundtable-stage acceptance (docs/ROUNDTABLE_IMPLEMENTATION.md): a single
 platform, pure text, no user, fully mocked + deterministic.
 
 Covers:
   - reproducibility: same brief + same mock skills/profile → identical transcript + consensus.
-  - read side (§6.5): brand_voice / user_advocate personas carry the injected profile / skills.
+  - read side: brand_voice / user_advocate personas carry the injected profile / skills.
   - drop-in shape: RoundtableConsensus.strategy has the SAME fields as the strategist's CreativeStrategy.
   - termination: the table always stops at MAX_ROUNDS.
 
@@ -159,7 +159,7 @@ async def test_personas_are_differentiated(monkeypatch):
 
 async def test_consensus_strategy_matches_strategist_creativestrategy_shape():
     """The consensus carries a real CreativeStrategy with the SAME fields the strategist emits,
-    so it is a drop-in for the creator (Phase 6)."""
+    so it is a drop-in for the creator."""
     brief = _brief()
     result = await run_table(PLATFORM, brief)
 
@@ -195,7 +195,7 @@ async def test_no_brand_no_user_runs_clean():
     assert result.consensus.strategy.strategies[PLATFORM]
 
 
-# ── Phase 3: the user "raise hand" seat ────────────────────────────────────────
+# ── The user "raise hand" seat ─────────────────────────────────────────────────
 
 async def test_user_utterance_becomes_a_turn():
     """A queued utterance makes the next turn the user's, with the text in the transcript."""
@@ -286,7 +286,7 @@ async def test_say_enqueues_to_store():
     assert await has_pending(factory.get_store(), task_id="t-say", table_id=PLATFORM) is True
 
 
-# ── Phase 3 refinement: raise hand → table waits for the user to actually speak ─
+# ── Raise hand → table waits for the user to actually speak ────────────────────
 
 async def test_raise_hand_makes_discussion_wait_for_user():
     """A raised hand reserves the next turn; the table BLOCKS there until the user sends, so
@@ -322,7 +322,7 @@ async def test_raise_hand_times_out_and_discussion_proceeds():
             assert "origin farm" not in t.text
 
 
-# ── Phase 5: one table per platform (concurrent fan-out) ───────────────────────
+# ── One table per platform (concurrent fan-out) ────────────────────────────────
 
 async def test_multi_platform():
     """A multi-platform brief fans out to one table per platform; the tables never cross-talk,
@@ -417,7 +417,7 @@ async def test_each_platform_drafts_from_its_own_strategy():
         "linkedin": "LEAD WITH A DATA HOOK",
         "instagram": "LEAD WITH A VISUAL STORY",
     })
-    # roundtable_entry starts at the creator with the per-platform strategy (Phase 6 shape).
+    # roundtable_entry starts at the creator with the per-platform strategy.
     result = await build_workflow(roundtable_entry=True).run(strategy)
 
     reqs = {e.data.platform: e.data for e in result.get_request_info_events()}
@@ -529,7 +529,7 @@ async def test_trend_scout_stale_snapshot_degrades_gracefully(monkeypatch):
 
 
 async def test_trend_scout_store_failure_degrades_to_no_trends(monkeypatch):
-    """A store that raises on get_trends must never fail the run (§3.5): the context
+    """A store that raises on get_trends must never fail the run: the context
     degrades to [] and the discussion still runs to consensus."""
     _enable_trend_scout(monkeypatch)
 
@@ -733,7 +733,7 @@ async def test_llm_manager_yields_to_user_on_raised_hand():
     assert ledger.next_speaker.answer == USER_SEAT_NAME
 
 
-# ── Step mode (每轮 4 选 1): per-round user control ─────────────────────────────
+# ── Step mode: per-round user control ─────────────────────────────────────────
 # `roundtable_mode: "manual"` pauses each table at every round boundary for the user's
 # 4-way choice — next / speak / enough / auto — answered via POST /tasks/{id}/round-control.
 # Default stays "auto" (hands-off), so nothing here changes the existing contract.

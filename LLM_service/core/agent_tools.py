@@ -1,16 +1,16 @@
 """
-Shared LLM tool-calling defs for web/image research (Phase 0 of the autonomous
-video-agent plan): the JSON-schema function defs an executor hands the model, plus
-one dispatcher that actually runs the named tool against the service factory.
+Shared LLM tool-calling defs for web/image research: the JSON-schema function
+defs an executor hands the model, plus one dispatcher that actually runs the
+named tool against the service factory.
 
 Mirrors intake/base.py's BRIEF_TOOL_DEFS — the one existing tool-calling contract in
 this codebase — rather than inventing a new shape. Intended consumers: the
 strategist/creator (grounding copy in real sources instead of guessing) and the
-Phase 1 Remotion scene-codegen loop (sourcing facts/visuals while it writes a
+Remotion scene-codegen loop (sourcing facts/visuals while it writes a
 scene). Neither is wired to call these tools yet — this module is the shared
 primitive both will drive once they are.
 
-Phase 3 addition: `fetch_url_text` and `search_reviews` pull substantial free-form
+Safety: `fetch_url_text` and `search_reviews` pull substantial free-form
 text from the open web — genuinely untrusted input, unlike everything else this
 pipeline generates itself — so their results are screened through the SAME
 SafetyService the reviewer already uses for LLM-authored copy (core/services/base.py)

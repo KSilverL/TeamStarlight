@@ -257,8 +257,8 @@ def get_video_generation() -> VideoGenerationService:
 
 def get_checkpoint_storage() -> CheckpointStorage:
     """The MAF CheckpointStorage that persists workflow supersteps so a RequestPort
-    pause survives a process restart (replaces the in-process MemorySaver). Mock =
-    in-memory; production = the Postgres `workflow_checkpoints` table (§8.2).
+    pause survives a process restart. Mock = in-memory; production = the Postgres
+    `workflow_checkpoints` table.
 
     Cached as one singleton per process so every task's workflow shares the same
     durable store; reset_services() drops it (tests get a clean store)."""

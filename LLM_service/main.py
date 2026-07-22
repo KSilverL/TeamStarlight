@@ -10,7 +10,7 @@ by hand and watch it happen, all through the same `WorkflowService` the HTTP API
   • build the brief manually, or via a text / (mock) voice intake conversation
   • toggle the ROUNDTABLE stage on/off  (strategist  ↔  multi-persona discussion). When it is on,
     the discussion STREAMS LIVE — each persona's turn prints the moment it is spoken — and after
-    every turn you choose what happens next (step mode, 每轮 4 选 1): 1) the next persona speaks,
+    every turn you choose what happens next (step mode): 1) the next persona speaks,
     2) you take the mic (your turn joins the table, then the next persona is assigned),
     3) enough — the table converges NOW on what was said, 4) hands-off — the rest of the
     discussion runs automatically with no further prompts
@@ -268,7 +268,7 @@ async def _run_once() -> None:
     svc = WorkflowService()
     task_id = f"cli-{os.urandom(3).hex()}"
 
-    # Per-round step control (每轮 4 选 1): after each persona speaks — before the manager
+    # Per-round step control: after each persona speaks — before the manager
     # assigns the next one — choose to advance, take the mic, converge now, or go hands-off.
     # State is per table; the first boundary of a table is skipped (nothing spoken yet, so
     # there is nothing to read). "enough" sets the finish flag the manager reads at the

@@ -208,10 +208,9 @@ class SoundrawMusic(MusicGenerationService):
     """Soundraw background-music generation.
 
     The exact request/response shape below is a best-effort implementation, not
-    verified against a live Soundraw account in this session — confirm it with one
-    manual call before trusting it inside a full job run (see implementation_plan.txt
-    Phase 3's verification steps). It's isolated to this one method so correcting
-    field names later is a small, contained change.
+    verified against a live Soundraw account — confirm it with one manual call
+    before trusting it inside a full job run. It's isolated to this one method so
+    correcting field names later is a small, contained change.
     """
 
     def __init__(self, settings: Settings) -> None:

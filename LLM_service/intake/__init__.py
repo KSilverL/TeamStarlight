@@ -1,10 +1,10 @@
 """
-Content intake layer (MIGRATION_PLAN §4) — the voice / text dual entry point.
+Content intake layer — the voice / text dual entry point.
 
 The frontend lets the user pick one of two entries; both run the **same** conversation
 state machine, the **same** system prompt + function definitions, and produce the
 **same** `CreativeBrief`. The only difference is the transport (typed text vs spoken
-audio). Downstream the workflow (M1/M2) is completely unaware of which entry was used.
+audio). The downstream workflow is completely unaware of which entry was used.
 
     build_intake("text")  → TextIntake
     build_intake("voice") → MockVoiceIntake (offline) | VoiceIntake (Voice Live, cascaded STT)

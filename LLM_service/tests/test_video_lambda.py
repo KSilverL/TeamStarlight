@@ -1,5 +1,5 @@
 """
-Remotion Lambda render backend (Phase 2 of the autonomous video-agent plan):
+Remotion Lambda render backend:
 workflow/video/render.py's local-vs-lambda dispatch, and
 workflow/video/lambda_render.py's orchestration (stable vs. ephemeral site
 selection, strict-JSON stdout parsing, error handling).

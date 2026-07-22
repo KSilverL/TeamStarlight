@@ -1,5 +1,5 @@
 """
-The unified intake product: `CreativeBrief` (MIGRATION_PLAN §4.1).
+The unified intake product: `CreativeBrief`.
 
 Both the voice and the text entry point produce exactly this model, so the
 downstream workflow takes one shape regardless of how it was gathered. `route`
@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 
 class PriorSessionContext(BaseModel):
-    """The distilled "前情提要" (prior-session recap) a NEW intake can carry from an EARLIER
+    """The distilled prior-session recap a NEW intake can carry from an EARLIER
     conversation — NOT the raw message list (token-blowup + at odds with analyse-first), but a
     short summary of what the last session settled on. The backend builds it (via
     `POST /summarize-handoff`) and passes it at `POST /intake`; its mere presence means
@@ -37,7 +37,7 @@ class PriorSessionContext(BaseModel):
     def has_content(self) -> bool:
         """True when the recap carries any distilled signal beyond the parent id. An all-empty
         context (only `parent_session_id`) carries nothing to seed, so callers degrade it to the
-        fresh-conversation path instead of folding an empty block into the prompt (Phase 5)."""
+        fresh-conversation path instead of folding an empty block into the prompt."""
         return bool(
             self.topic
             or self.prior_strategy_summary

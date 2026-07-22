@@ -1,5 +1,5 @@
 """
-Per-round user control for the roundtable — "step mode" (每轮 4 选 1).
+Per-round user control for the roundtable — "step mode" (a 4-way choice per round).
 
 When a run is started with `roundtable_mode: "manual"`, each table pauses at every round
 boundary (after a persona has spoken, before the next speaker is assigned) and asks the

@@ -1,7 +1,7 @@
 """
-SSE progress stream + the api surface (replaces test_status_events / test_api).
+SSE progress stream + the api surface.
 
-Covers the §7.2 event envelope bridged from the MAF workflow to SSE
+Covers the event envelope bridged from the MAF workflow to SSE
 (`GET /tasks/{id}/events`), the RequestPort resume endpoint (`POST /review`), the
 confirm-learning archivist (`POST /confirm-learning`), and the durability guarantee:
 the workflow's checkpoint persists on the RequestPort pause and a fresh workflow
@@ -57,7 +57,7 @@ async def test_draft_ready_result_streamed_per_platform():
     assert ready == {"linkedin", "instagram"}
 
 
-async def test_events_follow_the_72_envelope():
+async def test_events_follow_the_envelope():
     svc = WorkflowService()
     await svc.start(_START, task_id="t1")
     for e in svc.buffered_events("t1"):
@@ -158,7 +158,7 @@ async def test_api_start_persists_a_workflow_checkpoint():
     assert checkpoints
 
 
-# ── D2. Roundtable discussion streams over the same SSE channel (Phase 4) ─────
+# ── D2. Roundtable discussion streams over the same SSE channel ───────────────
 
 _RT_START = {
     "topic": "spring single-origin coffee launch",
