@@ -4,17 +4,21 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.mail.SimpleMailMessage;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.mail.javamail.JavaMailSenderImpl;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
-import com.example.tsldemo.Business; // adjust import to match your actual package
-import com.example.tsldemo.SignInAPI.BusinessRepository; // adjust import to match your actual repository
+import com.example.tsldemo.Business; 
+import com.example.tsldemo.SignInAPI.BusinessRepository; 
 
 @Component
 public class PlanScheduler {
-    private static final String DAILY_CRON = "0 0 6 * * *";
+    private static final String DAILY_CRON = "0 30 14 * * *";
     private static final ZoneId IRISH_ZONE = ZoneId.of("Europe/Dublin");
 
     @Autowired
@@ -22,6 +26,9 @@ public class PlanScheduler {
 
     @Autowired
     private BusinessRepository businessRepository;
+    
+    @Autowired
+    private JavaMailSender mailSender;
 
     @Scheduled(cron = DAILY_CRON, zone = "Europe/Dublin")
     public void runDailyPlanCheck() {
@@ -63,11 +70,15 @@ public class PlanScheduler {
                 System.out.println("[PlanScheduler] Executed item " + itemId + " (plan " + planId
                         + ") -> task " + taskId + ". Notify business " + businessId + " to review it.");
 
-                // TODO: hook in your actual notification mechanism here (email, in-app
-                // notification row, push, etc.) — e.g.:
-                // notificationService.notify(businessId,
-                //     "Today's post for '" + item.get("topic") + "' is drafting — review it here.",
-                //     taskId);
+                // TODO: Emailing at said time goes here
+                String userEmail = businessRepository.findById(businessId).get().getEmail();
+                
+                sendEmail(
+                		userEmail,
+                	    "Plan item executed",
+                	    "Today's scheduled post has started drafting. It will appear in your review queue shortly."
+                );
+
 
             } catch (Exception e) {
                 // 409 means "already started" (idempotency guard) — not a real error.
@@ -79,4 +90,18 @@ public class PlanScheduler {
             }
         }
     }
+    
+    private void sendEmail(String to, String subject, String body) {
+        SimpleMailMessage message = new SimpleMailMessage();
+
+        message.setTo(to);
+        message.setSubject(subject);
+        message.setText(body);
+
+        mailSender.send(message);
+
+        System.out.println("[PlanScheduler] Email sent to " + to);
+    }
+
+
 }
