@@ -35,3 +35,31 @@ async def test_resolve_storyboard_music_degrades_gracefully_on_failure(tmp_path:
 
     assert music_path is None
     assert not (tmp_path / "music.mp3").exists()
+
+
+async def test_resolve_storyboard_music_defaults_when_agent_choices_omitted(tmp_path: Path, monkeypatch):
+    captured = {}
+
+    class _CapturingMusic(MusicGenerationService):
+        async def generate(self, *, mood: str, genre: str, duration_seconds: float, energy: str) -> bytes:
+            captured.update(mood=mood, genre=genre, energy=energy)
+            return b"\xff\xfb\x10\xc0" * 10
+
+    monkeypatch.setattr(factory, "get_music_generation", lambda: _CapturingMusic())
+    await resolve_storyboard_music(job_dir=tmp_path, duration_seconds=20.0)
+    assert captured == {"mood": "inspiring", "genre": "corporate", "energy": "medium"}
+
+
+async def test_resolve_storyboard_music_forwards_agent_choices(tmp_path: Path, monkeypatch):
+    captured = {}
+
+    class _CapturingMusic(MusicGenerationService):
+        async def generate(self, *, mood: str, genre: str, duration_seconds: float, energy: str) -> bytes:
+            captured.update(mood=mood, genre=genre, energy=energy)
+            return b"\xff\xfb\x10\xc0" * 10
+
+    monkeypatch.setattr(factory, "get_music_generation", lambda: _CapturingMusic())
+    await resolve_storyboard_music(
+        job_dir=tmp_path, duration_seconds=20.0, mood="dramatic", genre="cinematic", energy="high",
+    )
+    assert captured == {"mood": "dramatic", "genre": "cinematic", "energy": "high"}

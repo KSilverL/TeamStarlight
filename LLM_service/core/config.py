@@ -249,8 +249,10 @@ class Settings:
     # ── Azure Speech (voiceover text-to-speech) ─────────────────────────────────
     azure_speech_key: Optional[str] = None
     azure_speech_region: Optional[str] = None
-    # Default Neural voice when a caller doesn't specify one (POST /tasks/{id}/render-video).
-    voiceover_default_voice: str = "en-US-JennyNeural"
+    # Default voice when a persona/caller doesn't specify one. An Azure Dragon HD voice
+    # (LM-based, far more natural than the older Neural voices) — same Speech endpoint;
+    # note HD voices may require the S0 tier and specific regions (see .env.example).
+    voiceover_default_voice: str = "en-US-Ava:DragonHDLatestNeural"
 
     # ── Higgsfield (premium generative AI video render backend) ─────────────────
     # Used only when video_render_backend == "higgsfield" (see below). Auth + upload +

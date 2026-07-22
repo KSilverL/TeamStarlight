@@ -43,10 +43,16 @@ export const StoryboardRenderer: React.FC<RenderableStoryboard> = ({
   slides,
   musicLocalPath,
   voiceoverLocalPath,
+  voiceoverSlidePaths,
 }) => {
   const activeTransition = transition ?? "none";
   const presentation = presentationFor(activeTransition, height > width);
   const timing = linearTiming({ durationInFrames: TRANSITION_OVERLAP_FRAMES });
+  // Per-slide narration (slide-synced) takes precedence: when Python resolved one clip
+  // per slide, each plays INSIDE its own sequence below. The global whole-video track is
+  // the fallback (caller-supplied script or a legacy storyboard), used only when there
+  // are no per-slide paths.
+  const hasSlideVoiceover = Boolean(voiceoverSlidePaths && voiceoverSlidePaths.length > 0);
 
   return (
     <>
@@ -54,7 +60,7 @@ export const StoryboardRenderer: React.FC<RenderableStoryboard> = ({
       {/* Full volume (Remotion default) — MUSIC_VOLUME above was chosen specifically
           to leave headroom under a narration track, so no ducking logic is needed
           here: the two tracks are just mixed as-is. */}
-      {voiceoverLocalPath && <Audio src={staticFile(voiceoverLocalPath)} />}
+      {!hasSlideVoiceover && voiceoverLocalPath && <Audio src={staticFile(voiceoverLocalPath)} />}
       {/* TransitionSeries with no <Transition> children is a plain hard-cut series,
           identical to the old <Series>; a <Transition> is interleaved between slides
           only when `transition` is active, overlapping them by TRANSITION_OVERLAP_FRAMES
@@ -74,8 +80,13 @@ export const StoryboardRenderer: React.FC<RenderableStoryboard> = ({
                 ")",
             );
           }
+          // This slide's narration clip (slide-synced): placed inside the sequence so
+          // Remotion positions it at the slide's start and clips it to the slide — which
+          // Python already stretched to fit the line. null/absent => this slide is silent.
+          const slideVoiceover = voiceoverSlidePaths?.[i] ?? null;
           const sequence = (
             <TransitionSeries.Sequence key={`seq-${i}`} durationInFrames={slide.durationFrames}>
+              {slideVoiceover && <Audio src={staticFile(slideVoiceover)} />}
               <SlideComponent
                 slide={slide as any}
                 accentColor={accentColor}

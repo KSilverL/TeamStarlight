@@ -198,4 +198,42 @@ more or less time, but it's optional — when omitted, a sensible per-type defau
 used. Don't try to compute exact totals; the platform's typical short-form length
 (roughly 15-35 seconds total) is enforced downstream regardless of what you suggest.
 
+## Audio — music (on `audio`) + per-slide narration (on each slide)
+
+A later step generates a music track and a spoken voiceover and mixes them into the
+render — you only choose the direction, never a URL or audio file.
+
+### Per-slide narration (`narration` on each slide) — this is how the voice stays in sync
+
+Give **each slide its own `narration`**: one natural spoken sentence the voiceover says
+*while that slide is on screen*. This is what keeps the audio matched to the visuals —
+the narration for the stat slide plays over the stat slide, the outro line over the
+outro, and so on.
+
+- Write it to be **heard**, not read: natural spoken rhythm, and it should **complement**
+  the slide (add context, momentum, a reason to care), not just read the slide's headline
+  back verbatim.
+- Keep each line **tight** — usually one short sentence. The video automatically stretches
+  each slide to fit its line, so you never need to cram, but don't pad either.
+- Together the lines should tell one continuous story across the slides: open on the
+  hook's idea, build through the middle, land on the outro's call to action.
+- A slide may set `narration` to `null` for a beat that plays under music alone.
+
+Prefer this per-slide `narration` over the whole-video `audio.narrationScript` (the latter
+is a fallback for the rare case you want a single voiceover not tied to slides — leave it
+null when you give per-slide narration).
+
+### Music (`audio` block)
+
+Always include an `audio` object. Pick music that matches the brand's energy and the story:
+- `musicMood`: *inspiring*, *uplifting*, *energetic*, *calm*, *dramatic*, or *playful*.
+- `musicGenre`: *corporate*, *cinematic*, *electronic*, *acoustic*, *hiphop*, or *ambient*.
+- `musicEnergy`: *low*, *medium*, or *high* — match the `transition`/`backgroundStyle`
+  energy (a calm, faded, aurora video wants *low*; a punchy, slide/wipe video wants *high*).
+- `narrationVoice`: the voice persona that best fits the brand — *warm* (friendly,
+  approachable), *energetic* (upbeat, dynamic), *authoritative* (confident, serious), or
+  *friendly* (bright, casual). One voice narrates the whole video.
+
+Use ONLY the listed values for music fields — anything else is rejected server-side.
+
 Return only valid structured data — no explanation.

@@ -38,6 +38,7 @@ __all__ = [
     "ImageSearchService",
     "BackgroundRemovalService",
     "MusicGenerationService",
+    "SynthesizedSpeech",
     "VoiceoverService",
     "VideoGenerationService",
     "empty_profile",
@@ -681,6 +682,19 @@ class MusicGenerationService(ABC):
 
 # ── Voiceover (Azure Speech text-to-speech) ────────────────────────────────────
 
+@dataclass(frozen=True)
+class SynthesizedSpeech:
+    """One synthesized narration clip: the `audio` bytes (mp3) plus the clip's
+    `duration_seconds`. The duration is returned by the service (not measured
+    downstream) because only the impl knows its output format — the Azure impl
+    computes it from the CBR bitrate, the mock from its word-count estimate. The
+    per-slide voiceover pipeline (workflow/video/voiceover.py) uses it to stretch
+    each slide so its narration is never clipped."""
+
+    audio: bytes
+    duration_seconds: float
+
+
 class VoiceoverService(ABC):
     """Narration text-to-speech for an optional voiceover track (Phase 3 of the
     video-agent plan) — distinct from VoiceService above, which bridges SPOKEN
@@ -690,10 +704,11 @@ class VoiceoverService(ABC):
     a reason to abort the render."""
 
     @abstractmethod
-    async def synthesize(self, *, text: str, voice: str) -> bytes:
-        """Return audio bytes (mp3) speaking `text` in `voice` (a provider-specific
-        voice id, e.g. an Azure Neural voice name). Raises on a hard failure (rate
-        limit, bad voice id, network) — callers fall back to no narration."""
+    async def synthesize(self, *, text: str, voice: str) -> SynthesizedSpeech:
+        """Return a `SynthesizedSpeech` (mp3 `audio` + `duration_seconds`) speaking
+        `text` in `voice` (a provider-specific voice id, e.g. an Azure Neural voice
+        name). Raises on a hard failure (rate limit, bad voice id, network) —
+        callers fall back to no narration."""
         ...
 
 
