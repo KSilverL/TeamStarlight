@@ -139,6 +139,43 @@ async def test_mock_plan_campaign_trend_lever():
     assert await mock.MockLLM().plan_campaign(**kw, trends="") == base
 
 
+async def test_mock_plan_campaign_cadence_and_questions():
+    kw = dict(goal="grow signups", platforms=["linkedin", "x"],
+              start_date="2026-08-01", end_date="2026-08-21")
+    # No cadence → the agent surfaces a recommended one AND asks follow-up questions.
+    blank = await mock.MockLLM().plan_campaign(**kw)
+    assert blank["recommended_cadence"]
+    assert 1 <= len(blank["follow_up_questions"]) <= 3
+
+    # An explicit cadence is echoed and needs no clarifiers.
+    explicit = await mock.MockLLM().plan_campaign(**kw, cadence_hint="2 posts a week")
+    assert "2 posts a week" in explicit["recommended_cadence"]
+    assert explicit["follow_up_questions"] == []
+
+    # A refine pass (feedback/answers) is observably distinct and drops the questions.
+    refined = await mock.MockLLM().plan_campaign(
+        **kw, feedback="more instagram, fewer promos", prior_plan="Strategy: prev")
+    assert refined["follow_up_questions"] == []
+    assert refined["strategy_summary"] != blank["strategy_summary"]
+    answered = await mock.MockLLM().plan_campaign(
+        **kw, answers="Q: capacity?\nA: 3/week", prior_plan="Strategy: prev")
+    assert answered["follow_up_questions"] == []
+
+
+async def test_mock_clarify_campaign_asks_before_generating():
+    kw = dict(goal="grow signups", platforms=["linkedin", "x"],
+              start_date="2026-08-01", end_date="2026-08-21")
+    # clarify returns ONLY cadence + questions — no dated items (it runs before generation)
+    blank = await mock.MockLLM().clarify_campaign(**kw)
+    assert set(blank) == {"recommended_cadence", "follow_up_questions"}
+    assert blank["recommended_cadence"]
+    assert 1 <= len(blank["follow_up_questions"]) <= 3
+    # a pinned cadence still asks (fewer) — its whole purpose is to gather info up front
+    explicit = await mock.MockLLM().clarify_campaign(**kw, cadence_hint="2 posts a week")
+    assert "2 posts a week" in explicit["recommended_cadence"]
+    assert explicit["follow_up_questions"]
+
+
 # ── MockStore round-trip ──────────────────────────────────────────────────────
 
 async def test_mock_store_plan_roundtrip_filters_and_isolation():
@@ -251,6 +288,82 @@ async def test_confirm_only_from_draft():
     assert exc.value.status == 409
 
 
+async def test_clarify_runs_before_generation():
+    svc = _service()
+    clar = await svc.clarify(dict(_CREATE))
+    assert set(clar) == {"recommended_cadence", "follow_up_questions"}
+    assert clar["recommended_cadence"] and clar["follow_up_questions"]
+    # same field-requiredness contract as create (goal / platforms / dates)
+    with pytest.raises(ApiError) as exc:
+        await svc.clarify({**_CREATE, "goal": ""})
+    assert exc.value.status == 400
+    with pytest.raises(ApiError):
+        await svc.clarify({**_CREATE, "target_platforms": []})
+    with pytest.raises(ApiError):
+        await svc.clarify({**_CREATE, "end_date": "2026-07-01"})  # before start
+
+
+async def test_create_surfaces_cadence_and_questions():
+    svc = _service()
+    plan = await svc.create(dict(_CREATE))  # _CREATE has no cadence_hint
+    assert plan["recommended_cadence"]
+    assert plan["follow_up_questions"]  # blank cadence → the planner asks to tailor
+
+
+async def test_create_with_clarify_answers_tailors_first_draft():
+    svc = _service()
+    # Feeding the clarify answers into create tailors the first draft AND drops the
+    # follow-up questions (they've been answered), so the questions aren't re-asked.
+    plan = await svc.create({
+        **_CREATE,
+        "answers": {"How often can you produce content each week?": "3 times"},
+    })
+    assert plan["follow_up_questions"] == []
+
+
+async def test_refine_regenerates_draft_in_place():
+    svc = _service()
+    plan = await svc.create(dict(_CREATE))
+    pid = plan["plan_id"]
+    assert plan["follow_up_questions"]
+
+    refined = await svc.refine(pid, feedback="more instagram, fewer promos")
+    assert refined["plan_id"] == pid            # same plan, regenerated in place
+    assert refined["status"] == "draft"         # refine never activates
+    assert refined["created_at"] == plan["created_at"]
+    assert refined["strategy_summary"] != plan["strategy_summary"]
+    assert refined["follow_up_questions"] == []  # feedback drops the clarifiers
+    assert refined["items"] and all(i["status"] == "planned" for i in refined["items"])
+    assert all(
+        refined["start_date"] <= i["planned_date"] <= refined["end_date"]
+        for i in refined["items"])
+
+    # answers alone also refine (no free-text feedback needed)
+    answered = await svc.refine(pid, answers={"How often can you produce content?": "3/week"})
+    assert answered["follow_up_questions"] == []
+
+
+async def test_refine_guards():
+    svc = _service()
+    plan = await svc.create(dict(_CREATE))
+    pid = plan["plan_id"]
+
+    with pytest.raises(ApiError) as exc:
+        await svc.refine(pid)  # neither feedback nor answers
+    assert exc.value.status == 400
+    with pytest.raises(ApiError) as exc:
+        await svc.refine(pid, answers={"q": "   "})  # blank answer = no signal
+    assert exc.value.status == 400
+    with pytest.raises(ApiError) as exc:
+        await svc.refine("plan-none", feedback="x")
+    assert exc.value.status == 404
+
+    await svc.confirm(pid)
+    with pytest.raises(ApiError) as exc:
+        await svc.refine(pid, feedback="too late now")  # only drafts refine
+    assert exc.value.status == 409
+
+
 async def test_update_item_edit_skip_and_unskip():
     svc = _service()
     plan = await svc.create(dict(_CREATE))
@@ -335,8 +448,18 @@ def test_http_plan_flow(http_server):
         r = client.get(f"{http_server}/plans/nope")
         assert r.status_code == 404 and "error" in r.json()
         assert client.get(f"{http_server}/plans/due").status_code == 400  # date required
+        assert client.post(f"{http_server}/plans/clarify", json={}).status_code == 400
 
-        plan = client.post(f"{http_server}/plans", json=_CREATE).json()
+        # clarify runs BEFORE generation: questions only, nothing stored, /plans list empty
+        clar = client.post(f"{http_server}/plans/clarify", json=_CREATE).json()
+        assert set(clar) == {"recommended_cadence", "follow_up_questions"}
+        assert clar["follow_up_questions"]
+        assert client.get(f"{http_server}/plans").json() == {"plans": []}
+
+        # the answers from clarify ride into create so the first draft is already tailored
+        plan = client.post(
+            f"{http_server}/plans",
+            json={**_CREATE, "answers": {clar["follow_up_questions"][0]: "3 a week"}}).json()
         pid = plan["plan_id"]
         assert plan["status"] == "draft" and plan["items"]
 
@@ -350,7 +473,17 @@ def test_http_plan_flow(http_server):
         assert client.get(
             f"{http_server}/plans", params={"business_id": "other"}).json() == {"plans": []}
 
+        # refine a draft: 400 without feedback/answers, then regenerate in place
+        assert client.post(f"{http_server}/plans/{pid}/refine", json={}).status_code == 400
+        refined = client.post(
+            f"{http_server}/plans/{pid}/refine",
+            json={"feedback": "more instagram"}).json()
+        assert refined["plan_id"] == pid and refined["status"] == "draft"
+
         assert client.post(f"{http_server}/plans/{pid}/confirm").json()["status"] == "active"
+        # a confirmed plan can no longer be refined
+        assert client.post(
+            f"{http_server}/plans/{pid}/refine", json={"feedback": "x"}).status_code == 409
 
         patched = client.patch(
             f"{http_server}/plans/{pid}/items/item-1", json={"topic": "patched topic"}).json()

@@ -34,7 +34,7 @@ Integration guide for the content-generation service (`LLM_service/api.py`).
 3. **Progress** streams over **SSE** (`GET /tasks/{id}/events`) — open it right after `POST /tasks`
    to catch the gate. Review resumes over REST (`POST /review`, synchronous).
 4. **Optional extras:** with `ROUNDTABLE_ENABLED` the run opens with a multi-persona discussion you can join ([Roundtable](#roundtable-optional)); after completion, `POST /tasks/{id}/confirm-learning` makes the service learn from the run.
-5. **Posting plans** — `POST /plans` turns a campaign goal into a dated posting *schedule* (topics + timing + rationale, no copy); the backend's daily cron then asks `GET /plans/due?date=<today>` and `POST …/execute`s each due item into an ordinary run, so the planned content is drafted **on the planned day** and waits at the gate ([Posting plans](#posting-plans--post-plans--the-daily-dueexecute-loop)).
+5. **Posting plans** — `POST /plans/clarify` first asks a few tailoring questions, then `POST /plans` turns a campaign goal into a dated posting *schedule* (topics + timing + rationale, no copy) that the user can `POST …/refine` until happy; the backend's daily cron then asks `GET /plans/due?date=<today>` and `POST …/execute`s each due item into an ordinary run, so the planned content is drafted **on the planned day** and waits at the gate ([Posting plans](#posting-plans--post-plans--the-daily-dueexecute-loop)).
 
 ---
 
@@ -729,7 +729,10 @@ There is also **no real platform publishing**: an item's `done` means its conten
 and approved, not posted.
 
 ```
-  POST /plans (goal + window + platforms) ─► draft plan (user reviews/edits it)
+  POST /plans/clarify (goal + window + platforms) ─► recommended_cadence + follow_up_questions
+        (ask the user, collect answers — BEFORE any schedule is generated)
+  POST /plans (… + answers) ─► draft plan (already tailored to the answers)
+        POST /plans/{pid}/refine          ─► regenerate the whole draft from feedback / answers
         PATCH /plans/{pid}/items/{iid}    ─► move a date / change a topic / skip a slot
         POST /plans/{pid}/confirm         ─► draft → active
   ── every day, backend cron: ──────────────────────────────────────────────────
@@ -737,6 +740,30 @@ and approved, not posted.
         POST /plans/{pid}/items/{iid}/execute ─► ordinary workflow run to the human gate
         (then notify the user: "today's draft is ready to review")
 ```
+
+### `POST /plans/clarify` — ask before generating (no plan yet)
+
+The pre-generation clarify step: the planner proposes a **preliminary** cadence and up to 3
+follow-up questions whose answers would let it tailor the schedule — **before** any dated plan
+exists. Same campaign brief as `POST /plans`; **nothing is stored**.
+
+```json
+// request — goal + target_platforms + start_date + end_date required (like POST /plans)
+{ "goal": "Launch our new coffee subscription", "target_platforms": ["linkedin", "instagram"],
+  "start_date": "2026-08-01", "end_date": "2026-08-21", "business_id": "biz-123", "user_id": "user-9" }
+```
+```json
+// response (200)
+{
+  "recommended_cadence": "LinkedIn 3×/wk (Tue–Thu AM); Instagram 2×/wk (weekday evenings)",
+  "follow_up_questions": ["Any key launch dates to build toward?", "How much content can you produce weekly?"]
+}
+```
+
+Show these to the user, collect their answers, then pass them to `POST /plans` as `answers`
+(`{question: answer}`) so the first draft is already shaped by them. Skipping clarify is fine —
+`POST /plans` still works standalone (and surfaces its own `follow_up_questions`). `400` on the
+same missing/blank `goal` / empty `target_platforms` / malformed-date contract as `POST /plans`.
 
 ### `POST /plans` — generate a plan (synchronous; returned as a draft)
 
@@ -747,11 +774,12 @@ and approved, not posted.
   "target_platforms": ["linkedin", "instagram"],
   "start_date": "2026-08-01",
   "end_date": "2026-08-21",
-  "cadence_hint": "about 2 posts a week",        // optional pacing wish
+  "cadence_hint": "about 2 posts a week",        // optional — omit to let the agent pick the pace
   "tone_hint": "warm, confident",                 // optional
   "business_id": "biz-123",                       // optional — folds the brand voice in
   "user_id": "user-9",                            // optional — folds learned preferences in
-  "content_types": ["text"]                       // optional per-slot default (text/brand/video)
+  "content_types": ["text"],                      // optional per-slot default (text/brand/video)
+  "answers": { "Any key launch dates?": "Aug 20" } // optional — answers to POST /plans/clarify's questions
 }
 ```
 ```json
@@ -764,6 +792,8 @@ and approved, not posted.
   "start_date": "2026-08-01", "end_date": "2026-08-21",
   "status": "draft",
   "strategy_summary": "Three weeks: educate first, convert last…",
+  "recommended_cadence": "LinkedIn 3×/wk (Tue–Thu AM); Instagram 2×/wk (weekday evenings)",
+  "follow_up_questions": ["Any key launch dates to build toward?", "How much content can you produce weekly?"],
   "items": [
     {
       "item_id": "item-1", "planned_date": "2026-08-01", "time_of_day": "morning",
@@ -778,8 +808,33 @@ and approved, not posted.
 
 The planner reads the brand profile (`business_id`), the user's learned skills (`user_id`) and —
 with `TREND_SCOUT_ENABLED` — the daily trends snapshot, same as every other generation path.
-Item dates are clamped into the window server-side (LLM dates are never trusted). `400` on a
-missing/blank `goal`, empty `target_platforms`, malformed dates, or `end_date` before `start_date`.
+When `cadence_hint` is **omitted** the planner **chooses the posting frequency itself** — from
+this brand/product, each platform's norms, and the user's past habits — and reports it in
+`recommended_cadence`. It may also return up to 3 `follow_up_questions` when a plan-shaping detail
+is missing; these never block generation (a usable draft is always returned) — the user answers
+them via `POST …/refine`. Item dates are clamped into the window server-side (LLM dates are never
+trusted). `400` on a missing/blank `goal`, empty `target_platforms`, malformed dates, or `end_date`
+before `start_date`.
+
+### `POST /plans/{plan_id}/refine` — regenerate a draft from feedback / answers
+
+The satisfaction loop: when the user isn't happy with a draft (or wants to answer its
+`follow_up_questions`), regenerate the **whole** draft in place — same `plan_id`, still a `draft`.
+
+```json
+// request — at least one of feedback / answers is required
+{
+  "feedback": "more Instagram, fewer promos, and push harder in the final week",
+  "answers": { "Any key launch dates to build toward?": "Launch day is Aug 20" }
+}
+```
+
+The planner revises the previous draft (rather than restarting), honours the feedback/answers,
+and drops any question the user has now answered. Re-reads the brand/user context fresh, so newly
+learned habits fold in. Returns the regenerated plan document. `400` if neither `feedback` nor a
+non-blank `answers` value is supplied; `404` unknown plan; `409` if the plan is no longer a draft
+(confirm/PATCH for surgical per-slot edits once you're satisfied). Repeat until happy, then
+`confirm`.
 
 ### `GET /plans` / `GET /plans/{plan_id}` — list / fetch
 
@@ -893,9 +948,9 @@ just a task. Practical rules:
 
 | Code | When |
 |---|---|
-| `400` | Missing/invalid fields (no `topic`, empty `target_platforms`, unknown/empty `content_types`, bad `decision`, `approve_after_edit` without `edited_draft`, `/say` or `/raise-hand` without `table_id`/`text`, `/roundtable` with no resolvable `platform`, an unknown `roundtable_mode` or `/round-control` `action`; `/plans` without `goal`/platforms/valid dates, `/plans/due` without a `date`, a PATCH with unknown item fields or a status other than `skipped`/`planned`) |
+| `400` | Missing/invalid fields (no `topic`, empty `target_platforms`, unknown/empty `content_types`, bad `decision`, `approve_after_edit` without `edited_draft`, `/say` or `/raise-hand` without `table_id`/`text`, `/roundtable` with no resolvable `platform`, an unknown `roundtable_mode` or `/round-control` `action`; `/plans` or `/plans/clarify` without `goal`/platforms/valid dates, `/plans/{id}/refine` without `feedback` or a non-blank `answers`, `/plans/due` without a `date`, a PATCH with unknown item fields or a status other than `skipped`/`planned`) |
 | `404` | Unknown `task_id`, `session_id`, `plan_id`/`item_id`, or video `job_id`; `/render-video` for a platform with no finished draft; `/download` when the rendered file is missing on disk |
-| `409` | Task not awaiting review, `task_id` already exists, brief not complete, `/confirm-learning` before the task is `completed`, `/render-video` on a platform whose run produced no storyboard, `/download` before the job is `done`; `/plans/{id}/confirm` on a non-draft plan, `/execute` on a non-active plan or a non-`planned` item (double-execute guard) |
+| `409` | Task not awaiting review, `task_id` already exists, brief not complete, `/confirm-learning` before the task is `completed`, `/render-video` on a platform whose run produced no storyboard, `/download` before the job is `done`; `/plans/{id}/confirm` or `/plans/{id}/refine` on a non-draft plan, `/execute` on a non-active plan or a non-`planned` item (double-execute guard) |
 | `422` | FastAPI request-body validation (malformed JSON / wrong field types); standard FastAPI `detail` payload |
 | `500` | Unexpected error on a **synchronous** call (e.g. `POST /review`). A failure during a **background** run (`POST /tasks` / `/roundtable[s]`, which already returned `running`) is **not** a `500` — the task goes `status: "error"` (with an `error` message) and the SSE stream closes on a `workflow`/`error` event. |
 

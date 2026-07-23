@@ -317,8 +317,14 @@ def _show_plan(plan: dict) -> None:
     _section(f"PLAN {plan['plan_id']} · {plan['status']}")
     print(f"  Goal:    {plan['goal']}")
     print(f"  Window:  {plan['start_date']} → {plan['end_date']}   ({len(plan['items'])} slots)")
+    if plan.get("recommended_cadence"):
+        print(f"  Cadence:  {plan['recommended_cadence']}   (the pace the planner chose)")
     if plan.get("strategy_summary"):
         print(f"  Strategy: {plan['strategy_summary']}")
+    if plan.get("follow_up_questions"):
+        print("\n  The planner would like to know (answer to tailor the plan — or ignore):")
+        for q in plan["follow_up_questions"]:
+            print(f"    ? {q}")
     print()
     for it in plan["items"]:
         when = f"{it['planned_date']}" + (f" · {it['time_of_day']}" if it.get("time_of_day") else "")
@@ -376,7 +382,7 @@ async def _run_posting_plan() -> None:
     today = date.today()
     start = await _ask("  Start date (YYYY-MM-DD)", today.isoformat())
     end = await _ask("  End date (YYYY-MM-DD)", (today + timedelta(days=14)).isoformat())
-    cadence = await _ask("  Cadence hint", "about 2 posts a week")
+    cadence = await _ask("  Cadence hint (blank = let the agent pick the best frequency)", "")
     business_id = (await _ask("  Brand id (blank = no-brand)", "biz_demo")) or None
     user_id = (await _ask("  User id (blank = none)", "user_demo")) or None
     picked = await _ask("  Content types per slot (comma-sep: text, brand, video)", "text")
@@ -385,7 +391,27 @@ async def _run_posting_plan() -> None:
     wf = WorkflowService()
     plans = PlanService(workflow=wf)
 
-    _section("2 · GENERATE — the planner proposes a dated schedule (strategy, not copy)")
+    # 2 · CLARIFY — ask the questions BEFORE generating, so the answers shape the plan.
+    _section("2 · CLARIFY — the planner asks a few questions before building the schedule")
+    clar = await plans.clarify({
+        "goal": goal, "target_platforms": plats,
+        "start_date": start, "end_date": end,
+        "cadence_hint": cadence, "business_id": business_id, "user_id": user_id,
+    })
+    if clar.get("recommended_cadence"):
+        print(f"  Suggested cadence: {clar['recommended_cadence']}")
+    answers: dict[str, str] = {}
+    questions = clar.get("follow_up_questions", [])
+    if questions:
+        print("  A few questions to tailor the plan (blank = skip any):")
+        for q in questions:
+            a = await _ask(f"    ? {q}\n      your answer", "")
+            if a.strip():
+                answers[q] = a
+    else:
+        print("  · the planner has enough to go on — no questions.")
+
+    _section("3 · GENERATE — the planner proposes a dated schedule (strategy, not copy)")
     plan = await plans.create({
         "goal": goal,
         "target_platforms": plats,
@@ -395,8 +421,30 @@ async def _run_posting_plan() -> None:
         "business_id": business_id,
         "user_id": user_id,
         "content_types": content_types,
+        "answers": answers or None,
     })
     _show_plan(plan)
+
+    # 2b · REFINE — not happy, or want to answer the planner's questions? Give feedback
+    # and/or answers and the WHOLE draft is regenerated in place (still a draft). Loop
+    # until satisfied — this is the satisfaction gate before confirming the schedule.
+    while await _yn("\n  Refine this draft (give feedback / answer the questions)?", default=False):
+        fb = await _ask("  Your feedback (e.g. 'more instagram, fewer promos'; blank = none)", "")
+        answers: dict[str, str] = {}
+        for q in plan.get("follow_up_questions", []):
+            a = await _ask(f"  ? {q}\n    your answer (blank = skip)", "")
+            if a.strip():
+                answers[q] = a
+        if not fb.strip() and not answers:
+            print("  · nothing to refine with — give feedback or answer at least one question.")
+            continue
+        try:
+            plan = await plans.refine(plan["plan_id"], feedback=fb, answers=answers or None)
+        except Exception as exc:  # 400/409 etc. — surface and let the user retry
+            print(f"  ✗ {exc}")
+            continue
+        print("\n  · regenerated from your input:")
+        _show_plan(plan)
 
     if not await _yn("\n  Confirm (activate) this plan so its slots can become due?", default=True):
         print("  · left as a draft — a draft's slots never show up in the daily due query.")
@@ -404,7 +452,7 @@ async def _run_posting_plan() -> None:
     plan = await plans.confirm(plan["plan_id"])
     print(f"  · plan {plan['plan_id']} is now {plan['status']}")
 
-    _section("3 · DAILY CRON — 'what should go out today?' (you play the backend's scheduler)")
+    _section("4 · DAILY CRON — 'what should go out today?' (you play the backend's scheduler)")
     print("  The service has no clock — YOU pass the date. Pick a date to see which slots are due,")
     print("  then execute one (drafts it to the human gate). Re-run for other dates / more slots.")
     default_date = plan["items"][0]["planned_date"]
@@ -454,7 +502,7 @@ def _cheat_sheet() -> None:
         ("No-brand path",        "Brand id = blank (steers on tone only, never reads the store)"),
         ("Text / voice intake",  "Brief step → choose 2 or 3 (vs 1 = manual)"),
         ("Learning + read-back", "Set Brand id + User id, then 'Learn this conversation?' = Y"),
-        ("Posting plan",         "Top menu → 2: generate a schedule, confirm, then 'daily cron' a date → execute a slot"),
+        ("Posting plan",         "Top menu → 2: clarify Qs first → generate (blank cadence = agent picks the pace) → refine on feedback → confirm → 'daily cron' a date → execute a slot"),
     ]
     for name, how in rows:
         print(f"  • {name:<21} {how}")
