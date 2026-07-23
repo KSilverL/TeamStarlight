@@ -1,11 +1,11 @@
 """
-Circuit breaker (new in M1).
+Circuit breaker.
 
 When the reviewer rejects a platform repeatedly, the *edge condition* on the
 reviewer's outgoing switch-case loops back to the creator only while
 `retry_count < MAX_RETRIES`. The MAX_RETRIES-th rejection trips the breaker and
 routes straight to the human gate with `needs_human_intervention=True` — no
-executor reads retry state across a service boundary (MIGRATION_PLAN §5.5/§11.4).
+executor reads retry state across a service boundary.
 
 A brief whose topic contains 'unsafe' makes MockSafety flag every draft, so the
 reject path fires deterministically on every attempt.

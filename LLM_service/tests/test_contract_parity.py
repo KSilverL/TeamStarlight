@@ -41,7 +41,10 @@ def azure_llm(reply: str) -> azure.AzureLLM:
     """An AzureLLM whose single chat seam returns a canned reply."""
     llm = azure.AzureLLM(get_settings())
 
-    async def _complete(messages, *, model=None, temperature=None, max_tokens=None):
+    async def _complete(
+        messages, *, model=None, temperature=None, max_tokens=None,
+        reasoning_effort=None, verbosity=None,
+    ):
         return reply
 
     llm._complete = _complete  # type: ignore[assignment]
@@ -99,7 +102,7 @@ async def test_plan_strategy_parity():
 
 
 async def test_plan_strategy_trends_parity():
-    """Phase 4: both impls accept the pre-rendered trends block and still return a str;
+    """Both impls accept the pre-rendered trends block and still return a str;
     the mock weaves the block's first trend line in verbatim (the testable lever), and
     an empty block leaves the strategy byte-identical to the no-trends call."""
     block = render_trends([Trend(
@@ -187,7 +190,7 @@ async def test_generate_video_storyboard_parity():
             assert "type" in slide
 
 
-_PLAN_KEYS = {"strategy_summary", "items"}
+_PLAN_KEYS = {"strategy_summary", "recommended_cadence", "follow_up_questions", "items"}
 _PLAN_ITEM_KEYS = {"planned_date", "time_of_day", "platforms", "topic", "angle", "rationale"}
 
 
@@ -214,6 +217,38 @@ async def test_plan_campaign_parity():
         for item in out["items"]:
             assert set(item) == _PLAN_ITEM_KEYS
             assert isinstance(item["platforms"], list) and item["platforms"]
+
+
+_CLARIFY_KEYS = {"recommended_cadence", "follow_up_questions"}
+
+
+async def test_clarify_campaign_parity():
+    kw = dict(goal="grow subscription signups", platforms=["linkedin", "instagram"],
+              start_date="2026-08-01", end_date="2026-08-14")
+    m = await mock.MockLLM().clarify_campaign(**kw)
+    canned = json.dumps({
+        "recommended_cadence": "LinkedIn 3×/wk; Instagram 2×/wk",
+        "follow_up_questions": ["Any launch dates?", "How much content can you make weekly?"],
+    })
+    a = await azure_llm(canned).clarify_campaign(**kw)
+    for out in (m, a):
+        assert isinstance(out, dict) and set(out) == _CLARIFY_KEYS
+        assert isinstance(out["recommended_cadence"], str)
+        assert isinstance(out["follow_up_questions"], list)
+        assert len(out["follow_up_questions"]) <= 3
+async def test_generate_video_prompt_parity():
+    """Both impls return the VideoPromptSpec shape ({prompt, motion}) for the premium
+    Higgsfield path, with and without reference images (image-to-video vs text-to-video)."""
+    kw = dict(topic="coffee launch", draft="Our new single-origin is here.",
+              tone_hint="warm", platform="instagram_reels")
+    canned = json.dumps({"prompt": "a slow cinematic pour of fresh coffee", "motion": "slow dolly-in"})
+    for has_ref in (False, True):
+        m = await mock.MockLLM().generate_video_prompt(**kw, has_reference_images=has_ref)
+        a = await azure_llm(canned).generate_video_prompt(**kw, has_reference_images=has_ref)
+        for out in (m, a):
+            assert set(out.keys()) == {"prompt", "motion"}
+            assert isinstance(out["prompt"], str) and out["prompt"]
+            assert out["motion"] is None or isinstance(out["motion"], str)
 
 
 # ── Cross-language slide-variant parity (Python spec ⟷ types.ts) ──────────────
@@ -552,7 +587,7 @@ async def test_trends_ttl_and_variety_parity():
         assert texts == ["news one", "meme one"]
 
 
-# ── Roundtable chat client + build parity (Phase 2) ───────────────────────────
+# ── Roundtable chat client + build parity ─────────────────────────────────────
 
 def azure_chat_client(reply: str) -> azure.AzureChatClient:
     """An AzureChatClient whose single completion seam returns a canned reply."""
@@ -655,3 +690,137 @@ async def test_voice_parity():
     assert set(a.keys()) == {"session_id", "transcript"}
     assert a["session_id"] == "s1" and a["transcript"] == "hello there"
     assert isinstance(azure.AzureVoice(get_settings()), VoiceService)
+
+
+# ── Realtime voice parity (native speech-to-speech, GPT-Realtime) ─────────────
+# AzureRealtimeVoice's network I/O goes through one seam (`_send_json`/the ws itself,
+# same pattern as AzureLLM._complete), so the wire-protocol shaping is testable with a
+# fake transport — no real socket/credentials, fully offline like the rest of this file.
+
+class _FakeRealtimeWS:
+    """A fake websocket: records every outbound frame, and replays scripted inbound
+    raw JSON strings on `async for`."""
+
+    def __init__(self, inbound: list[dict] | None = None) -> None:
+        self.sent: list[dict] = []
+        self._inbound = inbound or []
+
+    async def send(self, raw: str) -> None:
+        self.sent.append(json.loads(raw))
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def __aiter__(self):
+        return self._gen()
+
+    async def _gen(self):
+        for event in self._inbound:
+            yield json.dumps(event)
+
+
+def test_realtime_tool_schema_adapter():
+    """BRIEF_TOOL_DEFS (Chat-Completions' nested shape) reshapes to the Realtime
+    API's flat shape without losing any field the model needs."""
+    from LLM_service.intake.base import BRIEF_TOOL_DEFS
+
+    flat = azure._to_realtime_tools(BRIEF_TOOL_DEFS)
+    assert len(flat) == len(BRIEF_TOOL_DEFS)
+    for tool, nested in zip(flat, BRIEF_TOOL_DEFS):
+        fn = nested["function"]
+        assert tool == {
+            "type": "function",
+            "name": fn["name"],
+            "description": fn.get("description", ""),
+            "parameters": fn.get("parameters"),
+        }
+
+
+async def test_azure_realtime_session_wire_protocol():
+    """`_configure`/`send_audio`/`send_tool_result`/`nudge` shape the exact frames the
+    Realtime API expects, through the fake-ws seam (no real network)."""
+    ws = _FakeRealtimeWS()
+    session = azure._AzureRealtimeSession(ws, session_id="s1")
+
+    await session._configure(instructions="be nice", tools=[], voice="verse")
+    cfg = ws.sent[-1]
+    assert cfg["type"] == "session.update"
+    assert cfg["session"]["instructions"] == "be nice"
+    assert cfg["session"]["voice"] == "verse"
+    assert cfg["session"]["modalities"] == ["audio", "text"]
+    assert cfg["session"]["turn_detection"] == {"type": "server_vad"}
+    assert cfg["session"]["input_audio_transcription"] == {"model": "whisper-1"}
+
+    await session.send_audio(audio_b64="AAA=")
+    assert ws.sent[-1] == {"type": "input_audio_buffer.append", "audio": "AAA="}
+
+    await session.send_tool_result(call_id="call-1", output={"ok": True})
+    item_frame, response_frame = ws.sent[-2], ws.sent[-1]
+    assert item_frame["type"] == "conversation.item.create"
+    assert item_frame["item"]["type"] == "function_call_output"
+    assert item_frame["item"]["call_id"] == "call-1"
+    assert json.loads(item_frame["item"]["output"]) == {"ok": True}
+    assert response_frame == {"type": "response.create"}
+
+    await session.nudge(text="wrap up")
+    nudge_frame = ws.sent[-2]
+    assert nudge_frame["item"]["role"] == "system"
+    assert nudge_frame["item"]["content"] == [{"type": "input_text", "text": "wrap up"}]
+    assert ws.sent[-1] == {"type": "response.create"}
+
+
+def test_azure_realtime_translate_events():
+    """The server-event -> RealtimeEvent mapping the reader loop relies on."""
+    translate = azure._AzureRealtimeSession._translate
+
+    ev = translate({"type": "response.audio.delta", "delta": "abc"})
+    assert ev.type == "audio_delta" and ev.audio_b64 == "abc"
+
+    ev = translate({"type": "response.audio_transcript.delta", "delta": "hi"})
+    assert ev.type == "output_transcript_delta" and ev.text == "hi"
+
+    ev = translate({
+        "type": "conversation.item.input_audio_transcription.completed",
+        "transcript": " hey there ",
+    })
+    assert ev.type == "input_transcript" and ev.text == "hey there"
+
+    ev = translate({
+        "type": "response.function_call_arguments.done", "call_id": "call-1",
+        "name": "update_brief", "arguments": json.dumps({"topic": "x"}),
+    })
+    assert ev.type == "tool_call" and ev.call_id == "call-1"
+    assert ev.name == "update_brief" and ev.arguments == {"topic": "x"}
+
+    assert translate({"type": "input_audio_buffer.speech_started"}).type == "speech_started"
+    assert translate({"type": "response.done"}).type == "response_done"
+
+    ev = translate({"type": "error", "error": {"message": "boom"}})
+    assert ev.type == "error" and "boom" in ev.message
+
+    # Unrecognised event types are dropped, not raised on.
+    assert translate({"type": "session.created"}) is None
+
+
+async def test_azure_realtime_events_cancel_on_barge_in():
+    """Barge-in (`speech_started`) is forwarded to the caller AND cancels the
+    model's in-flight generation server-side."""
+    ws = _FakeRealtimeWS(inbound=[
+        {"type": "input_audio_buffer.speech_started"},
+        {"type": "response.done"},
+    ])
+    session = azure._AzureRealtimeSession(ws, session_id="s1")
+    events = [event async for event in session.events()]
+    assert [e.type for e in events] == ["speech_started", "response_done"]
+    assert {"type": "response.cancel"} in ws.sent
+
+
+async def test_realtime_voice_service_parity(monkeypatch):
+    """factory.get_realtime_voice() resolves mock vs Azure exactly like get_voice()."""
+    assert isinstance(factory.get_realtime_voice(), mock.MockRealtimeVoice)
+
+    monkeypatch.setenv("USE_MOCK_VOICE", "false")
+    monkeypatch.setenv("AZURE_VOICELIVE_ENDPOINT", "https://example.services.ai.azure.com")
+    reset_settings()
+    factory.reset_services()
+    assert isinstance(factory.get_realtime_voice(), azure.AzureRealtimeVoice)

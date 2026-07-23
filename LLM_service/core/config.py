@@ -10,10 +10,8 @@ Default is mock so the system never accidentally hits paid/real APIs without an
 explicit opt-in. One-click production: set `USE_MOCK=false`. Gradual rollout:
 keep `USE_MOCK=true` and flip individual services with `USE_MOCK_LLM=false`, etc.
 
-The toggle set tracks the MAF "virtual newsroom" service contracts
-(LLM / Safety / Store / Voice) — see core/services/base.py. The legacy RAG/image
-toggles are gone; `USE_MOCK_STORE` (PostgreSQL) replaces `USE_MOCK_RAG`, and
-`USE_MOCK_VOICE` is new for the voice intake layer.
+The toggle set tracks the service contracts in core/services/base.py
+(LLM / Safety / Store / Voice, plus the render-pipeline asset services).
 
 `get_settings()` is cached; tests call `reset_settings()` after monkeypatching env.
 """
@@ -136,6 +134,7 @@ class Settings:
     use_mock_music_generation: Optional[bool] = None
     use_mock_web_search: Optional[bool] = None
     use_mock_voiceover: Optional[bool] = None
+    use_mock_video_generation: Optional[bool] = None
 
     # ── Azure OpenAI / Foundry (chat + structured output + copywriting) ────────
     azure_openai_endpoint: Optional[str] = None
@@ -148,8 +147,9 @@ class Settings:
     azure_content_safety_key: Optional[str] = None
 
     # ── PostgreSQL (brand profiles + user skills + workflow checkpoints) ───────
-    # One database, three tables (§8): brand_profiles + user_skills +
-    # workflow_checkpoints. Each stores whole documents in a JSONB `doc` column.
+    # One database; brand_profiles + user_skills + workflow_checkpoints (and the
+    # video_jobs/trends/posting_plans tables) each store whole documents in a
+    # JSONB `doc` column.
     # DSN comes from DATABASE_URL (preferred, e.g. a Supabase connection string),
     # falling back to POSTGRES_DSN — see _load().
     postgres_dsn: Optional[str] = None     # postgresql://user:pass@host:5432/newsroom
@@ -169,12 +169,14 @@ class Settings:
     azure_voicelive_model: str = "gpt-realtime"
     azure_voicelive_api_version: str = "2026-04-10"
     azure_voicelive_api_key: Optional[str] = None   # falls back to the OpenAI key (same resource)
+    azure_voicelive_voice: str = "verse"            # Preset voice for the realtime speech-to-speech bridge,
+                                                      # (must be one the deployment supports).
 
     # ── Roundtable (multi-persona discussion stage) ────────────────────────────
-    # ROUNDTABLE_ENABLED gates the drop-in replacement of `strategist` (wired in Phase 6);
-    # off → the pipeline behaves exactly as today. max_rounds is the per-table hard cap
+    # ROUNDTABLE_ENABLED gates the drop-in replacement of `strategist`; off → the
+    # pipeline runs the plain linear graph. max_rounds is the per-table hard cap
     # that stops an infinite debate. The two model tiers (cheap personas / stronger
-    # manager) are read in the production path (Phase 2); the mock path ignores them.
+    # manager) are read in the production path; the mock path ignores them.
     roundtable_enabled: bool = False
     # Each persona turn is now a short, single-point contribution (see roundtable/personas.py),
     # so the table can afford MANY more short exchanges — the cap is raised accordingly. It is
@@ -194,6 +196,12 @@ class Settings:
     # point (a sentence or two) instead of an essay — faster turns + the intended discussion feel.
     # Blank/None → omit (use for a non-gpt-5 persona model). Manager unaffected.
     roundtable_persona_verbosity: Optional[str] = "low"
+    # Reasoning effort for the LLM manager's own calls (the facts/plan phase before the first
+    # turn, every round's progress ledger, the final consensus). The project default is "low" —
+    # the roundtable latency lever: it shrinks the silent plan phase before the first turn AND
+    # every between-turn round boundary, at some risk to ledger/selection quality. Set an explicit
+    # value (minimal/medium/high) to override; the _load() fallback also resolves blank → "low".
+    roundtable_manager_reasoning_effort: Optional[str] = "low"
     # The personas run on a cheaper, rate-limit-friendlier model; only the LLM manager keeps
     # the main (gpt-5.4) deployment. The personas may live on a SEPARATE Azure resource
     # (its own endpoint + key); when those are unset they fall back to the main resource and
@@ -252,6 +260,20 @@ class Settings:
     # Default Neural voice when a caller doesn't specify one (POST /tasks/{id}/render-video).
     voiceover_default_voice: str = "en-US-JennyNeural"
 
+    # ── Higgsfield (premium generative AI video render backend) ─────────────────
+    # Used only when video_render_backend == "higgsfield" (see below). Auth + upload +
+    # polling go through the official `higgsfield-client` SDK (base URL
+    # platform.higgsfield.ai). The model ids are catalog paths passed to the SDK's
+    # subscribe(): the image id (DoP image-to-video) is confirmed against the docs;
+    # the text-to-video id is NOT — set HIGGSFIELD_TEXT_MODEL to the catalog path from
+    # your cloud.higgsfield.ai dashboard before using the no-reference-image path.
+    # Duration is clamped to the model's per-generation max (~15s for v1's single clip).
+    higgsfield_api_key: Optional[str] = None
+    higgsfield_api_secret: Optional[str] = None
+    higgsfield_text_model: str = ""  # unverified — set from the dashboard for text-to-video
+    higgsfield_image_model: str = "higgsfield-ai/dop/standard"
+    higgsfield_max_duration_s: float = 15.0
+
     # ── Web research (Bing grounding via Azure AI Foundry agents) ──────────────
     # Reuses the same "Grounding with Bing Search" mechanism as
     # trend_scout_routine/run_scan.py (a portal-defined Foundry agent, called
@@ -274,6 +296,10 @@ class Settings:
     # local disk. "lambda": workflow/video/lambda_render.py — compiles + renders on
     # AWS Lambda, output in S3; render_storyboard() returns an https:// URL instead
     # of a Path either way, so jobs.py/api.py don't need to know which ran.
+    # "higgsfield": the premium generative-AI-video path (workflow/video/higgsfield_render.py)
+    # — no Remotion; a single cinematic clip generated from a crafted prompt (+ optional
+    # user reference images for image-to-video), written to job_dir/output.mp4. This is
+    # the intended fee-paying-tier product; the free tier stays on "local"/"lambda".
     video_render_backend: str = "local"
     # ── Remotion Lambda (workflow/video/lambda_render.py) ───────────────────────
     # Required when video_render_backend == "lambda". These name resources YOU
@@ -302,16 +328,42 @@ class Settings:
     # storyboard with several struggling slides could otherwise spend
     # max_attempts-per-slide x N-slides worth of real cost.
     codegen_max_total_attempts: int = 9
+    # Deployment for the scene-codegen LLM calls (generate_scene_component,
+    # plan_scene_design, review_scene_preview, convert_generated_to_template).
+    # None -> falls back to azure_chat_deployment, same pattern as
+    # roundtable_persona_model/preference_summary_model. Lets a separate/stronger
+    # (e.g. coding-tuned) deployment be swapped in later with no code change.
+    codegen_model: Optional[str] = None
+    # Reasoning effort for generate_scene_component/review_scene_preview/
+    # convert_generated_to_template on a gpt-5.x/o-series deployment. None -> model
+    # default. Unlike the roundtable personas (which use "minimal" for short, fast
+    # turns), codegen is correctness-critical and not latency-sensitive, so a
+    # higher effort is worth trying once it's actually wired (previously it silently
+    # was NOT being sent at all here, unlike the roundtable path).
+    codegen_reasoning_effort: Optional[str] = None
+    # generate_scene_component's max_completion_tokens. MUST have enough headroom
+    # for hidden reasoning tokens (gpt-5.x/o-series) PLUS a full compiling TSX
+    # component — the previous 4096 hardcoded cap left razor-thin margin once any
+    # reasoning is spent, the same failure mode documented for
+    # ROUNDTABLE_PERSONA_MAX_TOKENS ("keep >=512, else hidden reasoning eats the
+    # whole budget and turns come back EMPTY, finish_reason=length").
+    codegen_max_tokens: int = 12000
+    # plan_scene_design's max_completion_tokens. The old hardcoded 512 sat exactly
+    # at the documented danger threshold with no reasoning_effort steer — a prime
+    # suspect for the design plan silently coming back empty (swallowed by
+    # plan_scene_design's `except Exception: return ""`), degrading every
+    # subsequent generate_scene_component call for that slide.
+    codegen_plan_max_tokens: int = 1536
+    # plan_scene_design is a short creative brainstorm ("Do NOT write code"), not a
+    # deep-reasoning task — mirrors the roundtable personas' "minimal" so the
+    # budget goes to the visible bullets, not hidden reasoning tokens.
+    codegen_plan_reasoning_effort: Optional[str] = "minimal"
     # Visual QA pass for `map` slides (workflow/video/map_qa.py): preview-still +
     # vision review per map slide, with a bounded zoom-out repair on rejection.
     # Cost per attempt ≈ one `remotion still` (5-20s) + one vision call, so
     # MAP_QA_ENABLED=false is the latency/cost kill switch.
     map_qa_enabled: bool = True
     map_qa_max_attempts: int = 2
-
-    # ── Backend status webhook (legacy transport; SSE replaces it in M2) ───────
-    webhook_url: str = "http://localhost:9999/status"
-    webhook_enabled: Optional[bool] = None
 
     # ── Per-service resolution: override > global > default ─────────────────────
     def mock_llm(self) -> bool:
@@ -341,10 +393,8 @@ class Settings:
     def mock_voiceover(self) -> bool:
         return self.use_mock if self.use_mock_voiceover is None else self.use_mock_voiceover
 
-    def notify_via_webhook(self) -> bool:
-        """Whether status events are POSTed to the backend webhook. Defaults to
-        production-only; WEBHOOK_ENABLED overrides (e.g. to test the receiver)."""
-        return (not self.use_mock) if self.webhook_enabled is None else self.webhook_enabled
+    def mock_video_generation(self) -> bool:
+        return self.use_mock if self.use_mock_video_generation is None else self.use_mock_video_generation
 
     # ── Credential presence checks (used by production impls / factory) ─────────
     @property
@@ -388,13 +438,8 @@ class Settings:
         return bool(self.azure_speech_key and self.azure_speech_region)
 
     @property
-    def has_remotion_lambda(self) -> bool:
-        """Whether enough is configured to attempt a Lambda render: a function to
-        invoke, and a stable serve URL for the (common) no-`generated`-slide case.
-        A `generated`-slide job additionally needs `resolved_video_renderer_dir` to
-        exist locally (it deploys a fresh site from that project), checked at
-        render time, not here."""
-        return bool(self.remotion_lambda_function_name and self.remotion_lambda_serve_url)
+    def has_higgsfield(self) -> bool:
+        return bool(self.higgsfield_api_key and self.higgsfield_api_secret)
 
     @property
     def resolved_video_renderer_dir(self) -> Path:
@@ -433,7 +478,8 @@ class Settings:
             f"background_removal={tag(self.mock_background_removal())} "
             f"music_generation={tag(self.mock_music_generation())} "
             f"web_search={tag(self.mock_web_search())} "
-            f"voiceover={tag(self.mock_voiceover())}]"
+            f"voiceover={tag(self.mock_voiceover())} "
+            f"video_generation={tag(self.mock_video_generation())}]"
         )
 
 
@@ -452,6 +498,7 @@ def _load() -> Settings:
         use_mock_music_generation=_env_bool("USE_MOCK_MUSIC_GENERATION"),
         use_mock_web_search=_env_bool("USE_MOCK_WEB_SEARCH"),
         use_mock_voiceover=_env_bool("USE_MOCK_VOICEOVER"),
+        use_mock_video_generation=_env_bool("USE_MOCK_VIDEO_GENERATION"),
         azure_openai_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
         azure_openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
@@ -473,6 +520,7 @@ def _load() -> Settings:
         azure_voicelive_model=os.getenv("AZURE_VOICELIVE_MODEL", "gpt-realtime"),
         azure_voicelive_api_version=os.getenv("AZURE_VOICELIVE_API_VERSION", "2026-04-10"),
         azure_voicelive_api_key=os.getenv("AZURE_VOICELIVE_API_KEY"),
+        azure_voicelive_voice=os.getenv("AZURE_VOICELIVE_VOICE", "verse"),
         roundtable_enabled=bool(_env_bool("ROUNDTABLE_ENABLED")),
         roundtable_max_rounds=_env_int("ROUNDTABLE_MAX_ROUNDS", 12),
         roundtable_persona_max_tokens=(
@@ -486,6 +534,9 @@ def _load() -> Settings:
         ),
         roundtable_persona_model=os.getenv("ROUNDTABLE_PERSONA_MODEL"),
         roundtable_manager_model=os.getenv("ROUNDTABLE_MANAGER_MODEL"),
+        roundtable_manager_reasoning_effort=(
+            os.getenv("ROUNDTABLE_MANAGER_REASONING_EFFORT", "").strip() or "low"
+        ),
         roundtable_persona_endpoint=os.getenv("AZURE_PERSONA_ENDPOINT"),
         roundtable_persona_api_key=os.getenv("AZURE_PERSONA_API_KEY"),
         roundtable_user_turn_timeout=_env_float("ROUNDTABLE_USER_TURN_TIMEOUT", 300.0),
@@ -507,6 +558,11 @@ def _load() -> Settings:
         azure_speech_key=os.getenv("AZURE_SPEECH_KEY"),
         azure_speech_region=os.getenv("AZURE_SPEECH_REGION"),
         voiceover_default_voice=os.getenv("VOICEOVER_DEFAULT_VOICE", "en-US-JennyNeural"),
+        higgsfield_api_key=os.getenv("HIGGSFIELD_API_KEY"),
+        higgsfield_api_secret=os.getenv("HIGGSFIELD_API_SECRET"),
+        higgsfield_text_model=os.getenv("HIGGSFIELD_TEXT_MODEL", ""),
+        higgsfield_image_model=os.getenv("HIGGSFIELD_IMAGE_MODEL", "higgsfield-ai/dop/standard"),
+        higgsfield_max_duration_s=_env_float("HIGGSFIELD_MAX_DURATION_S", 15.0),
         web_search_agent_name=os.getenv("WEB_SEARCH_AGENT_NAME"),
         web_search_agent_version=os.getenv("WEB_SEARCH_AGENT_VERSION"),
         review_search_agent_name=os.getenv("REVIEW_SEARCH_AGENT_NAME"),
@@ -520,10 +576,15 @@ def _load() -> Settings:
         remotion_lambda_site_name_prefix=os.getenv("REMOTION_LAMBDA_SITE_NAME_PREFIX", "storyboard-job"),
         remotion_lambda_output_bucket=os.getenv("REMOTION_LAMBDA_OUTPUT_BUCKET"),
         codegen_max_total_attempts=_env_int("CODEGEN_MAX_TOTAL_ATTEMPTS", 9),
+        codegen_model=os.getenv("CODEGEN_MODEL"),
+        codegen_reasoning_effort=(os.getenv("CODEGEN_REASONING_EFFORT") or "").strip() or None,
+        codegen_max_tokens=_env_int("CODEGEN_MAX_TOKENS", 12000),
+        codegen_plan_max_tokens=_env_int("CODEGEN_PLAN_MAX_TOKENS", 1536),
+        codegen_plan_reasoning_effort=(
+            os.getenv("CODEGEN_PLAN_REASONING_EFFORT", "minimal").strip() or None
+        ),
         map_qa_enabled=True if map_qa is None else map_qa,
         map_qa_max_attempts=_env_int("MAP_QA_MAX_ATTEMPTS", 2),
-        webhook_url=os.getenv("WEBHOOK_URL", "http://localhost:9999/status"),
-        webhook_enabled=_env_bool("WEBHOOK_ENABLED"),
     )
 
 

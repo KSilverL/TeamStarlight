@@ -1,12 +1,12 @@
 """
-Backend status-event schema (the SSE wire format, MIGRATION_PLAN §7.2).
+Backend status-event schema (the SSE wire format).
 
 As the MAF workflow runs, the api.py SSE bridge emits a **progress** event for
 every executor (running → done, or interrupted/error) so the frontend can render
 the "editorial newsroom live" — "the red-team reviewer is checking your content…".
 When a draft is ready (and again as a FinalDraft lands) a **result** event carries
-the produced content. The §7.2 envelope is reused verbatim; only the phase taxonomy
-follows the new executors.
+the produced content. Every event shares one envelope (type/node/phase/platform/
+status/ts); the phase taxonomy follows the executors.
 
     GET /tasks/{id}/events   (text/event-stream)
     data: <event dict defined here>
@@ -21,6 +21,7 @@ from typing import Optional
 PROGRESS = "progress"               # "the task is now at executor X"
 RESULT = "result"                   # "executor X produced this content"
 AGENT_UTTERANCE = "agent_utterance" # "a roundtable participant just spoke"
+SPEAKER_SCHEDULED = "speaker_scheduled"  # "the manager just handed the mic to a participant"
 DISCUSSION_CONSENSUS = "discussion_consensus"  # the table converged (a RESULT status)
 ROUND_CONTROL = "round_control"     # step mode: the table is asking the user what to do next
 
@@ -32,13 +33,13 @@ ERROR = "error"              # executor raised an exception
 
 # ── executor id → newsroom phase ──────────────────────────────────────────────
 NODE_PHASE: dict[str, str] = {
-    "dispatcher": "dispatch",   # 总编导
-    "strategist": "strategist", # 内容策略师
-    "creator": "create",        # 人格创作者 (per-platform fan-out)
-    "reviewer": "review",       # 红队审核员
-    "human_gate": "review",     # RequestPort 人工审批
-    "archivist": "archive",     # 品牌档案馆长
-    "media_producer": "produce",  # 媒体制作人 (animated card + video spec)
+    "dispatcher": "dispatch",
+    "strategist": "strategist",
+    "creator": "create",         # per-platform fan-out
+    "reviewer": "review",
+    "human_gate": "review",      # RequestPort human approval
+    "archivist": "archive",
+    "media_producer": "produce",  # animated card + video storyboard
 }
 
 
@@ -81,10 +82,10 @@ def result_event(
     return event
 
 
-# ── Roundtable discussion events (Phase 4) ────────────────────────────────────
-# One table == one platform, so `table_id` and `platform` carry the same value. Both
-# builders keep the §7.2 envelope keys (type/node/phase/platform/status/ts) so the SSE
-# stream stays uniform, and add the discussion-specific fields on top.
+# ── Roundtable discussion events ──────────────────────────────────────────────
+# One table == one platform, so `table_id` and `platform` carry the same value. The
+# builders keep the shared envelope keys (type/node/phase/platform/status/ts) so the
+# SSE stream stays uniform, and add the discussion-specific fields on top.
 
 def agent_utterance_event(
     *,
@@ -108,6 +109,30 @@ def agent_utterance_event(
         "agent_id": speaker,
         "role": role,
         "text": text,
+        "round_index": round_index,
+    }
+
+
+def speaker_scheduled_event(
+    *,
+    table_id: str,
+    speaker: str,
+    round_index: int,
+) -> dict:
+    """The manager assigned the upcoming turn to `speaker` (emitted when the mic is handed
+    over, BEFORE the persona speaks — agent_utterance follows once the turn completes). This
+    is the moderator's "announcement": the UI can show who holds the floor in real time
+    instead of only learning about a turn after it finishes."""
+    return {
+        "type": SPEAKER_SCHEDULED,
+        "node": speaker,
+        "phase": "discuss",
+        "platform": table_id,
+        "status": "running",
+        "ts": time.time(),
+        "table_id": table_id,
+        "speaker": speaker,
+        "agent_id": speaker,
         "round_index": round_index,
     }
 

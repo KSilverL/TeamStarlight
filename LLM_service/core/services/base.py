@@ -4,12 +4,15 @@ honor. The return shapes declared here ARE the contract: a Mock* and its Azure*
 counterpart must produce structurally identical results (verified by
 tests/test_contract_parity.py).
 
-The MAF "virtual newsroom" needs four services (MIGRATION_PLAN §6):
+The core services backing the "virtual newsroom":
 
     LLMService     chat / structured output / copywriting   (Azure OpenAI / Foundry)
     SafetyService  content-safety screening                 (Azure AI Content Safety)
     StoreService   brand profiles + workflow checkpoints     (PostgreSQL)
     VoiceService   voice-intake transport bridge             (Voice Live API)
+
+plus the render-pipeline asset services (image search / background removal / music /
+voiceover / video generation), realtime voice, and web research — see __all__ below.
 
 Executors never construct Mock*/Azure* directly — they go through
 core.services.factory, which maps the feature toggle to a concrete impl. That
@@ -20,7 +23,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import AsyncIterator, List, Optional
 
 from ..skill_schema import SkillCandidate, SkillRule, UserSkillDoc
 from ..trend_schema import Trend
@@ -31,11 +34,15 @@ __all__ = [
     "SafetyService",
     "StoreService",
     "VoiceService",
+    "RealtimeEvent",
+    "RealtimeVoiceSession",
+    "RealtimeVoiceService",
     "WebSearchService",
     "ImageSearchService",
     "BackgroundRemovalService",
     "MusicGenerationService",
     "VoiceoverService",
+    "VideoGenerationService",
     "empty_profile",
 ]
 
@@ -58,6 +65,24 @@ def empty_profile(business_id: Optional[str]) -> dict:
         "examples": [],
         "updated_at": None,
     }
+
+
+def render_brand_profile(profile: dict) -> str:
+    """Render a Brand_Voice_Profile as a prompt block (empty string when cold-start).
+    Lives in core so both the roundtable's `brand_voice` seat AND the linear strategist /
+    plan layer share ONE renderer (like `render_trends`); `workflow/roundtable/personas.py`
+    re-exports it for back-compat."""
+    must_do = profile.get("must_do") or []
+    must_avoid = profile.get("must_avoid") or []
+    examples = [e.get("text", "") for e in (profile.get("examples") or []) if e.get("text")]
+    parts: List[str] = []
+    if must_do:
+        parts.append("BRAND MUST DO:\n" + "\n".join(f"- {x}" for x in must_do))
+    if must_avoid:
+        parts.append("BRAND MUST AVOID:\n" + "\n".join(f"- {x}" for x in must_avoid))
+    if examples:
+        parts.append("BRAND EXAMPLES:\n" + "\n".join(f"- {x}" for x in examples))
+    return "\n\n".join(parts)
 
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
@@ -93,14 +118,25 @@ class LLMService(ABC):
         platform: str,
         user_intent: str,
         trends: str = "",
+        skill: str = "",
+        brand_block: str = "",
+        user_block: str = "",
     ) -> str:
         """Return a platform-differentiated *strategy* (not copy) — the angle the
         creator should take on this platform. `trends` is a pre-rendered CURRENT TRENDS
-        block (`core.trend_schema.render_trends` — the Phase 4 spread of the daily
-        snapshot beyond the roundtable): when non-empty an impl offers to fuse ONE
+        block (`core.trend_schema.render_trends`, from the daily
+        snapshot): when non-empty an impl offers to fuse ONE
         genuinely-fitting trend into the angle, with explicit permission to use none —
-        a forced trend is worse than none. Empty means no trends available/enabled and
-        MUST leave the strategy exactly as before (degrade-to-empty rule)."""
+        a forced trend is worse than none.
+
+        `skill` / `brand_block` / `user_block` are the same context the roundtable brings
+        to bear, so a NON-roundtable run reasons with the platform style guide
+        (`skills/<platform>.md`), the brand voice profile (`render_brand_profile`), and
+        this user's learned rules (`render_user_skills`) rather than from the topic alone —
+        making the linear strategist as informed as a discussion table would be. Every one
+        of these blocks is optional and follows the degrade-to-empty rule: an empty block
+        MUST leave the strategy exactly as it would be without it (so the pre-Phase-4
+        topic-only call is byte-identical)."""
         ...
 
     @abstractmethod
@@ -121,7 +157,7 @@ class LLMService(ABC):
         ...
 
     @abstractmethod
-    async def plan_campaign(
+    async def clarify_campaign(
         self,
         *,
         goal: str,
@@ -135,17 +171,59 @@ class LLMService(ABC):
         trends: str = "",
         skill: str = "",
     ) -> dict:
+        """The pre-generation CLARIFY step: BEFORE any dated schedule is generated,
+        propose a preliminary posting cadence and ask ≤3 short questions whose answers
+        would let you tailor the plan — as a JSON-friendly dict matching
+        core.plan_schema.PlanClarification (recommended_cadence + follow_up_questions,
+        NO items). Same pre-rendered `brand_block` / `user_block` / `trends` blocks and
+        the same static `skill` (skills/posting_plan.md) as `plan_campaign`; empty blocks
+        leave the output unchanged. When `cadence_hint` is blank the impl reasons the
+        cadence from this brand/product/platform + the user's habits. The caller feeds the
+        collected answers back into `plan_campaign(answers=…)` to generate the plan."""
+        ...
+
+    @abstractmethod
+    async def plan_campaign(
+        self,
+        *,
+        goal: str,
+        platforms: List[str],
+        start_date: str,
+        end_date: str,
+        cadence_hint: str = "",
+        tone_hint: Optional[str] = None,
+        brand_block: str = "",
+        user_block: str = "",
+        trends: str = "",
+        skill: str = "",
+        feedback: str = "",
+        answers: str = "",
+        prior_plan: str = "",
+    ) -> dict:
         """Propose a multi-date posting plan (strategy + schedule, NOT copy) for the
         [start_date, end_date] window: which topic/angle to post on which date, on
         which platforms, and WHY that timing — as a JSON-friendly dict matching
-        core.plan_schema.PostingPlanSpec (strategy_summary + items). The LLM produces
-        DATA only: dates are clamped into the window downstream (`clamp_item_dates`),
-        never trusted. `brand_block` / `user_block` / `trends` are pre-rendered prompt
-        blocks (render_brand_profile / render_user_skills / render_trends) — empty
-        blocks MUST leave the plan unchanged (degrade-to-empty rule, same as
-        plan_strategy). `skill` is the static planning spec
-        (skills/posting_plan.md); `cadence_hint` is the caller's free-text pacing
-        wish (e.g. "2 posts a week")."""
+        core.plan_schema.PostingPlanSpec (strategy_summary + recommended_cadence +
+        follow_up_questions + items). The LLM produces DATA only: dates are clamped
+        into the window downstream (`clamp_item_dates`), never trusted.
+        `brand_block` / `user_block` / `trends` are pre-rendered prompt blocks
+        (render_brand_profile / render_user_skills / render_trends) — empty blocks
+        MUST leave the plan unchanged (degrade-to-empty rule, same as plan_strategy).
+        `skill` is the static planning spec (skills/posting_plan.md).
+
+        Cadence: `cadence_hint` is the caller's free-text pacing wish (e.g. "2 posts a
+        week"). When it is BLANK the impl chooses a cadence that fits this brand /
+        product / platform — reasoning from `brand_block` / `user_block` (the user's past
+        habits) — and reports it in `recommended_cadence`. `follow_up_questions` are ≤3
+        clarifiers the planner would ask to tailor further; empty when the brief is
+        self-sufficient. Neither gates item generation: a usable draft is always returned.
+
+        Refine loop (mirrors `write_copy`'s `feedback`/`prior_draft`): `prior_plan` is a
+        compact rendering of the previous draft to REVISE (not restart from scratch);
+        `feedback` is the user's free-text change request; `answers` is the user's
+        answers to earlier `follow_up_questions` (pre-rendered Q/A lines). When these are
+        present the impl revises minimally, honours them, and drops any now-answered
+        questions. All three empty = a fresh plan."""
         ...
 
     @abstractmethod
@@ -201,15 +279,14 @@ class LLMService(ABC):
         history: Optional[List[dict]] = None,
     ) -> str:
         """Generate a SINGLE, self-contained animated HTML document from an approved
-        post (the "生成 HTML" idea, ported from demos/brand_agent). Returns a complete
-        9:16 brand "video card" — inline CSS keyframes + SVG, auto-advancing scenes, no
-        external assets — ready to drop straight into the frontend. `skill` is the
-        static brand-animation style guide (skills/brand_animation.md): production folds
-        it into the prompt, the mock renders a deterministic offline card. The output
-        starts with `<!DOCTYPE html>` and embeds no raw user copy (the draft is escaped),
-        replacing the old template preview card. `history` (optional) is the prior
-        {role, content} conversation the caller assembled, folded in as context so a
-        follow-up card request can build on the thread; None/empty = single-turn."""
+        post. Returns a complete 9:16 brand "video card" — inline CSS keyframes + SVG,
+        auto-advancing scenes, no external assets — ready to drop straight into the
+        frontend. `skill` is the static brand-animation style guide
+        (skills/brand_animation.md): production folds it into the prompt, the mock
+        renders a deterministic offline card. The output starts with `<!DOCTYPE html>`
+        and embeds no raw user copy (the draft is escaped). `history` (optional) is the
+        prior {role, content} conversation the caller assembled, folded in as context so
+        a follow-up card request can build on the thread; None/empty = single-turn."""
         ...
 
     @abstractmethod
@@ -234,6 +311,31 @@ class LLMService(ABC):
         the static spec (skills/brand_video_storyboard.md). `history` (optional) is the
         prior {role, content} conversation the caller assembled, folded in as context
         for a follow-up; None/empty = single-turn."""
+        ...
+
+    @abstractmethod
+    async def generate_video_prompt(
+        self,
+        *,
+        topic: str,
+        draft: str,
+        tone_hint: Optional[str],
+        platform: str,
+        has_reference_images: bool = False,
+    ) -> dict:
+        """Craft a single text prompt for a GENERATIVE AI video clip (Higgsfield —
+        workflow/video/higgsfield_render.py), the premium sibling of the templated
+        Remotion storyboard. Returns a JSON-friendly dict matching
+        core.video_schema.VideoPromptSpec: {"prompt": str, "motion": str|None}.
+        `prompt` is one cinematic shot description the video model renders directly
+        (subject, setting, lighting, mood — NOT a storyboard, NOT post copy); `motion`
+        is an optional short camera/motion cue (e.g. 'slow dolly-in'). `platform` gives
+        length/format context only (the aspect ratio is derived deterministically
+        downstream). `has_reference_images` is True when the user attached 1-3 reference
+        images the clip is generated FROM (image-to-video): in that case the prompt must
+        COMPLEMENT the images — describe motion, camera, and atmosphere — and must NOT
+        re-describe or contradict the subject the images already fix. False means pure
+        text-to-video, so the prompt fully specifies the subject."""
         ...
 
     @abstractmethod
@@ -356,7 +458,7 @@ class LLMService(ABC):
 
     @abstractmethod
     async def plan_scene_design(self, *, description: str, data: dict) -> str:
-        """Stage 1 of two-stage `generated`-slide codegen (video-agent Phase 5): a
+        """Stage 1 of two-stage `generated`-slide codegen: a
         short visual concept (5-8 plain-text bullets — layout, dominant element,
         motion beats, backdrop/palette) produced BEFORE any code, then passed to
         every generate_scene_component call for that slide as `design_plan` so the
@@ -368,8 +470,8 @@ class LLMService(ABC):
     async def review_scene_preview(
         self, *, description: str, image_bytes: bytes, attempt: int = 1,
     ) -> dict:
-        """Multimodal visual QA for a `generated` slide (Phase 3 of the video-agent
-        plan): given the ORIGINAL creative brief (`description`) and a still frame
+        """Multimodal visual QA for a `generated` slide:
+        given the ORIGINAL creative brief (`description`) and a still frame
         (PNG bytes) rendered from the just-typechecked, just-rendered candidate
         component, judge whether it actually looks right — not just "did it compile
         and render without throwing" (workflow/video/codegen.py's typecheck +
@@ -379,7 +481,7 @@ class LLMService(ABC):
         is contextual only (which retry this is), mirroring `generate_scene_component`.
 
         Returns {"approved": bool, "feedback": str, "fixes": list[str]}. `feedback`
-        is empty when approved; `fixes` (Phase 5) is 1-3 concrete, imperative repair
+        is empty when approved; `fixes` is 1-3 concrete, imperative repair
         instructions when NOT approved (empty when approved), which codegen.py folds
         into the next attempt's `prior_error` (e.g. "move the caption above y=1700",
         not "looks bad"). Called only after typecheck + preview-render both already
@@ -440,7 +542,7 @@ class SafetyService(ABC):
 
 class StoreService(ABC):
     """Brand_Voice_Profile reads/writes plus workflow checkpoint persistence.
-    The vector RAG line is gone — preferences are human-readable, taggable rules
+    There is no vector RAG — preferences are human-readable, taggable rules
     (must_do / must_avoid / examples)."""
 
     @abstractmethod
@@ -544,13 +646,94 @@ class StoreService(ABC):
 # ── Voice (Voice Live bridge) ─────────────────────────────────────────────────
 
 class VoiceService(ABC):
-    """Transport bridge for the voice intake entry point. The full voice
-    conversation state machine lands in M3; M1 only fixes the contract so the
-    factory + parity tests cover all four services."""
+    """Transport bridge for the voice intake entry point: one spoken turn in,
+    its transcript out. The conversation state machine lives in intake/."""
 
     @abstractmethod
     async def transcribe_turn(self, *, session_id: str, user_audio: str) -> dict:
         """Turn a user audio turn into text. Contract keys: session_id, transcript."""
+        ...
+
+
+# ── Realtime voice (native speech-to-speech bridge, GPT-Realtime) ─────────────
+# A second, DUPLEX voice contract alongside VoiceService above. VoiceService's
+# transcribe_turn is a cascaded request/response shape (audio in -> text out, then the
+# text pipeline runs); this one is a live, persistent, event-streamed session where the
+# model consumes and produces audio directly and decides tool calls itself — there is no
+# "transcribe first" step on the path that drives the conversation. Transcripts still
+# arrive as a side channel (captions/logging/per-user learning), never as the mechanism.
+
+@dataclass(frozen=True)
+class RealtimeEvent:
+    """One event out of a live realtime session. `type` discriminates which of the
+    other (mostly-None) fields are populated:
+      - "audio_delta"               -> audio_b64 (assistant speech chunk)
+      - "output_transcript_delta"   -> text (assistant's spoken words, as text)
+      - "input_transcript"          -> text (the user's words, as text)
+      - "tool_call"                 -> call_id, name, arguments
+      - "speech_started"            -> (barge-in: the user started talking)
+      - "response_done"             -> (one assistant turn finished)
+      - "error"                     -> message
+    """
+    type: str
+    audio_b64: Optional[str] = None
+    text: Optional[str] = None
+    call_id: Optional[str] = None
+    name: Optional[str] = None
+    arguments: Optional[dict] = None
+    message: Optional[str] = None
+
+
+class RealtimeVoiceSession(ABC):
+    """One live duplex speech-to-speech session bound to a single intake conversation.
+    Callers push audio in and read `events()` for everything the model produces
+    (speech, transcripts, tool calls); a tool call MUST be answered via
+    `send_tool_result` so the model can continue (its narration of a tool's result,
+    e.g. a suggested topic, only happens once the result is fed back)."""
+
+    @abstractmethod
+    async def send_audio(self, *, audio_b64: str) -> None:
+        """Append one chunk of base64 PCM16 user audio to the session's input buffer."""
+        ...
+
+    @abstractmethod
+    async def send_tool_result(self, *, call_id: str, output: dict) -> None:
+        """Answer a "tool_call" event so the model resumes (and, for a tool whose
+        result the user should hear, narrates it)."""
+        ...
+
+    @abstractmethod
+    async def nudge(self, *, text: str) -> None:
+        """Inject an out-of-band system instruction (not spoken by the user) and
+        prompt a response — used once, e.g., to tell the model the brief is now
+        complete (the MAX_INTAKE_FOLLOWUPS cap was hit) so it wraps up the
+        conversation out loud instead of the brief completing silently behind it."""
+        ...
+
+    @abstractmethod
+    def events(self) -> AsyncIterator[RealtimeEvent]:
+        """The session's event stream, in order, until `close()`."""
+        ...
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Tear down the session."""
+        ...
+
+
+class RealtimeVoiceService(ABC):
+    """Opens a RealtimeVoiceSession. Cheap/cached like the other service getters;
+    the actual connection is made fresh per intake conversation by `open_session`
+    (one session cannot be shared across conversations)."""
+
+    @abstractmethod
+    async def open_session(
+        self, *, session_id: str, instructions: str, tools: List[dict],
+    ) -> RealtimeVoiceSession:
+        """Open one live session. `instructions` is the system prompt (the shared
+        INTAKE_SYSTEM_PROMPT, optionally with a prior-context block folded in);
+        `tools` is BRIEF_TOOL_DEFS (Chat-Completions shape — the impl reshapes it to
+        whatever the wire format needs)."""
         ...
 
 
@@ -626,8 +809,8 @@ class MusicGenerationService(ABC):
 # ── Voiceover (Azure Speech text-to-speech) ────────────────────────────────────
 
 class VoiceoverService(ABC):
-    """Narration text-to-speech for an optional voiceover track (Phase 3 of the
-    video-agent plan) — distinct from VoiceService above, which bridges SPOKEN
+    """Narration text-to-speech for an optional voiceover track
+    — distinct from VoiceService above, which bridges SPOKEN
     input during intake (speech-to-text); this is spoken OUTPUT for a rendered
     video. `workflow/video/voiceover.py` sizes/mixes the result; callers there
     treat a hard failure as "no voiceover" (mirrors MusicGenerationService), never
@@ -638,4 +821,38 @@ class VoiceoverService(ABC):
         """Return audio bytes (mp3) speaking `text` in `voice` (a provider-specific
         voice id, e.g. an Azure Neural voice name). Raises on a hard failure (rate
         limit, bad voice id, network) — callers fall back to no narration."""
+        ...
+
+
+# ── Generative AI video (Higgsfield — premium render backend) ──────────────────
+
+class VideoGenerationService(ABC):
+    """Generative, cinematic AI video for the premium render backend (Higgsfield —
+    workflow/video/higgsfield_render.py), distinct from the free templated Remotion
+    path. Selected by VIDEO_RENDER_BACKEND=higgsfield, never used on the local/lambda
+    Remotion path. One generation produces ONE clip (the model's native per-generation
+    max, ~≤15s); multi-scene stitching is a later phase."""
+
+    @abstractmethod
+    async def generate_clip(
+        self,
+        *,
+        prompt: str,
+        reference_images: Optional[List[bytes]] = None,
+        model: str,
+        duration_seconds: float,
+        width: int,
+        height: int,
+    ) -> bytes:
+        """Return MP4 bytes for one generated clip. The submit → poll → download cycle
+        happens INSIDE the impl (the caller just awaits the finished bytes, mirroring
+        MusicGenerationService/VoiceoverService). `reference_images` empty/None →
+        text-to-video (the `prompt` fully specifies the subject); 1-3 images present →
+        image-to-video (the images are the visual reference the clip is generated from,
+        the `prompt` supplies motion/atmosphere). `model` is the provider model id
+        (a different one per input mode); `width`/`height` come from
+        core.video_schema.aspect_for_platform and are mapped to the provider's aspect
+        param; `duration_seconds` is clamped to the model's max by the caller. Raises on
+        a hard failure (rate limit, bad params, network, generation error) — the render
+        job marks itself `error`, exactly like a failed Remotion render."""
         ...

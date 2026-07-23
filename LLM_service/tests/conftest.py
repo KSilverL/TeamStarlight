@@ -7,7 +7,7 @@ Autouse fixtures keep every test deterministic, offline, and in mock mode:
   - mock_environment: clears toggle/Azure env so the default (mock) mode is in force.
 
 MockSafety is deterministic (it flags a draft iff it contains the UNSAFE_MARKER
-substring), so — unlike the old random critic — there is nothing to pin.
+substring), so there is no randomness to pin.
 """
 
 from __future__ import annotations

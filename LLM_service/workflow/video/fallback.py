@@ -1,7 +1,6 @@
 """
 Last-resort conversion for a `generated` slide whose codegen loop exhausted its
-attempt budget (workflow/video/codegen.py): instead of the old degradation — a bare
-hook card showing the first 60 characters of the creative brief — one LLM call
+attempt budget (workflow/video/codegen.py): one LLM call
 (`LLMService.convert_generated_to_template`) re-expresses the brief + its structured
 `data` as the best-fitting FIXED template slide, so a chart-shaped brief still
 renders as a real chart and a places-shaped brief as a real map, just via the

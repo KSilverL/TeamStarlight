@@ -1,5 +1,5 @@
 """
-The shared intake conversation (MIGRATION_PLAN §4.2).
+The shared intake conversation.
 
 `IntakeSession` is the public contract both entry points implement. The actual
 conversation — the system prompt, the function (tool) definitions, the slot-filling
@@ -35,11 +35,11 @@ INTAKE_SYSTEM_PROMPT = (
 )
 
 def _render_prior_context(prior: PriorSessionContext) -> str:
-    """Render a "## 前情提要" (prior-session recap) block to append to INTAKE_SYSTEM_PROMPT, so the
+    """Render a prior-session recap block to append to INTAKE_SYSTEM_PROMPT, so the
     SAME analyse-first `fill_brief` pass folds the earlier conversation into its extraction (a
     sparse "let's keep going" opening can resolve against the prior topic/directions in one pass).
-    Returns "" for an empty recap (Phase 5 degrade), so a content-free context never bloats the
-    prompt or changes behaviour."""
+    Returns "" for an empty recap, so a content-free context never bloats the prompt or changes
+    behaviour."""
     if prior is None or not prior.has_content():
         return ""
     lines = ["", "## 前情提要 (continuing a prior conversation)",
@@ -119,7 +119,7 @@ class _SessionState:
     followups_asked: int = 0  # clarifying questions asked so far (capped at MAX_INTAKE_FOLLOWUPS)
     # The prior-session recap (backend-supplied) this conversation continues; None = fresh. An
     # all-empty recap is degraded to None at the entry point, so this is set only when it carries
-    # signal — it rides onto the final brief and folds a "前情提要" block into the fill_brief prompt.
+    # signal — it rides onto the final brief and folds a recap block into the fill_brief prompt.
     prior_context: Optional[PriorSessionContext] = None
 
 
@@ -164,7 +164,24 @@ class BriefConversation:
             brief_partial=dict(state.brief_partial),
             pending_field=pending,
         )
-        for key, value in result.get("brief_updates", {}).items():
+        await self.apply_tool_result(
+            state,
+            brief_updates=result.get("brief_updates", {}),
+            wants_topic_idea=result.get("wants_topic_idea", False),
+        )
+        return self._respond(state, greeting=greeting)
+
+    async def apply_tool_result(
+        self, state: _SessionState, *, brief_updates: dict, wants_topic_idea: bool,
+    ) -> None:
+        """Fold one turn's tool outcome into `state` — updates to `brief_partial`, the
+        `suggest_topic` copilot path, and the follow-up-cap force-complete check. This
+        is the ONE place brief-completion rules live, shared by both `turn()` (the
+        text/cascaded-voice engine, driven by `LLMService.fill_brief`'s tool-call
+        result) and the realtime voice engine (intake/realtime_voice.py, driven by a
+        `tool_call` event straight from the live GPT-Realtime session) — only how
+        `brief_updates`/`wants_topic_idea` are produced differs by transport."""
+        for key, value in brief_updates.items():
             if value:
                 state.brief_partial[key] = value
 
@@ -172,7 +189,7 @@ class BriefConversation:
         # once the goal is known, so the proposal is seeded by THEIR intent. Until then the
         # latched flag makes the clarifier ask for the goal instead of the topic; if the
         # goal never arrives, _force_complete's fallback suggestion still terminates intake.
-        if result.get("wants_topic_idea"):
+        if wants_topic_idea:
             state.wants_topic_idea = True
         if (
             state.wants_topic_idea
@@ -190,8 +207,6 @@ class BriefConversation:
         # missing → stop interrogating and fill the gaps ourselves so the brief completes.
         if state.followups_asked >= MAX_INTAKE_FOLLOWUPS and self._missing(state.brief_partial):
             await self._force_complete(state)
-
-        return self._respond(state, greeting=greeting)
 
     def _respond(self, state: _SessionState, *, greeting: bool) -> dict:
         missing = self._missing(state.brief_partial)
@@ -258,7 +273,7 @@ class BriefConversation:
         )
 
 
-# ── Public contract (§4.2) ────────────────────────────────────────────────────
+# ── Public contract ───────────────────────────────────────────────────────────
 
 class IntakeSession(ABC):
     """The interface the frontend instantiates per `intake_mode`."""
@@ -274,7 +289,7 @@ class IntakeSession(ABC):
         `target_platforms` (backend-supplied) seeds the brief so intake never asks about
         platforms — the user only ever clarifies the topic/goal. `prior_context` (optional,
         backend-supplied) is the recap of an earlier session this conversation continues; its
-        presence folds a "前情提要" block into the prompt. None — or an all-empty recap — is the
+        presence folds a recap block into the prompt. None — or an all-empty recap — is the
         fresh-conversation path, unchanged."""
         ...
 
@@ -315,7 +330,7 @@ class ConversationalIntake(IntakeSession):
         if target_platforms:
             state.brief_partial["target_platforms"] = list(target_platforms)
         # A prior-session recap is kept only when it carries signal; an all-empty recap degrades
-        # to the fresh path (Phase 5), so a content-free context never alters the conversation.
+        # to the fresh path, so a content-free context never alters the conversation.
         if prior_context is not None and prior_context.has_content():
             state.prior_context = prior_context
         self._sessions[session_id] = state

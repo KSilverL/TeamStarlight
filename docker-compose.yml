@@ -1,85 +1,89 @@
-services:
+llm:
+  build:
+    context: .
+    dockerfile: LLM_service/Dockerfile
+  ports:
+    - "8080:8080"
+  environment:
+    # Set to true for local development without Azure credentials.
+    - USE_MOCK=false
 
-  # ---------------------------------------------------------------------------
-  # Frontend — Next.js production build
-  # ---------------------------------------------------------------------------
-  frontend:
-    build:
-      context: frontend_service
-      dockerfile: Dockerfile
-    ports:
-      - "3000:3000"
-    environment:
-      # Main LLM service (text generation + MAF workflow /tasks + video render jobs)
-      - TEXT_AGENT_URL=http://llm:8080
-      - LLM_SERVICE_URL=http://llm:8080
-      # Java backend (signup / login)
-      - BACKEND_URL=http://backend:8081
-    depends_on:
-      - llm
-      - backend
+    # Video renderer
+    - VIDEO_RENDER_BACKEND=${VIDEO_RENDER_BACKEND:-local}
 
-  # ---------------------------------------------------------------------------
-  # Backend — Spring Boot Java service
-  # ---------------------------------------------------------------------------
-  backend:
-    build:
-      context: tsldemo
-      dockerfile: Dockerfile
-    ports:
-      - "8081:8081"
-    environment:
-      - LLM_SERVICE_BASE_URL=http://llm:8080
-      - TZ=Europe/Dublin
-      # Supabase credentials — override here or in a .env file if needed.
-      # Defaults are already baked into application.properties.
-      # LinkedIn OAuth — must match the redirect URI registered on the LinkedIn Developer app,
-      # and where to send the browser back to after the OAuth round-trip.
-      - LINKEDIN_REDIRECT_URI=${LINKEDIN_REDIRECT_URI:-http://localhost:8081/linkedin/callback}
-      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-http://localhost:3000}
-    depends_on:
-      - llm
+    - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+    - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+    - AZURE_OPENAI_CHAT_DEPLOYMENT=${AZURE_OPENAI_CHAT_DEPLOYMENT}
 
-  # ---------------------------------------------------------------------------
-  # LLM Service — Python FastAPI (MAF virtual-newsroom workflow)
-  # Requires AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY for production.
-  # Runs in mock mode by default (USE_MOCK=true) so it starts without creds.
-  # ---------------------------------------------------------------------------
-  llm:
-    build:
-      # Context is the repo root, not LLM_service/ — the image also bundles the
-      # sibling video_renderer/ Node project (local Remotion CLI render subprocess).
-      context: .
-      dockerfile: LLM_service/Dockerfile
-    ports:
-      - "8080:8080"
-    environment:
-      - USE_MOCK=true
-      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
-      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
-      - AZURE_OPENAI_CHAT_DEPLOYMENT=${AZURE_OPENAI_CHAT_DEPLOYMENT}
-      # Web search (Bing grounding via Azure AI Foundry agents). FOUNDRY_PROJECT_ENDPOINT
-      # must be set here too — get_web_search() raises without it once USE_MOCK_WEB_SEARCH
-      # is false, since it's the endpoint the WEB_SEARCH_AGENT_* names below resolve against.
-      - FOUNDRY_PROJECT_ENDPOINT=${FOUNDRY_PROJECT_ENDPOINT}
-      - USE_MOCK_WEB_SEARCH=false
-      - WEB_SEARCH_AGENT_NAME=${WEB_SEARCH_AGENT_NAME}
-      - WEB_SEARCH_AGENT_VERSION=${WEB_SEARCH_AGENT_VERSION}
-      - REVIEW_SEARCH_AGENT_NAME=${REVIEW_SEARCH_AGENT_NAME}
-      - REVIEW_SEARCH_AGENT_VERSION=${REVIEW_SEARCH_AGENT_VERSION}
-      - DATABASE_URL=${DATABASE_URL}
-      # Cosmos DB for PostgreSQL mandates SSL; Supabase doesn't need this set.
-      - POSTGRES_SSLMODE=${POSTGRES_SSLMODE}
-      - USE_MOCK_IMAGE_SEARCH=false
-      - USE_MOCK_BACKGROUND_REMOVAL=false
-      - PEXELS_API_KEY=${PEXELS_API_KEY}
-      - REMOVEBG_API_KEY=${REMOVEBG_API_KEY}
-      - GEOAPIFY_API_KEY=${GEOAPIFY_API_KEY}
-      - GEOAPIFY_MAP_STYLE=${GEOAPIFY_MAP_STYLE}
-      - USE_MOCK_MUSIC_GENERATION=true
-      - REMOVEBG_API_KEY=${REMOVEBG_API_KEY}
-      - USE_MOCK_MUSIC_GENERATION=true
-      # Brand profiles + user skills come from the same Postgres DATABASE_URL above, so the
-      # roundtable's brand_voice/user_advocate personas argue from real data, not mocks.
-      - USE_MOCK_STORE=true
-      # - SOUNDRAW_API_KEY=${SOUNDRAW_API_KEY}
+    # Web search
+    - FOUNDRY_PROJECT_ENDPOINT=${FOUNDRY_PROJECT_ENDPOINT}
+    - USE_MOCK_WEB_SEARCH=false
+    - WEB_SEARCH_AGENT_NAME=${WEB_SEARCH_AGENT_NAME}
+    - WEB_SEARCH_AGENT_VERSION=${WEB_SEARCH_AGENT_VERSION}
+    - REVIEW_SEARCH_AGENT_NAME=${REVIEW_SEARCH_AGENT_NAME}
+    - REVIEW_SEARCH_AGENT_VERSION=${REVIEW_SEARCH_AGENT_VERSION}
+
+    - DATABASE_URL=${DATABASE_URL}
+    - POSTGRES_SSLMODE=${POSTGRES_SSLMODE}
+
+    - USE_MOCK_IMAGE_SEARCH=false
+    - USE_MOCK_BACKGROUND_REMOVAL=false
+
+    - PEXELS_API_KEY=${PEXELS_API_KEY}
+    - REMOVEBG_API_KEY=${REMOVEBG_API_KEY}
+
+    - GEOAPIFY_API_KEY=${GEOAPIFY_API_KEY}
+    - GEOAPIFY_MAP_STYLE=${GEOAPIFY_MAP_STYLE}
+
+    - USE_MOCK_MUSIC_GENERATION=true
+    - USE_MOCK_SAFETY=true
+
+    # Voice
+    - USE_MOCK_VOICE=${USE_MOCK_VOICE}
+    - AZURE_VOICELIVE_ENDPOINT=${AZURE_VOICELIVE_ENDPOINT}
+    - AZURE_VOICELIVE_MODEL=${AZURE_VOICELIVE_MODEL}
+    - AZURE_VOICELIVE_API_VERSION=${AZURE_VOICELIVE_API_VERSION}
+    - AZURE_VOICELIVE_API_KEY=${AZURE_VOICELIVE_API_KEY}
+    - AZURE_VOICELIVE_VOICE=${AZURE_VOICELIVE_VOICE}
+
+    # Store
+    - USE_MOCK_STORE=false
+
+    # Roundtable
+    - ROUNDTABLE_ENABLED=${ROUNDTABLE_ENABLED}
+    - ROUNDTABLE_MAX_ROUNDS=${ROUNDTABLE_MAX_ROUNDS}
+    - ROUNDTABLE_PERSONA_MAX_TOKENS=${ROUNDTABLE_PERSONA_MAX_TOKENS}
+    - ROUNDTABLE_PERSONA_REASONING_EFFORT=${ROUNDTABLE_PERSONA_REASONING_EFFORT}
+    - ROUNDTABLE_PERSONA_VERBOSITY=${ROUNDTABLE_PERSONA_VERBOSITY}
+    - ROUNDTABLE_MANAGER_MODEL=${ROUNDTABLE_MANAGER_MODEL}
+    - ROUNDTABLE_PERSONA_MODEL=${ROUNDTABLE_PERSONA_MODEL}
+    - ROUNDTABLE_CONTROL_TIMEOUT=${ROUNDTABLE_CONTROL_TIMEOUT}
+    - AZURE_PERSONA_ENDPOINT=${AZURE_PERSONA_ENDPOINT}
+    - AZURE_PERSONA_API_KEY=${AZURE_PERSONA_API_KEY}
+    - TREND_SCOUT_ENABLED=${TREND_SCOUT_ENABLED}
+
+    # Code generation
+    - CODEGEN_MAX_TOTAL_ATTEMPTS=${CODEGEN_MAX_TOTAL_ATTEMPTS}
+    - CODEGEN_MODEL=${CODEGEN_MODEL}
+    - CODEGEN_REASONING_EFFORT=${CODEGEN_REASONING_EFFORT}
+    - CODEGEN_MAX_TOKENS=${CODEGEN_MAX_TOKENS}
+    - CODEGEN_PLAN_MAX_TOKENS=${CODEGEN_PLAN_MAX_TOKENS}
+    - CODEGEN_PLAN_REASONING_EFFORT=${CODEGEN_PLAN_REASONING_EFFORT}
+
+    # Higgsfield
+    - USE_MOCK_VIDEO_GENERATION=false
+    - HIGGSFIELD_API_KEY=${HIGGSFIELD_API_KEY}
+    - HIGGSFIELD_API_SECRET=${HIGGSFIELD_API_SECRET}
+    - HIGGSFIELD_IMAGE_MODEL=${HIGGSFIELD_IMAGE_MODEL}
+    - HIGGSFIELD_TEXT_MODEL=${HIGGSFIELD_TEXT_MODEL}
+    - HIGGSFIELD_MAX_DURATION_S=15
+
+    # Optional
+    # - SOUNDRAW_API_KEY=${SOUNDRAW_API_KEY}
+    # - AZURE_SPEECH_KEY=${AZURE_SPEECH_KEY}
+    # - AZURE_SPEECH_REGION=${AZURE_SPEECH_REGION}
+    # - AWS_REGION=${AWS_REGION}
+    # - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+    # - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    # - REMOTION_LAMBDA_FUNCTION_NAME=${REMOTION_LAMBDA_FUNCTION_NAME}
+    # - REMOTION_LAMBDA_SERVE_URL=${REMOTION_LAMBDA_SERVE_URL}

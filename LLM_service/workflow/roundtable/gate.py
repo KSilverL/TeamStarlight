@@ -1,5 +1,5 @@
 """
-The user "raise hand" gate (§1 decision 4, refined): a user's input takes time to type, so a
+The user "raise hand" gate: a user's input takes time to type, so a
 queued message alone risks arriving after the AIs have already converged — wasted. The fix is
 a two-phase protocol: the user **raises a hand** first (reserving the next user turn), and
 before each round the manager checks the hand; if it's up, the table **stops and waits** for

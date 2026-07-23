@@ -18,14 +18,16 @@ from typing import Any, Callable, Dict, Optional
 from agent_framework import CheckpointStorage, InMemoryCheckpointStorage
 
 from ..config import get_settings
-from . import azure, media_assets, mock, postgres, web_search
+from . import azure, higgsfield, media_assets, mock, postgres, web_search
 from .base import (
     BackgroundRemovalService,
     ImageSearchService,
     LLMService,
     MusicGenerationService,
+    RealtimeVoiceService,
     SafetyService,
     StoreService,
+    VideoGenerationService,
     VoiceoverService,
     VoiceService,
     WebSearchService,
@@ -36,6 +38,7 @@ __all__ = [
     "get_safety",
     "get_store",
     "get_voice",
+    "get_realtime_voice",
     "get_chat_client",
     "get_image_search",
     "get_live_image_search",
@@ -43,6 +46,7 @@ __all__ = [
     "get_music_generation",
     "get_web_search",
     "get_voiceover_generation",
+    "get_video_generation",
     "get_checkpoint_storage",
     "reset_services",
 ]
@@ -116,6 +120,20 @@ def get_voice() -> VoiceService:
                  "AZURE_VOICELIVE_ENDPOINT", "USE_MOCK_VOICE=true")
         return azure.AzureVoice(s)
     return _cached("voice", build)
+
+
+def get_realtime_voice() -> RealtimeVoiceService:
+    """Native speech-to-speech bridge (GPT-Realtime), used by WS /intake/{sid}/voice.
+    Distinct from get_voice()'s cascaded transcribe_turn contract, kept as a fallback
+    (still reachable over the cascaded REST intake path)."""
+    def build() -> RealtimeVoiceService:
+        s = get_settings()
+        if s.mock_voice():
+            return mock.MockRealtimeVoice()
+        _require(s.has_voice, "Azure Voice Live API (realtime)",
+                 "AZURE_VOICELIVE_ENDPOINT", "USE_MOCK_VOICE=true")
+        return azure.AzureRealtimeVoice(s)
+    return _cached("realtime_voice", build)
 
 
 def get_chat_client(
@@ -223,10 +241,24 @@ def get_voiceover_generation() -> VoiceoverService:
     return _cached("voiceover_generation", build)
 
 
+def get_video_generation() -> VideoGenerationService:
+    """Generative AI video (Higgsfield) — the premium render backend selected by
+    VIDEO_RENDER_BACKEND=higgsfield. Mock = a real, offline placeholder MP4;
+    production = the Higgsfield REST API (submit → poll → download)."""
+    def build() -> VideoGenerationService:
+        s = get_settings()
+        if s.mock_video_generation():
+            return mock.MockVideoGeneration()
+        _require(s.has_higgsfield, "Higgsfield",
+                 "HIGGSFIELD_API_KEY and HIGGSFIELD_API_SECRET", "USE_MOCK_VIDEO_GENERATION=true")
+        return higgsfield.HiggsfieldVideoGeneration(s)
+    return _cached("video_generation", build)
+
+
 def get_checkpoint_storage() -> CheckpointStorage:
     """The MAF CheckpointStorage that persists workflow supersteps so a RequestPort
-    pause survives a process restart (replaces the in-process MemorySaver). Mock =
-    in-memory; production = the Postgres `workflow_checkpoints` table (§8.2).
+    pause survives a process restart. Mock = in-memory; production = the Postgres
+    `workflow_checkpoints` table.
 
     Cached as one singleton per process so every task's workflow shares the same
     durable store; reset_services() drops it (tests get a clean store)."""

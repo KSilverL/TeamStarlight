@@ -1,7 +1,7 @@
 """
-SSE progress stream + the api surface (replaces test_status_events / test_api).
+SSE progress stream + the api surface.
 
-Covers the §7.2 event envelope bridged from the MAF workflow to SSE
+Covers the event envelope bridged from the MAF workflow to SSE
 (`GET /tasks/{id}/events`), the RequestPort resume endpoint (`POST /review`), the
 confirm-learning archivist (`POST /confirm-learning`), and the durability guarantee:
 the workflow's checkpoint persists on the RequestPort pause and a fresh workflow
@@ -57,7 +57,7 @@ async def test_draft_ready_result_streamed_per_platform():
     assert ready == {"linkedin", "instagram"}
 
 
-async def test_events_follow_the_72_envelope():
+async def test_events_follow_the_envelope():
     svc = WorkflowService()
     await svc.start(_START, task_id="t1")
     for e in svc.buffered_events("t1"):
@@ -158,7 +158,7 @@ async def test_api_start_persists_a_workflow_checkpoint():
     assert checkpoints
 
 
-# ── D2. Roundtable discussion streams over the same SSE channel (Phase 4) ─────
+# ── D2. Roundtable discussion streams over the same SSE channel ───────────────
 
 _RT_START = {
     "topic": "spring single-origin coffee launch",
@@ -191,6 +191,49 @@ async def test_roundtable_streams_utterances_then_consensus():
         assert e["platform"] == "linkedin" and e["table_id"] == "linkedin"
         assert e["speaker"] and e["agent_id"] == e["speaker"] and e["role"] and e["text"]
     assert consensus[0]["strategy"]["linkedin"] and consensus[0]["converged"] is True
+
+
+async def test_roundtable_announces_each_speaker_before_their_turn():
+    """The manager's mic handoff streams as a `speaker_scheduled` event BEFORE that
+    speaker's `agent_utterance` — the live "who has the floor" signal for the UI."""
+    svc = WorkflowService()
+    await svc.run_roundtable(_RT_START, "linkedin", task_id="rt_sched", max_rounds=4)
+    events = svc.buffered_events("rt_sched")
+
+    scheduled = [e for e in events if e["type"] == "speaker_scheduled"]
+    assert scheduled, "expected the manager to announce each upcoming speaker"
+    for e in scheduled:
+        assert _ENVELOPE_KEYS <= set(e)
+        assert e["table_id"] == "linkedin" and e["speaker"] and e["agent_id"] == e["speaker"]
+
+    # Every persona turn was announced first: a matching (speaker, round) scheduled event
+    # appears in the stream strictly before the utterance itself.
+    for i, e in enumerate(events):
+        if e["type"] != "agent_utterance":
+            continue
+        assert any(
+            s["type"] == "speaker_scheduled"
+            and s["speaker"] == e["speaker"]
+            and s["round_index"] == e["round_index"]
+            for s in events[:i]
+        ), f"utterance by {e['speaker']} (round {e['round_index']}) was never announced"
+
+
+async def test_roundtable_convening_is_announced_before_any_turn():
+    """The moment a table starts it emits a round-0 `moderator` speaker_scheduled — the
+    client's "the table is convening" signal while the (production) manager is still in its
+    silent plan phase, so the stream is never dead air between task start and the first
+    real mic handoff."""
+    svc = WorkflowService()
+    await svc.run_roundtable(_RT_START, "linkedin", task_id="rt_convene", max_rounds=4)
+    events = svc.buffered_events("rt_convene")
+
+    discussion = [e for e in events if e["type"] in ("speaker_scheduled", "agent_utterance")]
+    opener = discussion[0]
+    assert opener["type"] == "speaker_scheduled"
+    assert opener["speaker"] == "moderator" and opener["round_index"] == 0
+    assert opener["table_id"] == "linkedin"
+    assert _ENVELOPE_KEYS <= set(opener)
 
 
 async def test_roundtable_user_utterance_appears_in_the_stream():

@@ -64,10 +64,29 @@ class PlanItemSpec(BaseModel):
 
 
 class PostingPlanSpec(BaseModel):
-    """The planner LLM's whole output: an overall strategy summary + the dated slots."""
+    """The planner LLM's whole output: an overall strategy summary + the dated slots.
+
+    `recommended_cadence` is the pace the planner chose (human-readable, e.g. "LinkedIn
+    3×/wk, Instagram 2×/wk") — surfaced so the user sees, and can push back on, the
+    frequency the agent picked when they left `cadence_hint` blank. `follow_up_questions`
+    are ≤3 clarifiers the planner would ask to tailor the plan further; empty when the
+    brief is self-sufficient. Both feed the draft→refine loop (`PlanService.refine`),
+    they never gate item generation (a usable draft is always returned)."""
 
     strategy_summary: str = ""
+    recommended_cadence: str = ""
+    follow_up_questions: List[str] = Field(default_factory=list, max_length=3)
     items: List[PlanItemSpec] = Field(min_length=1, max_length=31)
+
+
+class PlanClarification(BaseModel):
+    """The pre-generation CLARIFY step's output — what the planner would ask BEFORE any
+    dated schedule exists, so the user's answers can shape the plan. A preliminary
+    `recommended_cadence` (the pace the planner is leaning toward) plus ≤3
+    `follow_up_questions`. No items: this is strategy-scouting, not the plan itself."""
+
+    recommended_cadence: str = ""
+    follow_up_questions: List[str] = Field(default_factory=list, max_length=3)
 
 
 # ── Stored models (the persisted plan document) ──────────────────────────────
@@ -95,6 +114,8 @@ class PostingPlan(BaseModel):
     end_date: str
     status: Literal[PLAN_STATUSES] = "draft"  # type: ignore[valid-type]
     strategy_summary: str = ""
+    recommended_cadence: str = ""
+    follow_up_questions: List[str] = Field(default_factory=list)
     items: List[PlanItem]
     created_at: str = ""
     updated_at: str = ""

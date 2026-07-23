@@ -1,5 +1,5 @@
 """
-Bespoke Remotion scene codegen (autonomous video-agent plan, Phase 1): for each
+Bespoke Remotion scene codegen: for each
 `generated` slide in a StoryboardSpec, an agentic loop asks the LLM to author a real
 Remotion .tsx component (core.services.base.LLMService.generate_scene_component),
 validates it (a TypeScript typecheck + a fast, few-frame preview render), and — on
@@ -31,16 +31,16 @@ completes (success or failure) via cleanup_job_generated(), and jobs.py also cal
 sweep_stale_generated() before each render to reap directories orphaned by crashed
 processes.
 
-Security note (implementation plan, Phase 1): this executes LLM-authored code inside
+Security note: this executes LLM-authored code inside
 the SAME Node/headless-Chromium process the rest of the project uses — an acceptable
-local-dev tradeoff for now. Phase 2's move to Remotion Lambda gives each render its
+local-dev tradeoff for now. The Remotion Lambda backend gives each render its
 own ephemeral, sandboxed invocation, which is where real isolation belongs before
 this runs against untrusted input in production.
 
-Phase 3 additions:
+Further design points:
   - The preview step renders a single still PNG (`remotion still`, not a short MP4)
-    at a representative mid-duration frame — strictly faster (no video encoding)
-    than the original 2-frame render, and that same PNG doubles as the input image
+    at a representative mid-duration frame — fast (no video encoding), and that
+    same PNG doubles as the input image
     for the multimodal visual-QA pass (LLMService.review_scene_preview): compiling
     and rendering without crashing is necessary but not sufficient, so a candidate
     that passes both is still judged on whether it actually LOOKS right (legible,
@@ -53,8 +53,7 @@ Phase 3 additions:
   - Every attempt (typecheck failure, preview-render failure, visual-QA rejection,
     success, or budget exhaustion) is logged via the standard `logging` module with
     structured `extra` fields (job_id, slide_index, attempt, ...) — this pipeline
-    is now non-deterministic and iterative, so per-attempt observability matters in
-    a way the old fixed-registry system never needed.
+    is non-deterministic and iterative, so per-attempt observability matters.
 """
 
 from __future__ import annotations
@@ -270,6 +269,19 @@ _REPAIR_HINTS: Tuple[Tuple[re.Pattern, str], ...] = (
     (re.compile(r"Rendered more hooks|Rendered fewer hooks|Invalid hook call|conditionally", re.IGNORECASE),
      "React hooks (useCurrentFrame, useVideoConfig, useMemo, ...) must be called unconditionally "
      "at the top level of the component — never inside conditions, loops, or callbacks."),
+    (re.compile(r"ResponsiveContainer", re.IGNORECASE),
+     "Never use recharts' ResponsiveContainer — it depends on a resize observer that doesn't "
+     "fire reliably in a headless-Chromium still/frame render. Give BarChart/LineChart/etc. "
+     "explicit numeric width/height props derived from useVideoConfig() instead."),
+    (re.compile(r"recharts|Property '.*' does not exist on type '(Bar|Line|Area|Pie)", re.IGNORECASE),
+     "Match recharts' real prop shapes exactly (dataKey, isAnimationActive={false}, explicit "
+     "numeric width/height on the chart container) — see the recharts exemplar scene for the "
+     "proven pattern; do not invent props recharts doesn't have."),
+    (re.compile(r"is of type 'unknown'|Property '.*' does not exist on type '\{\}'", re.IGNORECASE),
+     "slide.data is typed Record<string, unknown> — every field must be narrowed before use "
+     "(e.g. `typeof slide.data.x === \"string\" ? slide.data.x : \"\"`, or `Array.isArray(...)` "
+     "for lists), exactly like the exemplar scenes do. Never access a slide.data field directly "
+     "without narrowing first."),
     (re.compile(r"\bTS\d{4,5}\b"),
      "Fix ONLY the reported type error(s), keeping the visual design identical; where a chart/"
      "topojson library's types fight you, cast the data with `as any` rather than restructuring."),
@@ -296,8 +308,7 @@ async def _run_preview_render(
     timeout_s: float = _PREVIEW_TIMEOUT_S,
 ) -> Tuple[bool, str]:
     """A fast, low-res, SINGLE still-frame render (`remotion still`, not a video —
-    no encoding step, so this is strictly cheaper than the old 2-frame `render` this
-    replaced) of ONLY the given composition, at `frame`. Enough to catch a
+    no encoding step) of ONLY the given composition, at `frame`. Enough to catch a
     runtime/Remotion error (a bad interpolate() range, a hooks-rule violation) that
     a plain typecheck can't — and `output_path` (a PNG) doubles as the input image
     for the visual-QA passes (generate_scene() here, map_qa.py for map slides).
@@ -425,7 +436,7 @@ async def generate_scene(
     prior_source: Optional[str] = None
     log_ctx = {"job_id": job_id, "slide_index": slide_index}
 
-    # Stage 1 (video-agent Phase 5): one cheap visual-concept pass BEFORE any code,
+    # Stage 1: one cheap visual-concept pass BEFORE any code,
     # reused across every attempt so repairs fix code without re-rolling the concept.
     design_plan = await llm.plan_scene_design(description=spec.description, data=spec.data)
 
@@ -472,7 +483,7 @@ async def generate_scene(
             return RenderGeneratedSlide(componentName=name, data=spec.data, durationFrames=duration)
 
         feedback = review.get("feedback") or "visual QA rejected this attempt with no further detail"
-        # Fold the QA's concrete, imperative fixes (Phase 5) into the repair prompt —
+        # Fold the QA's concrete, imperative fixes into the repair prompt —
         # far more actionable than the prose feedback alone.
         fixes = review.get("fixes") or []
         fix_block = ("\nApply these specific fixes:\n" + "\n".join(f"- {f}" for f in fixes)) if fixes else ""

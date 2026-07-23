@@ -1,12 +1,11 @@
 """
-Dynamic storyboard schema for the video-creation agent (supersedes the old fixed
-3-scene `media_schema.BrandVideoProps`).
+Dynamic storyboard schema for the video-creation agent.
 
 Rather than picking between hardcoded templates, the LLM composes a `StoryboardSpec`
 — an ordered list of typed `slides`, each one drawn from a small, fixed registry of
-slide *types* (`hook`, `counter_stat`, `collage`, `outro` from Phase 1, plus
-`pie_chart`, `line_chart`, `bar_chart`, `node_diagram`, `comparison_table` from
-Phase 2). This is a Pydantic discriminated union: the `type` field on each slide
+slide *types* (`hook`, `counter_stat`, `collage`, `outro`, plus the chart types
+`pie_chart`, `line_chart`, `bar_chart`, `node_diagram`, `comparison_table`).
+This is a Pydantic discriminated union: the `type` field on each slide
 selects which model validates it (`Field(discriminator="type")`). Adding a new
 slide type later means adding one more model to `SlideSpec`'s Union — the LLM only
 ever sees types this module declares, so it can never compose something nothing can
@@ -51,8 +50,8 @@ class StatItem(BaseModel):
 # Per-slide-type duration budget at FPS=30: (default, min, max). The LLM may suggest
 # a durationFrames; workflow/video/assets.py clamps it into this range before the
 # renderable storyboard is built, so Remotion never sees an unbounded value. These
-# are a tunable starting point (extrapolated from the old fixed "12s / 3-scene"
-# spec), not a validated constant — adjust after watching a few real renders.
+# are a tunable starting point, not a validated constant — adjust after watching a
+# few real renders.
 DURATION_BUDGET: Dict[str, Tuple[int, int, int]] = {
     "hook": (90, 60, 150),
     "counter_stat": (150, 90, 240),
@@ -203,7 +202,7 @@ class OutroSlideSpec(BaseModel):
     durationFrames: Optional[int] = Field(None, description="Suggested frames at 30fps; clamped server-side")
 
 
-# ── Phase 2: data/chart slide specs ─────────────────────────────────────────
+# ── Data/chart slide specs ──────────────────────────────────────────────────
 # All values here are LLM-authored (no live data source feeds these slides) — the
 # LLM invents plausible illustrative numbers from the brief, same as it already
 # does for counter_stat.stats.
@@ -385,7 +384,7 @@ class MapSlideSpec(BaseModel):
     durationFrames: Optional[int] = Field(None, description="Suggested frames at 30fps; clamped server-side")
 
 
-# ── Phase 3: bespoke, LLM-authored scene (autonomous video-agent plan) ──────
+# ── Bespoke, LLM-authored scene ─────────────────────────────────────────────
 # Unlike the fixed types above (a hand-written React component per type), `generated`
 # lets the storyboard LLM ask for a BESPOKE scene when none of the fixed types fit —
 # `description` is its creative brief to the separate scene-codegen agent
@@ -495,6 +494,27 @@ class StoryboardSpec(BaseModel):
     slides: List[SlideSpec] = Field(
         min_length=2, max_length=8,
         description="An ordered storyboard composed from the slide registry — choose the types, order, and count that best fit the brief",
+    )
+
+
+# ── Generative AI video prompt (Higgsfield premium backend) ─────────────────
+# NOT part of the Remotion storyboard union — this is the tiny spec the LLM produces
+# (LLMService.generate_video_prompt) for the VIDEO_RENDER_BACKEND=higgsfield path,
+# where a single cinematic clip is generated from a text prompt (+ optional user
+# reference images), not composited from typed slides. Kept deliberately minimal.
+
+
+class VideoPromptSpec(BaseModel):
+    """The crafted prompt for one generative AI video clip. `prompt` is a single
+    cinematic shot description the video model renders directly (subject/setting/
+    lighting/mood — not a storyboard, not post copy). `motion` is an optional short
+    camera/motion cue folded into the generation request. When the user attached
+    reference images the prompt describes motion/atmosphere that COMPLEMENTS them
+    rather than re-specifying the subject (see generate_video_prompt's contract)."""
+
+    prompt: str = Field(description="One cinematic shot description for the video model")
+    motion: Optional[str] = Field(
+        None, description="Optional short camera/motion cue, e.g. 'slow dolly-in', 'handheld pan'"
     )
 
 

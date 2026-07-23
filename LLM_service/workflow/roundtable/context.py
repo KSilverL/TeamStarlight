@@ -1,5 +1,5 @@
 """
-Read side of the learning loop (§6.5): before a table is built, pull the brand voice
+Read side of the learning loop: before a table is built, pull the brand voice
 (by `business_id`) and this user's learned skills (by `user_id`) from the store, so the
 discussion opens already carrying "this brand's tone + this user's past preferences"
 instead of starting cold.

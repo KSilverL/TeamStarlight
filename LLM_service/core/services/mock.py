@@ -14,11 +14,12 @@ reject path (and thus the circuit breaker) without any randomness to pin.
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import html as _html
 import re
 from datetime import date, datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import AsyncIterator, Dict, List, Optional
 
 from agent_framework import (
     BaseChatClient,
@@ -31,7 +32,7 @@ from agent_framework._types import ResponseStream
 
 from ...skills import parse_char_limit
 from ..config import get_settings
-from ..plan_schema import PlanItemSpec, PostingPlanSpec
+from ..plan_schema import PlanClarification, PlanItemSpec, PostingPlanSpec
 from ..skill_schema import SkillCandidate, SkillRule, UserSkillDoc
 from ..trend_schema import Trend, select_current_trends
 from ..video_schema import StoryboardSpec
@@ -40,9 +41,13 @@ from .base import (
     ImageSearchService,
     LLMService,
     MusicGenerationService,
+    RealtimeEvent,
+    RealtimeVoiceService,
+    RealtimeVoiceSession,
     SafetyResult,
     SafetyService,
     StoreService,
+    VideoGenerationService,
     VoiceoverService,
     VoiceService,
     WebSearchService,
@@ -87,6 +92,7 @@ _PLATFORM_FOCUS: Dict[str, str] = {
     "x": "emotional resonance and brevity",
     "instagram": "visual storytelling and lifestyle",
     "tiktok": "playful, trend-native hooks",
+    "facebook": "community connection and shareable storytelling",
 }
 
 _MOCK_LATENCY = 0.0  # bump for demos; kept 0 so tests are instant
@@ -94,6 +100,13 @@ _MOCK_LATENCY = 0.0  # bump for demos; kept 0 so tests are instant
 
 def _focus(platform: str) -> str:
     return _PLATFORM_FOCUS.get(platform.lower(), "general audience engagement")
+
+
+def _first_bullet(block: str) -> str:
+    """The first "- " bullet in a pre-rendered prompt block, or "" — the deterministic
+    lever the mock uses to prove a context block (trends / brand / user) was injected;
+    an empty block yields "" so the output stays byte-identical (degrade-to-empty)."""
+    return next((ln[2:] for ln in block.splitlines() if ln.startswith("- ")), "")
 
 
 def _alias(platform: str) -> str:
@@ -400,7 +413,7 @@ def _mock_scene_component(*, broken: bool) -> str:
 
 
 def _mock_storyboard(topic: str, draft: str, tone_hint: Optional[str], platform: str) -> dict:
-    """A deterministic 4-slide StoryboardSpec-shaped dict — one of each Phase 1 slide
+    """A deterministic 4-slide StoryboardSpec-shaped dict — one of each core slide
     type, in a typical order (hook -> collage -> counter_stat -> outro), so
     contract-parity / shape tests have something stable to assert on."""
     primary, secondary, accent = _MEDIA_PALETTE
@@ -450,7 +463,15 @@ class MockLLM(LLMService):
         }
 
     async def plan_strategy(
-        self, *, topic: str, platform: str, user_intent: str, trends: str = ""
+        self,
+        *,
+        topic: str,
+        platform: str,
+        user_intent: str,
+        trends: str = "",
+        skill: str = "",
+        brand_block: str = "",
+        user_block: str = "",
     ) -> str:
         await asyncio.sleep(_MOCK_LATENCY)
         intent = user_intent or "raise awareness"
@@ -458,11 +479,19 @@ class MockLLM(LLMService):
             f"On {platform}, lead with {_focus(platform)}. "
             f"Anchor it to '{topic}' and aim to {intent}."
         )
-        # Deterministic trend fusion: weave the block's FIRST trend line in verbatim, so
-        # tests can assert the injection; empty block leaves the strategy byte-identical.
-        first = next((ln[2:] for ln in trends.splitlines() if ln.startswith("- ")), "")
-        if first:
-            strategy += f" If it genuinely fits, ride this current trend: {first}"
+        # Deterministic context fusion (same lever for every block): weave each block's
+        # FIRST bullet in verbatim so tests can assert the injection; an empty block leaves
+        # the strategy byte-identical (degrade-to-empty). `skill` is free-form house style,
+        # not a bulleted block, so it steers the (real) prompt but not the mock's fixed text.
+        brand_first = _first_bullet(brand_block)
+        if brand_first:
+            strategy += f" Honour the brand voice: {brand_first}."
+        user_first = _first_bullet(user_block)
+        if user_first:
+            strategy += f" Reflect this user's preference: {user_first}."
+        trend_first = _first_bullet(trends)
+        if trend_first:
+            strategy += f" If it genuinely fits, ride this current trend: {trend_first}"
         return strategy
 
     async def suggest_topic(
@@ -479,6 +508,42 @@ class MockLLM(LLMService):
             topic += f", riding {first}"
         return topic
 
+    async def clarify_campaign(
+        self,
+        *,
+        goal: str,
+        platforms: List[str],
+        start_date: str,
+        end_date: str,
+        cadence_hint: str = "",
+        tone_hint: Optional[str] = None,
+        brand_block: str = "",
+        user_block: str = "",
+        trends: str = "",
+        skill: str = "",
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        plats = platforms or ["linkedin"]
+        recommended_cadence = (
+            cadence_hint
+            or f"~2 posts/week per platform across {', '.join(plats)}"
+        )
+        # Clarify's whole purpose is to gather info up front, so it always asks — unless
+        # the caller already pinned the cadence, in which case one lighter question.
+        if cadence_hint:
+            questions = [
+                "Are there any key dates or launches this campaign should build toward?"
+            ]
+        else:
+            questions = [
+                "How often can you realistically produce content each week?",
+                "Are there any key dates or launches this campaign should build toward?",
+            ]
+        return PlanClarification(
+            recommended_cadence=recommended_cadence,
+            follow_up_questions=questions,
+        ).model_dump()
+
     async def plan_campaign(
         self,
         *,
@@ -492,6 +557,9 @@ class MockLLM(LLMService):
         user_block: str = "",
         trends: str = "",
         skill: str = "",
+        feedback: str = "",
+        answers: str = "",
+        prior_plan: str = "",
     ) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
         lo, hi = date.fromisoformat(start_date), date.fromisoformat(end_date)
@@ -535,7 +603,34 @@ class MockLLM(LLMService):
             summary += " Tuned to this user's learned preferences."
         if first:
             summary += f" Trend anchor: {first}"
-        return PostingPlanSpec(strategy_summary=summary, items=items).model_dump()
+        # A refine pass (prior_plan + feedback/answers) is observably distinct from a
+        # fresh create: mark the summary so tests can assert regeneration happened.
+        refining = bool(feedback or answers or prior_plan)
+        if feedback:
+            summary = f"Revised per feedback ({feedback}). " + summary
+        if answers:
+            summary += " Tuned to your answers."
+        # Cadence the "agent chose": echo an explicit hint, else derive one deterministically
+        # (this is the pace surfaced to the user when they left cadence_hint blank).
+        recommended_cadence = (
+            cadence_hint
+            or f"~2 posts/week per platform across {', '.join(plats)}"
+        )
+        # Follow-up clarifiers only when there's no explicit cadence AND the user hasn't
+        # yet answered/pushed back — so a blank-cadence create surfaces questions and a
+        # refine drops them.
+        follow_up_questions: List[str] = []
+        if not cadence_hint and not refining:
+            follow_up_questions = [
+                "How often can you realistically produce content each week?",
+                "Are there any key dates or launches this campaign should build toward?",
+            ]
+        return PostingPlanSpec(
+            strategy_summary=summary,
+            recommended_cadence=recommended_cadence,
+            follow_up_questions=follow_up_questions,
+            items=items,
+        ).model_dump()
 
     async def write_copy(
         self,
@@ -619,6 +714,28 @@ class MockLLM(LLMService):
     ) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
         return _mock_storyboard(topic, draft, tone_hint, platform)
+
+    async def generate_video_prompt(
+        self,
+        *,
+        topic: str,
+        draft: str,
+        tone_hint: Optional[str],
+        platform: str,
+        has_reference_images: bool = False,
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        subject = (topic or draft or "the brand story").strip()
+        tone = (tone_hint or "cinematic").strip()
+        if has_reference_images:
+            # Complement the user's reference images: describe motion/atmosphere only.
+            prompt = (
+                f"Bring the reference image to life with subtle, {tone} motion — "
+                f"gentle parallax and soft light shifts, staying true to the shot."
+            )
+        else:
+            prompt = f"A {tone} shot capturing {subject}, warm cinematic lighting, shallow depth of field."
+        return {"prompt": prompt, "motion": "slow dolly-in"}
 
     async def distill_rules(
         self,
@@ -848,8 +965,8 @@ class MockLLM(LLMService):
 # The roundtable runs real MAF Magentic agents; each persona is an `Agent` backed by a
 # chat client. This mock implements the installed `BaseChatClient` contract and returns
 # deterministic, scripted text keyed by (agent_name, call_index) — so a discussion is
-# fully reproducible offline (the production counterpart, an OpenAIChatClient, lands in
-# Phase 2). The agent name encodes the persona role; `call_index` advances each turn.
+# fully reproducible offline (the production counterpart is AzureChatClient).
+# The agent name encodes the persona role; `call_index` advances each turn.
 
 _ROUNDTABLE_PERSONA_LINES: Dict[str, List[str]] = {
     "platform_editor": [
@@ -1117,8 +1234,121 @@ class MockVoice(VoiceService):
         await asyncio.sleep(_MOCK_LATENCY)
         # Deterministic "transcription": the offline script provides the spoken words,
         # so a faithful transcript is the verbatim text. This makes a voice intake
-        # produce a CreativeBrief identical to the same words typed (§4.4).
+        # produce a CreativeBrief identical to the same words typed.
         return {"session_id": session_id, "transcript": user_audio.strip()}
+
+
+# ── Realtime voice (offline stand-in for GPT-Realtime speech-to-speech) ───────
+# No real audio/network offline: `send_audio`'s `audio_b64` is base64 of the literal
+# spoken words (the same "the script provides the words" convention as MockVoice
+# above), decoded back to text and run through the SAME deterministic extraction
+# MockLLM.fill_brief uses (_free_extract / _COPILOT_TRIGGERS) to decide whether to
+# emit an `update_brief` or `suggest_topic` tool call. This drives the exact same
+# orchestration code (intake/realtime_voice.py) that the real Azure session does —
+# only the transport is faked.
+
+_SENTINEL = object()
+
+# Mirrors intake.base.REQUIRED_FIELDS (topic, user_intent) — duplicated as a tiny,
+# self-contained constant so this module stays independent of the intake package.
+# Lets the mock track "what would the model have just asked about" the same way
+# MockLLM.fill_brief's `pending_field` fallback does, so a bare answer to a spoken
+# follow-up (no "to <verb>..." phrasing) still slots into the right field.
+_REALTIME_REQUIRED_FIELDS = ("topic", "user_intent")
+
+
+def _mock_pcm16_silence(num_samples: int = 800) -> str:
+    """Base64 PCM16 silence — a deterministic stand-in for the assistant's spoken
+    audio in mock mode (there is no real TTS offline)."""
+    return base64.b64encode(bytes(num_samples * 2)).decode("ascii")
+
+
+class _MockRealtimeSession(RealtimeVoiceSession):
+    def __init__(self, *, session_id: str) -> None:
+        self._session_id = session_id
+        self._queue: "asyncio.Queue" = asyncio.Queue()
+        self._call_count = 0
+        # This session's own tally of what it has told the caller so far (from tool
+        # calls it emitted / their results) — used only to pick the pending field below.
+        self._known: Dict[str, str] = {}
+
+    def _pending_field(self) -> Optional[str]:
+        for field in _REALTIME_REQUIRED_FIELDS:
+            if not self._known.get(field):
+                return field
+        return None
+
+    async def _emit(self, event: RealtimeEvent) -> None:
+        await self._queue.put(event)
+
+    async def send_audio(self, *, audio_b64: str) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        text = base64.b64decode(audio_b64).decode("utf-8", errors="replace").strip()
+        # Side channel only, mirrors input_audio_transcription — never what decides
+        # the brief (that's the tool call below, exactly like the real model).
+        await self._emit(RealtimeEvent(type="input_transcript", text=text))
+
+        updates = _free_extract(text)
+        wants_topic_idea = any(trigger in text.lower() for trigger in _COPILOT_TRIGGERS)
+        # Pending-field fallback (mirrors MockLLM.fill_brief): a direct answer with no
+        # extractable phrasing still slots into whatever field is still missing —
+        # except a "give me ideas" turn must not become the topic itself.
+        pending = self._pending_field()
+        if pending and not updates.get(pending) and text and not (wants_topic_idea and pending == "topic"):
+            updates[pending] = text
+        self._known.update({k: v for k, v in updates.items() if v})
+
+        self._call_count += 1
+        call_id = f"call-{self._call_count}"
+        if wants_topic_idea:
+            await self._emit(RealtimeEvent(
+                type="tool_call", call_id=call_id, name="suggest_topic",
+                arguments={"user_intent": updates.get("user_intent", "")},
+            ))
+        elif updates:
+            await self._emit(RealtimeEvent(
+                type="tool_call", call_id=call_id, name="update_brief", arguments=updates,
+            ))
+        else:
+            # Nothing extracted: the model would just ask a follow-up out loud.
+            await self._emit(RealtimeEvent(type="output_transcript_delta", text="Could you tell me more?"))
+            await self._emit(RealtimeEvent(type="audio_delta", audio_b64=_mock_pcm16_silence()))
+            await self._emit(RealtimeEvent(type="response_done"))
+
+    async def send_tool_result(self, *, call_id: str, output: dict) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        if output.get("topic"):
+            self._known["topic"] = output["topic"]
+        # Deterministic narration of the tool's result — mirrors the real model
+        # speaking the function_call_output once it comes back.
+        line = f"How about this: {output['topic']}?" if output.get("topic") else "Got it, thanks."
+        await self._emit(RealtimeEvent(type="output_transcript_delta", text=line))
+        await self._emit(RealtimeEvent(type="audio_delta", audio_b64=_mock_pcm16_silence()))
+        await self._emit(RealtimeEvent(type="response_done"))
+
+    async def nudge(self, *, text: str) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        await self._emit(RealtimeEvent(type="output_transcript_delta", text="Great, that's everything I need."))
+        await self._emit(RealtimeEvent(type="audio_delta", audio_b64=_mock_pcm16_silence()))
+        await self._emit(RealtimeEvent(type="response_done"))
+
+    async def events(self) -> AsyncIterator[RealtimeEvent]:
+        while True:
+            event = await self._queue.get()
+            if event is _SENTINEL:
+                return
+            yield event
+
+    async def close(self) -> None:
+        await self._queue.put(_SENTINEL)
+
+
+class MockRealtimeVoice(RealtimeVoiceService):
+    async def open_session(
+        self, *, session_id: str, instructions: str, tools: List[dict],
+    ) -> RealtimeVoiceSession:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return _MockRealtimeSession(session_id=session_id)
 
 
 # ── Image search / background removal (offline stand-ins for Pexels / Remove.bg) ──
@@ -1223,6 +1453,68 @@ class MockVoiceover(VoiceoverService):
         words = len(text.split())
         duration_seconds = max(1.0, (words / _MOCK_SPEAKING_RATE_WPM) * 60)
         return _silent_mp3(duration_seconds)
+
+
+# Minimal but structurally-valid MP4 container (ftyp + mdat), used as the offline
+# placeholder when no ffmpeg is on PATH. Real bytes with correct box headers so the
+# file is a genuine (if empty) .mp4, not a text stub — the higgsfield render path just
+# writes these to job_dir/output.mp4 and streams them back; nothing ffprobes it.
+_MINIMAL_MP4 = (
+    b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+    b"\x00\x00\x00\x08mdat"
+)
+
+
+def _placeholder_mp4(duration_seconds: float) -> bytes:
+    """Return real MP4 bytes for the offline video-generation stand-in. Prefers a
+    genuine playable clip via a system `ffmpeg` (lavfi colour source) when available
+    — useful for a dev eyeballing the pipeline — and falls back to a minimal valid
+    MP4 container otherwise, so tests never depend on ffmpeg being installed."""
+    import shutil
+    import subprocess
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        secs = max(1.0, min(duration_seconds, 15.0))
+        try:
+            proc = subprocess.run(
+                [
+                    ffmpeg, "-y", "-f", "lavfi",
+                    "-i", f"color=c=black:s=256x256:d={secs:.1f}:r=12",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    "-f", "mp4", "pipe:1",
+                ],
+                capture_output=True, timeout=30,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                return proc.stdout
+        except (OSError, subprocess.SubprocessError):
+            pass  # fall through to the static container
+    return _MINIMAL_MP4
+
+
+class MockVideoGeneration(VideoGenerationService):
+    """Offline stand-in for Higgsfield (core/services/higgsfield.py): returns a real
+    MP4 (a black clip via ffmpeg when present, else a minimal valid container) so the
+    premium render path — submit-less — writes job_dir/output.mp4 and the download
+    endpoint streams it, all without real credentials or network. `reference_images`
+    is accepted and ignored (the mock can't actually condition on them).
+
+    TODO: nothing to wire — the real path is HiggsfieldVideoGeneration; this only
+    proves the plumbing, not real generation (mirrors MockMusicGeneration)."""
+
+    async def generate_clip(
+        self,
+        *,
+        prompt: str,
+        reference_images: Optional[List[bytes]] = None,
+        model: str,
+        duration_seconds: float,
+        width: int,
+        height: int,
+    ) -> bytes:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return _placeholder_mp4(duration_seconds)
 
 
 # ── Web research (offline stand-in for the Foundry-agent-backed search) ───────

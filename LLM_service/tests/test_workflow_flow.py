@@ -22,7 +22,7 @@ def _approve_all(result) -> dict:
 async def test_all_platforms_reach_draft_ready_then_final(workflow, make_brief):
     brief = make_brief(platforms=("linkedin", "instagram", "x"))
 
-    # Phase 1+2: runs to the human gate with one draft-ready request per platform.
+    # Runs to the human gate with one draft-ready request per platform.
     result = await workflow.run(brief)
     pending = {e.data.platform: e.data for e in result.get_request_info_events()}
     assert set(pending) == {"linkedin", "instagram", "x"}
@@ -69,7 +69,7 @@ async def test_executors_run_in_pipeline_order(workflow, make_brief):
     assert invoked.index("creator") < invoked.index("reviewer") < invoked.index("human_gate")
 
 
-# ── Phase 4 (trend scout spread): the LINEAR strategist reads the daily trends ─
+# ── Trend scout spread: the LINEAR strategist reads the daily trends ──────────
 # Same TREND_SCOUT_ENABLED toggle + degrade-to-empty rule as the roundtable seat;
 # tests flip the env themselves (conftest wipes it per test, so the default path
 # stays trend-free).

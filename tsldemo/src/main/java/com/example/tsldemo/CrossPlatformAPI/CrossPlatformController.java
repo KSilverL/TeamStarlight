@@ -2,6 +2,7 @@ package com.example.tsldemo.CrossPlatformAPI;
 
 import com.example.tsldemo.DTOs.Request.LinkedInCredsReqDTO;
 import com.example.tsldemo.DTOs.Request.LinkedInPostReqDTO;
+import com.example.tsldemo.DTOs.Request.LinkedInVideoPostReqDTO;
 import com.example.tsldemo.auth.JwtUtil;
 
 import jakarta.servlet.http.HttpServletResponse;
@@ -9,6 +10,7 @@ import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.io.IOException;
@@ -25,7 +27,7 @@ public class CrossPlatformController {
         this.jwtUtil = jwtUtil;
     }
 
-    /** All four endpoints are scoped to the calling business, taken from the JWT — never from
+    /** All endpoints are scoped to the calling business, taken from the JWT — never from
      * anything the client claims in the request body — so one business can't read or act on
      * another's LinkedIn connection. */
     private int requireBusinessId(String authHeader) {
@@ -36,6 +38,7 @@ public class CrossPlatformController {
         return businessId;
     }
 
+    //////////////////////////////////////////////////////// LINKEDIN METHODS ////////////////////////////////////////////////////////
     @PostMapping("/linkedin/auth")
     public void linkedInAuth(
             HttpServletResponse response,
@@ -66,6 +69,30 @@ public class CrossPlatformController {
 
         int businessId = requireBusinessId(authHeader);
         String postId = crossPlatformService.postToLinkedIn(businessId, requestDTO);
+        return ResponseEntity.ok(Map.of("PostId", postId));
+    }
+
+    /** Posts a user-attached image. Sent as multipart/form-data (the raw image bytes plus a
+     * text commentary), unlike the JSON text/video endpoints — the browser uploads a real file
+     * here rather than referencing an already-rendered asset by id. */
+    @PostMapping("/linkedin/post-image")
+    public ResponseEntity<?> linkedInPostImage(
+            @RequestParam("message") String message,
+            @RequestParam("image") MultipartFile image,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+
+        int businessId = requireBusinessId(authHeader);
+        String postId = crossPlatformService.postImageToLinkedIn(businessId, message, image);
+        return ResponseEntity.ok(Map.of("PostId", postId));
+    }
+
+    @PostMapping("/linkedin/post-video")
+    public ResponseEntity<?> linkedInPostVideo(
+            @RequestBody LinkedInVideoPostReqDTO requestDTO,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+
+        int businessId = requireBusinessId(authHeader);
+        String postId = crossPlatformService.postVideoToLinkedIn(businessId, requestDTO);
         return ResponseEntity.ok(Map.of("PostId", postId));
     }
 

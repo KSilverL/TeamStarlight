@@ -11,7 +11,7 @@ Three layers:
   - Service layer — `WorkflowService` / `IntakeService` / `MediaService`: pure async
     wrappers over the workflow / intake / media generators. Directly unit-testable;
     this is where the contract lives. `WorkflowService` bridges the MAF event stream
-    to the §7.2 event envelope.
+    to the SSE event envelope (core/events.py).
   - Schema layer — pydantic request models, so the OpenAPI schema documents every
     request body. Field-level validation that must return HTTP 400 (not FastAPI's
     422) stays in the service layer (`_brief_from_inputs` / `_verdict_from_payload`).
@@ -21,8 +21,8 @@ Three layers:
     voice intake gets a real WebSocket endpoint (FastAPI native).
 
 Durability: the workflow's checkpoints persist to `factory.get_checkpoint_storage()`
-(PostgreSQL in production), so a RequestPort pause survives a process restart —
-replacing the old in-process MemorySaver. This server keeps each task's workflow
+(PostgreSQL in production), so a RequestPort pause survives a process restart.
+This server keeps each task's workflow
 object in memory for fast resume; full rehydration-from-checkpoint after a restart
 builds on the same CheckpointStorage.
 
@@ -35,6 +35,7 @@ Run it:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import uuid
@@ -42,7 +43,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Body, FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -57,7 +58,8 @@ from .core.events import (
     round_control_event,
 )
 from .core.services import factory
-from .intake import IntakeSession, PriorSessionContext, build_intake
+from .core.services.base import RealtimeVoiceSession
+from .intake import IntakeSession, PriorSessionContext, RealtimeVoiceIntake, build_intake
 from .skills import load_skill
 from .workflow import Brief, HumanVerdict, build_workflow
 from .workflow.builder import WORKFLOW_NAME
@@ -73,13 +75,13 @@ from .workflow.roundtable.context import build_persona_context
 from .workflow.roundtable.personas import render_brand_profile, render_user_skills
 from .workflow.video.jobs import get_render_job, start_render_job
 from .core.plan_schema import (
+    PlanClarification,
     PlanItem,
     PostingPlan,
     PostingPlanSpec,
     clamp_item_dates,
     select_due_items,
 )
-from .core.skill_schema import SkillCandidate
 from .core.trend_schema import render_trends
 from .core.video_schema import StoryboardSpec
 
@@ -127,7 +129,7 @@ def _prior_context_from_payload(raw) -> Optional[PriorSessionContext]:
     continues). `None` → fresh conversation. A malformed object (not a dict, missing the required
     `parent_session_id`) is a client error → HTTP 400 (not FastAPI's 422, since it arrives as a
     free-form key). A well-formed but content-free recap (only `parent_session_id`) degrades back
-    to `None` — the fresh path (Phase 5) — so an empty recap never changes intake behaviour."""
+    to `None` — the fresh path — so an empty recap never changes intake behaviour."""
     if raw is None:
         return None
     if not isinstance(raw, dict):
@@ -243,7 +245,7 @@ class WorkflowService:
             raise ApiError(404, f"unknown task_id: {task_id}")
         return task
 
-    # ── Event translation (MAF event → §7.2 envelope) + publish ───────────────
+    # ── Event translation (MAF event → SSE envelope) + publish ────────────────
 
     def _publish(self, task: _Task, event: dict) -> None:
         # A stable, monotonic per-task index baked into the stored event, so a client that
@@ -259,7 +261,7 @@ class WorkflowService:
 
     @staticmethod
     def _translate(ev) -> list[dict]:
-        """Map one MAF workflow event to zero or more §7.2 envelope dicts (pure)."""
+        """Map one MAF workflow event to zero or more SSE envelope dicts (pure)."""
         platform = getattr(getattr(ev, "data", None), "platform", None)
         etype = ev.type
         if etype == "executor_invoked":
@@ -348,6 +350,17 @@ class WorkflowService:
                 q.put_nowait(_STREAM_DONE)
         return self._snapshot(task)
 
+    async def _dispatch(self, task: _Task, coro, *, background: bool, running: dict) -> dict:
+        """Run `coro` (a start/roundtable segment) either inline — returning its final
+        snapshot and re-raising any failure as HTTP 500 — or as a detached background task,
+        returning `running` immediately while the run streams over SSE. Centralizes the
+        non-blocking split so the strong `task.runner` reference (asyncio holds tasks only
+        weakly) and the `_run_guarded` wiring live in exactly one place."""
+        if background:
+            task.runner = asyncio.create_task(self._run_guarded(task, coro, reraise=False))
+            return running
+        return await self._run_guarded(task, coro, reraise=True)
+
     async def _run_guarded(self, task: _Task, coro, *, reraise: bool) -> dict:
         """Drive `coro` (a start/resume/roundtable segment) to its next pause/end, but never let
         an executor exception leave SSE subscribers hung: on failure mark the task errored, emit a
@@ -414,7 +427,7 @@ class WorkflowService:
         #  • text + roundtable → creator entry (the discussion already produced the strategy);
         #  • text, no roundtable → the original dispatcher → strategist → creator path.
         # The roundtable stage (when enabled) still runs FIRST here (its own checkpoints + user
-        # pauses) for both the text and media-only paths — stage-chaining (§1).
+        # pauses) for both the text and media-only paths — stage-chaining.
         if not text_requested:
             build_kwargs = {"media_only": True}
         elif roundtable:
@@ -440,10 +453,8 @@ class WorkflowService:
             task, brief, roundtable=roundtable, text_requested=text_requested,
             before_round=before_round, rt_sequential=rt_sequential,
         )
-        if background:
-            task.runner = asyncio.create_task(self._run_guarded(task, coro, reraise=False))
-            return self._snapshot(task)  # status == "running"; watch GET /tasks/{id}/events
-        return await self._run_guarded(task, coro, reraise=True)
+        # background → returns a "running" snapshot; watch GET /tasks/{id}/events for progress.
+        return await self._dispatch(task, coro, background=background, running=self._snapshot(task))
 
     async def _execute(
         self, task: _Task, brief: Brief, *, roundtable: bool, text_requested: bool, before_round,
@@ -467,7 +478,7 @@ class WorkflowService:
                     before_round=before_round,
                 )
                 # Keep the full discussion transcript so the per-user learning loop can distil
-                # preferences from the user's interjections after the gate (§6.5 write side).
+                # preferences from the user's interjections after the gate.
                 task.roundtable_transcript = [
                     t.model_dump() for r in results for t in r.consensus.transcript
                 ]
@@ -568,11 +579,10 @@ class WorkflowService:
         return PriorSessionContext(parent_session_id=parent_session_id, **content).model_dump()
 
     async def say(self, task_id: str, table_id: str, text: str, interrupt: bool = False) -> dict:
-        """Enqueue one user "raise hand" utterance for a roundtable table (§1 decision 4).
+        """Enqueue one user "raise hand" utterance for a roundtable table.
         Keyed by (task_id, table_id) and persisted via the store, so a runner — even in
-        another process — picks it up at the next round boundary. The roundtable stage is
-        not yet driven from this service (Phase 6), so this only enqueues; it does not
-        require a registered task here."""
+        another process — picks it up at the next round boundary. This only enqueues;
+        it does not require a registered task here."""
         if not (text or "").strip():
             raise ApiError(400, "'text' is required")
         if not (table_id or "").strip():
@@ -584,7 +594,7 @@ class WorkflowService:
         return {"task_id": task_id, "table_id": table_id, "queued": True, "pending": pending}
 
     async def raise_hand(self, task_id: str, table_id: str) -> dict:
-        """The user reserves the next turn on a table (§ Phase 3 refinement). Before each round
+        """The user reserves the next turn on a table. Before each round
         the manager sees the raised hand and makes the table WAIT for the user's message
         (up to ROUNDTABLE_USER_TURN_TIMEOUT) instead of converging without them."""
         if not (table_id or "").strip():
@@ -679,10 +689,10 @@ class WorkflowService:
             return {"task_id": task_id, "platform": platform,
                     "consensus": result.consensus.model_dump()}
 
-        if background:
-            task.runner = asyncio.create_task(self._run_guarded(task, _go(), reraise=False))
-            return {"task_id": task_id, "platform": platform, "status": "running"}
-        return await self._run_guarded(task, _go(), reraise=True)
+        return await self._dispatch(
+            task, _go(), background=background,
+            running={"task_id": task_id, "platform": platform, "status": "running"},
+        )
 
     async def run_roundtables(
         self, inputs: dict, *, task_id: Optional[str] = None, max_rounds=None,
@@ -719,10 +729,10 @@ class WorkflowService:
             return {"task_id": task_id,
                     "consensuses": [r.consensus.model_dump() for r in results]}
 
-        if background:
-            task.runner = asyncio.create_task(self._run_guarded(task, _go(), reraise=False))
-            return {"task_id": task_id, "status": "running"}
-        return await self._run_guarded(task, _go(), reraise=True)
+        return await self._dispatch(
+            task, _go(), background=background,
+            running={"task_id": task_id, "status": "running"},
+        )
 
     async def get(self, task_id: str) -> dict:
         return self._snapshot(self._require(task_id))
@@ -735,12 +745,12 @@ class WorkflowService:
         return self._require(task_id).outputs.get(platform)
 
     def buffered_events(self, task_id: str) -> list[dict]:
-        """Non-blocking snapshot of the §7.2 event log so far (the SSE replay
+        """Non-blocking snapshot of the event log so far (the SSE replay
         buffer). Unlike `events()`, this never waits for future events."""
         return list(self._require(task_id).events)
 
     async def events(self, task_id: str):
-        """Async generator of §7.2 events for SSE: replays the buffer, then follows
+        """Async generator of events for SSE: replays the buffer, then follows
         live until the task completes. Yields `None` (a heartbeat) every 15s of
         inactivity so the route can keep the connection alive — an idle proxy/browser
         timeout would otherwise force a reconnect, which replays the whole buffer and
@@ -773,12 +783,19 @@ class WorkflowService:
 
 
 class IntakeService:
-    """Async wrapper over the intake layer (§4 / §7.1). Holds the live intake
-    sessions; both voice and text run the same shared conversation, so this code is
-    transport-agnostic — it just routes turns by session id."""
+    """Async wrapper over the intake layer. Holds the live intake
+    sessions; text and cascaded voice run the same shared conversation, so this code
+    is transport-agnostic — it just routes turns by session id.
+
+    Native speech-to-speech (RealtimeVoiceIntake, WS /intake/{sid}/voice) is a
+    separate transport with no meaningful "turn"/"assistant_message" REST shape, so
+    it lives in its own `_realtime_sessions` map; `transcript`/`get_brief` check
+    both so the REST `GET /intake/{sid}/brief` keeps working regardless of which
+    transport produced the finished brief."""
 
     def __init__(self) -> None:
         self._sessions: dict[str, IntakeSession] = {}
+        self._realtime_sessions: dict[str, RealtimeVoiceIntake] = {}
 
     def _require(self, session_id: str) -> IntakeSession:
         session = self._sessions.get(session_id)
@@ -802,12 +819,34 @@ class IntakeService:
         self._sessions[session_id] = session
         return {"intake_mode": mode, **result}
 
+    async def open_realtime_voice(
+        self, session_id: str, *, user_id: Optional[str] = None,
+        target_platforms: Optional[list] = None, prior_context: Optional[dict] = None,
+    ) -> tuple[RealtimeVoiceIntake, RealtimeVoiceSession]:
+        
+        """Open a native speech-to-speech session for `session_id` (WS /intake/{sid}/voice's
+        `start` frame) and register it so REST GET /intake/{sid}/brief can find it once
+        finished. Returns (intake, realtime_session) — the WS handler pumps audio through
+        the latter and events through `intake.handle_event`."""
+        
+        prior = _prior_context_from_payload(prior_context)
+        intake = RealtimeVoiceIntake()
+        realtime_session = await intake.open(
+            session_id, user_id=user_id, target_platforms=target_platforms, prior_context=prior,
+        )
+        self._realtime_sessions[session_id] = intake
+        return intake, realtime_session
+
     def transcript(self, session_id: str) -> list:
         """The session's {role, content} message history, threaded into a task at start
         so per-user learning can summarize the whole conversation. Empty for an unknown
         session, so starting a task never fails on a stale intake session id."""
+        
         session = self._sessions.get(session_id)
-        return session.transcript(session_id) if session is not None else []
+        if session is not None:
+            return session.transcript(session_id)
+        realtime = self._realtime_sessions.get(session_id)
+        return realtime.transcript() if realtime is not None else []
 
     async def turn(self, session_id: str, user_input: str) -> dict:
         session = self._require(session_id)
@@ -816,7 +855,14 @@ class IntakeService:
         return await session.send_user_turn(session_id, user_input)
 
     async def get_brief(self, session_id: str) -> dict:
-        session = self._require(session_id)
+        session = self._sessions.get(session_id)
+        if session is None:
+            realtime = self._realtime_sessions.get(session_id)
+            if realtime is None:
+                raise ApiError(404, f"unknown intake session: {session_id}")
+            if not realtime.is_complete():
+                raise ApiError(409, "brief is not complete yet")
+            return realtime.get_brief().model_dump()
         try:
             brief = await session.get_brief(session_id)
         except ValueError as exc:
@@ -875,6 +921,7 @@ class VideoService:
     async def start(
         self, task_id: str, platform: str, *,
         narration_text: Optional[str] = None, narration_voice: Optional[str] = None,
+        reference_images: Optional[list[str]] = None,
     ) -> dict:
         draft = self._workflow.get_final_draft(task_id, platform)
         if draft is None:
@@ -885,6 +932,7 @@ class VideoService:
         doc = await start_render_job(
             task_id=task_id, platform=platform, storyboard=StoryboardSpec(**storyboard),
             narration_text=narration_text, narration_voice=narration_voice,
+            reference_images=_decode_reference_images(reference_images),
         )
         return {"job_id": doc["id"], "status": doc["status"]}
 
@@ -990,9 +1038,9 @@ class PlanService:
         if changed:
             await self._save(plan)
 
-    # ── operations ─────────────────────────────────────────────────────────────
-
-    async def create(self, inputs: dict) -> dict:
+    def _campaign_inputs(self, inputs: dict) -> tuple:
+        """Validate the fields common to clarify + create (goal / platforms / window),
+        returning them normalised. HTTP 400 on any violation (not FastAPI's 422)."""
         goal = str(inputs.get("goal") or "").strip()
         platforms = inputs.get("target_platforms")
         if not goal:
@@ -1003,30 +1051,135 @@ class PlanService:
         end_date = self._valid_date(inputs.get("end_date"), "end_date")
         if end_date < start_date:
             raise ApiError(400, "end_date must be on or after start_date")
-        content_types = _content_types_from_inputs(inputs)
+        return goal, list(platforms), start_date, end_date
 
-        # Read side reuses the roundtable's single store read (brand profile + user
-        # skills + the gated daily trends) and its renderers, so the planner opens
-        # knowing this brand's voice, this user's preferences, and today's trends —
-        # the same context every other generation path gets.
+    @staticmethod
+    async def _context_blocks(
+        *,
+        goal: str,
+        platforms: list,
+        tone_hint: Optional[str],
+        business_id: Optional[str],
+        user_id: Optional[str],
+    ) -> dict:
+        """The single read-side context every plan path (clarify / create / refine) gets:
+        brand profile + the user's learned habits + the gated daily trends, pre-rendered
+        as the planner's prompt blocks (same as the roundtable's read side) + the static
+        planning skill. So the planner always opens knowing this brand's voice, this
+        user's past habits, and today's trends."""
         brief = Brief(
             topic=goal, target_platforms=list(platforms), user_intent=goal,
-            business_id=inputs.get("business_id"), user_id=inputs.get("user_id"),
-            tone_hint=inputs.get("tone_hint"),
+            business_id=business_id, user_id=user_id, tone_hint=tone_hint,
         )
         ctx = await build_persona_context(brief)
+        return {
+            "brand_block": render_brand_profile(ctx.brand_profile),
+            "user_block": render_user_skills(ctx.user_skills),
+            "trends": render_trends(ctx.trends),
+            "skill": load_skill("posting_plan"),
+        }
+
+    @staticmethod
+    async def _plan_campaign(
+        *,
+        goal: str,
+        platforms: list,
+        start_date: str,
+        end_date: str,
+        cadence_hint: str,
+        tone_hint: Optional[str],
+        business_id: Optional[str],
+        user_id: Optional[str],
+        feedback: str = "",
+        answers: str = "",
+        prior_plan: str = "",
+    ) -> PostingPlanSpec:
+        """Generate the dated schedule. Shared by `create` and `refine` (refine adds
+        feedback/answers/prior_plan; create folds in the clarify answers)."""
+        blocks = await PlanService._context_blocks(
+            goal=goal, platforms=platforms, tone_hint=tone_hint,
+            business_id=business_id, user_id=user_id)
         raw = await factory.get_llm().plan_campaign(
+            goal=goal, platforms=list(platforms),
+            start_date=start_date, end_date=end_date,
+            cadence_hint=cadence_hint, tone_hint=tone_hint,
+            feedback=feedback, answers=answers, prior_plan=prior_plan, **blocks,
+        )
+        return PostingPlanSpec(**raw)
+
+    @staticmethod
+    def _items_from_spec(
+        spec: PostingPlanSpec, *, start_date: str, end_date: str, content_types: list
+    ) -> list:
+        """Clamp the spec's slots into the window (LLM dates are never trusted) and
+        stamp fresh item ids + the default content_types onto each."""
+        items_spec = clamp_item_dates(spec.items, start_date=start_date, end_date=end_date)
+        return [
+            PlanItem(
+                **s.model_dump(), item_id=f"item-{i + 1}",
+                content_types=list(content_types),
+            )
+            for i, s in enumerate(items_spec)
+        ]
+
+    @staticmethod
+    def _render_prior_plan(plan: dict) -> str:
+        """Compact rendering of a stored draft for the refine pass — the strategy summary
+        plus one line per slot — so the planner revises it instead of restarting."""
+        lines = [f"Strategy: {plan.get('strategy_summary', '')}"]
+        if plan.get("recommended_cadence"):
+            lines.append(f"Cadence: {plan['recommended_cadence']}")
+        for item in plan.get("items", []):
+            lines.append(
+                f"- {item.get('planned_date', '')} "
+                f"[{', '.join(item.get('platforms', []))}] "
+                f"{item.get('topic', '')} — {item.get('angle', '')}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_answers(answers: Optional[dict]) -> str:
+        """Turn a {question: answer} map into Q/A lines for the planner prompt."""
+        if not answers:
+            return ""
+        return "\n".join(f"Q: {q}\nA: {a}" for q, a in answers.items() if str(a).strip())
+
+    # ── operations ─────────────────────────────────────────────────────────────
+
+    async def clarify(self, inputs: dict) -> dict:
+        """The pre-generation CLARIFY step: propose a preliminary cadence + up to 3
+        follow-up questions from the campaign brief + the brand/user context — BEFORE any
+        dated schedule exists — so the user's answers (fed back as `POST /plans`'s
+        `answers`) shape the plan. Stateless: nothing is stored."""
+        goal, platforms, start_date, end_date = self._campaign_inputs(inputs)
+        blocks = await self._context_blocks(
+            goal=goal, platforms=platforms, tone_hint=inputs.get("tone_hint"),
+            business_id=inputs.get("business_id"), user_id=inputs.get("user_id"))
+        raw = await factory.get_llm().clarify_campaign(
+            goal=goal, platforms=list(platforms),
+            start_date=start_date, end_date=end_date,
+            cadence_hint=str(inputs.get("cadence_hint") or ""),
+            tone_hint=inputs.get("tone_hint"), **blocks,
+        )
+        return PlanClarification(**raw).model_dump()
+
+    async def create(self, inputs: dict) -> dict:
+        goal, platforms, start_date, end_date = self._campaign_inputs(inputs)
+        content_types = _content_types_from_inputs(inputs)
+
+        # The planner picks the cadence itself when none is given (see the skill +
+        # recommended_cadence), and _plan_campaign folds in the brand voice + this user's
+        # learned habits — the same read-side context every other generation path gets.
+        # `answers` are the user's replies to the clarify step's questions (if that
+        # pre-generation step ran), so the very first draft is already tailored to them.
+        spec = await self._plan_campaign(
             goal=goal, platforms=list(platforms),
             start_date=start_date, end_date=end_date,
             cadence_hint=str(inputs.get("cadence_hint") or ""),
             tone_hint=inputs.get("tone_hint"),
-            brand_block=render_brand_profile(ctx.brand_profile),
-            user_block=render_user_skills(ctx.user_skills),
-            trends=render_trends(ctx.trends),
-            skill=load_skill("posting_plan"),
+            business_id=inputs.get("business_id"), user_id=inputs.get("user_id"),
+            answers=self._render_answers(inputs.get("answers")),
         )
-        spec = PostingPlanSpec(**raw)
-        items_spec = clamp_item_dates(spec.items, start_date=start_date, end_date=end_date)
         now = datetime.now(timezone.utc).isoformat()
         plan = PostingPlan(
             plan_id=f"plan-{uuid.uuid4().hex[:12]}",
@@ -1038,17 +1191,56 @@ class PlanService:
             end_date=end_date,
             status="draft",
             strategy_summary=spec.strategy_summary,
-            items=[
-                PlanItem(
-                    **s.model_dump(), item_id=f"item-{i + 1}",
-                    content_types=list(content_types),
-                )
-                for i, s in enumerate(items_spec)
-            ],
+            recommended_cadence=spec.recommended_cadence,
+            follow_up_questions=list(spec.follow_up_questions),
+            items=self._items_from_spec(
+                spec, start_date=start_date, end_date=end_date,
+                content_types=content_types),
             created_at=now,
             updated_at=now,
         ).model_dump()
         await factory.get_store().upsert_posting_plan(plan=plan)
+        return plan
+
+    async def refine(
+        self, plan_id: str, *, feedback: str = "", answers: Optional[dict] = None
+    ) -> dict:
+        """Regenerate a DRAFT plan in place from the user's feedback and/or answers to
+        the follow-up questions (mirrors write_copy's feedback loop). Keeps the plan_id,
+        window and created_at; refreshes strategy/cadence/questions/items and bumps
+        updated_at; stays a draft (confirm activates it). Full regenerate — per-item
+        PATCH stays the tool for surgical edits once the user is satisfied."""
+        answers = answers or {}
+        if not (feedback or "").strip() and not self._render_answers(answers):
+            raise ApiError(400, "refine requires 'feedback' or 'answers'")
+        plan = await self._require(plan_id)
+        if plan.get("status") != "draft":
+            raise ApiError(
+                409, f"plan {plan_id} is not a draft (status={plan.get('status')}) — "
+                "only drafts can be refined")
+        start_date, end_date = plan["start_date"], plan["end_date"]
+        existing_items = plan.get("items") or []
+        content_types = (
+            existing_items[0].get("content_types") if existing_items else None) or ["text"]
+        spec = await self._plan_campaign(
+            goal=plan["goal"], platforms=list(plan["target_platforms"]),
+            start_date=start_date, end_date=end_date,
+            cadence_hint="", tone_hint=None,
+            business_id=plan.get("business_id"), user_id=plan.get("user_id"),
+            feedback=(feedback or "").strip(),
+            answers=self._render_answers(answers),
+            prior_plan=self._render_prior_plan(plan),
+        )
+        plan["strategy_summary"] = spec.strategy_summary
+        plan["recommended_cadence"] = spec.recommended_cadence
+        plan["follow_up_questions"] = list(spec.follow_up_questions)
+        plan["items"] = [
+            i.model_dump()
+            for i in self._items_from_spec(
+                spec, start_date=start_date, end_date=end_date,
+                content_types=list(content_types))
+        ]
+        await self._save(plan)
         return plan
 
     async def get(self, plan_id: str) -> dict:
@@ -1152,6 +1344,24 @@ class PlanService:
         item["task_id"] = task_id
         await self._save(plan)
         return {"plan_id": plan_id, "item": item, "task": snapshot}
+def _decode_reference_images(images: Optional[list[str]]) -> Optional[list[bytes]]:
+    """Decode up to 3 base64 reference images (accepting `data:image/...;base64,<b64>`
+    data URLs or raw base64) into bytes for the Higgsfield backend. A malformed entry is
+    a client error (400) — reference images are opt-in, so a bad one should surface, not
+    silently vanish. Returns None when none were supplied."""
+    if not images:
+        return None
+    import base64
+    import binascii
+
+    out: list[bytes] = []
+    for img in images[:3]:
+        b64 = img.split(",", 1)[1] if img.startswith("data:") else img
+        try:
+            out.append(base64.b64decode(b64, validate=True))
+        except (binascii.Error, ValueError):
+            raise ApiError(400, "reference_images must be valid base64 (optionally a data URL)")
+    return out or None
 
 
 def _verdict_from_payload(payload: dict) -> HumanVerdict:
@@ -1295,8 +1505,8 @@ class IntakeStartRequest(BaseModel):
     prior_context: Optional[dict] = Field(
         None, description="Recap of an earlier session this conversation continues (a "
         "PriorSessionContext from POST /summarize-handoff). Its presence means 'continue that "
-        "thread' — it folds a 前情提要 block into the intake prompt; absent (or content-free) is a "
-        "fresh conversation. Must carry a `parent_session_id`; malformed → 400.")
+        "thread' — it folds a prior-session recap block into the intake prompt; absent (or "
+        "content-free) is a fresh conversation. Must carry a `parent_session_id`; malformed → 400.")
 
 
 class SummarizeHandoffRequest(BaseModel):
@@ -1332,7 +1542,7 @@ _HISTORY_FIELD = Field(
 
 class GenerateTextRequest(BaseModel):
     prompt: str = Field(..., description="Brief to turn into platform-native post copy")
-    platform: Optional[str] = Field("linkedin", description="Target platform style (linkedin | instagram | twitter | x | …)")
+    platform: Optional[str] = Field("linkedin", description="Target platform style (linkedin | instagram | twitter | x | facebook | …)")
     history: Optional[list] = _HISTORY_FIELD
 
 
@@ -1345,11 +1555,16 @@ class RenderVideoRequest(BaseModel):
     platform: str = Field(..., description="Which finished platform draft's storyboard to render")
     narration_text: Optional[str] = Field(
         None, description="Optional voiceover script to synthesize and mix into the render "
-        "(Phase 3: TTS via Azure Speech, or a silent mock). Omit for no narration."
+        "(TTS via Azure Speech, or a silent mock). Omit for no narration."
     )
     narration_voice: Optional[str] = Field(
         None, description="Provider voice id (e.g. an Azure Neural voice name). "
         "Omit to use VOICEOVER_DEFAULT_VOICE."
+    )
+    reference_images: Optional[list[str]] = Field(
+        None, description="1-3 user-attached reference images as base64 data URLs "
+        "(or raw base64), passed to the Higgsfield backend for image-to-video. "
+        "Ignored by the Remotion (local/lambda) backends."
     )
 
 
@@ -1372,6 +1587,42 @@ class CreatePlanRequest(BaseModel):
     content_types: Optional[list[str]] = Field(
         None, description="Default deliverables for every slot ('text' / 'brand' / 'video', "
         "'html' accepted as an alias). Omitted → ['text']. Editable per item afterwards.")
+    answers: Optional[dict[str, str]] = Field(
+        None, description="Answers to the follow_up_questions from a prior POST /plans/clarify, "
+        "keyed by the question — so the very first draft is already tailored to them.")
+
+
+class ClarifyPlanRequest(BaseModel):
+    """The pre-generation clarify step — POST /plans/clarify. Same campaign brief as
+    POST /plans, but returns ONLY a preliminary `recommended_cadence` + up to 3
+    `follow_up_questions` (no plan, nothing stored). Collect the user's answers, then pass
+    them to POST /plans as `answers` so the schedule is generated from them."""
+    model_config = ConfigDict(extra="allow")
+
+    goal: Optional[str] = Field(None, description="The campaign goal (required)")
+    target_platforms: Optional[list[str]] = Field(
+        None, description="Non-empty list, e.g. ['linkedin', 'instagram'] (required)")
+    start_date: Optional[str] = Field(None, description="Window start, YYYY-MM-DD (required)")
+    end_date: Optional[str] = Field(None, description="Window end, YYYY-MM-DD (required)")
+    cadence_hint: Optional[str] = Field(
+        None, description="Free-text pacing wish; omitted → the planner proposes one")
+    tone_hint: Optional[str] = None
+    business_id: Optional[str] = Field(None, description="Brand id; folds the brand voice in")
+    user_id: Optional[str] = Field(None, description="End-user id; folds learned habits in")
+
+
+class RefinePlanRequest(BaseModel):
+    """Regenerate a draft plan from the user's reaction — POST /plans/{plan_id}/refine.
+    Supply free-text `feedback` and/or `answers` to the draft's `follow_up_questions`;
+    the whole draft is re-planned in place (same plan_id, still a draft). At least one of
+    the two must be present. Use PATCH /plans/{plan_id}/items/{item_id} for surgical
+    per-slot edits instead of a full regenerate."""
+    model_config = ConfigDict(extra="allow")
+
+    feedback: Optional[str] = Field(
+        None, description="Free-text change request, e.g. 'more Instagram, fewer promos'")
+    answers: Optional[dict[str, str]] = Field(
+        None, description="Answers to the draft's follow_up_questions, keyed by the question")
 
 
 class UpdatePlanItemRequest(BaseModel):
@@ -1457,7 +1708,7 @@ async def get_task(request: Request, task_id: str) -> dict:
     return await _workflow(request).get(task_id)
 
 
-@tasks_router.get("/{task_id}/events", summary="Stream §7.2 progress/result events (SSE)")
+@tasks_router.get("/{task_id}/events", summary="Stream progress/result events (SSE)")
 async def task_events(request: Request, task_id: str) -> StreamingResponse:
     svc = _workflow(request)
     await svc.get(task_id)  # 404 early if the task is unknown (before we start streaming)
@@ -1554,6 +1805,7 @@ async def render_video(request: Request, task_id: str, body: RenderVideoRequest)
     return await _video(request).start(
         task_id, body.platform,
         narration_text=body.narration_text, narration_voice=body.narration_voice,
+        reference_images=body.reference_images,
     )
 
 
@@ -1580,27 +1832,84 @@ async def intake_brief(request: Request, session_id: str) -> dict:
 
 @intake_router.websocket("/{session_id}/voice")
 async def intake_voice(websocket: WebSocket, session_id: str) -> None:
-    """Real-time voice intake bridge. The Java backend relays the browser's audio/turns
-    over this socket; each inbound `{"user_input": "..."}` frame runs one turn on the
-    shared intake engine and the assistant reply is sent back. (The Voice Live audio
-    transcription itself is the VoiceService's concern, behind USE_MOCK_VOICE.)"""
+    """Native speech-to-speech voice intake bridge (GPT-Realtime). NOT a
+    transcribe-then-chat cascade: the client streams raw audio in and the model's
+    own audio streams back out, with the model deciding tool calls directly — there
+    is no "turn this into text first" step on the path that drives the conversation.
+
+    Protocol (client -> server): one `{"type":"start", "target_platforms"?,
+    "user_id"?, "prior_context"?}` frame, then `{"type":"audio","audio":"<base64
+    pcm16>"}` frames as the user speaks (server-side VAD handles end-of-turn/barge-in,
+    so the client never needs to signal a turn boundary itself).
+
+    Protocol (server -> client): `{"type":"audio","audio":...}` (assistant speech),
+    `{"type":"transcript","role":"user"|"assistant","text":...}` (captions/logging —
+    a side channel, never what decides the brief), `{"type":"brief_update",
+    "brief_partial":{...},"complete":bool}` (after each assistant turn),
+    `{"type":"interrupted"}` (the user barged in — stop local playback),
+    `{"type":"error","message":...}`.
+
+    The cascaded STT-only path (VoiceService/AzureVoice) is unaffected and stays
+    reachable via the REST `POST /intake` (`mode: "voice"`) flow."""
     svc: IntakeService = websocket.app.state.intake
     await websocket.accept()
+
+    try:
+        start_msg = await websocket.receive_json()
+    except WebSocketDisconnect:
+        return
+    if start_msg.get("type") != "start":
+        await websocket.send_json({"error": "first frame must be {'type': 'start', ...}", "status": 400})
+        await websocket.close()
+        return
+
+    try:
+        intake, session = await svc.open_realtime_voice(
+            session_id,
+            user_id=start_msg.get("user_id"),
+            target_platforms=start_msg.get("target_platforms"),
+            prior_context=start_msg.get("prior_context"),
+        )
+    except ApiError as exc:
+        await websocket.send_json({"error": exc.message, "status": exc.status})
+        await websocket.close()
+        return
+
+    async def _pump_model_events() -> None:
+        """Relay every event the model produces to the client, and feed each one
+        into the shared brief-completion state machine (intake.handle_event)."""
+        async for event in session.events():
+            await intake.handle_event(event)
+            if event.type == "audio_delta" and event.audio_b64:
+                await websocket.send_json({"type": "audio", "audio": event.audio_b64})
+            elif event.type == "input_transcript" and event.text:
+                await websocket.send_json({"type": "transcript", "role": "user", "text": event.text})
+            elif event.type == "output_transcript_delta" and event.text:
+                await websocket.send_json({"type": "transcript", "role": "assistant", "text": event.text})
+            elif event.type == "speech_started":
+                await websocket.send_json({"type": "interrupted"})
+            elif event.type == "error":
+                await websocket.send_json({"type": "error", "message": event.message})
+            elif event.type == "response_done":
+                await websocket.send_json({
+                    "type": "brief_update",
+                    "brief_partial": intake.brief_partial(),
+                    "complete": intake.is_complete(),
+                })
+
+    pump_task = asyncio.create_task(_pump_model_events())
     try:
         while True:
             msg = await websocket.receive_json()
-            try:
-                result = await svc.turn(session_id, msg.get("user_input", ""))
-                await websocket.send_json(result)
-                if result.get("complete"):
-                    break
-            except ApiError as exc:
-                await websocket.send_json({"error": exc.message, "status": exc.status})
-                if exc.status == 404:
-                    break
+            if msg.get("type") == "audio" and msg.get("audio"):
+                await session.send_audio(audio_b64=msg["audio"])
     except WebSocketDisconnect:
-        return
-    await websocket.close()
+        pass
+    finally:
+        pump_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pump_task
+        await session.close()
 
 
 @media_router.post("/generate-text", summary="Generate platform-native post copy from a brief")
@@ -1629,6 +1938,17 @@ async def download_video_job(request: Request, job_id: str):
     if is_remote:
         return RedirectResponse(location, status_code=307)
     return FileResponse(location, media_type="video/mp4", filename=f"{job_id}.mp4")
+
+
+@plans_router.post(
+    "/clarify",
+    summary="Pre-generation clarify: propose a cadence + follow-up questions (no plan yet)",
+)
+async def clarify_plan(request: Request, body: ClarifyPlanRequest) -> dict:
+    """Ask the planner what it would need to know BEFORE building the schedule. Returns
+    `{recommended_cadence, follow_up_questions}`; collect the answers and pass them to
+    POST /plans as `answers`."""
+    return await _plans(request).clarify(body.model_dump(exclude_none=True))
 
 
 @plans_router.post("", summary="Generate a multi-date posting plan (returned as a draft)")
@@ -1661,6 +1981,15 @@ async def due_plan_items(
 @plans_router.get("/{plan_id}", summary="Fetch one plan (item statuses reconciled)")
 async def get_plan(request: Request, plan_id: str) -> dict:
     return await _plans(request).get(plan_id)
+
+
+@plans_router.post(
+    "/{plan_id}/refine",
+    summary="Regenerate a draft plan from feedback / answers to its follow-up questions",
+)
+async def refine_plan(request: Request, plan_id: str, body: RefinePlanRequest) -> dict:
+    return await _plans(request).refine(
+        plan_id, feedback=body.feedback or "", answers=body.answers)
 
 
 @plans_router.post("/{plan_id}/confirm", summary="Activate a draft plan")
