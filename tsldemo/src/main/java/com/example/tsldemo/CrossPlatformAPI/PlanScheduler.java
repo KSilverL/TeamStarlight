@@ -18,7 +18,7 @@ import com.example.tsldemo.SignInAPI.BusinessRepository;
 
 @Component
 public class PlanScheduler {
-    private static final String DAILY_CRON = "0 30 14 * * *";
+    private static final String DAILY_CRON = "0 0 18 * * *";
     private static final ZoneId IRISH_ZONE = ZoneId.of("Europe/Dublin");
 
     @Autowired
@@ -81,7 +81,6 @@ public class PlanScheduler {
 
 
             } catch (Exception e) {
-                // 409 means "already started" (idempotency guard) — not a real error.
                 if (e.getMessage() != null && e.getMessage().contains("409")) {
                     System.out.println("[PlanScheduler] Item " + itemId + " already executed — skipping.");
                 } else {

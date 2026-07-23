@@ -95,4 +95,37 @@ public class PlanService {
                 .retrieve()
                 .body(Map.class);
     }
+    
+    @SuppressWarnings("unchecked")
+    public Map<String,Object> getTask(String taskId){
+
+        return restClient.get()
+                .uri(llmServiceBaseUrl + "/tasks/" + taskId)
+                .retrieve()
+                .body(Map.class);
+    }
+    
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> clarifyPlan(int businessId, Map<String, Object> body) {
+        body.put("business_id", String.valueOf(businessId));
+
+        return restClient.post()
+                .uri(llmServiceBaseUrl + "/plans/clarify")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(body)
+                .retrieve()
+                .body(Map.class);
+    }
+    
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> refinePlan(String planId,
+                                          Map<String,Object> body) {
+
+        return restClient.post()
+                .uri(llmServiceBaseUrl + "/plans/" + planId + "/refine")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(body)
+                .retrieve()
+                .body(Map.class);
+    }
 }

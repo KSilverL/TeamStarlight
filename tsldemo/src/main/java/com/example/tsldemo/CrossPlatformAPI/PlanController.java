@@ -90,14 +90,50 @@ public class PlanController {
         return ResponseEntity.ok(planService.patchPlanItem(planId, itemId, body));
     }
 
-    @PostMapping("/{planId}/items/{itemId}/execute")
-    public ResponseEntity<?> executePlanItem(
-            @PathVariable String planId,
-            @PathVariable String itemId,
-            @RequestBody(required = false) Map<String, Object> body,
-            @RequestHeader(value = "Authorization", required = false) String authHeader) {
-        int businessId = requireBusinessId(authHeader);
-        requireOwnedPlan(planId, businessId);
-        return ResponseEntity.ok(planService.executePlanItem(planId, itemId, body));
+//    @PostMapping("/{planId}/items/{itemId}/execute")
+//    public ResponseEntity<?> executePlanItem(
+//            @PathVariable String planId,
+//            @PathVariable String itemId,
+//            @RequestBody(required = false) Map<String, Object> body,
+//            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+//        int businessId = requireBusinessId(authHeader);
+//        requireOwnedPlan(planId, businessId);
+//        return ResponseEntity.ok(planService.executePlanItem(planId, itemId, body));
+//    }
+   
+    
+    @GetMapping("/tasks/{taskId}")
+    public ResponseEntity<?> getTask(
+            @PathVariable String taskId
+    ){
+        return ResponseEntity.ok(
+            planService.getTask(taskId)
+        );
     }
+    
+    @PostMapping("/clarify")
+    public ResponseEntity<?> clarifyPlan(
+            @RequestBody Map<String, Object> body,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+
+        int businessId = requireBusinessId(authHeader);
+        return ResponseEntity.ok(planService.clarifyPlan(businessId, body));
+    }
+    
+    @PostMapping("/{planId}/refine")
+    public ResponseEntity<?> refinePlan(
+            @PathVariable String planId,
+            @RequestBody Map<String,Object> body,
+            @RequestHeader(value="Authorization", required=false)
+            String authHeader) {
+
+        int businessId = requireBusinessId(authHeader);
+
+        requireOwnedPlan(planId, businessId);
+
+        return ResponseEntity.ok(
+                planService.refinePlan(planId, body)
+        );
+    }
+
 }
