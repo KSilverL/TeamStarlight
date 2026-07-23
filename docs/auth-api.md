@@ -5,7 +5,7 @@ This document covers all REST endpoints involved in account creation and login a
 - **Frontend** (Next.js, `http://localhost:3000`) — the sign-up and login forms
 - **Backend** (Spring Boot, `http://localhost:8081`) — persists business accounts, verifies credentials, and issues JWT tokens
 
-Every other endpoint in this doc set refers to "the authenticated user" — that user is a **Business account** created and verified through the endpoints below. A `Business` owns its chat sessions (`chat-api.md`), brand profile (`brand-profile-api.md`), approval queue (`approval-queue-api.md`), and calendar (`calendar-api.md`).
+Every other endpoint in this doc set refers to "the authenticated user" — that user is a **Business account** created and verified through the endpoints below. A `Business` owns its chat sessions (`chat-api.md`), brand profile (`brand-profile-api.md`), approval queue (`approval-queue-api.md`), calendar (`calendar-api.md`), and posting plans (`posting-plans-api.md`).
 
 ---
 

@@ -157,7 +157,7 @@ class LLMService(ABC):
         ...
 
     @abstractmethod
-    async def plan_campaign(
+    async def clarify_campaign(
         self,
         *,
         goal: str,
@@ -171,17 +171,59 @@ class LLMService(ABC):
         trends: str = "",
         skill: str = "",
     ) -> dict:
+        """The pre-generation CLARIFY step: BEFORE any dated schedule is generated,
+        propose a preliminary posting cadence and ask ≤3 short questions whose answers
+        would let you tailor the plan — as a JSON-friendly dict matching
+        core.plan_schema.PlanClarification (recommended_cadence + follow_up_questions,
+        NO items). Same pre-rendered `brand_block` / `user_block` / `trends` blocks and
+        the same static `skill` (skills/posting_plan.md) as `plan_campaign`; empty blocks
+        leave the output unchanged. When `cadence_hint` is blank the impl reasons the
+        cadence from this brand/product/platform + the user's habits. The caller feeds the
+        collected answers back into `plan_campaign(answers=…)` to generate the plan."""
+        ...
+
+    @abstractmethod
+    async def plan_campaign(
+        self,
+        *,
+        goal: str,
+        platforms: List[str],
+        start_date: str,
+        end_date: str,
+        cadence_hint: str = "",
+        tone_hint: Optional[str] = None,
+        brand_block: str = "",
+        user_block: str = "",
+        trends: str = "",
+        skill: str = "",
+        feedback: str = "",
+        answers: str = "",
+        prior_plan: str = "",
+    ) -> dict:
         """Propose a multi-date posting plan (strategy + schedule, NOT copy) for the
         [start_date, end_date] window: which topic/angle to post on which date, on
         which platforms, and WHY that timing — as a JSON-friendly dict matching
-        core.plan_schema.PostingPlanSpec (strategy_summary + items). The LLM produces
-        DATA only: dates are clamped into the window downstream (`clamp_item_dates`),
-        never trusted. `brand_block` / `user_block` / `trends` are pre-rendered prompt
-        blocks (render_brand_profile / render_user_skills / render_trends) — empty
-        blocks MUST leave the plan unchanged (degrade-to-empty rule, same as
-        plan_strategy). `skill` is the static planning spec
-        (skills/posting_plan.md); `cadence_hint` is the caller's free-text pacing
-        wish (e.g. "2 posts a week")."""
+        core.plan_schema.PostingPlanSpec (strategy_summary + recommended_cadence +
+        follow_up_questions + items). The LLM produces DATA only: dates are clamped
+        into the window downstream (`clamp_item_dates`), never trusted.
+        `brand_block` / `user_block` / `trends` are pre-rendered prompt blocks
+        (render_brand_profile / render_user_skills / render_trends) — empty blocks
+        MUST leave the plan unchanged (degrade-to-empty rule, same as plan_strategy).
+        `skill` is the static planning spec (skills/posting_plan.md).
+
+        Cadence: `cadence_hint` is the caller's free-text pacing wish (e.g. "2 posts a
+        week"). When it is BLANK the impl chooses a cadence that fits this brand /
+        product / platform — reasoning from `brand_block` / `user_block` (the user's past
+        habits) — and reports it in `recommended_cadence`. `follow_up_questions` are ≤3
+        clarifiers the planner would ask to tailor further; empty when the brief is
+        self-sufficient. Neither gates item generation: a usable draft is always returned.
+
+        Refine loop (mirrors `write_copy`'s `feedback`/`prior_draft`): `prior_plan` is a
+        compact rendering of the previous draft to REVISE (not restart from scratch);
+        `feedback` is the user's free-text change request; `answers` is the user's
+        answers to earlier `follow_up_questions` (pre-rendered Q/A lines). When these are
+        present the impl revises minimally, honours them, and drops any now-answered
+        questions. All three empty = a fresh plan."""
         ...
 
     @abstractmethod

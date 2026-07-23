@@ -33,7 +33,7 @@ from agent_framework._types import ResponseStream
 from pydantic import TypeAdapter, ValidationError
 
 from ..config import Settings
-from ..plan_schema import PostingPlanSpec
+from ..plan_schema import PlanClarification, PostingPlanSpec
 from ..skill_schema import SkillCandidate, SkillRule
 from ..video_schema import StoryboardSpec, TemplateSlideSpec, VideoPromptSpec
 from .base import (
@@ -324,7 +324,7 @@ class AzureLLM(LLMService):
         )
         return raw.strip()
 
-    async def plan_campaign(
+    async def clarify_campaign(
         self,
         *,
         goal: str,
@@ -338,6 +338,71 @@ class AzureLLM(LLMService):
         trends: str = "",
         skill: str = "",
     ) -> dict:
+        schema = json.dumps(PlanClarification.model_json_schema())
+        style_guide = f"\n\n{skill}" if skill else ""
+        system = (
+            "You are a social-media campaign strategist. BEFORE designing any schedule, "
+            "you gather what you need: propose a preliminary posting cadence and ask up "
+            "to 3 SHORT questions whose answers would let you tailor the plan (key dates "
+            "or launches, content-production capacity, the primary conversion action, the "
+            "audience). Never ask which platforms to use — they are given. Return ONLY "
+            "valid JSON (no markdown fences, no prose) matching this schema exactly:\n"
+            f"{schema}" + style_guide
+        )
+        if not cadence_hint:
+            system += (
+                "\n\nNo cadence was given: propose the frequency you are leaning toward in "
+                "`recommended_cadence`, reasoning from this brand, this product, each "
+                "platform's norms, and the user's past habits below."
+            )
+        if trends:
+            system += "\n\n" + trends
+        for block in (brand_block, user_block):
+            if block:
+                system += f"\n\n{block}"
+        user = (
+            f"Campaign goal: {goal}\n"
+            f"Platforms: {', '.join(platforms)}\n"
+            f"Window: {start_date} to {end_date}\n"
+            f"Cadence: {cadence_hint or 'your call — propose one'}\n"
+            f"Tone: {tone_hint or 'brand voice'}"
+        )
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": user}]
+        last_error: Exception = ValueError("clarify_campaign: no attempts made")
+        for _ in range(_PLAN_CAMPAIGN_MAX_ATTEMPTS):
+            raw = await self._complete(messages)
+            try:
+                data = json.loads(_strip_fences(raw))
+                return PlanClarification(**data).model_dump()
+            except (json.JSONDecodeError, ValidationError) as exc:
+                last_error = exc
+                messages = messages + [
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content": (
+                        f"Your previous JSON was invalid: {exc}. Return corrected JSON "
+                        "only, matching the schema exactly."
+                    )},
+                ]
+        raise last_error
+
+    async def plan_campaign(
+        self,
+        *,
+        goal: str,
+        platforms: List[str],
+        start_date: str,
+        end_date: str,
+        cadence_hint: str = "",
+        tone_hint: Optional[str] = None,
+        brand_block: str = "",
+        user_block: str = "",
+        trends: str = "",
+        skill: str = "",
+        feedback: str = "",
+        answers: str = "",
+        prior_plan: str = "",
+    ) -> dict:
         schema = json.dumps(PostingPlanSpec.model_json_schema())
         style_guide = f"\n\n{skill}" if skill else ""
         system = (
@@ -345,10 +410,22 @@ class AzureLLM(LLMService):
             "dated schedule of post slots (strategy, not copy): for each slot say the "
             "date, the platform(s), the topic, the specific angle, and WHY that topic "
             "on that date (the rationale). Every planned_date must fall between "
-            f"{start_date} and {end_date} inclusive. Return ONLY valid JSON (no "
-            "markdown fences, no prose) matching this schema exactly:\n"
+            f"{start_date} and {end_date} inclusive. Also set `recommended_cadence` to "
+            "the posting frequency you chose and `follow_up_questions` to at most 3 "
+            "clarifiers (empty if the brief is self-sufficient). Return ONLY valid JSON "
+            "(no markdown fences, no prose) matching this schema exactly:\n"
             f"{schema}" + style_guide
         )
+        if not cadence_hint:
+            # No explicit pace: the agent decides. Reason from the brand/product/platform
+            # and the user's past habits, and report the choice in recommended_cadence.
+            system += (
+                "\n\nNo cadence was given: CHOOSE the posting frequency yourself — pick "
+                "what best fits this brand, this product, and each platform's norms, "
+                "weighing the brand voice profile and the user's past habits below. Put "
+                "the pace you chose in `recommended_cadence` so the user can see and "
+                "adjust it."
+            )
         if trends:
             # Same fusion-with-rejection-permission framing as plan_strategy.
             system += (
@@ -360,6 +437,15 @@ class AzureLLM(LLMService):
         for block in (brand_block, user_block):
             if block:
                 system += f"\n\n{block}"
+        if prior_plan:
+            # Refine pass: revise the prior draft in place, honouring the user's feedback
+            # and answers, and drop any question they have now answered.
+            system += (
+                "\n\nThis is a REVISION of an existing draft (below). Keep what works and "
+                "change only what the user's feedback/answers ask for; do not restart from "
+                "scratch. Drop any follow_up_question the user has already answered.\n\n"
+                "## PREVIOUS DRAFT\n" + prior_plan
+            )
         user = (
             f"Campaign goal: {goal}\n"
             f"Platforms: {', '.join(platforms)}\n"
@@ -367,6 +453,10 @@ class AzureLLM(LLMService):
             f"Cadence: {cadence_hint or 'your call — pick a pace that serves the goal'}\n"
             f"Tone: {tone_hint or 'brand voice'}"
         )
+        if answers:
+            user += f"\n\nAnswers to earlier questions:\n{answers}"
+        if feedback:
+            user += f"\n\nUser feedback on the previous draft:\n{feedback}"
         messages = [{"role": "system", "content": system},
                     {"role": "user", "content": user}]
         last_error: Exception = ValueError("plan_campaign: no attempts made")

@@ -32,7 +32,7 @@ from agent_framework._types import ResponseStream
 
 from ...skills import parse_char_limit
 from ..config import get_settings
-from ..plan_schema import PlanItemSpec, PostingPlanSpec
+from ..plan_schema import PlanClarification, PlanItemSpec, PostingPlanSpec
 from ..skill_schema import SkillCandidate, SkillRule, UserSkillDoc
 from ..trend_schema import Trend, select_current_trends
 from ..video_schema import StoryboardSpec
@@ -508,6 +508,42 @@ class MockLLM(LLMService):
             topic += f", riding {first}"
         return topic
 
+    async def clarify_campaign(
+        self,
+        *,
+        goal: str,
+        platforms: List[str],
+        start_date: str,
+        end_date: str,
+        cadence_hint: str = "",
+        tone_hint: Optional[str] = None,
+        brand_block: str = "",
+        user_block: str = "",
+        trends: str = "",
+        skill: str = "",
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        plats = platforms or ["linkedin"]
+        recommended_cadence = (
+            cadence_hint
+            or f"~2 posts/week per platform across {', '.join(plats)}"
+        )
+        # Clarify's whole purpose is to gather info up front, so it always asks — unless
+        # the caller already pinned the cadence, in which case one lighter question.
+        if cadence_hint:
+            questions = [
+                "Are there any key dates or launches this campaign should build toward?"
+            ]
+        else:
+            questions = [
+                "How often can you realistically produce content each week?",
+                "Are there any key dates or launches this campaign should build toward?",
+            ]
+        return PlanClarification(
+            recommended_cadence=recommended_cadence,
+            follow_up_questions=questions,
+        ).model_dump()
+
     async def plan_campaign(
         self,
         *,
@@ -521,6 +557,9 @@ class MockLLM(LLMService):
         user_block: str = "",
         trends: str = "",
         skill: str = "",
+        feedback: str = "",
+        answers: str = "",
+        prior_plan: str = "",
     ) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
         lo, hi = date.fromisoformat(start_date), date.fromisoformat(end_date)
@@ -564,7 +603,34 @@ class MockLLM(LLMService):
             summary += " Tuned to this user's learned preferences."
         if first:
             summary += f" Trend anchor: {first}"
-        return PostingPlanSpec(strategy_summary=summary, items=items).model_dump()
+        # A refine pass (prior_plan + feedback/answers) is observably distinct from a
+        # fresh create: mark the summary so tests can assert regeneration happened.
+        refining = bool(feedback or answers or prior_plan)
+        if feedback:
+            summary = f"Revised per feedback ({feedback}). " + summary
+        if answers:
+            summary += " Tuned to your answers."
+        # Cadence the "agent chose": echo an explicit hint, else derive one deterministically
+        # (this is the pace surfaced to the user when they left cadence_hint blank).
+        recommended_cadence = (
+            cadence_hint
+            or f"~2 posts/week per platform across {', '.join(plats)}"
+        )
+        # Follow-up clarifiers only when there's no explicit cadence AND the user hasn't
+        # yet answered/pushed back — so a blank-cadence create surfaces questions and a
+        # refine drops them.
+        follow_up_questions: List[str] = []
+        if not cadence_hint and not refining:
+            follow_up_questions = [
+                "How often can you realistically produce content each week?",
+                "Are there any key dates or launches this campaign should build toward?",
+            ]
+        return PostingPlanSpec(
+            strategy_summary=summary,
+            recommended_cadence=recommended_cadence,
+            follow_up_questions=follow_up_questions,
+            items=items,
+        ).model_dump()
 
     async def write_copy(
         self,

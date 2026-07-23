@@ -190,7 +190,7 @@ async def test_generate_video_storyboard_parity():
             assert "type" in slide
 
 
-_PLAN_KEYS = {"strategy_summary", "items"}
+_PLAN_KEYS = {"strategy_summary", "recommended_cadence", "follow_up_questions", "items"}
 _PLAN_ITEM_KEYS = {"planned_date", "time_of_day", "platforms", "topic", "angle", "rationale"}
 
 
@@ -217,6 +217,25 @@ async def test_plan_campaign_parity():
         for item in out["items"]:
             assert set(item) == _PLAN_ITEM_KEYS
             assert isinstance(item["platforms"], list) and item["platforms"]
+
+
+_CLARIFY_KEYS = {"recommended_cadence", "follow_up_questions"}
+
+
+async def test_clarify_campaign_parity():
+    kw = dict(goal="grow subscription signups", platforms=["linkedin", "instagram"],
+              start_date="2026-08-01", end_date="2026-08-14")
+    m = await mock.MockLLM().clarify_campaign(**kw)
+    canned = json.dumps({
+        "recommended_cadence": "LinkedIn 3×/wk; Instagram 2×/wk",
+        "follow_up_questions": ["Any launch dates?", "How much content can you make weekly?"],
+    })
+    a = await azure_llm(canned).clarify_campaign(**kw)
+    for out in (m, a):
+        assert isinstance(out, dict) and set(out) == _CLARIFY_KEYS
+        assert isinstance(out["recommended_cadence"], str)
+        assert isinstance(out["follow_up_questions"], list)
+        assert len(out["follow_up_questions"]) <= 3
 async def test_generate_video_prompt_parity():
     """Both impls return the VideoPromptSpec shape ({prompt, motion}) for the premium
     Higgsfield path, with and without reference images (image-to-video vs text-to-video)."""
