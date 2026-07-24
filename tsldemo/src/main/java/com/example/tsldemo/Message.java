@@ -90,4 +90,23 @@ public class Message {
 		this.session = session;
 	}
 	
+	//temp function
+	@Override
+	public String toString() {
+	    return "{"
+	        + "\"messageId\": " + id + ", "
+	        + "\"role\": \"" + role + "\", "
+	        + "\"variant\": \"" + (variant != null ? variant : "") + "\", "
+	        + "\"content\": \"" + escape(content) + "\", "
+	        + "\"timestamp\": \"" + timestamp + "\", "
+	        + "\"sessionId\": \"" + (session != null ? session.getId() : null) + "\""
+	        + "}";
+	}
+	
+	private String escape(String s) {
+	    if (s == null) return "";
+	    return s.replace("\"", "\\\"")
+	            .replace("\n", "\\n")
+	            .replace("\r", "\\r");
+	}
 }
