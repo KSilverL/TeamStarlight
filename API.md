@@ -281,6 +281,14 @@ Switch on `type`:
 - `platform`: set for per-platform steps, else `null`
 - A terminal `{ "node": "workflow", "status": "done" }` means the task finished; `{ "node": "workflow", "status": "error" }` means it failed (the task is now `status: "error"`). Either one closes the stream.
 
+**`session_title`** — the short **history-sidebar** title, upgraded from the deterministic one on the initial snapshot to a polished LLM version:
+```json
+{ "type": "session_title", "node": "session", "phase": "intake",
+  "platform": null, "status": "done", "ts": ..., "task_id": "sess-1a2b3c4d5e6f",
+  "title": "Ethiopia Harvest Launch" }
+```
+- Emitted **at most once**, shortly after the run starts (the title generation runs concurrently, off the hot path, so it never delays the roundtable/drafting). The same value also lands on the snapshot's `title`. If you already rendered the fallback title from the first `running` snapshot, just replace it in place when this arrives. Absent (no event) simply means the fallback was already good enough — keep showing the snapshot's `title`.
+
 **`result`** — content is ready (two shapes):
 
 Draft ready for review (the animated card + video spec are produced **after** approval,
@@ -436,6 +444,7 @@ Returned by `POST /tasks`, `POST /tasks/{id}/review`, and this endpoint:
 {
   "task_id": "sess-1a2b3c4d5e6f",
   "status": "awaiting_review",
+  "title": "Ethiopia Harvest Launch",
   "pending": [
     { "request_id": "...", "platform": "linkedin", "draft": "...",
       "comment": "approved by red team", "needs_human_intervention": false }
@@ -456,6 +465,7 @@ Returned by `POST /tasks`, `POST /tasks/{id}/review`, and this endpoint:
 - `pending` — drafts waiting for your verdict. Drive your review UI off this list.
 - `outputs` — finalized drafts.
 - `proposed_rules` — the brand rules `/confirm-learning` wrote (snapshot; empty until you confirm).
+- `title` — a short human-readable label for this session, for your **history sidebar**. Present from the very first `running` snapshot (a deterministic topic-derived title, zero latency), then **upgraded in place** to a polished cheap-tier LLM title that also arrives as a one-off [`session_title` SSE event](#the-sse-event-stream) — the upgrade runs concurrently and never delays the run.
 
 **`status` values:**
 
@@ -996,9 +1006,9 @@ record Output(String platform, String draft, String decision, String comment,
               List<String> content_types,
               String html_card, Map<String,Object> video_storyboard) {}  // media present only if requested
 record RenderVideo(String platform) {}                        // POST /tasks/{id}/render-video
-record TaskSnapshot(String task_id, String status, List<Pending> pending,
+record TaskSnapshot(String task_id, String status, String title, List<Pending> pending,
                     List<Output> outputs, List<Map<String,Object>> proposed_rules,
-                    String error) {}   // error: present only when status == "error"
+                    String error) {}   // title: history-sidebar label; error: present only when status == "error"
 
 // Posting plans
 record CreatePlan(String goal, List<String> target_platforms, String start_date, String end_date,

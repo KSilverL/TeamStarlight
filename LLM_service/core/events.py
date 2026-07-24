@@ -24,6 +24,7 @@ AGENT_UTTERANCE = "agent_utterance" # "a roundtable participant just spoke"
 SPEAKER_SCHEDULED = "speaker_scheduled"  # "the manager just handed the mic to a participant"
 DISCUSSION_CONSENSUS = "discussion_consensus"  # the table converged (a RESULT status)
 ROUND_CONTROL = "round_control"     # step mode: the table is asking the user what to do next
+SESSION_TITLE = "session_title"     # the short title for this session (history sidebar)
 
 # ── Progress `status` lifecycle ───────────────────────────────────────────────
 RUNNING = "running"          # executor entered
@@ -80,6 +81,24 @@ def result_event(
     if payload:
         event.update(payload)
     return event
+
+
+def session_title_event(*, task_id: str, title: str) -> dict:
+    """The short, human-readable title for this session, for the frontend's history sidebar.
+    Generated OFF the hot path (a cheap-tier LLM call fired concurrently at task start), so it
+    arrives a beat after the run begins — the `running` snapshot already carries a deterministic
+    fallback title, and this event upgrades it in place once the polished version lands. Emitted
+    at most once per task; also readable on the task snapshot's `title`."""
+    return {
+        "type": SESSION_TITLE,
+        "node": "session",
+        "phase": "intake",
+        "platform": None,
+        "status": "done",
+        "ts": time.time(),
+        "task_id": task_id,
+        "title": title,
+    }
 
 
 # ── Roundtable discussion events ──────────────────────────────────────────────

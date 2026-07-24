@@ -157,6 +157,16 @@ class LLMService(ABC):
         ...
 
     @abstractmethod
+    async def name_session(self, *, topic: str, user_intent: str) -> str:
+        """Distil a very short (≤6-word) session title for the frontend's history sidebar, in
+        the SAME language as the input. Returns the bare title — no quotes, no trailing
+        punctuation, single line. This is decoration, NOT on the intake→roundtable hot path: it
+        runs on the cheap summary tier and is called concurrently (never awaited) at task start,
+        so the caller always applies a deterministic topic-derived fallback and clamps the length
+        — an empty or oversized return degrades gracefully and never blocks a run."""
+        ...
+
+    @abstractmethod
     async def clarify_campaign(
         self,
         *,

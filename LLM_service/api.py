@@ -56,6 +56,7 @@ from .core.events import (
     progress_event,
     result_event,
     round_control_event,
+    session_title_event,
 )
 from .core.services import factory
 from .core.services.base import RealtimeVoiceSession
@@ -201,6 +202,17 @@ def _roundtable_mode_from_inputs(inputs: dict) -> str:
     return mode
 
 
+def _clean_title(text: str, *, max_chars: int = 48) -> str:
+    """Normalize a session title (from the LLM, or a raw topic used as the deterministic
+    fallback) into one tidy sidebar line: strip wrapping quotes, collapse whitespace/newlines,
+    and clamp to `max_chars` with an ellipsis. Empty in → empty out, so the caller can fall back."""
+    t = (text or "").strip().strip("\"'“”‘’").strip()
+    t = " ".join(t.split())
+    if len(t) > max_chars:
+        t = t[:max_chars].rstrip(" ,.;:—-") + "…"
+    return t
+
+
 class _Task:
     """In-process record for one workflow run."""
 
@@ -220,6 +232,8 @@ class _Task:
         self.preference_summary: Optional[dict] = None  # PreferenceSummary written back on confirm
         self.event_listener = None                    # optional sync hook: live-stream each event (CLI)
         self.runner: Optional[asyncio.Task] = None    # background drive task (HTTP non-blocking path)
+        self.title: Optional[str] = None              # short session title for the history sidebar
+        self.title_runner: Optional[asyncio.Task] = None  # concurrent, off-path title-generation task
         self.lock = asyncio.Lock()                    # serializes resumes: two concurrent /review calls
         # (e.g. auto-approving two platforms' drafts back-to-back) must not both drive the same
         # underlying `workflow` at once — that races on `task.pending` and can 409 a legitimate call.
@@ -380,6 +394,21 @@ class WorkflowService:
                 raise
             return self._snapshot(task)
 
+    async def _generate_title(self, task: _Task, brief: Brief) -> None:
+        """Off-path: upgrade the deterministic sidebar title to a cheap-tier LLM one, then publish
+        it over SSE. Best-effort decoration — any failure (or an empty/degenerate return) silently
+        keeps the deterministic title already on the task, and never disturbs the run."""
+        try:
+            raw = await factory.get_llm().name_session(
+                topic=brief.topic, user_intent=brief.user_intent)
+        except Exception:
+            return  # title is optional decoration; a failure must never surface or hang the run
+        title = _clean_title(raw)
+        if not title or title == task.title:
+            return  # nothing better than the fallback already set — don't emit a redundant event
+        task.title = title
+        self._publish(task, session_title_event(task_id=task.task_id, title=title))
+
     def _snapshot(self, task: _Task) -> dict:
         snap = {
             "task_id": task.task_id,
@@ -388,6 +417,8 @@ class WorkflowService:
             "outputs": list(task.outputs.values()),
             "proposed_rules": task.proposed_rules,
         }
+        if task.title is not None:
+            snap["title"] = task.title  # short session title for the frontend's history sidebar
         if task.error is not None:
             snap["error"] = task.error  # the run failed; status == "error"
         if task.preference_summary is not None:
@@ -442,6 +473,16 @@ class WorkflowService:
         task.conversation = list(conversation or [])  # intake transcript for per-user learning
         task.event_listener = event_listener
         self._tasks[task_id] = task
+
+        # Session title for the frontend's history sidebar — deliberately OFF the intake→roundtable
+        # hot path. Set a deterministic topic-derived title NOW so the `running` snapshot already
+        # carries one (zero added latency), then upgrade it via a cheap-tier LLM call that runs
+        # CONCURRENTLY with the roundtable/drafting (create_task, never awaited here) and lands over
+        # SSE. Only the non-blocking HTTP path spawns the upgrade; inline runs (CLI/tests) keep the
+        # deterministic title, so no stray task is left pending when the loop tears down.
+        task.title = _clean_title(brief.topic)
+        if background:
+            task.title_runner = asyncio.create_task(self._generate_title(task, brief))
 
         # Step mode (roundtable_mode: "manual"): the HTTP path has no terminal to prompt on, so
         # the service provides its own per-round hook — pause each table, ask over SSE, resume
