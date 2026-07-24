@@ -104,6 +104,9 @@ public class ApiDTOS {
 
 	    public String status;
 
+	    @JsonProperty("title")
+	    public String title;
+
 	    public List<Pending> pending;
 
 	    public List<Output> outputs;
@@ -112,7 +115,6 @@ public class ApiDTOS {
 	    List<Map<String,Object>> proposedRules;
 
 	    public String error;
-	    
 	}
 	
 	public record Verdict(

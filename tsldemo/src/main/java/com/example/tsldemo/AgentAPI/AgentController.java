@@ -102,6 +102,28 @@ public class AgentController {
         return service.agentRoundControl(taskId, request);
     }
 
+    @GetMapping(
+    	    value = "/tasks/{taskId}/events",
+    	    produces = MediaType.TEXT_EVENT_STREAM_VALUE
+    	)
+    	public SseEmitter events(@PathVariable String taskId) {
+
+    	    SseEmitter emitter = new SseEmitter(Long.MAX_VALUE);
+
+    	    service.consumeEvents(taskId, event -> {
+    	        try {
+    	            emitter.send(
+    	                SseEmitter.event()
+    	                    .name("message")
+    	                    .data(event)
+    	            );
+    	        } catch (Exception e) {
+    	            emitter.completeWithError(e);
+    	        }
+    	    });
+
+    	    return emitter;
+    	}
 	
 }
 
