@@ -324,6 +324,23 @@ class AzureLLM(LLMService):
         )
         return raw.strip()
 
+    async def name_session(self, *, topic: str, user_intent: str) -> str:
+        system = (
+            "You name a social-media content session for a history sidebar. Read the topic and "
+            "goal and return a SINGLE short title of at most 6 words, in the SAME language as the "
+            "input. Return the bare title only — no quotes, no trailing punctuation, no markdown, "
+            "no prefix like 'Title:'."
+        )
+        user = f"Topic: {topic}\nGoal: {user_intent}"
+        # Cheap summary tier (PREFERENCE_SUMMARY_MODEL / ROUNDTABLE_PERSONA_MODEL), falling back to
+        # the main deployment when neither is set — this is off-path decoration, so it must not
+        # compete with the manager/persona deployments on the intake→roundtable hot path.
+        raw = await self._complete(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model=self._settings.preference_summary_model,
+        )
+        return raw.strip()
+
     async def clarify_campaign(
         self,
         *,

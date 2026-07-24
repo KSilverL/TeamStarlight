@@ -139,6 +139,17 @@ async def test_suggest_topic_parity():
     assert await mock.MockLLM().suggest_topic(**kw, trends="") == m
 
 
+async def test_name_session_parity():
+    """The session title is a SHORT single line by contract (it labels a history-sidebar
+    entry): both impls return a non-empty single-line str, and the mock is deterministic."""
+    kw = dict(topic="Summer oat milk latte launch", user_intent="drive Gen-Z trials")
+    m = await mock.MockLLM().name_session(**kw)
+    a = await azure_llm("Summer Oat Milk Launch").name_session(**kw)
+    assert isinstance(m, str) and isinstance(a, str) and m and a
+    assert "\n" not in m and "\n" not in a
+    assert await mock.MockLLM().name_session(**kw) == m  # deterministic
+
+
 @pytest.mark.parametrize("platform", ["linkedin", "instagram", "x", "tiktok"])
 async def test_write_copy_parity(platform):
     kw = dict(

@@ -508,6 +508,13 @@ class MockLLM(LLMService):
             topic += f", riding {first}"
         return topic
 
+    async def name_session(self, *, topic: str, user_intent: str) -> str:
+        await asyncio.sleep(_MOCK_LATENCY)
+        # Deterministic short title: the first handful of the topic's words, cleaned. Mirrors the
+        # caller's fallback so mock/offline runs still surface a tidy sidebar title.
+        words = (topic or user_intent or "New session").split()
+        return " ".join(words[:6]).strip(" ,.;:—-") or "New session"
+
     async def clarify_campaign(
         self,
         *,
