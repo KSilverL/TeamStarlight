@@ -12,12 +12,23 @@ import lombok.Setter;
 public class CrossPlatPostReqDTO{
 
     @JsonProperty("businessId")
-    int businessId;
+    Long businessId;
 
     @JsonProperty("message")
     String message;
 
     @JsonProperty("media")
     MultipartFile media;
+
+    // Meta Specific Stuff
+    @JsonProperty("pageId")
+    Long[] pageId;
+
+    // For video
+    @JsonProperty("title")
+    String title;
+
+    @JsonProperty("description")
+    String description;
 
 }
