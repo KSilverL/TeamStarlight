@@ -403,13 +403,22 @@ def _mock_scene_component(*, broken: bool) -> str:
     )
 
 
-def _mock_storyboard(topic: str, draft: str, tone_hint: Optional[str], platform: str) -> dict:
+def _mock_storyboard(
+    topic: str, draft: str, tone_hint: Optional[str], platform: str, direction: str = "",
+) -> dict:
     """A deterministic 4-slide StoryboardSpec-shaped dict — one of each Phase 1 slide
     type, in a typical order (hook -> collage -> counter_stat -> outro), so
-    contract-parity / shape tests have something stable to assert on."""
+    contract-parity / shape tests have something stable to assert on. When `direction`
+    (the roundtable's agreed video direction) is given, it is echoed into the hook slide's
+    narration so tests can assert the direction reached the generator; empty `direction`
+    leaves the deterministic baseline output unchanged."""
     primary, secondary, accent = _MEDIA_PALETTE
     brand = _brand_name(topic)
     tagline = (tone_hint or "Crafted with intent").strip()[:48] or "Crafted with intent"
+    hook_narration = (
+        f"Introducing {brand}. Direction: {direction.strip()}"
+        if direction and direction.strip() else f"Introducing {brand}."
+    )
     return StoryboardSpec(
         brandName=brand,
         primaryColor=primary,
@@ -418,7 +427,7 @@ def _mock_storyboard(topic: str, draft: str, tone_hint: Optional[str], platform:
         platform=platform,
         slides=[
             {"type": "hook", "headline": tagline, "imageQuery": topic, "shape": "circle",
-             "narration": f"Introducing {brand}."},
+             "narration": hook_narration},
             {"type": "collage", "headline": "Why It Matters", "imageQueries": [topic, "team", "product"],
              "narration": f"Here's why {topic} matters for you."},
             {"type": "counter_stat", "sectionLabel": "By The Numbers", "stats": [
@@ -570,10 +579,11 @@ class MockLLM(LLMService):
         tone_hint: Optional[str],
         platform: str,
         skill: str = "",
+        direction: str = "",
         history: Optional[List[dict]] = None,
     ) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
-        return _mock_storyboard(topic, draft, tone_hint, platform)
+        return _mock_storyboard(topic, draft, tone_hint, platform, direction)
 
     async def generate_video_prompt(
         self,

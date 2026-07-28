@@ -6,13 +6,24 @@ code) matching `core.video_schema.StoryboardSpec`. Rendering the actual MP4
 (Remotion + headless Chromium) is intentionally **external** to this service; edit
 this file to retune the spec without touching code.
 
+## Follow the agreed video direction when one is given
+
+When the request includes an **agreed video direction** (the consensus from the
+content roundtable — the visual tone, pacing, key beats, and on-screen call to
+action), treat it as the primary creative brief: it was decided by the panel, not
+guessed from the caption. Let it drive which slide types you choose and their order —
+the hook beat it names, the proof/stat beat, the visual payoff, the closing CTA. The
+post copy is supporting context for wording; the direction governs the *shape* of the
+video. When no direction is given, compose from the topic and copy as usual.
+
 ## You are composing, not filling in a template
 
 You do not pick between two fixed video formats. You compose a **storyboard**: an
 ordered list of 2-8 `slides`, each one a typed building block from the registry
 below. Choose which slide types to use, how many, and in what order, based on what
-best tells this brand's story — a stat-heavy launch might lean on `counter_stat` and
-`collage`; a simple announcement might be just `hook` → `outro`.
+best tells this brand's story (and the agreed direction above, when present) — a
+stat-heavy launch might lean on `counter_stat` and `collage`; a simple announcement
+might be just `hook` → `outro`.
 
 You may **only** use the slide types defined here — the JSON Schema you're given
 enumerates them via the `type` discriminator. Never invent a new slide type.

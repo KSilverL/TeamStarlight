@@ -385,6 +385,7 @@ class AzureLLM(LLMService):
         tone_hint: Optional[str],
         platform: str,
         skill: str = "",
+        direction: str = "",
         history: Optional[List[dict]] = None,
     ) -> dict:
         schema = json.dumps(StoryboardSpec.model_json_schema())
@@ -398,11 +399,18 @@ class AzureLLM(LLMService):
             "Return ONLY valid JSON (no markdown fences, no prose) matching the schema "
             f"exactly:\n{schema}" + style_guide
         )
+        # The roundtable's agreed video direction (when present) is the primary creative brief —
+        # the caption is supporting context, not the whole basis.
+        direction_block = (
+            f"\nAgreed video direction (from the content roundtable — follow this):\n{direction}"
+            if direction and direction.strip() else ""
+        )
         user = (
             f"Brand topic: {topic}\n"
             f"Approved post copy:\n{draft}\n"
             f"Tone: {tone_hint or 'brand voice'}\n"
             f"Target platform: {platform}"
+            f"{direction_block}"
         )
         messages = [{"role": "system", "content": system}, *(history or []),
                     {"role": "user", "content": user}]

@@ -58,6 +58,7 @@ class MediaProducerExecutor(Executor):
                 topic=topic, draft=basis, tone_hint=tone_hint,
                 platform=approved.platform,
                 skill=load_skill("brand_video_storyboard"),
+                direction=approved.strategy,  # the roundtable's agreed video direction
             )
             return StoryboardSpec(**raw)
 

@@ -198,6 +198,7 @@ class LLMService(ABC):
         tone_hint: Optional[str],
         platform: str,
         skill: str = "",
+        direction: str = "",
         history: Optional[List[dict]] = None,
     ) -> dict:
         """Generate a dynamic, composable storyboard for a short-form brand video as a
@@ -208,9 +209,12 @@ class LLMService(ABC):
         external to this service. `platform` lets the prompt reason about length/format
         context, but the final aspect ratio is derived deterministically downstream
         (core.video_schema.aspect_for_platform), never trusted from the LLM. `skill` is
-        the static spec (skills/brand_video_storyboard.md). `history` (optional) is the
-        prior {role, content} conversation the caller assembled, folded in as context
-        for a follow-up; None/empty = single-turn."""
+        the static spec (skills/brand_video_storyboard.md). `direction` (optional) is the
+        roundtable's agreed creative direction for the video (visual tone, pacing, key beats,
+        on-screen CTA) — folded into the prompt so the storyboard reflects the discussion, not
+        just the caption; '' means none. `history` (optional) is the prior {role, content}
+        conversation the caller assembled, folded in as context for a follow-up; None/empty =
+        single-turn."""
         ...
 
     @abstractmethod
@@ -667,7 +671,7 @@ class BackgroundRemovalService(ABC):
         ...
 
 
-# ── Background music (Soundraw) ───────────────────────────────────────────────
+# ── Background music ───────────────────────────────────────────────
 
 class MusicGenerationService(ABC):
     """Background music generation, sized to a render's exact duration."""
