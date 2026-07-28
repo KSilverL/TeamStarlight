@@ -7,6 +7,9 @@ import com.example.tsldemo.DTOs.Error.Detail;
 import com.example.tsldemo.DTOs.ResponseReceived.BriefPartial;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
+
+
 public class ApiDTOS {
 	public static class IntakeRequest {
         public String mode;
@@ -265,5 +268,26 @@ public class ApiDTOS {
 	    String createdAt,
 	    String updatedAt
 	) {}
+	
+	
+	
+	public record InstagramRequest(
+	        @JsonProperty("video_url")
+	        String videoUrl,
+
+	        @JsonProperty("media_type")
+	        String mediaType,
+
+	        String caption
+	) {}
+	
+	public record InstagramResponse(String id) {}
+	
+	public record InstagramPublishRequest(
+	        @JsonProperty("creation_id")
+	        String creationId
+	) {}
+	
+	public record InstagramStatusResponse(String status_code) {}
 	
 }
