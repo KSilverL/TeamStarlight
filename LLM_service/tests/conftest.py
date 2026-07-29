@@ -6,6 +6,10 @@ Autouse fixtures keep every test deterministic, offline, and in mock mode:
     (so MockStore's in-memory state never leaks between tests).
   - mock_environment: clears toggle/Azure env so the default (mock) mode is in force.
 
+Plus one module-level guard: `LLM_SERVICE_IGNORE_DOTENV` is set at import, before
+any LLM_service module can resolve settings, so `LLM_service/.env` is never read
+during the suite (see below).
+
 MockSafety is deterministic (it flags a draft iff it contains the UNSAFE_MARKER
 substring), so there is no randomness to pin.
 """
@@ -13,16 +17,25 @@ substring), so there is no randomness to pin.
 from __future__ import annotations
 
 import contextlib
+import os
 import threading
 import time
 
-import pytest
-from agent_framework import InMemoryCheckpointStorage
+# BEFORE importing anything from LLM_service: `get_settings()` reads
+# LLM_service/.env, and a developer's local .env would otherwise leak real
+# endpoints, credentials and feature toggles (ROUNDTABLE_ENABLED, POSTGRES_DSN, …)
+# into the suite the first time any module resolves settings — including at
+# import time, before an autouse fixture could clear them. Set here, at conftest
+# import, so the suite is hermetic no matter what is in the file.
+os.environ["LLM_SERVICE_IGNORE_DOTENV"] = "1"
 
-from LLM_service.core.config import reset_settings
-from LLM_service.core.services.factory import reset_services
-from LLM_service.workflow import Brief, build_workflow
-from LLM_service.workflow.roundtable import reset_controls, reset_gates
+import pytest  # noqa: E402
+from agent_framework import InMemoryCheckpointStorage  # noqa: E402
+
+from LLM_service.core.config import reset_settings  # noqa: E402
+from LLM_service.core.services.factory import reset_services  # noqa: E402
+from LLM_service.workflow import Brief, build_workflow  # noqa: E402
+from LLM_service.workflow.roundtable import reset_controls, reset_gates  # noqa: E402
 
 _TOGGLE_VARS = ("USE_MOCK", "USE_MOCK_LLM", "USE_MOCK_SAFETY", "USE_MOCK_STORE", "USE_MOCK_VOICE",
                 "USE_MOCK_WEB_SEARCH", "TREND_SCOUT_ENABLED")

@@ -274,17 +274,77 @@ class WorkflowService:
             task.event_listener(event)
 
     @staticmethod
+    def _platforms_of(data) -> list[str]:
+        """The platforms an event payload covers, in order, deduplicated.
+
+        **Every stage after intake is per-platform**, so its progress events say
+        which platform they belong to — that is what lets a subscriber run one
+        lane per platform, mirroring how the graph actually works (the strategist
+        calls `plan_strategy` once per platform with that platform's
+        `skills/<platform>.md`; the creator fans out; the reviewer, gate and
+        media_producer are per-platform; the roundtable seats one table each).
+
+        Two sources, in priority order:
+
+        1. The message's own `platform` — `Draft`, `ReviewOutcome`,
+           `ApprovedDraft`, `FinalDraft`, `HumanReviewRequest` all declare it.
+        2. Otherwise the run's `target_platforms`, which the backend supplies at
+           `POST /tasks` and which every brief-level message carries onward
+           (`Brief`/`DispatchPlan` directly, `CreativeStrategy` via its `brief`).
+           A brief-level executor covers all of them at once, so it yields one
+           event per platform.
+
+        The payload shape differs by event type, which is the subtlety that
+        started all this: `executor_invoked` carries the single INBOUND message,
+        while `executor_completed` carries a **list of the messages the executor
+        emitted** — so `.platform` read off that list object is None every time,
+        not because the platform is unknown but because it sits one level down.
+
+        Returns `[]` only when the payload carries neither (a `None` payload — the
+        gate emits no message when it yields its request), leaving that event
+        untagged rather than inventing an attribution.
+        """
+        seen: list[str] = []
+
+        def add(platform: Optional[str]) -> None:
+            if platform and platform not in seen:
+                seen.append(platform)
+
+        for message in (data if isinstance(data, list) else [data]):
+            platform = getattr(message, "platform", None)
+            if platform:
+                add(platform)
+                continue
+            targets = getattr(message, "target_platforms", None) or getattr(
+                getattr(message, "brief", None), "target_platforms", None)
+            for target in targets or []:
+                add(target)
+        return seen
+
+    @staticmethod
     def _translate(ev) -> list[dict]:
-        """Map one MAF workflow event to zero or more SSE envelope dicts (pure)."""
-        platform = getattr(getattr(ev, "data", None), "platform", None)
+        """Map one MAF workflow event to zero or more SSE envelope dicts (pure).
+
+        One progress event **per platform the payload covers** (see
+        `_platforms_of`), since the envelope's `platform` is single-valued and
+        everything after intake runs per platform. A payload covering nothing
+        (the gate emits no message when it yields its request) still produces one
+        untagged event, so no executor transition ever goes unreported.
+        """
         etype = ev.type
+        executor_id = getattr(ev, "executor_id", None)
+        platforms = WorkflowService._platforms_of(getattr(ev, "data", None))
+
+        def progress_for(node: str, status: str) -> list[dict]:
+            return [progress_event(node, status, platform=p) for p in platforms] \
+                or [progress_event(node, status, platform=None)]
+
         if etype == "executor_invoked":
-            return [progress_event(ev.executor_id, RUNNING, platform=platform)]
+            return progress_for(executor_id, RUNNING)
         if etype == "executor_completed":
-            return [progress_event(ev.executor_id, "done", platform=platform)]
+            return progress_for(executor_id, "done")
         if etype in ("executor_failed", "error"):
-            return [progress_event(getattr(ev, "executor_id", "workflow") or "workflow", "error",
-                                   platform=platform)]
+            return progress_for(executor_id or "workflow", "error")
         if etype == "request_info":
             data = ev.data  # HumanReviewRequest — draft cleared the reviewer
             # The animated card + video spec are produced post-approval (media_producer),
@@ -373,7 +433,15 @@ class WorkflowService:
         if background:
             task.runner = asyncio.create_task(self._run_guarded(task, coro, reraise=False))
             return running
-        return await self._run_guarded(task, coro, reraise=True)
+        try:
+            return await self._run_guarded(task, coro, reraise=True)
+        finally:
+            # Inline (CLI): settle the concurrent, off-path title task so it never outlives the
+            # call as a dangling task, and its session_title event is deterministically delivered
+            # (buffer + listener) before we return. The background path leaves it running — there
+            # it lands over SSE. None when no live consumer asked for the upgrade (plain tests).
+            if task.title_runner is not None:
+                await asyncio.gather(task.title_runner, return_exceptions=True)
 
     async def _run_guarded(self, task: _Task, coro, *, reraise: bool) -> dict:
         """Drive `coro` (a start/resume/roundtable segment) to its next pause/end, but never let
@@ -477,11 +545,13 @@ class WorkflowService:
         # Session title for the frontend's history sidebar — deliberately OFF the intake→roundtable
         # hot path. Set a deterministic topic-derived title NOW so the `running` snapshot already
         # carries one (zero added latency), then upgrade it via a cheap-tier LLM call that runs
-        # CONCURRENTLY with the roundtable/drafting (create_task, never awaited here) and lands over
-        # SSE. Only the non-blocking HTTP path spawns the upgrade; inline runs (CLI/tests) keep the
-        # deterministic title, so no stray task is left pending when the loop tears down.
+        # CONCURRENTLY with the roundtable/drafting (create_task, never awaited on the hot path) and
+        # lands over SSE / the event listener. Spawn it whenever there's a live consumer to receive
+        # it — the non-blocking HTTP path (`background`) OR an inline caller streaming live (the CLI,
+        # via `event_listener`); `_dispatch` settles it on the inline path so no task is left
+        # pending. A plain inline run (tests) keeps just the deterministic title.
         task.title = _clean_title(brief.topic)
-        if background:
+        if background or event_listener is not None:
             task.title_runner = asyncio.create_task(self._generate_title(task, brief))
 
         # Step mode (roundtable_mode: "manual"): the HTTP path has no terminal to prompt on, so
@@ -561,7 +631,7 @@ class WorkflowService:
                 verdict = verdicts.get(data["platform"])
                 if verdict is None:
                     continue  # leave un-addressed platforms pending
-                responses[req_id] = _verdict_from_payload(verdict)
+                responses[req_id] = _verdict_from_payload(verdict, data["platform"])
                 # Record the AI draft the human reviewed + the verdict, so confirm-learning can
                 # distil brand rules (AI-vs-final diff) and trace a learned preference to the edit.
                 task.original_drafts[data["platform"]] = data["draft"]
@@ -1405,7 +1475,11 @@ def _decode_reference_images(images: Optional[list[str]]) -> Optional[list[bytes
     return out or None
 
 
-def _verdict_from_payload(payload: dict) -> HumanVerdict:
+def _verdict_from_payload(payload: dict, platform: Optional[str] = None) -> HumanVerdict:
+    """Validate one gate verdict. `platform` is the pending request's platform —
+    stamped onto the message so the resumed gate's progress events can say which
+    platform they belong to (verdicts are already keyed by platform at
+    `POST /review`, so this is never asked of the client)."""
     decision = (payload.get("decision") or "").lower()
     if decision not in ("approve", "approve_after_edit", "reject"):
         raise ApiError(400, "decision must be approve, approve_after_edit, or reject")
@@ -1415,6 +1489,7 @@ def _verdict_from_payload(payload: dict) -> HumanVerdict:
         decision=decision,
         edited_draft=payload.get("edited_draft"),
         reason=payload.get("reason"),
+        platform=platform,
     )
 
 
