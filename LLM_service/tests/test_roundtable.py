@@ -66,6 +66,7 @@ def _brief(**over) -> Brief:
         business_id=over.get("business_id", ROUNDTABLE_FIXTURE_BUSINESS_ID),
         user_id=over.get("user_id", ROUNDTABLE_FIXTURE_USER_ID),
         tone_hint="warm, authentic",
+        content_types=over.get("content_types", ["text"]),
     )
 
 
@@ -114,6 +115,44 @@ async def test_personas_carry_injected_profile_and_skills():
 
     # audience_advocate is pure prompt — no injected store content.
     assert "BRAND MUST DO" not in personas[AUDIENCE_ADVOCATE].instructions
+
+
+async def test_text_only_scope_is_a_hard_constraint_for_every_persona():
+    """Every seat receives the requested deliverable scope, so platform/media priors cannot
+    turn a text-only request into a video, Reel, carousel, image, or animation proposal."""
+    brief = _brief(content_types=["text"])
+    context = await build_persona_context(brief)
+    personas = build_personas(
+        PLATFORM, brief,
+        brand_profile=context.brand_profile, user_skills=context.user_skills,
+    )
+
+    for persona in personas:
+        instructions = persona.instructions
+        assert "DELIVERABLE SCOPE — HARD CONSTRAINT" in instructions
+        assert "The user requested exactly: written social post/caption copy." in instructions
+        assert "This is a TEXT-ONLY task." in instructions
+        assert "Do not propose or assume a video, Reel, animation, image/photo" in instructions
+        assert "platform-guide advice about visuals or media does not apply" in instructions
+
+
+async def test_mixed_deliverable_scope_allows_only_the_requested_formats():
+    """A mixed request names every allowed artifact and explicitly leaves the omitted one out."""
+    brief = _brief(content_types=["text", "video"])
+    context = await build_persona_context(brief)
+    personas = build_personas(
+        PLATFORM, brief,
+        brand_profile=context.brand_profile, user_skills=context.user_skills,
+    )
+
+    for persona in personas:
+        instructions = persona.instructions
+        assert (
+            "The user requested exactly: written social post/caption copy, a short brand video."
+            in instructions
+        )
+        assert "Unrequested and out of scope: an animated HTML brand card." in instructions
+        assert "This is a TEXT-ONLY task." not in instructions
 
 
 async def test_personas_are_differentiated(monkeypatch):
