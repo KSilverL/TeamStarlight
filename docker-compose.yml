@@ -35,9 +35,10 @@ services:
       - LLM_SERVICE_BASE_URL=http://llm:8080
       # Supabase credentials — override here or in a .env file if needed.
       # Defaults are already baked into application.properties.
-      # LinkedIn OAuth — must match the redirect URI registered on the LinkedIn Developer app,
-      # and where to send the browser back to after the OAuth round-trip.
+      # LinkedIn/Meta OAuth — must match the redirect URI registered on the respective Developer
+      # app, and where to send the browser back to after the OAuth round-trip.
       - LINKEDIN_REDIRECT_URI=${LINKEDIN_REDIRECT_URI:-http://localhost:8081/linkedin/callback}
+      - META_REDIRECT_URI=${META_REDIRECT_URI:-http://localhost:8081/meta/callback}
       - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-http://localhost:3000}
     depends_on:
       - llm
