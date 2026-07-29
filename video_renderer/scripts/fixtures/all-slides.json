@@ -1,0 +1,36 @@
+{
+  "brandName": "STARLIGHT",
+  "theme": "dark",
+  "primaryColor": "#0d1117",
+  "secondaryColor": "#2d4ed8",
+  "accentColor": "#f5c84c",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "slides": [
+    { "type": "hook", "headline": "The future is bright", "subtext": "and it starts today", "shape": "blob", "durationFrames": 90 },
+    { "type": "counter_stat", "sectionLabel": "By the numbers", "stats": [
+      { "value": "1200", "label": "Customers", "icon": "★" },
+      { "value": "98%", "label": "Retention", "icon": "◆" },
+      { "value": "24", "label": "Countries", "icon": "▲" }
+    ], "durationFrames": 120 },
+    { "type": "bar_chart", "headline": "Revenue by region", "bars": [
+      { "label": "EMEA", "value": 42 }, { "label": "AMER", "value": 58 }, { "label": "APAC", "value": 31 }
+    ], "durationFrames": 120 },
+    { "type": "line_chart", "headline": "Growth over time", "xLabels": ["2021", "2022", "2023", "2024"], "series": [
+      { "label": "Users", "values": [10, 24, 51, 92] }
+    ], "durationFrames": 120 },
+    { "type": "pie_chart", "headline": "Market share", "slices": [
+      { "label": "Us", "value": 45 }, { "label": "Rival A", "value": 30 }, { "label": "Rival B", "value": 25 }
+    ], "calloutText": "45% and growing", "durationFrames": 120 },
+    { "type": "node_diagram", "headline": "How it works", "nodes": ["Collect", "Analyze", "Act"], "durationFrames": 120 },
+    { "type": "comparison_table", "headline": "Us vs them", "columns": ["Us", "Them"], "rows": [
+      { "label": "Speed", "values": ["Fast", "Slow"] },
+      { "label": "Price", "values": ["$9", "$29"] }
+    ], "durationFrames": 120 },
+    { "type": "collage", "headline": "Our world", "resolvedImages": [
+      { "query": "team", "localPath": null }, { "query": "office", "localPath": null }, { "query": "product", "localPath": null }
+    ], "layout": "grid", "durationFrames": 120 },
+    { "type": "outro", "brandName": "STARLIGHT", "ctaLabel": "Get Started", "contact": "@starlight · starlight.io", "durationFrames": 90 }
+  ]
+}

@@ -35,6 +35,7 @@ Run it:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import uuid
@@ -42,7 +43,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Body, FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .core.config import get_settings, load_dotenv
@@ -56,7 +57,8 @@ from .core.events import (
     round_control_event,
 )
 from .core.services import factory
-from .intake import IntakeSession, PriorSessionContext, build_intake
+from .core.services.base import RealtimeVoiceSession
+from .intake import IntakeSession, PriorSessionContext, RealtimeVoiceIntake, build_intake
 from .skills import load_skill
 from .workflow import Brief, HumanVerdict, build_workflow
 from .workflow.builder import WORKFLOW_NAME
@@ -294,9 +296,6 @@ class WorkflowService:
     # ── Drive one run segment (start or resume) until the next pause / end ─────
 
     async def _drive(self, task: _Task, *, message=None, responses=None) -> dict:
-        # TODO (Revisit this to see if it needs to be altered)
-        # answered = set(responses.keys()) if responses else set()
-        # new_pending: dict[str, dict] = {}
         # Answered gates stop being pending the moment we resume with their response — before
         # the stream even starts, not after it drains (see below for why "after" is wrong).
         if responses:
@@ -310,6 +309,13 @@ class WorkflowService:
         async for ev in stream:
             if ev.type == "request_info":
                 d = ev.data
+                # Written straight into `task.pending` (not a local buffer merged in after the
+                # loop): a multi-platform run keeps streaming (e.g. platform B still drafting)
+                # after platform A's `request_info` pauses it, and `_publish` below fires A's
+                # `draft_ready` SSE event immediately. A client that auto-approves on receipt
+                # must see A as pending right away, or a same-task `review()` call landing
+                # before this loop finishes for every platform wrongly 409s ("not awaiting
+                # review") even though the client just did exactly what the event told it to.
                 task.pending[ev.request_id] = {
                     "request_id": ev.request_id,
                     "platform": d.platform,
@@ -321,10 +327,6 @@ class WorkflowService:
                 self._record_output(task, ev.data)
             for out in self._translate(ev):
                 self._publish(task, out)
-
-        # Keep unanswered gates pending; drop the ones we just answered; add new ones.
-        # task.pending = {k: v for k, v in task.pending.items() if k not in answered}
-        # task.pending.update(new_pending)
 
         if task.pending:
             task.status = "awaiting_review"
@@ -438,41 +440,9 @@ class WorkflowService:
         self, task: _Task, brief: Brief, *, roundtable: bool, text_requested: bool, before_round,
         rt_sequential: bool = False,
     ) -> dict:
-        # """The heavy segment of a start: (optional) roundtable discussion, then drive the MAF
-        # workflow to its first pause/end. Shared by the inline and background start paths."""
-        # if roundtable:
-        #     results = await run_tables(
-        #         brief, platforms=brief.target_platforms, task_id=task.task_id,
-        #         on_event=lambda ev: self._publish(task, ev),
-        #         before_round=before_round,
-        #     )
-        #     # Keep the full discussion transcript so the per-user learning loop can distil
-        #     # preferences from the user's interjections after the gate (§6.5 write side).
-        #     task.roundtable_transcript = [
-        #         t.model_dump() for r in results for t in r.consensus.transcript
-        #     ]
-        #     # Merge the N single-platform consensuses into ONE CreativeStrategy. With text it is
-        #     # the strategist drop-in (→ creator); media-only it is the render brief (→ media_entry).
-        #     strategy = CreativeStrategy(
-        #         brief=brief,
-        #         strategies={
-        #             r.consensus.platform: r.consensus.strategy.strategies.get(r.consensus.platform, "")
-        #             for r in results
-        #         },
-        #     )
-        #     return await self._drive(task, message=strategy)
-
-        # if not text_requested:
-        #     # Media-only without a roundtable: synthesize a (topic-based) strategy and run straight
-        #     # to the media_producer — no discussion, no copy, no human gate.
-        #     strategy = CreativeStrategy(
-        #         brief=brief, strategies={p: "" for p in brief.target_platforms})
-        #     return await self._drive(task, message=strategy)
-
-        # return await self._drive(task, message=brief)
-        """"
-        The heavy segment of a start: (optional) roundtable discussion, then drive the MAF
+        """The heavy segment of a start: (optional) roundtable discussion, then drive the MAF
         workflow to its first pause/end. Shared by the inline and background start paths.
+
         Holds `task.lock` for the whole segment — the same lock `review()` takes before it
         resumes — so a client can never call `task.workflow.run()` a second time (via a
         same-task `review()`) while this first run is still mid-stream for a slower platform.
@@ -485,7 +455,7 @@ class WorkflowService:
                 results = await run_tables(
                     brief, platforms=brief.target_platforms, task_id=task.task_id,
                     on_event=lambda ev: self._publish(task, ev),
-                    before_round=before_round, sequential=rt_sequential,
+                    before_round=before_round,
                 )
                 # Keep the full discussion transcript so the per-user learning loop can distil
                 # preferences from the user's interjections after the gate (§6.5 write side).
@@ -493,7 +463,7 @@ class WorkflowService:
                     t.model_dump() for r in results for t in r.consensus.transcript
                 ]
                 # Merge the N single-platform consensuses into ONE CreativeStrategy. With text it
-                # is the strategist drop-in (→ creator); media-only it is the render brief (→ media_entry).
+                # is the scout drop-in (→ creator); media-only it is the render brief (→ media_entry).
                 strategy = CreativeStrategy(
                     brief=brief,
                     strategies={
@@ -514,27 +484,10 @@ class WorkflowService:
 
     async def review(self, task_id: str, verdicts: dict) -> dict:
         task = self._require(task_id)
-        # if not task.pending:
-        #     raise ApiError(409, "task is not awaiting review")
         if not isinstance(verdicts, dict) or not verdicts:
             raise ApiError(400, "'verdicts' must be a non-empty object keyed by platform")
 
-        # responses: dict[str, HumanVerdict] = {}
-        # for req_id, data in task.pending.items():
-        #     verdict = verdicts.get(data["platform"])
-        #     if verdict is None:
-        #         continue  # leave un-addressed platforms pending
-        #     responses[req_id] = _verdict_from_payload(verdict)
-        #     # Record the AI draft the human reviewed + the verdict, so confirm-learning can
-        #     # distil brand rules (AI-vs-final diff) and trace a learned preference to the edit.
-        #     task.original_drafts[data["platform"]] = data["draft"]
-        #     task.last_verdicts.append({"platform": data["platform"], **verdict})
-        # if not responses:
-        #     raise ApiError(400, "no verdict matched a pending platform")
-        # # Learning no longer runs automatically — it waits for POST /tasks/{id}/confirm-learning.
-        # # Guard the resume too: an executor failure (e.g. media render) must not hang subscribers.
-        # return await self._run_guarded(task, self._drive(task, responses=responses), reraise=True)
-         # Serialize resumes on this task: two platforms' drafts can both auto-approve within
+        # Serialize resumes on this task: two platforms' drafts can both auto-approve within
         # milliseconds of each other (see `task.lock`), and concurrently driving the same
         # `task.workflow` races on `task.pending` — the loser can see a stale/emptied view and
         # wrongly 409, or corrupt the bookkeeping for the platform it never touched.
@@ -794,7 +747,6 @@ class WorkflowService:
             if task.done:
                 return
             while True:
-                # ev = await q.get()
                 try:
                     ev = await asyncio.wait_for(q.get(), timeout=15)
                 except asyncio.TimeoutError:
@@ -813,11 +765,18 @@ class WorkflowService:
 
 class IntakeService:
     """Async wrapper over the intake layer (§4 / §7.1). Holds the live intake
-    sessions; both voice and text run the same shared conversation, so this code is
-    transport-agnostic — it just routes turns by session id."""
+    sessions; text and cascaded voice run the same shared conversation, so this code
+    is transport-agnostic — it just routes turns by session id.
+
+    Native speech-to-speech (RealtimeVoiceIntake, WS /intake/{sid}/voice) is a
+    separate transport with no meaningful "turn"/"assistant_message" REST shape, so
+    it lives in its own `_realtime_sessions` map; `transcript`/`get_brief` check
+    both so the REST `GET /intake/{sid}/brief` keeps working regardless of which
+    transport produced the finished brief."""
 
     def __init__(self) -> None:
         self._sessions: dict[str, IntakeSession] = {}
+        self._realtime_sessions: dict[str, RealtimeVoiceIntake] = {}
 
     def _require(self, session_id: str) -> IntakeSession:
         session = self._sessions.get(session_id)
@@ -841,12 +800,34 @@ class IntakeService:
         self._sessions[session_id] = session
         return {"intake_mode": mode, **result}
 
+    async def open_realtime_voice(
+        self, session_id: str, *, user_id: Optional[str] = None,
+        target_platforms: Optional[list] = None, prior_context: Optional[dict] = None,
+    ) -> tuple[RealtimeVoiceIntake, RealtimeVoiceSession]:
+        
+        """Open a native speech-to-speech session for `session_id` (WS /intake/{sid}/voice's
+        `start` frame) and register it so REST GET /intake/{sid}/brief can find it once
+        finished. Returns (intake, realtime_session) — the WS handler pumps audio through
+        the latter and events through `intake.handle_event`."""
+        
+        prior = _prior_context_from_payload(prior_context)
+        intake = RealtimeVoiceIntake()
+        realtime_session = await intake.open(
+            session_id, user_id=user_id, target_platforms=target_platforms, prior_context=prior,
+        )
+        self._realtime_sessions[session_id] = intake
+        return intake, realtime_session
+
     def transcript(self, session_id: str) -> list:
         """The session's {role, content} message history, threaded into a task at start
         so per-user learning can summarize the whole conversation. Empty for an unknown
         session, so starting a task never fails on a stale intake session id."""
+        
         session = self._sessions.get(session_id)
-        return session.transcript(session_id) if session is not None else []
+        if session is not None:
+            return session.transcript(session_id)
+        realtime = self._realtime_sessions.get(session_id)
+        return realtime.transcript() if realtime is not None else []
 
     async def turn(self, session_id: str, user_input: str) -> dict:
         session = self._require(session_id)
@@ -855,7 +836,14 @@ class IntakeService:
         return await session.send_user_turn(session_id, user_input)
 
     async def get_brief(self, session_id: str) -> dict:
-        session = self._require(session_id)
+        session = self._sessions.get(session_id)
+        if session is None:
+            realtime = self._realtime_sessions.get(session_id)
+            if realtime is None:
+                raise ApiError(404, f"unknown intake session: {session_id}")
+            if not realtime.is_complete():
+                raise ApiError(409, "brief is not complete yet")
+            return realtime.get_brief().model_dump()
         try:
             brief = await session.get_brief(session_id)
         except ValueError as exc:
@@ -911,7 +899,11 @@ class VideoService:
     def __init__(self, *, workflow: WorkflowService) -> None:
         self._workflow = workflow
 
-    async def start(self, task_id: str, platform: str) -> dict:
+    async def start(
+        self, task_id: str, platform: str, *,
+        narration_text: Optional[str] = None, narration_voice: Optional[str] = None,
+        reference_images: Optional[list[str]] = None,
+    ) -> dict:
         draft = self._workflow.get_final_draft(task_id, platform)
         if draft is None:
             raise ApiError(404, f"no finished draft for platform '{platform}' on task {task_id}")
@@ -920,6 +912,8 @@ class VideoService:
             raise ApiError(409, f"platform '{platform}' has no video storyboard yet")
         doc = await start_render_job(
             task_id=task_id, platform=platform, storyboard=StoryboardSpec(**storyboard),
+            narration_text=narration_text, narration_voice=narration_voice,
+            reference_images=_decode_reference_images(reference_images),
         )
         return {"job_id": doc["id"], "status": doc["status"]}
 
@@ -929,14 +923,42 @@ class VideoService:
             raise ApiError(404, f"unknown video job: {job_id}")
         return job
 
-    async def download_path(self, job_id: str) -> Path:
+    async def download_location(self, job_id: str) -> tuple[str, bool]:
+        """Returns (location, is_remote). `render_storyboard` (workflow/video/render.py)
+        returns a local Path when VIDEO_RENDER_BACKEND=local (the default) or an
+        https:// S3 URL when =lambda; jobs.py stores whichever verbatim as
+        `output_path` (str() either way), so this is where the two are told apart —
+        neither jobs.py nor the StoreService schema needs to know which ran."""
         job = await self.get(job_id)
         if job["status"] != "done" or not job.get("output_path"):
             raise ApiError(409, f"video job {job_id} is not done yet (status={job['status']})")
-        path = Path(job["output_path"])
+        location = job["output_path"]
+        if location.startswith("http://") or location.startswith("https://"):
+            return location, True
+        path = Path(location)
         if not path.is_file():
             raise ApiError(404, f"rendered file for job {job_id} is missing on disk")
-        return path
+        return str(path), False
+
+
+def _decode_reference_images(images: Optional[list[str]]) -> Optional[list[bytes]]:
+    """Decode up to 3 base64 reference images (accepting `data:image/...;base64,<b64>`
+    data URLs or raw base64) into bytes for the Higgsfield backend. A malformed entry is
+    a client error (400) — reference images are opt-in, so a bad one should surface, not
+    silently vanish. Returns None when none were supplied."""
+    if not images:
+        return None
+    import base64
+    import binascii
+
+    out: list[bytes] = []
+    for img in images[:3]:
+        b64 = img.split(",", 1)[1] if img.startswith("data:") else img
+        try:
+            out.append(base64.b64decode(b64, validate=True))
+        except (binascii.Error, ValueError):
+            raise ApiError(400, "reference_images must be valid base64 (optionally a data URL)")
+    return out or None
 
 
 def _verdict_from_payload(payload: dict) -> HumanVerdict:
@@ -1128,6 +1150,19 @@ class GenerateHtmlRequest(BaseModel):
 
 class RenderVideoRequest(BaseModel):
     platform: str = Field(..., description="Which finished platform draft's storyboard to render")
+    narration_text: Optional[str] = Field(
+        None, description="Optional voiceover script to synthesize and mix into the render "
+        "(Phase 3: TTS via Azure Speech, or a silent mock). Omit for no narration."
+    )
+    narration_voice: Optional[str] = Field(
+        None, description="Provider voice id (e.g. an Azure Neural voice name). "
+        "Omit to use VOICEOVER_DEFAULT_VOICE."
+    )
+    reference_images: Optional[list[str]] = Field(
+        None, description="1-3 user-attached reference images as base64 data URLs "
+        "(or raw base64), passed to the Higgsfield backend for image-to-video. "
+        "Ignored by the Remotion (local/lambda) backends."
+    )
 
 
 # ── Dependencies: pull the per-app service singletons off app.state ───────────
@@ -1275,7 +1310,11 @@ async def start_roundtables(request: Request, body: RoundtableRequest) -> dict:
     summary="Render the MP4 for one platform's already-produced video storyboard",
 )
 async def render_video(request: Request, task_id: str, body: RenderVideoRequest) -> dict:
-    return await _video(request).start(task_id, body.platform)
+    return await _video(request).start(
+        task_id, body.platform,
+        narration_text=body.narration_text, narration_voice=body.narration_voice,
+        reference_images=body.reference_images,
+    )
 
 
 @intake_router.post("", summary="Open an intake conversation (voice or text)")
@@ -1301,27 +1340,84 @@ async def intake_brief(request: Request, session_id: str) -> dict:
 
 @intake_router.websocket("/{session_id}/voice")
 async def intake_voice(websocket: WebSocket, session_id: str) -> None:
-    """Real-time voice intake bridge. The Java backend relays the browser's audio/turns
-    over this socket; each inbound `{"user_input": "..."}` frame runs one turn on the
-    shared intake engine and the assistant reply is sent back. (The Voice Live audio
-    transcription itself is the VoiceService's concern, behind USE_MOCK_VOICE.)"""
+    """Native speech-to-speech voice intake bridge (GPT-Realtime). NOT a
+    transcribe-then-chat cascade: the client streams raw audio in and the model's
+    own audio streams back out, with the model deciding tool calls directly — there
+    is no "turn this into text first" step on the path that drives the conversation.
+
+    Protocol (client -> server): one `{"type":"start", "target_platforms"?,
+    "user_id"?, "prior_context"?}` frame, then `{"type":"audio","audio":"<base64
+    pcm16>"}` frames as the user speaks (server-side VAD handles end-of-turn/barge-in,
+    so the client never needs to signal a turn boundary itself).
+
+    Protocol (server -> client): `{"type":"audio","audio":...}` (assistant speech),
+    `{"type":"transcript","role":"user"|"assistant","text":...}` (captions/logging —
+    a side channel, never what decides the brief), `{"type":"brief_update",
+    "brief_partial":{...},"complete":bool}` (after each assistant turn),
+    `{"type":"interrupted"}` (the user barged in — stop local playback),
+    `{"type":"error","message":...}`.
+
+    The cascaded STT-only path (VoiceService/AzureVoice) is unaffected and stays
+    reachable via the REST `POST /intake` (`mode: "voice"`) flow."""
     svc: IntakeService = websocket.app.state.intake
     await websocket.accept()
+
+    try:
+        start_msg = await websocket.receive_json()
+    except WebSocketDisconnect:
+        return
+    if start_msg.get("type") != "start":
+        await websocket.send_json({"error": "first frame must be {'type': 'start', ...}", "status": 400})
+        await websocket.close()
+        return
+
+    try:
+        intake, session = await svc.open_realtime_voice(
+            session_id,
+            user_id=start_msg.get("user_id"),
+            target_platforms=start_msg.get("target_platforms"),
+            prior_context=start_msg.get("prior_context"),
+        )
+    except ApiError as exc:
+        await websocket.send_json({"error": exc.message, "status": exc.status})
+        await websocket.close()
+        return
+
+    async def _pump_model_events() -> None:
+        """Relay every event the model produces to the client, and feed each one
+        into the shared brief-completion state machine (intake.handle_event)."""
+        async for event in session.events():
+            await intake.handle_event(event)
+            if event.type == "audio_delta" and event.audio_b64:
+                await websocket.send_json({"type": "audio", "audio": event.audio_b64})
+            elif event.type == "input_transcript" and event.text:
+                await websocket.send_json({"type": "transcript", "role": "user", "text": event.text})
+            elif event.type == "output_transcript_delta" and event.text:
+                await websocket.send_json({"type": "transcript", "role": "assistant", "text": event.text})
+            elif event.type == "speech_started":
+                await websocket.send_json({"type": "interrupted"})
+            elif event.type == "error":
+                await websocket.send_json({"type": "error", "message": event.message})
+            elif event.type == "response_done":
+                await websocket.send_json({
+                    "type": "brief_update",
+                    "brief_partial": intake.brief_partial(),
+                    "complete": intake.is_complete(),
+                })
+
+    pump_task = asyncio.create_task(_pump_model_events())
     try:
         while True:
             msg = await websocket.receive_json()
-            try:
-                result = await svc.turn(session_id, msg.get("user_input", ""))
-                await websocket.send_json(result)
-                if result.get("complete"):
-                    break
-            except ApiError as exc:
-                await websocket.send_json({"error": exc.message, "status": exc.status})
-                if exc.status == 404:
-                    break
+            if msg.get("type") == "audio" and msg.get("audio"):
+                await session.send_audio(audio_b64=msg["audio"])
     except WebSocketDisconnect:
-        return
-    await websocket.close()
+        pass
+    finally:
+        pump_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pump_task
+        await session.close()
 
 
 @media_router.post("/generate-text", summary="Generate platform-native post copy from a brief")
@@ -1339,10 +1435,17 @@ async def get_video_job(request: Request, job_id: str) -> dict:
     return await _video(request).get(job_id)
 
 
-@video_jobs_router.get("/{job_id}/download", summary="Download the finished MP4")
-async def download_video_job(request: Request, job_id: str) -> FileResponse:
-    path = await _video(request).download_path(job_id)
-    return FileResponse(path, media_type="video/mp4", filename=f"{job_id}.mp4")
+@video_jobs_router.get("/{job_id}/download", summary="Download or stream the finished MP4")
+async def download_video_job(request: Request, job_id: str):
+    """Local backend: streams the MP4 straight off disk (FileResponse), as before.
+    Lambda backend: 307-redirects to the S3 output URL instead of proxying the
+    bytes through this process — S3 already serves HTTP range requests natively, so
+    a <video> element can seek/scrub the redirected URL directly, satisfying
+    "stream, don't just download" without this service touching the bytes at all."""
+    location, is_remote = await _video(request).download_location(job_id)
+    if is_remote:
+        return RedirectResponse(location, status_code=307)
+    return FileResponse(location, media_type="video/mp4", filename=f"{job_id}.mp4")
 
 
 # ── App factory ────────────────────────────────────────────────────────────────

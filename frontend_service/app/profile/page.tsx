@@ -1,7 +1,7 @@
 // Sidebar, Nav Config & page shell
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import Link from "next/link";
 import type { Section } from "./types";
 import ApprovalQueue from "./components/ApprovalQueue";
@@ -155,6 +155,17 @@ const SECTION_TITLES: Record<Section, string> = {
 
 export default function ProfilePage() {
   const [active, setActive] = useState<Section>("approval");
+
+  // The LinkedIn OAuth round-trip redirects here with ?linkedin=connected|error — land
+  // the user on the Brand Profile tab (where the Connected Accounts banner lives) instead
+  // of the default Approval Queue tab, so the result of the flow is actually visible.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("linkedin")) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time client-only URL read on mount, not a state sync loop
+      setActive("brand");
+    }
+  }, []);
 
   return (
     <div className="flex h-screen bg-[#F8F5EE] text-[#1B1A17] overflow-hidden">

@@ -4,6 +4,7 @@
 .pytest_cache
 **/__pycache__/
 *.pyc
+.idea/
 
 AGENTS.md
 CLAUDE.md

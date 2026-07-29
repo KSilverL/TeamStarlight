@@ -17,9 +17,13 @@ public interface CrossPlatformRepository extends JpaRepository<CrossPlatformOAut
 
     CrossPlatformOAuth findByBusinessIdAndPlatform(Long businessId, PlatformEnum platform);
 
+    // Overload for the LinkedIn flow, which carries the business id as the primitive int it
+    // extracts from the JWT. The businessId column is a Long, but Spring Data binds the int
+    // parameter to it fine — this just spares every LinkedIn call site an explicit boxing.
+    CrossPlatformOAuth findByBusinessIdAndPlatform(int businessId, PlatformEnum platform);
+
     List<CrossPlatformOAuth> findByBusinessIdAndPlatformIn(Long businessId, List<PlatformEnum> platforms);
 
     @Transactional
     void deleteByBusinessIdAndPlatformIn(@Param("businessId") Long businessId, @Param("platforms") List<PlatformEnum> platforms);
-
 }

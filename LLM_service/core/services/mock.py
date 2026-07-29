@@ -14,10 +14,11 @@ reject path (and thus the circuit breaker) without any randomness to pin.
 from __future__ import annotations
 
 import asyncio
+import base64
 import html as _html
 import re
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import AsyncIterator, Dict, List, Optional
 
 from agent_framework import (
     BaseChatClient,
@@ -38,10 +39,16 @@ from .base import (
     ImageSearchService,
     LLMService,
     MusicGenerationService,
+    RealtimeEvent,
+    RealtimeVoiceService,
+    RealtimeVoiceSession,
     SafetyResult,
     SafetyService,
     StoreService,
+    VideoGenerationService,
+    VoiceoverService,
     VoiceService,
+    WebSearchService,
     empty_profile,
 )
 
@@ -49,6 +56,32 @@ from .base import (
 # copy, so a brief whose topic contains this marker produces a draft that is
 # rejected on every attempt — exactly what the circuit-breaker test needs.
 UNSAFE_MARKER = "unsafe"
+
+# Substring that makes MockLLM.generate_scene_component return deliberately invalid
+# TSX on the FIRST attempt only (a real prior_error clears it on retry) — the
+# offline lever for exercising workflow/video/codegen.py's self-repair loop
+# deterministically, mirroring UNSAFE_MARKER above.
+BROKEN_CODEGEN_MARKER = "break-codegen"
+
+# Substring that makes MockLLM.review_scene_preview reject on the FIRST attempt
+# only (attempt > 1 always approves) — the offline lever for exercising
+# codegen.py's visual-QA-driven retry deterministically, mirroring
+# BROKEN_CODEGEN_MARKER above (a different failure MODE: compiles and renders
+# fine, but the mock vision judge flags it anyway).
+VISUAL_QA_REJECT_MARKER = "bad-visual"
+
+# Substring that makes MockLLM.review_scene_preview reject on the FIRST attempt
+# with subject-mismatch feedback (the frame doesn't DEPICT the brief's subject —
+# e.g. a text card standing in for a requested map), mirroring the strengthened
+# depiction criterion in AzureLLM.review_scene_preview's rubric. Same
+# reject-once/approve-on-retry contract as VISUAL_QA_REJECT_MARKER.
+SUBJECT_MISMATCH_MARKER = "off-brief"
+
+# Substring that makes MockLLM.convert_generated_to_template return an INVALID
+# answer (it echoes `type: "generated"` back — exactly the failure the template-only
+# union validation in workflow/video/fallback.py must reject) — the offline lever
+# for exercising the deterministic hook-card floor of the fallback ladder.
+BROKEN_FALLBACK_MARKER = "break-fallback"
 
 # Platform-differentiated strategy angle (strategist). Keyed case-insensitively.
 _PLATFORM_FOCUS: Dict[str, str] = {
@@ -327,6 +360,48 @@ body{{background:#000;display:flex;justify-content:center;align-items:center;min
 </div></body></html>"""
 
 
+def _mock_scene_component(*, broken: bool) -> str:
+    """A deterministic, offline stand-in .tsx source, matching the SAME prop shape
+    every fixed slide component uses (`{ slide, accentColor, secondaryColor,
+    primaryColor }` — see e.g. video_renderer/src/slides/HookSlide.tsx) so it slots
+    into Composition.tsx with no special-casing. `broken` (driven by
+    BROKEN_CODEGEN_MARKER) returns code that references an undefined identifier —
+    valid-looking enough to write to disk, but fails a real typecheck/preview-render,
+    so codegen.py's retry loop has something genuine to recover from."""
+    if broken:
+        return (
+            'import React from "react";\n'
+            'import { AbsoluteFill } from "remotion";\n'
+            'import type { GeneratedSlide } from "../../types";\n\n'
+            "const GeneratedScene: React.FC<{ slide: GeneratedSlide; accentColor: string;\n"
+            "  secondaryColor: string; primaryColor: string }> = ({ slide }) => {\n"
+            "  return <AbsoluteFill>{undefinedIdentifierBoom}</AbsoluteFill>;\n"
+            "};\n\n"
+            "export default GeneratedScene;\n"
+        )
+    return (
+        'import React from "react";\n'
+        'import { AbsoluteFill, interpolate, useCurrentFrame } from "remotion";\n'
+        'import type { GeneratedSlide } from "../../types";\n\n'
+        "const GeneratedScene: React.FC<{\n"
+        "  slide: GeneratedSlide;\n"
+        "  accentColor: string;\n"
+        "  secondaryColor: string;\n"
+        "  primaryColor: string;\n"
+        "}> = ({ slide, primaryColor }) => {\n"
+        "  const frame = useCurrentFrame();\n"
+        '  const opacity = interpolate(frame, [0, 15], [0, 1], { extrapolateRight: "clamp" });\n'
+        '  const headline = String((slide.data as any).headline ?? "Generated Scene");\n'
+        "  return (\n"
+        '    <AbsoluteFill style={{ justifyContent: "center", alignItems: "center", backgroundColor: primaryColor }}>\n'
+        '      <h1 style={{ color: "white", fontSize: 64, opacity }}>{headline}</h1>\n'
+        "    </AbsoluteFill>\n"
+        "  );\n"
+        "};\n\n"
+        "export default GeneratedScene;\n"
+    )
+
+
 def _mock_storyboard(topic: str, draft: str, tone_hint: Optional[str], platform: str) -> dict:
     """A deterministic 4-slide StoryboardSpec-shaped dict — one of each Phase 1 slide
     type, in a typical order (hook -> collage -> counter_stat -> outro), so
@@ -490,6 +565,28 @@ class MockLLM(LLMService):
         await asyncio.sleep(_MOCK_LATENCY)
         return _mock_storyboard(topic, draft, tone_hint, platform)
 
+    async def generate_video_prompt(
+        self,
+        *,
+        topic: str,
+        draft: str,
+        tone_hint: Optional[str],
+        platform: str,
+        has_reference_images: bool = False,
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        subject = (topic or draft or "the brand story").strip()
+        tone = (tone_hint or "cinematic").strip()
+        if has_reference_images:
+            # Complement the user's reference images: describe motion/atmosphere only.
+            prompt = (
+                f"Bring the reference image to life with subtle, {tone} motion — "
+                f"gentle parallax and soft light shifts, staying true to the shot."
+            )
+        else:
+            prompt = f"A {tone} shot capturing {subject}, warm cinematic lighting, shallow depth of field."
+        return {"prompt": prompt, "motion": "slow dolly-in"}
+
     async def distill_rules(
         self,
         *,
@@ -611,6 +708,81 @@ class MockLLM(LLMService):
             "rejected_directions": _unique(rejected)[:5],
             "user_notes": _unique(notes)[:5],
         }
+
+    async def plan_scene_design(self, *, description: str, data: dict) -> str:
+        """Deterministic offline stub: a fixed 2-bullet concept so codegen.py's
+        two-stage flow is exercised without a model. The real value is tuned in
+        AzureLLM.plan_scene_design."""
+        await asyncio.sleep(_MOCK_LATENCY)
+        return "- Centre the dominant element on the canvas\n- Stagger supporting elements in from below"
+
+    async def generate_scene_component(
+        self,
+        *,
+        description: str,
+        data: dict,
+        width: int,
+        height: int,
+        fps: int,
+        duration_frames: int,
+        attempt: int = 1,
+        prior_error: Optional[str] = None,
+        prior_source: Optional[str] = None,
+        design_plan: Optional[str] = None,
+    ) -> str:
+        await asyncio.sleep(_MOCK_LATENCY)
+        broken = BROKEN_CODEGEN_MARKER in description.lower() and prior_error is None
+        return _mock_scene_component(broken=broken)
+
+    async def review_scene_preview(
+        self, *, description: str, image_bytes: bytes, attempt: int = 1,
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        if attempt == 1:
+            if SUBJECT_MISMATCH_MARKER in description.lower():
+                return {"approved": False, "feedback": "mock visual QA: frame does not depict the brief's subject",
+                        "fixes": ["render the subject as real graphics, not text"]}
+            if VISUAL_QA_REJECT_MARKER in description.lower():
+                return {"approved": False, "feedback": "mock visual QA: headline overlaps the frame edge",
+                        "fixes": ["move the headline inside the central 84% of the canvas"]}
+        return {"approved": True, "feedback": "", "fixes": []}
+
+    async def convert_generated_to_template(
+        self, *, description: str, data: dict,
+    ) -> dict:
+        """Deterministic offline analogue of AzureLLM's conversion: chart-shaped
+        `data` (a list of {label-ish: str, value-ish: number} dicts) becomes a
+        `bar_chart`; anything else becomes a text-only `hook` built from the
+        brief's first words. BROKEN_FALLBACK_MARKER echoes `generated` back — the
+        invalid answer fallback.py's template-only validation must reject."""
+        await asyncio.sleep(_MOCK_LATENCY)
+        if BROKEN_FALLBACK_MARKER in description.lower():
+            return {"type": "generated", "description": description, "data": data}
+        bars = self._bar_items_from(data)
+        if bars:
+            return {"type": "bar_chart", "headline": description.split(".")[0][:60] or None, "bars": bars}
+        return {"type": "hook", "headline": " ".join(description.split()[:7]) or "See what's new"}
+
+    @staticmethod
+    def _bar_items_from(data: dict) -> list:
+        """First list in `data` that looks like 2-6 labelled numbers, reshaped to
+        BarItem dicts; [] when nothing chart-shaped exists."""
+        for value in data.values():
+            if not (isinstance(value, list) and 2 <= len(value) <= 6):
+                continue
+            bars = []
+            for item in value:
+                if not isinstance(item, dict):
+                    break
+                label = next((v for v in item.values() if isinstance(v, str)), None)
+                number = next((v for v in item.values() if isinstance(v, (int, float)) and not isinstance(v, bool)), None)
+                if label is None or number is None:
+                    break
+                bars.append({"label": label, "value": float(number)})
+            else:
+                if bars:
+                    return bars
+        return []
 
     async def fill_brief(
         self,
@@ -885,6 +1057,119 @@ class MockVoice(VoiceService):
         return {"session_id": session_id, "transcript": user_audio.strip()}
 
 
+# ── Realtime voice (offline stand-in for GPT-Realtime speech-to-speech) ───────
+# No real audio/network offline: `send_audio`'s `audio_b64` is base64 of the literal
+# spoken words (the same "the script provides the words" convention as MockVoice
+# above), decoded back to text and run through the SAME deterministic extraction
+# MockLLM.fill_brief uses (_free_extract / _COPILOT_TRIGGERS) to decide whether to
+# emit an `update_brief` or `suggest_topic` tool call. This drives the exact same
+# orchestration code (intake/realtime_voice.py) that the real Azure session does —
+# only the transport is faked.
+
+_SENTINEL = object()
+
+# Mirrors intake.base.REQUIRED_FIELDS (topic, user_intent) — duplicated as a tiny,
+# self-contained constant so this module stays independent of the intake package.
+# Lets the mock track "what would the model have just asked about" the same way
+# MockLLM.fill_brief's `pending_field` fallback does, so a bare answer to a spoken
+# follow-up (no "to <verb>..." phrasing) still slots into the right field.
+_REALTIME_REQUIRED_FIELDS = ("topic", "user_intent")
+
+
+def _mock_pcm16_silence(num_samples: int = 800) -> str:
+    """Base64 PCM16 silence — a deterministic stand-in for the assistant's spoken
+    audio in mock mode (there is no real TTS offline)."""
+    return base64.b64encode(bytes(num_samples * 2)).decode("ascii")
+
+
+class _MockRealtimeSession(RealtimeVoiceSession):
+    def __init__(self, *, session_id: str) -> None:
+        self._session_id = session_id
+        self._queue: "asyncio.Queue" = asyncio.Queue()
+        self._call_count = 0
+        # This session's own tally of what it has told the caller so far (from tool
+        # calls it emitted / their results) — used only to pick the pending field below.
+        self._known: Dict[str, str] = {}
+
+    def _pending_field(self) -> Optional[str]:
+        for field in _REALTIME_REQUIRED_FIELDS:
+            if not self._known.get(field):
+                return field
+        return None
+
+    async def _emit(self, event: RealtimeEvent) -> None:
+        await self._queue.put(event)
+
+    async def send_audio(self, *, audio_b64: str) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        text = base64.b64decode(audio_b64).decode("utf-8", errors="replace").strip()
+        # Side channel only, mirrors input_audio_transcription — never what decides
+        # the brief (that's the tool call below, exactly like the real model).
+        await self._emit(RealtimeEvent(type="input_transcript", text=text))
+
+        updates = _free_extract(text)
+        wants_topic_idea = any(trigger in text.lower() for trigger in _COPILOT_TRIGGERS)
+        # Pending-field fallback (mirrors MockLLM.fill_brief): a direct answer with no
+        # extractable phrasing still slots into whatever field is still missing —
+        # except a "give me ideas" turn must not become the topic itself.
+        pending = self._pending_field()
+        if pending and not updates.get(pending) and text and not (wants_topic_idea and pending == "topic"):
+            updates[pending] = text
+        self._known.update({k: v for k, v in updates.items() if v})
+
+        self._call_count += 1
+        call_id = f"call-{self._call_count}"
+        if wants_topic_idea:
+            await self._emit(RealtimeEvent(
+                type="tool_call", call_id=call_id, name="suggest_topic",
+                arguments={"user_intent": updates.get("user_intent", "")},
+            ))
+        elif updates:
+            await self._emit(RealtimeEvent(
+                type="tool_call", call_id=call_id, name="update_brief", arguments=updates,
+            ))
+        else:
+            # Nothing extracted: the model would just ask a follow-up out loud.
+            await self._emit(RealtimeEvent(type="output_transcript_delta", text="Could you tell me more?"))
+            await self._emit(RealtimeEvent(type="audio_delta", audio_b64=_mock_pcm16_silence()))
+            await self._emit(RealtimeEvent(type="response_done"))
+
+    async def send_tool_result(self, *, call_id: str, output: dict) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        if output.get("topic"):
+            self._known["topic"] = output["topic"]
+        # Deterministic narration of the tool's result — mirrors the real model
+        # speaking the function_call_output once it comes back.
+        line = f"How about this: {output['topic']}?" if output.get("topic") else "Got it, thanks."
+        await self._emit(RealtimeEvent(type="output_transcript_delta", text=line))
+        await self._emit(RealtimeEvent(type="audio_delta", audio_b64=_mock_pcm16_silence()))
+        await self._emit(RealtimeEvent(type="response_done"))
+
+    async def nudge(self, *, text: str) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        await self._emit(RealtimeEvent(type="output_transcript_delta", text="Great, that's everything I need."))
+        await self._emit(RealtimeEvent(type="audio_delta", audio_b64=_mock_pcm16_silence()))
+        await self._emit(RealtimeEvent(type="response_done"))
+
+    async def events(self) -> AsyncIterator[RealtimeEvent]:
+        while True:
+            event = await self._queue.get()
+            if event is _SENTINEL:
+                return
+            yield event
+
+    async def close(self) -> None:
+        await self._queue.put(_SENTINEL)
+
+
+class MockRealtimeVoice(RealtimeVoiceService):
+    async def open_session(
+        self, *, session_id: str, instructions: str, tools: List[dict],
+    ) -> RealtimeVoiceSession:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return _MockRealtimeSession(session_id=session_id)
+
+
 # ── Image search / background removal (offline stand-ins for Pexels / Remove.bg) ──
 
 class MockImageSearch(ImageSearchService):
@@ -900,6 +1185,24 @@ class MockImageSearch(ImageSearchService):
                 "photographer": "Mock Photographer",
                 "width": 1080,
                 "height": 1080,
+            }
+            for i in range(max(per_page, 0))
+        ]
+
+
+class MockLiveImageSearch(ImageSearchService):
+    """Deterministic, offline stand-in for LiveImageSearch (core/services/web_search.py):
+    a distinct URL host from MockImageSearch so the two sourcing paths (stock vs.
+    live web) stay tellable apart in tests/logs even in mock mode."""
+
+    async def search(self, *, query: str, per_page: int = 1) -> List[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return [
+            {
+                "url": f"https://mock.bing.local/{i}/{query.replace(' ', '-')}.jpg",
+                "photographer": "mock-source.local",
+                "width": None,
+                "height": None,
             }
             for i in range(max(per_page, 0))
         ]
@@ -949,3 +1252,122 @@ class MockMusicGeneration(MusicGenerationService):
     async def generate(self, *, mood: str, genre: str, duration_seconds: float, energy: str) -> bytes:
         await asyncio.sleep(_MOCK_LATENCY)
         return _silent_mp3(duration_seconds)
+
+
+# Average conversational speaking rate, used only to size the mock's silent
+# placeholder track (a real TTS call determines the ACTUAL duration; this is a
+# reasonable estimate purely so the offline pipeline has a plausible-length file).
+_MOCK_SPEAKING_RATE_WPM = 150
+
+
+class MockVoiceover(VoiceoverService):
+    """Offline stand-in for Azure Speech TTS: returns a real (silent) MP3 whose
+    duration is estimated from `text`'s word count at a typical speaking rate, so
+    the voiceover-resolution pipeline — including Remotion's ffprobe inspection of
+    the file — works end to end without real credentials. Reuses `_silent_mp3`
+    (already built for MockMusicGeneration; same ffprobe-decodability requirement)."""
+
+    async def synthesize(self, *, text: str, voice: str) -> bytes:
+        await asyncio.sleep(_MOCK_LATENCY)
+        words = len(text.split())
+        duration_seconds = max(1.0, (words / _MOCK_SPEAKING_RATE_WPM) * 60)
+        return _silent_mp3(duration_seconds)
+
+
+# Minimal but structurally-valid MP4 container (ftyp + mdat), used as the offline
+# placeholder when no ffmpeg is on PATH. Real bytes with correct box headers so the
+# file is a genuine (if empty) .mp4, not a text stub — the higgsfield render path just
+# writes these to job_dir/output.mp4 and streams them back; nothing ffprobes it.
+_MINIMAL_MP4 = (
+    b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+    b"\x00\x00\x00\x08mdat"
+)
+
+
+def _placeholder_mp4(duration_seconds: float) -> bytes:
+    """Return real MP4 bytes for the offline video-generation stand-in. Prefers a
+    genuine playable clip via a system `ffmpeg` (lavfi colour source) when available
+    — useful for a dev eyeballing the pipeline — and falls back to a minimal valid
+    MP4 container otherwise, so tests never depend on ffmpeg being installed."""
+    import shutil
+    import subprocess
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        secs = max(1.0, min(duration_seconds, 15.0))
+        try:
+            proc = subprocess.run(
+                [
+                    ffmpeg, "-y", "-f", "lavfi",
+                    "-i", f"color=c=black:s=256x256:d={secs:.1f}:r=12",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    "-f", "mp4", "pipe:1",
+                ],
+                capture_output=True, timeout=30,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                return proc.stdout
+        except (OSError, subprocess.SubprocessError):
+            pass  # fall through to the static container
+    return _MINIMAL_MP4
+
+
+class MockVideoGeneration(VideoGenerationService):
+    """Offline stand-in for Higgsfield (core/services/higgsfield.py): returns a real
+    MP4 (a black clip via ffmpeg when present, else a minimal valid container) so the
+    premium render path — submit-less — writes job_dir/output.mp4 and the download
+    endpoint streams it, all without real credentials or network. `reference_images`
+    is accepted and ignored (the mock can't actually condition on them).
+
+    TODO: nothing to wire — the real path is HiggsfieldVideoGeneration; this only
+    proves the plumbing, not real generation (mirrors MockMusicGeneration)."""
+
+    async def generate_clip(
+        self,
+        *,
+        prompt: str,
+        reference_images: Optional[List[bytes]] = None,
+        model: str,
+        duration_seconds: float,
+        width: int,
+        height: int,
+    ) -> bytes:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return _placeholder_mp4(duration_seconds)
+
+
+# ── Web research (offline stand-in for the Foundry-agent-backed search) ───────
+
+class MockWebSearch(WebSearchService):
+    """Deterministic, offline stand-in for AzureWebSearch: no network, results
+    derived purely from the query/subject text, so the whole pipeline (and its
+    tests) run without real search credentials."""
+
+    async def search_web(self, *, query: str, count: int = 5) -> List[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        slug = (query.strip() or "topic").replace(" ", "-").lower()
+        return [
+            {
+                "title": f"What to know about {query} (mock result {i + 1})",
+                "url": f"https://mock.search.local/{slug}/{i}",
+                "snippet": f"A brief mock summary about {query}, result #{i + 1}.",
+            }
+            for i in range(max(count, 0))
+        ]
+
+    async def fetch_url_text(self, *, url: str) -> str:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return f"[MOCK ARTICLE TEXT for {url}] This is a deterministic offline stand-in article body."
+
+    async def search_reviews(self, *, subject: str, count: int = 5) -> List[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        slug = (subject.strip() or "product").replace(" ", "-").lower()
+        return [
+            {
+                "quote": f"\"{subject} exceeded my expectations\" — mock review #{i + 1}.",
+                "rating": 4.5,
+                "source": "Mock Reviews",
+                "url": f"https://mock.reviews.local/{slug}/{i}",
+            }
+            for i in range(max(count, 0))
+        ]

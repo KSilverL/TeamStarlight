@@ -20,7 +20,7 @@ without real network access; a real run without the SDK/creds fails loudly.
 from __future__ import annotations
 
 import json
-from typing import List, Optional
+from typing import AsyncIterator, List, Optional
 
 from agent_framework import (
     BaseChatClient,
@@ -30,17 +30,35 @@ from agent_framework import (
     Message,
 )
 from agent_framework._types import ResponseStream
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from ..config import Settings
 from ..skill_schema import SkillCandidate, SkillRule
-from ..video_schema import StoryboardSpec
+from ..video_schema import StoryboardSpec, TemplateSlideSpec, VideoPromptSpec
 from .base import (
     LLMService,
+    RealtimeEvent,
+    RealtimeVoiceService,
+    RealtimeVoiceSession,
     SafetyResult,
     SafetyService,
+    VoiceoverService,
     VoiceService,
 )
+
+
+def _voice_live_ws_url(settings: Settings) -> str:
+    endpoint = (settings.azure_voicelive_endpoint or "").rstrip("/")
+    if endpoint.startswith("https://"):
+        endpoint = "wss://" + endpoint[len("https://"):]
+    elif endpoint.startswith("http://"):
+        endpoint = "ws://" + endpoint[len("http://"):]
+    if not endpoint.endswith("/voice-live/realtime"):
+        endpoint = f"{endpoint}/voice-live/realtime"
+    return (
+        f"{endpoint}"
+        f"?api-version={settings.azure_voicelive_api_version}&model={settings.azure_voicelive_model}"
+    )
 
 # Discriminated-union storyboard JSON is meaningfully harder for the model to nail
 # on the first try than the old fixed shape — bounded retry, re-prompting with the
@@ -60,6 +78,73 @@ def _strip_fences(text: str) -> str:
     return s.strip()
 
 
+# ── Scene-codegen prompt assets (video-agent Phase 5) ─────────────────────────
+
+# The design-system exports a generated scene may import — mirrors the barrel at
+# video_renderer/src/design/index.ts. Using them yields consistent, on-brand motion
+# for far less code (and fewer ways to break) than hand-rolling every animation.
+_DESIGN_IMPORTS_DOC = (
+    "- `../../design` — the project design system (STRONGLY PREFERRED over hand-rolling):\n"
+    "    tokens: `fontSize`, `space`, `radius`, `letterSpacing`, `accentGlow`, `dropGlow`;\n"
+    "    fonts: `displayFont`, `bodyFont` (font-family strings for headline vs body);\n"
+    "    palettes: `paletteFor(name, {accentColor, secondaryColor}, theme)`, `withAlpha`, `mixHex`;\n"
+    "    animations (pure fns of frame): `riseSoft`, `popScale`, `slideIn`, `blurIn`, `maskWipe`,\n"
+    "      `fadeIn`, `springEnter`, `stagger(i, step)`, `countUp(frame, target, {delay})`, `progress`;\n"
+    "    shapes: `SHAPE_RADIUS`, `SHAPE_CLIP`; backdrops (components): `GradientWash`, `BackdropOrbs`,\n"
+    "      `GridPattern`, `NoiseTexture`; blocks: `SlideHeadline`, `Kicker`, `SourceCaption`, `CtaButton`.\n"
+)
+
+# Art-director rules the generated scene must follow — the difference between "it
+# compiles" and "it looks intentional". Kept terse so they steer without bloating.
+_DESIGN_LANGUAGE_DOC = (
+    "DESIGN LANGUAGE (follow all):\n"
+    "- Motion: nothing appears without an entrance; stagger grouped elements 3-6 frames apart "
+    "(`stagger`); everything should have finished animating by ~80% of durationFrames.\n"
+    "- Composition: one dominant element; generous margins (keep content within the central ~84% "
+    "of the canvas); at most two type sizes on screen; align to a clear grid.\n"
+    "- Depth: layer a backdrop (a `../../design` backdrop or a subtle gradient) UNDER the subject, "
+    "with any caption/label as a third layer — never a flat single plane.\n"
+    "- Colour: use `primaryColor` for the background and `accentColor`/`secondaryColor` (or "
+    "`paletteFor(...)`) for marks; keep text at full contrast against the background.\n"
+)
+
+
+def _read_scene_patterns() -> str:
+    """The proven-snippets skill (LLM_service/skills/remotion_scene_patterns.md),
+    inlined into the codegen prompt so it can be retuned without a code change.
+    Returns "" if absent."""
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "skills" / "remotion_scene_patterns.md"
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+# Both exemplars live at the same depth under src/ (same import-path shape a real
+# src/generated/<job>/ file uses). ExemplarScene demonstrates hand-rolled,
+# data-driven visuals; ExemplarChartScene demonstrates the `recharts` construction
+# style — the system prompt offers both `recharts` and hand-rolled SVG/CSS as
+# available imports, so the few-shot material should show both actually working.
+_EXEMPLAR_FILENAMES = ("ExemplarScene.tsx", "ExemplarChartScene.tsx")
+
+
+def _read_scene_exemplars(settings: Settings) -> List[str]:
+    """The checked-in reference scenes (video_renderer/src/design/exemplars/),
+    embedded verbatim as the codegen few-shot. Missing files (older checkout) are
+    skipped silently; an empty result falls back to the inline skeleton, so
+    codegen still works."""
+    base = settings.resolved_video_renderer_dir / "src" / "design" / "exemplars"
+    exemplars: List[str] = []
+    for name in _EXEMPLAR_FILENAMES:
+        try:
+            exemplars.append((base / name).read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    return exemplars
+
+
 # ── LLM (Azure OpenAI / Foundry chat) ─────────────────────────────────────────
 
 class AzureLLM(LLMService):
@@ -76,18 +161,52 @@ class AzureLLM(LLMService):
             self._client = AsyncOpenAI(
                 base_url=base_url,
                 api_key=s.azure_openai_api_key,
+                # SDK-level exponential backoff on 429/5xx/connection errors — the
+                # scene-codegen loop in particular used to burn a whole retry
+                # attempt (a real compile + preview render) on one transient HTTP
+                # blip because nothing retried at this layer.
+                # 300s (not the old 120s): a reasoning-tier codegen call
+                # (CODEGEN_REASONING_EFFORT) can legitimately run past 120s, and at
+                # 120s a real slow-but-successful call was getting killed and
+                # retried up to max_retries times, compounding into a multi-minute
+                # timeout storm that surfaced as an uncaught exception.
+                max_retries=3,
+                timeout=300.0,
             )
         return self._client
 
-    async def _complete(self, messages: List[dict], *, model: Optional[str] = None) -> str:
+    async def _complete(
+        self, messages: List[dict], *, model: Optional[str] = None,
+        temperature: Optional[float] = None, max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None, verbosity: Optional[str] = None,
+    ) -> str:
         """Single seam through which all chat traffic flows (overridable in tests).
         `model` overrides the deployment for one call (e.g. the cheap summary tier);
-        None → the main chat deployment."""
+        None → the main chat deployment. `temperature`/`max_tokens` are sent only
+        when explicitly set, keeping every existing call site byte-identical (and
+        avoiding params a reasoning-tier deployment would reject unless a caller
+        opts in). `max_tokens` maps to `max_completion_tokens` — the legacy name is
+        rejected by gpt-5.x/o-series (see AzureChatClient._complete).
+        `reasoning_effort`/`verbosity` mirror AzureChatClient's handling for a
+        gpt-5.x reasoning-tier deployment. Critically: when `reasoning_effort` is
+        set, `temperature` is DROPPED even if the caller passed one — a reasoning
+        deployment rejects (or ignores) a custom temperature, which is exactly why
+        AzureChatClient (the roundtable path) never sends one; callers that opt
+        into reasoning_effort are asserting this is a reasoning-tier call."""
         client = self._ensure_client()
-        resp = await client.chat.completions.create(
-            model=model or self._settings.azure_chat_deployment,
-            messages=messages,
-        )
+        kwargs: dict = {
+            "model": model or self._settings.azure_chat_deployment,
+            "messages": messages,
+        }
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
+        if verbosity:
+            kwargs["verbosity"] = verbosity
+        if temperature is not None and not reasoning_effort:
+            kwargs["temperature"] = temperature
+        if max_tokens is not None:
+            kwargs["max_completion_tokens"] = max_tokens
+        resp = await client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content or ""
 
     async def chat(self, messages: List[dict]) -> str:
@@ -302,6 +421,263 @@ class AzureLLM(LLMService):
                     )},
                 ]
         raise last_error
+
+    async def generate_video_prompt(
+        self,
+        *,
+        topic: str,
+        draft: str,
+        tone_hint: Optional[str],
+        platform: str,
+        has_reference_images: bool = False,
+    ) -> dict:
+        schema = json.dumps(VideoPromptSpec.model_json_schema())
+        if has_reference_images:
+            mode_note = (
+                "The user attached 1-3 REFERENCE IMAGES the clip is generated FROM "
+                "(image-to-video). Your prompt must COMPLEMENT them — describe camera "
+                "movement, motion, lighting and atmosphere ONLY. Do NOT re-describe or "
+                "contradict the subject the images already fix."
+            )
+        else:
+            mode_note = (
+                "There are NO reference images (text-to-video), so your prompt must fully "
+                "specify the subject, setting, lighting and mood of the shot."
+            )
+        system = (
+            "You are a cinematographer writing a prompt for a generative video model. "
+            "Given a brand topic, the approved post copy, and the platform, write ONE "
+            "single cinematic shot description (subject/setting/lighting/mood as needed) "
+            "— not a storyboard, not post copy, not a list of scenes. " + mode_note +
+            " Return ONLY valid JSON (no markdown fences, no prose) matching this schema "
+            f"exactly:\n{schema}"
+        )
+        user = (
+            f"Brand topic: {topic}\n"
+            f"Approved post copy:\n{draft}\n"
+            f"Tone: {tone_hint or 'brand voice'}\n"
+            f"Target platform: {platform}"
+        )
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        last_error: Exception = ValueError("generate_video_prompt: no attempts made")
+        for _ in range(_VIDEO_STORYBOARD_MAX_ATTEMPTS):
+            raw = await self._complete(messages)
+            try:
+                data = json.loads(_strip_fences(raw))
+                return VideoPromptSpec(**data).model_dump()
+            except (json.JSONDecodeError, ValidationError) as exc:
+                last_error = exc
+                messages = messages + [
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content": (
+                        f"Your previous JSON was invalid: {exc}. Return corrected JSON "
+                        "only, matching the schema exactly."
+                    )},
+                ]
+        raise last_error
+
+    async def review_scene_preview(
+        self, *, description: str, image_bytes: bytes, attempt: int = 1,
+    ) -> dict:
+        import base64
+
+        system = (
+            "You are a meticulous visual QA reviewer for short-form brand video "
+            "scenes. You'll see the creative brief for a scene and a still frame "
+            "rendered from the candidate code (already confirmed to compile and "
+            "render without crashing — you're judging how it LOOKS, not whether it "
+            "runs). Reject if: text overlaps other content or the frame edge, "
+            "contrast makes text illegible, the frame is blank/empty when it "
+            "shouldn't be, or the content clearly doesn't match the brief. "
+            "Crucially, the frame must actually DEPICT the brief's subject, not "
+            "merely reference it: a brief asking for a map must show a recognizable "
+            "map shape, a chart brief must show a plotted chart, a diagram brief a "
+            "drawn diagram — a plain text card restating the brief is a REJECTION "
+            "even if perfectly legible. When rejecting for this, name the missing "
+            "subject in your feedback. Minor "
+            "stylistic taste is not grounds for rejection — only genuine visual "
+            "breakage or a missing subject. Reply with ONLY JSON: "
+            "{\"approved\": bool, \"feedback\": str, \"fixes\": string[]}. `feedback` empty "
+            "if approved. When NOT approved, `fixes` is 1-3 concrete, imperative "
+            "instructions the engineer can act on directly (e.g. \"move the caption "
+            "above y=1700 so it clears the chart\", \"increase the label font to >=28px\", "
+            "\"render the values as bars, not text\") — not vague notes."
+        )
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        user_content = [
+            {"type": "text", "text": f"Scene brief: {description}"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+        ]
+        raw = await self._complete(
+            [{"role": "system", "content": system}, {"role": "user", "content": user_content}],
+            model=self._settings.codegen_model,
+        )
+        data = json.loads(_strip_fences(raw))
+        fixes = data.get("fixes")
+        return {
+            "approved": bool(data.get("approved", True)),
+            "feedback": str(data.get("feedback") or ""),
+            "fixes": [str(f) for f in fixes] if isinstance(fixes, list) else [],
+        }
+
+    async def plan_scene_design(self, *, description: str, data: dict) -> str:
+        """Stage 1 of two-stage codegen (video-agent Phase 5): a short visual concept
+        for a `generated` scene BEFORE any code is written. Returns 5-8 plain-text
+        bullets (layout regions, motion beats, palette/backdrop choice) that ride
+        along in every generate/repair call for the slide — so repairs fix code
+        without re-rolling the concept. Cheap and creative (higher temperature);
+        never raises into the loop for a soft failure — an empty plan just means
+        codegen proceeds without one."""
+        system = (
+            "You are an art director for short-form brand video. Given a scene brief "
+            "and its data, sketch a concrete visual concept as 5-8 terse bullets: the "
+            "layout (regions of the 1080-wide vertical canvas), the ONE dominant "
+            "element, the motion beats (what enters when), and a backdrop/palette "
+            "choice. Be specific and buildable — name positions and sequence, not "
+            "adjectives. Do NOT write code. Return only the bullet list."
+        )
+        user = f"Scene brief: {description}\nData: {json.dumps(data)}"
+        try:
+            raw = await self._complete(
+                [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                model=self._settings.codegen_model,
+                reasoning_effort=self._settings.codegen_plan_reasoning_effort,
+                temperature=0.8, max_tokens=self._settings.codegen_plan_max_tokens,
+            )
+            return raw.strip()
+        except Exception:
+            return ""
+
+    async def generate_scene_component(
+        self,
+        *,
+        description: str,
+        data: dict,
+        width: int,
+        height: int,
+        fps: int,
+        duration_frames: int,
+        attempt: int = 1,
+        prior_error: Optional[str] = None,
+        prior_source: Optional[str] = None,
+        design_plan: Optional[str] = None,
+    ) -> str:
+        exemplars = _read_scene_exemplars(self._settings)
+        pattern_block = (
+            "Study these EXEMPLARY scenes from the same project and follow their "
+            "shape, imports, and quality (content entirely from slide.data, "
+            "staggered entrances, layered backdrop, counting numbers) — one shows "
+            "hand-rolled data-driven visuals, the other shows the `recharts` "
+            "construction style; use whichever construction fits your brief, or "
+            "neither if your brief calls for something else entirely. Do NOT copy "
+            "their content — author a scene for YOUR brief:\n\n"
+            + "\n\n".join(f"```tsx\n{ex}\n```" for ex in exemplars) + "\n\n"
+            if exemplars else
+            # Fallback skeleton when the checked-in exemplar can't be read.
+            "Your output must follow this structural pattern:\n```tsx\n"
+            "import React from \"react\";\n"
+            "import { AbsoluteFill, useCurrentFrame, useVideoConfig } from \"remotion\";\n"
+            "import type { GeneratedSlide } from \"../../types\";\n"
+            "const Scene: React.FC<{ slide: GeneratedSlide; accentColor: string; "
+            "secondaryColor: string; primaryColor: string }> = "
+            "({ slide, accentColor, secondaryColor, primaryColor }) => {\n"
+            "  const frame = useCurrentFrame();\n"
+            "  const { fps, width, height } = useVideoConfig();\n"
+            "  return <AbsoluteFill style={{ backgroundColor: primaryColor }}>{/* ... */}</AbsoluteFill>;\n"
+            "};\nexport default Scene;\n```\n\n"
+        )
+        system = (
+            "You are a Remotion (React + TypeScript) motion-graphics engineer. Author "
+            "ONE bespoke scene component's .tsx source for a short brand video. Your "
+            "default export MUST be a React.FC accepting EXACTLY this prop shape: "
+            "{ slide, accentColor, secondaryColor, primaryColor } — where `slide` is "
+            "{ type: \"generated\", componentName, data, durationFrames } and your "
+            "content comes from `slide.data`. Import that type as "
+            "`import type { GeneratedSlide } from \"../../types\";`. Do NOT expect "
+            "width/height/fps/durationFrames as props — call useVideoConfig() and "
+            "useCurrentFrame(). Call all hooks unconditionally at the top level.\n\n"
+            "Imports available (NOTHING else is installed):\n"
+            "- `remotion` — AbsoluteFill, interpolate, spring, useCurrentFrame, "
+            "useVideoConfig, Img, staticFile, ...\n"
+            "- `react`\n"
+            + _DESIGN_IMPORTS_DOC +
+            "- `recharts` — charts. ALWAYS set `isAnimationActive={false}` and drive "
+            "animation by interpolating props per frame (recharts' own animation is "
+            "wall-clock-based and breaks deterministic rendering).\n"
+            "- `d3-shape`, `d3-scale` — arcs/areas/lines/scales for custom SVG.\n"
+            "- `d3-geo` — geoMercator()/geoPath() for maps; `.fitExtent([[x0,y0],"
+            "[x1,y1]], geojson)` fits a region to the canvas.\n"
+            "- `topojson-client` + `world-atlas/countries-50m.json` — real country "
+            "geometry: `feature(world as any, (world as any).objects.countries)`.\n\n"
+            + _DESIGN_LANGUAGE_DOC + "\n"
+            + pattern_block +
+            "Render every number/label from `slide.data` as real graphics; NEVER "
+            "restate the brief as plain text on a coloured background. "
+            "Return ONLY the .tsx source — no markdown fences, no explanation."
+        )
+        patterns = _read_scene_patterns()
+        if patterns:
+            system += f"\n\nReference snippets you may adapt:\n{patterns}"
+        if design_plan:
+            system += f"\n\nFollow this visual concept for the scene:\n{design_plan}"
+        if attempt > 1 and prior_error:
+            system += (
+                f"\n\nYour previous attempt failed with this exact error:\n{prior_error}\n\n"
+                f"Previous source:\n{prior_source or ''}\n\n"
+                "Fix this specific failure directly — do not start over or change the "
+                "visual concept; keep everything that worked."
+            )
+        user = (
+            f"Scene brief: {description}\n"
+            f"Data available at runtime (props.data): {json.dumps(data)}\n"
+            f"Canvas: {width}x{height} @ {fps}fps, durationFrames={duration_frames}"
+        )
+        # Low temperature for the correctness-critical first shot; slightly higher
+        # on repairs so a retry can escape a repeated failure mode instead of
+        # re-emitting near-identical broken code (dropped instead if
+        # codegen_reasoning_effort opts into a reasoning-tier deployment — see
+        # _complete). Token ceiling must have headroom for hidden reasoning tokens
+        # PLUS a full compiling TSX component, not just the component alone.
+        raw = await self._complete(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model=self._settings.codegen_model,
+            reasoning_effort=self._settings.codegen_reasoning_effort,
+            temperature=0.3 if attempt == 1 else 0.5,
+            max_tokens=self._settings.codegen_max_tokens,
+        )
+        return _strip_fences(raw)
+
+    async def convert_generated_to_template(
+        self, *, description: str, data: dict,
+    ) -> dict:
+        """One-shot degradation for an exhausted `generated` slide (workflow/video/
+        fallback.py): re-express the brief + data as the best-fitting FIXED slide.
+        Returns the raw parsed dict; the caller validates against the template-only
+        union and degrades any invalid answer to a hook card, so no retry loop here."""
+        schema = json.dumps(TypeAdapter(TemplateSlideSpec).json_schema())
+        system = (
+            "A bespoke video scene could not be generated. Re-express its creative "
+            "brief and structured data as the SINGLE best-fitting fixed slide from "
+            "this JSON Schema (discriminated by `type`). Carry every number, label, "
+            "series, and coordinate from the data into the chosen type's fields — "
+            "do not drop content a field could hold, and do not invent new content. "
+            "Prefer the type whose visual form matches the brief (values over time "
+            "→ line_chart, proportions → pie_chart, ranked items → bar_chart, "
+            "places → map, named-thing comparisons → comparison_table, a sequence "
+            "of concepts → node_diagram, standalone figures → counter_stat); use "
+            "`hook` only when nothing structured fits. Return ONLY valid JSON for "
+            f"that one slide (no markdown fences, no prose):\n{schema}"
+        )
+        user = (
+            f"Creative brief: {description}\n"
+            f"Structured data: {json.dumps(data)}"
+        )
+        raw = await self._complete(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model=self._settings.codegen_model,
+            temperature=0.2,
+        )
+        return json.loads(_strip_fences(raw))
 
     async def distill_rules(
         self,
@@ -657,32 +1033,21 @@ class AzureVoice(VoiceService):
         self._settings = settings
 
     def _ws_url(self) -> str:
-        s = self._settings
-        # Voice Live is a WebSocket endpoint: normalise an https:// base to wss://
-        # (http:// → ws://) and ensure the /voice-live/realtime path is present, so
-        # either a bare resource host or a full wss URL in config connects correctly.
-        endpoint = (s.azure_voicelive_endpoint or "").rstrip("/")
-        if endpoint.startswith("https://"):
-            endpoint = "wss://" + endpoint[len("https://"):]
-        elif endpoint.startswith("http://"):
-            endpoint = "ws://" + endpoint[len("http://"):]
-        if not endpoint.endswith("/voice-live/realtime"):
-            endpoint = f"{endpoint}/voice-live/realtime"
-        return (
-            f"{endpoint}"
-            f"?api-version={s.azure_voicelive_api_version}&model={s.azure_voicelive_model}"
-        )
+        return _voice_live_ws_url(self._settings)
 
     async def _transcribe(self, user_audio: str) -> str:
         """Send one audio turn to Voice Live and return its transcript. Overridable
-        seam for tests; `websockets` is lazy-imported so this module imports without
-        it. `user_audio` is a base64-encoded PCM16 chunk forwarded from the browser
-        over WS /intake/{sid}/voice.
+        seam for tests; 
+            `websockets` is lazy-imported so this module imports without it. 
+            `user_audio` is a base64-encoded PCM16 chunk, supplied via the cascaded
+                REST intake path (`POST /intake` / `/turn`, `mode: "voice"`) — kept as a
+                 fallback alongside the native speech-to-speech bridge (AzureRealtimeVoice
+                 below), which is what `WS /intake/{sid}/voice` now uses.
 
         Voice Live handles VAD / end-of-turn detection server-side; we append the
         audio buffer, commit it, and read back the input-audio transcription."""
+        
         import json
-
         import websockets  # lazy import
 
         s = self._settings
@@ -708,3 +1073,198 @@ class AzureVoice(VoiceService):
     async def transcribe_turn(self, *, session_id: str, user_audio: str) -> dict:
         transcript = await self._transcribe(user_audio)
         return {"session_id": session_id, "transcript": transcript}
+
+
+# ── Realtime voice (native speech-to-speech bridge) ─────────────
+
+def _to_realtime_tools(tools: List[dict]) -> List[dict]:
+    """Reshape BRIEF_TOOL_DEFS' Chat-Completions shape
+    (`{"type":"function","function":{"name",...,"parameters"}}`) into the flatter
+    Realtime API shape (`{"type":"function","name",...,"parameters"}`) — the same
+    tool definitions, one shared source (intake/base.py), two wire shapes."""
+    out: List[dict] = []
+    for t in tools:
+        fn = t.get("function", t)
+        out.append({
+            "type": "function",
+            "name": fn.get("name"),
+            "description": fn.get("description", ""),
+            "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+        })
+    return out
+
+
+class AzureRealtimeVoice(RealtimeVoiceService):
+    """Opens a native speech-to-speech session against GPT-Realtime (Azure AI
+    Foundry / Voice Live). Unlike AzureVoice above, the model consumes and produces
+    audio directly over one persistent duplex connection and decides tool calls
+    itself — there is no separate transcribe-then-chat step on the path that drives
+    the conversation."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    async def open_session(
+        self, *, session_id: str, instructions: str, tools: List[dict],
+    ) -> RealtimeVoiceSession:
+        import websockets  # lazy import
+
+        s = self._settings
+        api_key = s.azure_voicelive_api_key or s.azure_openai_api_key
+        headers = {"api-key": api_key} if api_key else {}
+
+        ws = await websockets.connect(_voice_live_ws_url(s), additional_headers=headers)
+        session = _AzureRealtimeSession(ws, session_id=session_id)
+        await session._configure(instructions=instructions, tools=tools, voice=s.azure_voicelive_voice)
+        return session
+
+
+class _AzureRealtimeSession(RealtimeVoiceSession):
+    """One live GPT-Realtime connection. `_send_json`/`_recv_raw` are the
+    overridable network seam (same pattern as AzureLLM._complete): tests can swap
+    in a fake transport and drive `events()`/`send_tool_result()` against scripted
+    JSON, with no real socket or credentials."""
+
+    def __init__(self, ws, *, session_id: str) -> None:
+        self._ws = ws
+        self._session_id = session_id
+
+    async def _send_json(self, payload: dict) -> None:
+        await self._ws.send(json.dumps(payload))
+
+    async def _recv_raw(self) -> AsyncIterator[dict]:
+        async for raw in self._ws:
+            yield json.loads(raw)
+
+    async def _configure(self, *, instructions: str, tools: List[dict], voice: str) -> None:
+        await self._send_json({
+            "type": "session.update",
+            "session": {
+                "modalities": ["audio", "text"],
+                "instructions": instructions,
+                "voice": voice,
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
+                # Side channel only (captions / logging / per-user learning transcript) —
+                # never on the path that decides brief content; the model reasons over
+                # audio directly and calls tools itself.
+                "input_audio_transcription": {"model": "whisper-1"},
+                # Server-side VAD drives end-of-turn AND barge-in detection, so the client
+                # never needs to manually commit the input buffer.
+                "turn_detection": {"type": "server_vad"},
+                "tools": _to_realtime_tools(tools),
+                "tool_choice": "auto",
+            },
+        })
+
+    async def send_audio(self, *, audio_b64: str) -> None:
+        await self._send_json({"type": "input_audio_buffer.append", "audio": audio_b64})
+
+    async def send_tool_result(self, *, call_id: str, output: dict) -> None:
+        await self._send_json({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": json.dumps(output),
+            },
+        })
+        # Prompt the model to continue — this is what makes it actually SPEAK a
+        # tool's result (e.g. narrate a suggested topic) rather than stay silent.
+        await self._send_json({"type": "response.create"})
+
+    async def nudge(self, *, text: str) -> None:
+        await self._send_json({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        })
+        await self._send_json({"type": "response.create"})
+
+    async def events(self) -> AsyncIterator[RealtimeEvent]:
+        async for event in self._recv_raw():
+            translated = self._translate(event)
+            if translated is None:
+                continue
+            yield translated
+            if translated.type == "speech_started":
+                # Barge-in: stop the model's in-flight generation server-side too
+                # (the caller is responsible for flushing local audio playback).
+                await self._send_json({"type": "response.cancel"})
+
+    @staticmethod
+    def _translate(event: dict) -> Optional[RealtimeEvent]:
+        etype = event.get("type")
+        if etype == "response.audio.delta":
+            return RealtimeEvent(type="audio_delta", audio_b64=event.get("delta"))
+        if etype == "response.audio_transcript.delta":
+            return RealtimeEvent(type="output_transcript_delta", text=event.get("delta"))
+        if etype == "conversation.item.input_audio_transcription.completed":
+            return RealtimeEvent(type="input_transcript", text=(event.get("transcript") or "").strip())
+        if etype == "response.function_call_arguments.done":
+            return RealtimeEvent(
+                type="tool_call",
+                call_id=event.get("call_id"),
+                name=event.get("name"),
+                arguments=json.loads(event.get("arguments") or "{}"),
+            )
+        if etype == "input_audio_buffer.speech_started":
+            return RealtimeEvent(type="speech_started")
+        if etype == "response.done":
+            return RealtimeEvent(type="response_done")
+        if etype == "error":
+            return RealtimeEvent(type="error", message=str(event.get("error")))
+        return None
+
+    async def close(self) -> None:
+        await self._ws.close()
+
+
+# ── Voiceover (Azure Speech text-to-speech) ────────────────────────────────────
+# UNVERIFIED against a live Azure Speech resource (no credentials were available
+# when this was written) — same caveat SoundrawMusic (media_assets.py) carries for
+# the same reason. The REST TTS endpoint/SSML/header shape below matches Azure
+# Speech's documented v1 API; confirm with one real call before trusting it in
+# production (see the implementation plan's Phase 3 verification steps).
+
+class AzureSpeechVoiceover(VoiceoverService):
+    """Text-to-speech via Azure Speech's REST endpoint (not the Voice Live
+    WebSocket API AzureVoice above uses — that's speech-to-text for intake; this is
+    speech synthesis for a rendered video's narration track)."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    def _synthesis_url(self) -> str:
+        region = self._settings.azure_speech_region
+        return f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
+
+    @staticmethod
+    def _ssml(text: str, voice: str) -> str:
+        import html as _html_mod
+
+        escaped = _html_mod.escape(text)
+        return (
+            '<speak version="1.0" xml:lang="en-US">'
+            f'<voice name="{voice}">{escaped}</voice>'
+            "</speak>"
+        )
+
+    async def synthesize(self, *, text: str, voice: str) -> bytes:
+        import httpx  # lazy import, matches the rest of core/services/*
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                self._synthesis_url(),
+                headers={
+                    "Ocp-Apim-Subscription-Key": self._settings.azure_speech_key,
+                    "Content-Type": "application/ssml+xml",
+                    "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+                },
+                content=self._ssml(text, voice).encode("utf-8"),
+            )
+            resp.raise_for_status()
+            return resp.content

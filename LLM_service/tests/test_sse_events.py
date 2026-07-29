@@ -193,6 +193,32 @@ async def test_roundtable_streams_utterances_then_consensus():
     assert consensus[0]["strategy"]["linkedin"] and consensus[0]["converged"] is True
 
 
+async def test_roundtable_announces_each_speaker_before_their_turn():
+    """The manager's mic handoff streams as a `speaker_scheduled` event BEFORE that
+    speaker's `agent_utterance` — the live "who has the floor" signal for the UI."""
+    svc = WorkflowService()
+    await svc.run_roundtable(_RT_START, "linkedin", task_id="rt_sched", max_rounds=4)
+    events = svc.buffered_events("rt_sched")
+
+    scheduled = [e for e in events if e["type"] == "speaker_scheduled"]
+    assert scheduled, "expected the manager to announce each upcoming speaker"
+    for e in scheduled:
+        assert _ENVELOPE_KEYS <= set(e)
+        assert e["table_id"] == "linkedin" and e["speaker"] and e["agent_id"] == e["speaker"]
+
+    # Every persona turn was announced first: a matching (speaker, round) scheduled event
+    # appears in the stream strictly before the utterance itself.
+    for i, e in enumerate(events):
+        if e["type"] != "agent_utterance":
+            continue
+        assert any(
+            s["type"] == "speaker_scheduled"
+            and s["speaker"] == e["speaker"]
+            and s["round_index"] == e["round_index"]
+            for s in events[:i]
+        ), f"utterance by {e['speaker']} (round {e['round_index']}) was never announced"
+
+
 async def test_roundtable_user_utterance_appears_in_the_stream():
     """A queued user 'raise hand' shows up as a user-role agent_utterance in the SSE stream."""
     await push_utterance(factory.get_store(), task_id="rt2", table_id="linkedin",
@@ -483,6 +509,54 @@ def test_http_video_render_trigger(http_server, monkeypatch):
         assert download.content == b"fake-mp4-bytes"
 
         assert client.get(f"{http_server}/video-jobs/nope").status_code == 404
+
+
+def test_http_video_download_redirects_for_a_remote_lambda_url(http_server, monkeypatch):
+    """When render_storyboard (workflow/video/render.py) returns an https:// URL
+    (the VIDEO_RENDER_BACKEND=lambda path — the output lives in S3, never on this
+    process's disk), the download route 307-redirects to it instead of trying to
+    FileResponse a local path. Local-backend behaviour (the Path case) is covered
+    by test_http_video_render_trigger above; this is the same trigger/poll flow
+    with only the faked render's return value changed."""
+    import LLM_service.workflow.video.assets as assets_module
+    import LLM_service.workflow.video.jobs as jobs_module
+
+    remote_url = "https://bucket.s3.amazonaws.com/renders/job-xyz/output.mp4"
+
+    async def _fake_remote_render(renderable, *, job_dir, settings, timeout_s=240.0):
+        return remote_url
+
+    async def _no_download(url):
+        return None
+
+    monkeypatch.setattr(jobs_module, "render_storyboard", _fake_remote_render)
+    monkeypatch.setattr(assets_module, "_download", _no_download)
+
+    with httpx.Client(timeout=10) as client:
+        started = client.post(f"{http_server}/tasks", json={
+            "topic": "harvest", "target_platforms": ["linkedin"], "business_id": "biz_render_remote",
+            "content_types": ["text", "video"],
+        })
+        task_id = started.json()["task_id"]
+        client.post(f"{http_server}/tasks/{task_id}/review",
+                    json={"verdicts": {"linkedin": {"decision": "approve"}}})
+
+        triggered = client.post(f"{http_server}/tasks/{task_id}/render-video",
+                                 json={"platform": "linkedin"})
+        job_id = triggered.json()["job_id"]
+
+        job = None
+        for _ in range(50):
+            job = client.get(f"{http_server}/video-jobs/{job_id}").json()
+            if job["status"] != "pending":
+                break
+            time.sleep(0.05)
+        assert job is not None and job["status"] == "done", job
+        assert job["output_path"] == remote_url
+
+        download = client.get(f"{http_server}/video-jobs/{job_id}/download", follow_redirects=False)
+        assert download.status_code == 307
+        assert download.headers["location"] == remote_url
         assert client.get(f"{http_server}/video-jobs/nope/download").status_code == 404
 
 
