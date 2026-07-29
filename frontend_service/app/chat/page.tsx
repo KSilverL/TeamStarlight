@@ -11,6 +11,7 @@ interface SessionSummary {
   createdAt: string;
   status: string;
   targetPlatforms: string[] | null;
+  title?: string | null;
 }
 
 interface DBMessage {
@@ -482,6 +483,10 @@ export default function ChatPage() {
   const [pastSessions, setPastSessions] = useState<SessionSummary[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
+  const [sessionTitle, setSessionTitle] = useState<string | null>(null);
+  // Guards against later prompts in the same session overwriting the name —
+  // the session is named once, from the first task's title.
+  const sessionTitleRef = useRef<string | null>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -506,6 +511,9 @@ export default function ChatPage() {
   async function loadSession(session: SessionSummary) {
     if (loadingSessionId) return;
     setLoadingSessionId(session.id);
+	sessionTitleRef.current = session.title ?? null;
+	setSessionTitle(session.title ?? null);
+	
     try {
       const token = localStorage.getItem("starlight_token");
       const res = await fetch(`/api/sessions/${session.id}/messages`, {
@@ -542,6 +550,15 @@ export default function ChatPage() {
     } finally {
       setLoadingSessionId(null);
     }
+  }
+  
+  function applySessionTitle(title: string) {
+    if (sessionTitleRef.current) return; // already named this session
+    sessionTitleRef.current = title;
+    setSessionTitle(title);
+    setPastSessions((prev) =>
+      prev.map((s) => (s.id === sessionIdRef.current ? { ...s, title } : s))
+    );
   }
 
   function formatDate(isoString: string) {
@@ -765,6 +782,9 @@ export default function ChatPage() {
         return;
       }
       taskId = data.task_id as string;
+	  if (data.title) {
+	    applySessionTitle(data.title as string);
+	  }
     } catch {
       pushMessage({ role: "assistant", content: "Could not reach the workflow backend." });
       return;
@@ -1154,7 +1174,7 @@ export default function ChatPage() {
                       } disabled:opacity-50`}
                     >
                       <p className="font-medium text-xs truncate">
-                        {isLoading ? "Loading…" : formatDate(s.createdAt)}
+                        {isLoading ? "Loading…" : (s.title ?? formatDate(s.createdAt))}
                       </p>
                       {s.targetPlatforms && s.targetPlatforms.length > 0 && (
                         <p className="text-[10px] text-[#9E9893] mt-0.5 truncate">
@@ -1285,14 +1305,15 @@ export default function ChatPage() {
               </svg>
             </button>
             <div>
-              <h1 className="font-semibold text-sm text-[#1B1A17]">
-                {activeSessionId ? `Session ${activeSessionId}` : "New Session"}
-              </h1>
+			  <h1 className="font-semibold text-sm text-[#1B1A17]">
+			    {sessionTitle ?? (activeSessionId ? `Session ${activeSessionId}` : "New Session")}
+			  </h1>
               <p className="text-xs text-[#9E9893] mt-0.5">
                 {selectedPlatforms.length} platform
                 {selectedPlatforms.length !== 1 ? "s" : ""} ·{" "}
                 {contentTypes.length ? contentTypes.join(", ") : "no"} content
               </p>
+			  
             </div>
           </div>
           <div className="flex items-center gap-1.5">
