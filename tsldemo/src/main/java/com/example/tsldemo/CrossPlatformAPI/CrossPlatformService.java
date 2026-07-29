@@ -838,7 +838,14 @@ public class CrossPlatformService {
                 else if (mime.startsWith("video/")) {
                     url = "https://graph.facebook.com/v25.0/{page_id}/videos";
                     form.add("title", requestDTO.getTitle());
-                    form.add("description", requestDTO.getDescription());
+                    // This edge captions from `description` — the `message` added above is the
+                    // /feed and /photos field and is silently ignored here, so a caller that set
+                    // only `message` would publish a video with no caption at all. Fall back to
+                    // it rather than letting the caption vanish.
+                    form.add("description",
+                            requestDTO.getDescription() == null || requestDTO.getDescription().isBlank()
+                                    ? requestDTO.getMessage()
+                                    : requestDTO.getDescription());
                 }
 
             }

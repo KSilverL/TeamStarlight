@@ -1653,10 +1653,13 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
           Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
+          // Graph captions a Page video from `description` on the /{page-id}/videos edge —
+          // `message` is the /feed and /photos field and is silently dropped there. Send the
+          // caption as both so the one Java endpoint can serve whichever edge the mime picks.
           jobId,
           message: caption.trim(),
           title: videoTitle.trim(),
-          description: "",
+          description: caption.trim(),
           pageIds,
         }),
       });
