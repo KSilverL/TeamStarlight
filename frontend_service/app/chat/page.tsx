@@ -152,6 +152,9 @@ interface RoundtableTurn {
   role: string;
   text: string;
   roundIndex: number;
+  // Set once the (asynchronous, background-synthesized) agent_utterance_audio event
+  // for this same turn arrives — a data: URL, playable directly in an <audio> tag.
+  audioUrl?: string;
 }
 
 // The discussion feed interleaves completed turns with the moderator's mic handoffs
@@ -700,6 +703,20 @@ export default function ChatPage() {
     }));
   }
 
+  /** agent_utterance_audio: the background TTS clip for an already-shown turn arrived —
+   *  find it by (speaker, roundIndex) and attach the clip; the turn itself doesn't move. */
+  function attachRoundtableTurnAudio(
+    taskId: string, tableId: string, speaker: string, roundIndex: number, audioUrl: string
+  ) {
+    upsertRoundtable(taskId, tableId, (m) => ({
+      roundtableFeed: (m.roundtableFeed ?? []).map((item) =>
+        item.kind === "turn" && item.turn.speaker === speaker && item.turn.roundIndex === roundIndex
+          ? { ...item, turn: { ...item.turn, audioUrl } }
+          : item
+      ),
+    }));
+  }
+
   function finalizeRoundtable(tableId: string, strategy: Record<string, unknown> | undefined) {
     const existingId = roundtableMsgIdRef.current.get(tableId);
     if (!existingId) return;
@@ -837,6 +854,21 @@ export default function ChatPage() {
           text: event.text as string,
           roundIndex: event.round_index as number,
         });
+      }
+
+      // agent_utterance_audio: the TTS clip for a turn already shown — arrives later,
+      // synthesized in the background so it never held up the text discussion.
+      if (type === "agent_utterance_audio") {
+        const audioB64 = event.audio_b64 as string | undefined;
+        if (audioB64) {
+          attachRoundtableTurnAudio(
+            taskId,
+            event.table_id as string,
+            event.speaker as string,
+            event.round_index as number,
+            `data:audio/mpeg;base64,${audioB64}`
+          );
+        }
       }
 
       // discussion_consensus: the table converged on a strategy before drafting starts.
@@ -2139,6 +2171,9 @@ function RoundtableStage({ message, formatTime }: RoundtableStageProps) {
                     <p className="text-xs text-[#1B1A17] whitespace-pre-wrap leading-relaxed">
                       {item.turn.text}
                     </p>
+                    {item.turn.audioUrl && (
+                      <audio controls src={item.turn.audioUrl} className="mt-1 h-7 w-full" />
+                    )}
                   </div>
                 );
               })}

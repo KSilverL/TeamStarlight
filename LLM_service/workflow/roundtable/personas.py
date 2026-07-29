@@ -45,6 +45,20 @@ TREND_SCOUT = "trend_scout"
 # TREND_SCOUT_ENABLED — with the toggle off the roster (and every existing test) is unchanged.
 ROSTER: List[str] = [PLATFORM_EDITOR, BRAND_VOICE, USER_ADVOCATE, AUDIENCE_ADVOCATE]
 
+# One Azure Neural TTS voice per seat, for the optional spoken readback of the discussion
+# (runner.py synthesizes each turn's line in this voice once it completes). Same "one
+# model, many roles" economy as the text personas above — just via VoiceoverService's
+# `voice` parameter instead of a system prompt. Used as a fallback for any unmapped
+# speaker (e.g. the "user" seat, which is never synthesized).
+DEFAULT_VOICE = "en-US-JennyNeural"
+PERSONA_VOICES: Dict[str, str] = {
+    PLATFORM_EDITOR: "en-US-GuyNeural",
+    BRAND_VOICE: "en-US-DavisNeural",
+    USER_ADVOCATE: "en-US-JennyNeural",
+    AUDIENCE_ADVOCATE: "en-US-AriaNeural",
+    TREND_SCOUT: "en-US-SaraNeural",
+}
+
 # Appended VERBATIM to every seat's instructions so each turn reads like a real person speaking
 # at a fast roundtable, not an essay: ONE point, a sentence or two, reacting to what was just
 # said. This is the primary lever for "短句为主" — keep it the same for all seats so the manager
