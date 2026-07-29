@@ -1589,6 +1589,9 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
   const [postError, setPostError] = useState<string | null>(null);
   // Reference images carried from the compose box; the user can drop any before rendering.
   const [refs, setRefs] = useState<string[]>(message.referenceImages ?? []);
+  // instagram posting
+  const [igPostStatus, setIgPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
+  const [igPostError, setIgPostError] = useState<string | null>(null);
 
   async function handlePostVideoToLinkedIn() {
     if (!jobId || !caption.trim()) return;
@@ -1619,6 +1622,29 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
     } catch {
       setPostStatus("error");
       setPostError("Could not reach the backend.");
+    }
+  }
+  
+  async function handlePostVideoToInstagram() {
+    if (!jobId) return;
+    setIgPostStatus("posting");
+    setIgPostError(null);
+    try {
+      const res = await fetch("/api/instagram/post-video", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jobId, caption: caption ?? "" }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setIgPostStatus("error");
+        setIgPostError(data.error ?? "Failed to post video to Instagram.");
+        return;
+      }
+      setIgPostStatus("posted");
+    } catch (err) {
+      setIgPostStatus("error");
+      setIgPostError("Could not reach the backend.");
     }
   }
 
@@ -1776,6 +1802,30 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
             )}
           </div>
         )}
+		
+		{renderState === "done" && downloadUrl && (
+		  <div className="px-4 pb-4 pt-1 border-t border-[#E8E3DA] space-y-2">
+		    {igPostStatus === "posted" ? (
+		      <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+		        ✓ Posted to Instagram
+		      </div>
+		    ) : (
+				<button
+				  type="button"
+				  onClick={handlePostVideoToInstagram}
+				  // disabled={igPostStatus === "posting"}
+				  className="w-full bg-gradient-to-r from-purple-600 to-pink-600 hover:opacity-90 disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+				>
+				  {igPostStatus === "posting" ? "Uploading & posting…" : "Post Video to Instagram"}
+				</button>
+		    )}
+
+		    {igPostStatus === "error" && igPostError && (
+		      <p className="text-xs text-red-600 text-center">{igPostError}</p>
+		    )}
+		  </div>
+		)}
+
 
         <p className="text-xs text-[#9E9893] px-4 pb-3">
           {formatTime(message.timestamp)}
