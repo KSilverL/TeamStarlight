@@ -121,11 +121,21 @@ class HumanVerdict(BaseModel):
 
     decision ∈ {"approve", "approve_after_edit", "reject"}. On approve_after_edit,
     `edited_draft` carries the human's final text. On reject, the platform is
-    re-dispatched to the creator for a fresh attempt."""
+    re-dispatched to the creator for a fresh attempt.
+
+    `platform` makes the verdict self-describing, like every other message in the
+    graph. It is which platform's draft this verdict answers — the service fills it
+    in from the pending request at `POST /review` (callers key verdicts by platform
+    there, so it is never something the client has to repeat). Without it the
+    resumed gate is the one post-intake step whose progress events cannot say which
+    platform they belong to: MAF hands the executor a bare verdict, so the payload
+    would carry no attribution at all. Optional with a None default so older
+    checkpoints deserialize and direct constructions in tests stay valid."""
 
     decision: str
     edited_draft: Optional[str] = None
     reason: Optional[str] = None
+    platform: Optional[str] = None
 
 
 class BrandRule(BaseModel):

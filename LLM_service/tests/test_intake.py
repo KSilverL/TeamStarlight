@@ -223,8 +223,11 @@ async def test_prior_context_folds_into_prompt_and_rides_onto_brief(monkeypatch)
         "sess-cont", _ONE_SHOT, target_platforms=["linkedin"], prior_context=_PRIOR)
     assert started["complete"] is True
 
-    # The recap was folded into the prompt the LLM saw.
-    assert "前情提要" in captured["system_prompt"]
+    # The recap was folded into the prompt the LLM saw. Asserted against the
+    # renderer's own output rather than a literal heading, so rewording the block
+    # (or translating it) stays a free edit — what must hold is that whatever
+    # `_render_prior_context` produces reaches the prompt intact.
+    assert _render_prior_context(_PRIOR) in captured["system_prompt"]
     assert "autumn cold brew launch" in captured["system_prompt"]
     assert "lead with the seasonal angle" in captured["system_prompt"]
 
@@ -237,10 +240,20 @@ async def test_prior_context_folds_into_prompt_and_rides_onto_brief(monkeypatch)
 
 def test_render_prior_context_empty_is_blank_nonempty_has_block():
     """The renderer is the degrade point: an empty recap produces no block (prompt
-    unchanged); a recap with signal produces the recap section."""
+    unchanged); a recap with signal produces the recap section.
+
+    Asserts on the recap's CONTENT, not on its heading — the wording and language
+    of the block are prose the prompt author should be free to change without
+    breaking a test."""
     assert _render_prior_context(PriorSessionContext(parent_session_id="sess-prev")) == ""
+
     block = _render_prior_context(_PRIOR)
-    assert block.startswith("\n") and "前情提要" in block
+    assert block.startswith("\n")           # appends to the system prompt, not inline
+    assert block.strip().startswith("##")   # a section of its own
+    # Every field carrying signal reaches the block.
+    assert "autumn cold brew launch" in block
+    assert "lead with the seasonal angle" in block
+    assert "heavy discount framing" in block
     assert "keep it warm and local" in block
 
 
