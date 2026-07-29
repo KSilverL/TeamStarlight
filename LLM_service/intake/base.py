@@ -336,6 +336,7 @@ class ConversationalIntake(IntakeSession):
         self._sessions[session_id] = state
         opening = await self._ingest(session_id, opening_user_input) if opening_user_input else None
         result = await self._conversation.begin(state, opening)
+
         return {"session_id": session_id, **result}
 
     def transcript(self, session_id: str) -> List[dict]:
