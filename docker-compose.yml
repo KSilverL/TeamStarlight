@@ -1,91 +1,45 @@
 services:
-  # ---------------------------------------------------------------------------
-  # Frontend — Next.js production build
-  # ---------------------------------------------------------------------------
-  frontend:
-    build:
-      context: frontend_service
-      dockerfile: Dockerfile
-      args:
-        # Build-time only (see Dockerfile) — the browser's direct WS to LLM_service's
-        # realtime voice endpoint (MVP; no Java WS proxy yet).
-        NEXT_PUBLIC_LLM_SERVICE_WS_URL: ${NEXT_PUBLIC_LLM_SERVICE_WS_URL}
-    ports:
-      - "3000:3000"
-    environment:
-      # Main LLM service (text generation + MAF workflow /tasks + video render jobs)
-      - TEXT_AGENT_URL=http://llm:8080
-      - LLM_SERVICE_URL=http://llm:8080
-      # Java backend (signup / login)
-      - BACKEND_URL=http://backend:8081
-    depends_on:
-      - llm
-      - backend
-
-  # ---------------------------------------------------------------------------
-  # Backend — Spring Boot Java service
-  # ---------------------------------------------------------------------------
-  backend:
-    build:
-      context: tsldemo
-      dockerfile: Dockerfile
-    ports:
-      - "8081:8081"
-    environment:
-      - LLM_SERVICE_BASE_URL=http://llm:8080
-      # Supabase credentials — override here or in a .env file if needed.
-      # Defaults are already baked into application.properties.
-      # LinkedIn OAuth — must match the redirect URI registered on the LinkedIn Developer app,
-      # and where to send the browser back to after the OAuth round-trip.
-      - LINKEDIN_REDIRECT_URI=${LINKEDIN_REDIRECT_URI:-http://localhost:8081/linkedin/callback}
-      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-http://localhost:3000}
-    depends_on:
-      - llm
-
-  # ---------------------------------------------------------------------------
-  # LLM Service — Python FastAPI (MAF virtual-newsroom workflow)
-  # Requires AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY for production.
-  # Runs in mock mode by default (USE_MOCK=true) so it starts without creds.
-  # ---------------------------------------------------------------------------
   llm:
     build:
-      # Context is the repo root, not LLM_service/ — the image also bundles the
-      # sibling video_renderer/ Node project (local Remotion CLI render subprocess).
       context: .
       dockerfile: LLM_service/Dockerfile
     ports:
       - "8080:8080"
     environment:
+      # Set to true for local development without Azure credentials.
       - USE_MOCK=false
-      # "local" (default) -> the Remotion CLI pipeline (workflow/video/render.py +
-      # codegen.py's `generated`-slide self-repair loop). Set VIDEO_RENDER_BACKEND=higgsfield
-      # in .env to switch back to the premium generative-AI-video path — nothing else
-      # here needs to change either way (HIGGSFIELD_* stays wired below regardless).
+
+      # Video renderer
       - VIDEO_RENDER_BACKEND=${VIDEO_RENDER_BACKEND:-local}
+
       - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
       - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
       - AZURE_OPENAI_CHAT_DEPLOYMENT=${AZURE_OPENAI_CHAT_DEPLOYMENT}
-      # Web search (Bing grounding via Azure AI Foundry agents). FOUNDRY_PROJECT_ENDPOINT
-      # must be set here too — get_web_search() raises without it once USE_MOCK_WEB_SEARCH
-      # is false, since it's the endpoint the WEB_SEARCH_AGENT_* names below resolve against.
+
+      # Web search
       - FOUNDRY_PROJECT_ENDPOINT=${FOUNDRY_PROJECT_ENDPOINT}
       - USE_MOCK_WEB_SEARCH=false
       - WEB_SEARCH_AGENT_NAME=${WEB_SEARCH_AGENT_NAME}
       - WEB_SEARCH_AGENT_VERSION=${WEB_SEARCH_AGENT_VERSION}
       - REVIEW_SEARCH_AGENT_NAME=${REVIEW_SEARCH_AGENT_NAME}
       - REVIEW_SEARCH_AGENT_VERSION=${REVIEW_SEARCH_AGENT_VERSION}
+
       - DATABASE_URL=${DATABASE_URL}
-      # Cosmos DB for PostgreSQL mandates SSL; Supabase doesn't need this set.
       - POSTGRES_SSLMODE=${POSTGRES_SSLMODE}
+
       - USE_MOCK_IMAGE_SEARCH=false
       - USE_MOCK_BACKGROUND_REMOVAL=false
+
       - PEXELS_API_KEY=${PEXELS_API_KEY}
       - REMOVEBG_API_KEY=${REMOVEBG_API_KEY}
+
       - GEOAPIFY_API_KEY=${GEOAPIFY_API_KEY}
       - GEOAPIFY_MAP_STYLE=${GEOAPIFY_MAP_STYLE}
+
       - USE_MOCK_MUSIC_GENERATION=true
       - USE_MOCK_SAFETY=true
-      # for voice
+
+      # Voice
       - USE_MOCK_VOICE=${USE_MOCK_VOICE}
       - AZURE_VOICELIVE_ENDPOINT=${AZURE_VOICELIVE_ENDPOINT}
       - AZURE_VOICELIVE_MODEL=${AZURE_VOICELIVE_MODEL}
@@ -93,13 +47,10 @@ services:
       - AZURE_VOICELIVE_API_KEY=${AZURE_VOICELIVE_API_KEY}
       - AZURE_VOICELIVE_VOICE=${AZURE_VOICELIVE_VOICE}
 
-      # Brand profiles + user skills come from the same Postgres DATABASE_URL above, so the
-      # roundtable's brand_voice/user_advocate personas argue from real data, not mocks.
+      # Store
       - USE_MOCK_STORE=false
-      # - SOUNDRAW_API_KEY=${SOUNDRAW_API_KEY}
-      # Roundtable discussion stage (multi-persona debate before drafting) — see .env.example
-      # for the full explanation of each knob. Manager stays on AZURE_OPENAI_CHAT_DEPLOYMENT;
-      # personas can run on a separate, cheaper resource via AZURE_PERSONA_*.
+
+      # Roundtable
       - ROUNDTABLE_ENABLED=${ROUNDTABLE_ENABLED}
       - ROUNDTABLE_MAX_ROUNDS=${ROUNDTABLE_MAX_ROUNDS}
       - ROUNDTABLE_PERSONA_MAX_TOKENS=${ROUNDTABLE_PERSONA_MAX_TOKENS}
@@ -111,31 +62,33 @@ services:
       - AZURE_PERSONA_ENDPOINT=${AZURE_PERSONA_ENDPOINT}
       - AZURE_PERSONA_API_KEY=${AZURE_PERSONA_API_KEY}
       - TREND_SCOUT_ENABLED=${TREND_SCOUT_ENABLED}
-      # Remotion `generated`-slide codegen deployment/tuning (workflow/video/codegen.py).
-      # CODEGEN_MAX_TOTAL_ATTEMPTS was never passed through compose either — added here too.
+
+      # Code generation
       - CODEGEN_MAX_TOTAL_ATTEMPTS=${CODEGEN_MAX_TOTAL_ATTEMPTS}
       - CODEGEN_MODEL=${CODEGEN_MODEL}
       - CODEGEN_REASONING_EFFORT=${CODEGEN_REASONING_EFFORT}
       - CODEGEN_MAX_TOKENS=${CODEGEN_MAX_TOKENS}
       - CODEGEN_PLAN_MAX_TOKENS=${CODEGEN_PLAN_MAX_TOKENS}
       - CODEGEN_PLAN_REASONING_EFFORT=${CODEGEN_PLAN_REASONING_EFFORT}
-      # Voiceover (Azure Speech TTS) — off by default (mock), opt-in per render via
-      # POST /tasks/{id}/render-video's narration_text field either way.
-      # - AZURE_SPEECH_KEY=${AZURE_SPEECH_KEY}
-      # - AZURE_SPEECH_REGION=${AZURE_SPEECH_REGION}
-      # Cloud (Remotion Lambda) video rendering — off by default (VIDEO_RENDER_BACKEND
-      # defaults to "local", the subprocess path this image is already built for).
-      # Uncomment once a function + stable site are deployed (see .env.example).
-      # - AWS_REGION=${AWS_REGION}
-      # - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      # - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      # - REMOTION_LAMBDA_FUNCTION_NAME=${REMOTION_LAMBDA_FUNCTION_NAME}
-      # - REMOTION_LAMBDA_SERVE_URL=${REMOTION_LAMBDA_SERVE_URL}
 
-      # Higgsfield credentials
+      # Higgsfield
       - USE_MOCK_VIDEO_GENERATION=false
       - HIGGSFIELD_API_KEY=${HIGGSFIELD_API_KEY}
       - HIGGSFIELD_API_SECRET=${HIGGSFIELD_API_SECRET}
       - HIGGSFIELD_IMAGE_MODEL=${HIGGSFIELD_IMAGE_MODEL}
       - HIGGSFIELD_TEXT_MODEL=${HIGGSFIELD_TEXT_MODEL}
       - HIGGSFIELD_MAX_DURATION_S=15
+
+  frontend:
+    build:
+      context: frontend_service
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - BRAND_VIDEO_AGENT_URL=http://backend:8081
+      - TEXT_AGENT_URL=http://backend:8081
+      - BACKEND_URL=http://backend:8081
+    depends_on:
+      - llm
+      - backend

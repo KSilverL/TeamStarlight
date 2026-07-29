@@ -1,5 +1,8 @@
 import { NextRequest } from "next/server";
 
+const VIDEO_AGENT_URL =
+  process.env.BRAND_VIDEO_AGENT_URL ?? "http://localhost:8081";
+
 const LLM_URL = process.env.LLM_SERVICE_URL ?? "http://localhost:8080";
 
 export async function POST(request: NextRequest) {

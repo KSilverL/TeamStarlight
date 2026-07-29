@@ -1589,6 +1589,9 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
   const [postError, setPostError] = useState<string | null>(null);
   // Reference images carried from the compose box; the user can drop any before rendering.
   const [refs, setRefs] = useState<string[]>(message.referenceImages ?? []);
+  // instagram posting
+  const [igPostStatus, setIgPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
+  const [igPostError, setIgPostError] = useState<string | null>(null);
 
   async function handlePostVideoToLinkedIn() {
     if (!jobId || !caption.trim()) return;
@@ -1619,6 +1622,29 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
     } catch {
       setPostStatus("error");
       setPostError("Could not reach the backend.");
+    }
+  }
+  
+  async function handlePostVideoToInstagram() {
+    if (!jobId) return;
+    setIgPostStatus("posting");
+    setIgPostError(null);
+    try {
+      const res = await fetch("/api/instagram/post-video", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jobId, caption: caption ?? "" }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setIgPostStatus("error");
+        setIgPostError(data.error ?? "Failed to post video to Instagram.");
+        return;
+      }
+      setIgPostStatus("posted");
+    } catch (err) {
+      setIgPostStatus("error");
+      setIgPostError("Could not reach the backend.");
     }
   }
 
@@ -1776,6 +1802,30 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
             )}
           </div>
         )}
+		
+		{renderState === "done" && downloadUrl && (
+		  <div className="px-4 pb-4 pt-1 border-t border-[#E8E3DA] space-y-2">
+		    {igPostStatus === "posted" ? (
+		      <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+		        ✓ Posted to Instagram
+		      </div>
+		    ) : (
+				<button
+				  type="button"
+				  onClick={handlePostVideoToInstagram}
+				  // disabled={igPostStatus === "posting"}
+				  className="w-full bg-gradient-to-r from-purple-600 to-pink-600 hover:opacity-90 disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+				>
+				  {igPostStatus === "posting" ? "Uploading & posting…" : "Post Video to Instagram"}
+				</button>
+		    )}
+
+		    {igPostStatus === "error" && igPostError && (
+		      <p className="text-xs text-red-600 text-center">{igPostError}</p>
+		    )}
+		  </div>
+		)}
+
 
         <p className="text-xs text-[#9E9893] px-4 pb-3">
           {formatTime(message.timestamp)}
@@ -2399,6 +2449,9 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
   const platform = platformMap[message.platform!];
   const draft = message.draft!;
   const approval = message.approval;
+
+  // "now" = post immediately, "schedule" = pick a date/time first
+  const [postMode, setPostMode] = useState<"now" | "schedule">("now");
   const [postStatus, setPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
   const [postError, setPostError] = useState<string | null>(null);
   // Image posting is tracked separately from the text post so the two buttons don't clobber
@@ -2445,16 +2498,31 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
     }
   }
 
+  // Scheduling fields — native date/time inputs give a built-in calendar UI
+  const [scheduleDate, setScheduleDate] = useState(""); // "2026-07-18"
+  const [scheduleTime, setScheduleTime] = useState(""); // "10:00"
+  const [scheduleStatus, setScheduleStatus] = useState<"idle" | "scheduling" | "scheduled" | "error">("idle");
+  const [scheduleError, setScheduleError] = useState<string | null>(null);
+
+  function fullText() {
+    return draft.hashtags && draft.hashtags.length > 0
+      ? `${draft.text}\n\n${draft.hashtags.join(" ")}`
+      : draft.text;
+  }
+
   async function handlePostToLinkedIn() {
     const token = localStorage.getItem("starlight_token");
     if (!token) {
       setPostStatus("error");
-      setPostError("Log in, then connect LinkedIn from your Brand Profile before posting.");
+      setPostError(
+        "Log in, then connect LinkedIn from your Brand Profile before posting."
+      );
       return;
     }
+
     setPostStatus("posting");
     setPostError(null);
-    const text = captionText;
+
     try {
       const res = await fetch("/api/linkedin/post", {
         method: "POST",
@@ -2462,14 +2530,17 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ message: text }),
+        body: JSON.stringify({ message: fullText() }),
       });
+
       const data = await res.json();
+
       if (!res.ok || data.error) {
         setPostStatus("error");
         setPostError(data.error ?? "Failed to post to LinkedIn.");
         return;
       }
+
       setPostStatus("posted");
     } catch {
       setPostStatus("error");
@@ -2477,14 +2548,51 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
     }
   }
 
+  async function handleSchedulePost() {
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setScheduleStatus("error");
+      setScheduleError("Log in, then connect LinkedIn from your Brand Profile before scheduling.");
+      return;
+    }
+    if (!scheduleDate || !scheduleTime) {
+      setScheduleStatus("error");
+      setScheduleError("Pick a date and time first.");
+      return;
+    }
+    setScheduleStatus("scheduling");
+    setScheduleError(null);
+
+    const scheduled_time = `${scheduleDate}T${scheduleTime}:00`;
+
+    try {
+      const res = await fetch("/api/linkedin/scheduled-posts", {   // ← changed here
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ message: fullText(), scheduled_time }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setScheduleStatus("error");
+        setScheduleError(data.error ?? "Failed to schedule the post.");
+        return;
+      }
+      setScheduleStatus("scheduled");
+    } catch {
+      setScheduleStatus("error");
+      setScheduleError("Could not reach the backend.");
+    }
+  }
+  
   return (
     <div className="w-full max-w-lg">
       <p className="text-sm text-[#6B6561] mb-2">{message.content}</p>
       <div className="bg-white border border-[#E8E3DA] rounded-2xl overflow-hidden shadow-sm">
         {/* Platform header */}
-        <div
-          className={`flex items-center justify-between px-4 py-2.5 ${platform.headerClass}`}
-        >
+        <div className={`flex items-center justify-between px-4 py-2.5 ${platform.headerClass}`}>
           <span className="text-sm font-semibold">{platform.label}</span>
           {approval === "approved" && (
             <span className="text-xs bg-green-500 text-white px-2 py-0.5 rounded-full font-medium">
@@ -2528,7 +2636,7 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
           )}
         </div>
 
-        {/* Actions */}
+        {/* Approve / Reject */}
         {approval === "pending" && (
           <div className="flex gap-2 px-4 pb-4">
             <button
@@ -2546,23 +2654,84 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
           </div>
         )}
 
+        {/* Post / Schedule (LinkedIn only, once approved) */}
         {approval === "approved" && message.platform === "linkedin" && (
-          <div className="px-4 pb-4">
+          <div className="px-4 pb-4 space-y-3">
             {postStatus === "posted" ? (
               <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
                 ✓ Posted to LinkedIn
               </div>
+            ) : scheduleStatus === "scheduled" ? (
+              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+                ✓ Scheduled for {scheduleDate} at {scheduleTime}
+              </div>
             ) : (
-              <button
-                onClick={handlePostToLinkedIn}
-                disabled={postStatus === "posting"}
-                className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-              >
-                {postStatus === "posting" ? "Posting…" : "Post to LinkedIn"}
-              </button>
-            )}
-            {postStatus === "error" && postError && (
-              <p className="text-xs text-red-600 mt-2 text-center">{postError}</p>
+              <>
+                {/* Mode toggle */}
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setPostMode("now")}
+                    className={`flex-1 text-sm font-medium py-1.5 rounded-lg transition-colors ${
+                      postMode === "now"
+                        ? "bg-[#0A66C2] text-white"
+                        : "bg-[#F2EDE4] text-[#6B6561] border border-[#E8E3DA]"
+                    }`}
+                  >
+                    Post Now
+                  </button>
+                  <button
+                    onClick={() => setPostMode("schedule")}
+                    className={`flex-1 text-sm font-medium py-1.5 rounded-lg transition-colors ${
+                      postMode === "schedule"
+                        ? "bg-[#0A66C2] text-white"
+                        : "bg-[#F2EDE4] text-[#6B6561] border border-[#E8E3DA]"
+                    }`}
+                  >
+                    Schedule
+                  </button>
+                </div>
+
+                {postMode === "now" ? (
+                  <button
+                    onClick={handlePostToLinkedIn}
+                    disabled={postStatus === "posting"}
+                    className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                  >
+                    {postStatus === "posting" ? "Posting…" : "Post to LinkedIn"}
+                  </button>
+                ) : (
+                  <div className="space-y-2">
+                    <div className="flex gap-2">
+                      <input
+                        type="date"
+                        value={scheduleDate}
+                        onChange={(e) => setScheduleDate(e.target.value)}
+                        className="flex-1 bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-1.5 text-sm text-[#1B1A17] focus:outline-none focus:border-[#0A66C2]"
+                      />
+                      <input
+                        type="time"
+                        value={scheduleTime}
+                        onChange={(e) => setScheduleTime(e.target.value)}
+                        className="flex-1 bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-1.5 text-sm text-[#1B1A17] focus:outline-none focus:border-[#0A66C2]"
+                      />
+                    </div>
+                    <button
+                      onClick={handleSchedulePost}
+                      disabled={scheduleStatus === "scheduling"}
+                      className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                    >
+                      {scheduleStatus === "scheduling" ? "Scheduling…" : "Schedule Post"}
+                    </button>
+                  </div>
+                )}
+
+                {postStatus === "error" && postError && (
+                  <p className="text-xs text-red-600 text-center">{postError}</p>
+                )}
+                {scheduleStatus === "error" && scheduleError && (
+                  <p className="text-xs text-red-600 text-center">{scheduleError}</p>
+                )}
+              </>
             )}
 
             {/* Optional: attach an image and publish it with this caption as an image post. */}

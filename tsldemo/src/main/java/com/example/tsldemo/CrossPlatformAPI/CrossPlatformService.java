@@ -6,12 +6,21 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.ZoneId;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.stream.Stream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
+
 
 import org.apache.tika.Tika;
 import org.slf4j.Logger;
@@ -21,6 +30,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.scheduling.TaskScheduler;
 import org.springframework.stereotype.Service;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
@@ -30,6 +40,8 @@ import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.server.ResponseStatusException;
 
 import com.example.tsldemo.CrossPlatformOAuth;
+import com.example.tsldemo.Message;
+import com.example.tsldemo.Session;
 import com.example.tsldemo.DTOs.Request.LinkedInCredsReqDTO;
 import com.example.tsldemo.DTOs.Request.LinkedInPostReqDTO;
 import com.example.tsldemo.DTOs.Request.LinkedInVideoPostReqDTO;
@@ -40,6 +52,7 @@ import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInVideoInitializ
 import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInVideoStatusRespDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInVideoUploadInstructionDTO;
 import com.example.tsldemo.ENUMS.PlatformEnum;
+import com.example.tsldemo.SessionAPI.SessionService;
 
 import jakarta.servlet.http.HttpServletResponse;
 
@@ -86,6 +99,8 @@ public class CrossPlatformService {
 
     @Autowired
     private CrossPlatformRepository crossPlatformRepository;
+    
+    @Autowired SessionService sessionServ;
 
 	private final RestClient restClient;
 
@@ -94,12 +109,16 @@ public class CrossPlatformService {
 
     @Value("${frontend.base-url:http://localhost:3000}")
     private String frontendBaseUrl;
-
+    
     @Value("${llm.service.base-url:http://localhost:8080}")
     private String llmServiceBaseUrl;
+    
+    private final TaskScheduler taskScheduler;
 
-    public CrossPlatformService(RestClient restClient) {
+
+    public CrossPlatformService(RestClient restClient, TaskScheduler taskScheduler) {
         this.restClient = restClient;
+        this.taskScheduler = taskScheduler;
     }
 
     //////////////////////////////////////////////////////// LINKEDIN METHODS ////////////////////////////////////////////////////////
@@ -536,4 +555,16 @@ public class CrossPlatformService {
         crossPlatformRepository.save(crossPlatformOAuth);
     }
 
+    
+    public void schedulePostToLinkedIn(int businessId, LinkedInPostReqDTO scheduledPost) {
+        Instant when = scheduledPost.scheduledTime()
+                .atZone(ZoneId.systemDefault())
+                .toInstant();
+
+        taskScheduler.schedule(() -> {
+            System.out.println("Scheduled LinkedIn post fired at " + Instant.now());
+            postToLinkedIn(businessId, scheduledPost);
+        }, when);
+    }
+    
 }
