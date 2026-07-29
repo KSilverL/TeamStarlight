@@ -205,6 +205,49 @@ async def test_generate_video_prompt_parity():
             assert out["motion"] is None or isinstance(out["motion"], str)
 
 
+async def test_voiceover_synthesize_parity():
+    """Both VoiceoverService impls return a SynthesizedSpeech (audio bytes + a positive
+    duration). The Azure impl derives duration from its CBR output; the mock from word
+    count — either way jobs.py can size/stretch slides against it."""
+    from LLM_service.core.config import Settings
+    from LLM_service.core.services.base import SynthesizedSpeech
+
+    text, voice = "Welcome to the launch.", "en-US-Ava:DragonHDLatestNeural"
+    m = await mock.MockVoiceover().synthesize(text=text, voice=voice)
+
+    # Azure impl: fake the HTTP layer via a stub client so no network/credentials.
+    az = azure.AzureSpeechVoiceover(Settings(azure_speech_key="k", azure_speech_region="eastus"))
+
+    class _Resp:
+        content = b"\xff\xfb\x10\xc0" * 500
+
+        def raise_for_status(self):
+            pass
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **k):
+            return _Resp()
+
+    import httpx
+    original = httpx.AsyncClient
+    httpx.AsyncClient = lambda *a, **k: _Client()
+    try:
+        a = await az.synthesize(text=text, voice=voice)
+    finally:
+        httpx.AsyncClient = original
+
+    for out in (m, a):
+        assert isinstance(out, SynthesizedSpeech)
+        assert isinstance(out.audio, bytes) and out.audio
+        assert isinstance(out.duration_seconds, float) and out.duration_seconds > 0
+
+
 # ── Cross-language slide-variant parity (Python spec ⟷ types.ts) ──────────────
 # The renderer's types.ts is hand-mirrored from video_schema.py with no automated
 # check on the TS side; this guards the `variant` Literal unions specifically, since

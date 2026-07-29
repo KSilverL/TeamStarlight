@@ -902,7 +902,7 @@ class VideoService:
     async def start(
         self, task_id: str, platform: str, *,
         narration_text: Optional[str] = None, narration_voice: Optional[str] = None,
-        reference_images: Optional[list[str]] = None,
+        narration_enabled: bool = True, reference_images: Optional[list[str]] = None,
     ) -> dict:
         draft = self._workflow.get_final_draft(task_id, platform)
         if draft is None:
@@ -913,6 +913,7 @@ class VideoService:
         doc = await start_render_job(
             task_id=task_id, platform=platform, storyboard=StoryboardSpec(**storyboard),
             narration_text=narration_text, narration_voice=narration_voice,
+            narration_enabled=narration_enabled,
             reference_images=_decode_reference_images(reference_images),
         )
         return {"job_id": doc["id"], "status": doc["status"]}
@@ -1151,12 +1152,17 @@ class GenerateHtmlRequest(BaseModel):
 class RenderVideoRequest(BaseModel):
     platform: str = Field(..., description="Which finished platform draft's storyboard to render")
     narration_text: Optional[str] = Field(
-        None, description="Optional voiceover script to synthesize and mix into the render "
-        "(Phase 3: TTS via Azure Speech, or a silent mock). Omit for no narration."
+        None, description="Override the agent-authored voiceover script. Omit to use the "
+        "narration the storyboard LLM wrote (narration is on by default); set "
+        "narration_enabled=false for a silent-narration render."
     )
     narration_voice: Optional[str] = Field(
-        None, description="Provider voice id (e.g. an Azure Neural voice name). "
-        "Omit to use VOICEOVER_DEFAULT_VOICE."
+        None, description="Override the voice as a provider voice id (e.g. an Azure Neural "
+        "voice name). Omit to use the voice persona the storyboard LLM picked."
+    )
+    narration_enabled: bool = Field(
+        True, description="Whether to render narration at all. True (default) uses the "
+        "agent's script (or narration_text override); false suppresses narration entirely."
     )
     reference_images: Optional[list[str]] = Field(
         None, description="1-3 user-attached reference images as base64 data URLs "
@@ -1313,6 +1319,7 @@ async def render_video(request: Request, task_id: str, body: RenderVideoRequest)
     return await _video(request).start(
         task_id, body.platform,
         narration_text=body.narration_text, narration_voice=body.narration_voice,
+        narration_enabled=body.narration_enabled,
         reference_images=body.reference_images,
     )
 

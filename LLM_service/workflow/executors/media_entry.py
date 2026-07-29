@@ -33,5 +33,6 @@ class MediaEntryExecutor(Executor):
                     needs_human_intervention=False,
                     proposed_rules=[],
                     brief=brief,
+                    strategy=basis,  # the discussion consensus doubles as the media direction here
                 )
             )

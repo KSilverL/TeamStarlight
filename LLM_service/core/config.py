@@ -20,6 +20,7 @@ toggles are gone; `USE_MOCK_STORE` (PostgreSQL) replaces `USE_MOCK_RAG`, and
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from functools import lru_cache
@@ -243,14 +244,23 @@ class Settings:
     # https://apidocs.geoapify.com/docs/maps/map-tiles/ for the preset names.
     geoapify_map_style: Optional[str] = "osm-liberty"
 
-    # ── Soundraw (background music generation) ──────────────────────────────────
+    # ── Background music ────────────────────────────────────────────────────────
+    # Soundraw is a generative option but is enterprise-gated; the default real
+    # provider is a local, curated royalty-free library (media_assets.BundledMusicLibrary):
+    # zero key, zero cost, offline. `music_library_dir` overrides where its tracks +
+    # manifest.json live (default: LLM_service/assets/music/). The bundled library is
+    # used when USE_MOCK_MUSIC_GENERATION=false and the library has ≥1 tagged track;
+    # Soundraw is only reached if no library is populated.
+    music_library_dir: Optional[str] = None
     soundraw_api_key: Optional[str] = None
 
     # ── Azure Speech (voiceover text-to-speech) ─────────────────────────────────
     azure_speech_key: Optional[str] = None
     azure_speech_region: Optional[str] = None
-    # Default Neural voice when a caller doesn't specify one (POST /tasks/{id}/render-video).
-    voiceover_default_voice: str = "en-US-JennyNeural"
+    # Default voice when a persona/caller doesn't specify one. An Azure Dragon HD voice
+    # (LM-based, far more natural than the older Neural voices) — same Speech endpoint;
+    # note HD voices may require the S0 tier and specific regions (see .env.example).
+    voiceover_default_voice: str = "en-US-Ava:DragonHDLatestNeural"
 
     # ── Higgsfield (premium generative AI video render backend) ─────────────────
     # Used only when video_render_backend == "higgsfield" (see below). Auth + upload +
@@ -431,6 +441,28 @@ class Settings:
         return bool(self.soundraw_api_key)
 
     @property
+    def resolved_music_library_dir(self) -> Path:
+        """Absolute path to the bundled royalty-free music library. MUSIC_LIBRARY_DIR
+        overrides; otherwise defaults to LLM_service/assets/music/ (this file is
+        core/config.py, so parent.parent is LLM_service/)."""
+        if self.music_library_dir:
+            return Path(self.music_library_dir).resolve()
+        return Path(__file__).resolve().parent.parent / "assets" / "music"
+
+    @property
+    def has_music_library(self) -> bool:
+        """Whether a usable bundled music library is present: a manifest.json with at
+        least one tagged track. Parses defensively — a missing/malformed manifest reads
+        as 'no library' (the factory then falls back to Soundraw/mock), never an error."""
+        manifest = self.resolved_music_library_dir / "manifest.json"
+        if not manifest.is_file():
+            return False
+        try:
+            return bool(json.loads(manifest.read_text(encoding="utf-8")).get("tracks"))
+        except Exception:
+            return False
+
+    @property
     def has_web_search(self) -> bool:
         return bool(self.foundry_project_endpoint and self.web_search_agent_name)
 
@@ -560,10 +592,11 @@ def _load() -> Settings:
         removebg_api_key=os.getenv("REMOVEBG_API_KEY"),
         geoapify_api_key=os.getenv("GEOAPIFY_API_KEY"),
         geoapify_map_style=os.getenv("GEOAPIFY_MAP_STYLE") or None,
+        music_library_dir=os.getenv("MUSIC_LIBRARY_DIR"),
         soundraw_api_key=os.getenv("SOUNDRAW_API_KEY"),
         azure_speech_key=os.getenv("AZURE_SPEECH_KEY"),
         azure_speech_region=os.getenv("AZURE_SPEECH_REGION"),
-        voiceover_default_voice=os.getenv("VOICEOVER_DEFAULT_VOICE", "en-US-JennyNeural"),
+        voiceover_default_voice=os.getenv("VOICEOVER_DEFAULT_VOICE", "en-US-Ava:DragonHDLatestNeural"),
         higgsfield_api_key=os.getenv("HIGGSFIELD_API_KEY"),
         higgsfield_api_secret=os.getenv("HIGGSFIELD_API_SECRET"),
         higgsfield_text_model=os.getenv("HIGGSFIELD_TEXT_MODEL", ""),

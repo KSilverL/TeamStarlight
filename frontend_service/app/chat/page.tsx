@@ -185,6 +185,10 @@ interface Message {
   // Workflow-specific fields — set when the message originates from the MAF pipeline.
   workflowTaskId?: string;
   needsHumanIntervention?: boolean;
+  // Set on a text draft (variant "text-preview") when the same task also asked for a video:
+  // the real publish is the native video post (video + this copy as caption), so the draft
+  // card hides its own text/image post buttons and points the user to the video card below.
+  videoAlsoRequested?: boolean;
   videoStoryboard?: VideoStoryboard;
   // User-attached reference images (base64 data URLs) for image-to-video generation
   // (Higgsfield backend). Threaded from the compose box onto the storyboard message so
@@ -883,6 +887,10 @@ export default function ChatPage() {
             workflowTaskId: taskId,
             needsHumanIntervention: (event.needs_human_intervention as boolean) ?? false,
             approval: "pending",
+            // When a video was also requested, the single publish is the native video post
+            // (caption = this copy) from the storyboard card below — so hide this card's own
+            // text/image post buttons to avoid a competing second post.
+            videoAlsoRequested: contentTypes.includes("video"),
           });
           if (sessionIdRef.current) {
             persistMessage(sessionIdRef.current, "assistant", event.draft as string);
@@ -928,6 +936,9 @@ export default function ChatPage() {
             workflowTaskId: taskId,
             approval: "approved",
             referenceImages: pendingRefsRef.current.length ? pendingRefsRef.current : undefined,
+            // Carry the approved copy so the video card prefills its caption with it — a text+video
+            // task then publishes as one native video post with the generated copy as the caption.
+            draft: contentTypes.includes("text") ? { text: event.draft as string } : undefined,
           });
         }
       }
@@ -1587,8 +1598,9 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
-  const [caption, setCaption] = useState("");
-  // Optional Facebook video title (maps to the Graph /videos `title`); Instagram-branch only.
+  // Prefill the caption with the approved post copy when a text+video task threaded it on
+  // (message.draft); a video-only task has none, so it starts empty for the user to write.
+  const [caption, setCaption] = useState(() => message.draft?.text ?? "");
   const [videoTitle, setVideoTitle] = useState("");
   const [postStatus, setPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
   const [postError, setPostError] = useState<string | null>(null);
@@ -2719,7 +2731,18 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
           </div>
         )}
 
-        {approval === "approved" && message.platform === "linkedin" && (
+        {/* A text+video task publishes as a single native video post (caption = this copy) from
+            the storyboard card below, so this card offers no competing text/image post — just a note. */}
+        {approval === "approved" && message.platform === "linkedin" && message.videoAlsoRequested && (
+          <div className="px-4 pb-4">
+            <div className="rounded-lg bg-[#F8F5EE] border border-[#E8E3DA] px-3 py-2 text-xs text-[#6B6561]">
+              This copy will be published as the caption of your video post below — render and
+              post it there to publish once.
+            </div>
+          </div>
+        )}
+
+        {approval === "approved" && message.platform === "linkedin" && !message.videoAlsoRequested && (
           <div className="px-4 pb-4">
             {postStatus === "posted" ? (
               <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">

@@ -679,6 +679,23 @@ re-generates a storyboard from a raw brief.
 { "job_id": "vid-a1b2c3d4e5f6", "status": "pending" }
 ```
 
+The storyboard LLM authors the video's audio — background music on `StoryboardSpec.audio`
+plus a **per-slide narration** line on each slide — so the bare request above already
+produces a scored, **narrated** video whose voice stays synced to each slide (each slide's
+line is synthesized separately and played over that slide; slides stretch to fit). Optional
+overrides:
+
+| Field | Default | Effect |
+|---|---|---|
+| `narration_text` | agent's per-slide narration | Override with your own single whole-video script (replaces the per-slide lines) |
+| `narration_voice` | agent-picked voice persona (Azure Dragon HD) | Override the voice with a provider voice id (e.g. `en-GB-RyanNeural`) |
+| `narration_enabled` | `true` | Set `false` for a music-only render with no narration |
+
+```json
+// request — silent-narration render
+{ "platform": "instagram", "narration_enabled": false }
+```
+
 Errors: `404` if the task/platform has no finished draft yet; `409` if that platform's run did
 not request `"video"` (no storyboard to render).
 
@@ -702,9 +719,11 @@ not request `"video"` (no storyboard to render).
 `status` goes `"pending"` → `"done"` (with `output_path`) or `"error"` (with the message —
 including a Remotion stderr tail on a render failure). A job never hangs the poll: any
 unexpected failure still lands as `"error"`. During the render the service resolves every
-storyboard image query (stock-photo search + background cutout) and generates a background
-track sized to the video — each of those degrades gracefully (missing image → plain colour
-shape; no music → silent video), so asset problems never fail the job.
+storyboard image query (stock-photo search + background cutout), synthesizes each slide's
+narration line (stretching the slide to fit), and generates a background music track
+(agent-selected mood/genre/energy) sized to the final length — each of those degrades
+gracefully (missing image → plain colour shape; a slide's narration fails → that slide
+silent; no music → silent video), so asset problems never fail the job.
 
 ### `GET /video-jobs/{job_id}/download` — fetch the MP4
 
