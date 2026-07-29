@@ -132,5 +132,9 @@ public class SessionController {
 		
 	}
 	
+	@DeleteMapping("api/session/{id}")
+	public Session deleteSession(@PathVariable String id) {
+		return service.deleteSession(id);
+	}
 	
 }

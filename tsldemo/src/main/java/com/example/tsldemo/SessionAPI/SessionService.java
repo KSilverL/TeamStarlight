@@ -24,6 +24,7 @@ import com.example.tsldemo.ApiDTOS.IntakeTurnRequest;
 import com.example.tsldemo.Business;
 import com.example.tsldemo.Message;
 import com.example.tsldemo.Session;
+import com.example.tsldemo.AgentAPI.AgentService;
 import com.example.tsldemo.DTOs.ResponseReceived.IntakeRespDTO;
 import com.example.tsldemo.SignInAPI.BusinessRepository;
 
@@ -44,12 +45,10 @@ public class SessionService {
         this.restClient = restClient;
     }
     
-    //TODO: clean function
     public IntakeResponse sendSessionToAgent(IntakeRequest intakeDTO, int businessId) {
     	Session session = createNewSession(businessId);
         intakeDTO.sessionId = session.getId();
         
-        //TODO: Fix IntakeReqDTO
         @Nullable 
         IntakeResponse intakeResp = restClient.post()
                 .uri(llmServiceBaseUrl + "/intake")
@@ -58,7 +57,6 @@ public class SessionService {
                 .retrieve()
                 .body(IntakeResponse.class);
                 
-        System.out.println(intakeResp.assistantMessage);
         Message userPrompt = new Message("user", intakeDTO.openingInput);
         Message openingMessage = new Message("assistant",intakeResp.assistantMessage);
         
@@ -125,5 +123,19 @@ public class SessionService {
 		repo.save(s);
 		
 	}
+	
+	public void setSessionTitle(String id, String title) {
+		Session s = repo.getReferenceById(id);
+		s.setTitle(title);
+		repo.save(s);
+		
+	}
+	
+	public Session deleteSession(String id) {
+    	Session session = repo.findById(id).get();
+    	repo.deleteById(id);
+    	
+    	return session;
+    }
 
 }
