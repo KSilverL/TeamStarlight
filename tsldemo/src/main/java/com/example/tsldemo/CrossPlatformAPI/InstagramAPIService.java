@@ -1,17 +1,16 @@
 package com.example.tsldemo.CrossPlatformAPI;
-
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
-import org.springframework.web.multipart.MultipartFile;
 
 import com.example.tsldemo.ApiDTOS.InstagramResponse;
 import com.example.tsldemo.ApiDTOS.InstagramStatusResponse;
+import com.example.tsldemo.AgentAPI.AgentService;
 
 @Service
 public class InstagramAPIService {
-
-    private final String graphUrl = "https://graph.instagram.com/v23.0/";
+//
+//    private final String graphUrl = "https://graph.instagram.com/v23.0/";
 
     @Value("${instagram.account.id}")
     private String accountId;
@@ -21,14 +20,18 @@ public class InstagramAPIService {
 
     private final RestClient restClient;
     private final VideoStorageService videoStorageService;
+    private final AgentService agentService;
 
-    public InstagramAPIService(RestClient restClient, VideoStorageService videoStorageService) {
+    public InstagramAPIService(RestClient restClient, VideoStorageService videoStorageService, AgentService agentService) {
         this.restClient = restClient;
         this.videoStorageService = videoStorageService;
+        this.agentService = agentService;
     }
 
-    public String postVideo(MultipartFile video, String caption) throws Exception {
-        String sasVideoUrl = videoStorageService.uploadAndGetSasUrl(video);
+    public String postVideo(String videoJobId, String caption) throws Exception {
+    	byte[] videoBytes = agentService.downloadVideo(videoJobId);
+    	
+        String sasVideoUrl = videoStorageService.uploadAndGetSasUrl(videoBytes, videoJobId, videoBytes.length);
 
         InstagramResponse container = restClient.post()
                 .uri(uriBuilder -> uriBuilder

@@ -2,7 +2,6 @@ package com.example.tsldemo.CrossPlatformAPI;
 
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.multipart.MultipartFile;
 
 @RestController
 @RequestMapping("/instagram")
@@ -16,10 +15,10 @@ public class InstagramAPIController {
 
     @PostMapping(value = "/post-video", consumes = "multipart/form-data")
     public ResponseEntity<String> postVideo(
-            @RequestParam("video") MultipartFile video,
+            @RequestParam("job_id") String jobId,
             @RequestParam("caption") String caption) throws Exception {
 
-        String mediaId = instagramAPIService.postVideo(video, caption);
+        String mediaId = instagramAPIService.postVideo(jobId, caption);
         return ResponseEntity.ok(mediaId);
     }
 }
