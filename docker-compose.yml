@@ -122,8 +122,8 @@ services:
 
       # Voiceover (Azure Speech TTS) — off by default (mock), opt-in per render via
       # POST /tasks/{id}/render-video's narration_text field either way.
-      - AZURE_SPEECH_KEY=${AZURE_SPEECH_KEY}
-      - AZURE_SPEECH_REGION=${AZURE_SPEECH_REGION}
+      - ROUNDTABLE_TTS_KEY=${ROUNDTABLE_TTS_KEY}
+      - ROUNDTABLE_TTS_REGION=${ROUNDTABLE_TTS_REGION}
       # Cloud (Remotion Lambda) video rendering — off by default (VIDEO_RENDER_BACKEND
       # defaults to "local", the subprocess path this image is already built for).
       # Uncomment once a function + stable site are deployed (see .env.example).

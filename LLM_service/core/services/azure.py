@@ -1239,7 +1239,7 @@ class AzureSpeechVoiceover(VoiceoverService):
         self._settings = settings
 
     def _synthesis_url(self) -> str:
-        region = self._settings.azure_speech_region
+        region = self._settings.roundtable_tts_region
         return f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
 
     @staticmethod
@@ -1260,7 +1260,7 @@ class AzureSpeechVoiceover(VoiceoverService):
             resp = await client.post(
                 self._synthesis_url(),
                 headers={
-                    "Ocp-Apim-Subscription-Key": self._settings.azure_speech_key,
+                    "Ocp-Apim-Subscription-Key": self._settings.roundtable_tts_key,
                     "Content-Type": "application/ssml+xml",
                     "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
                 },

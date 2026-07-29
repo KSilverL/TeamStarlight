@@ -246,9 +246,9 @@ class Settings:
     # ── Soundraw (background music generation) ──────────────────────────────────
     soundraw_api_key: Optional[str] = None
 
-    # ── Azure Speech (voiceover text-to-speech) ─────────────────────────────────
-    azure_speech_key: Optional[str] = None
-    azure_speech_region: Optional[str] = None
+    # ── Azure Speech (text-to-speech — roundtable persona readback + video narration) ──
+    roundtable_tts_key: Optional[str] = None
+    roundtable_tts_region: Optional[str] = None
     # Default Neural voice when a caller doesn't specify one (POST /tasks/{id}/render-video).
     voiceover_default_voice: str = "en-US-JennyNeural"
 
@@ -435,8 +435,8 @@ class Settings:
         return bool(self.foundry_project_endpoint and self.web_search_agent_name)
 
     @property
-    def has_azure_speech(self) -> bool:
-        return bool(self.azure_speech_key and self.azure_speech_region)
+    def has_roundtable_tts(self) -> bool:
+        return bool(self.roundtable_tts_key and self.roundtable_tts_region)
 
     @property
     def has_higgsfield(self) -> bool:
@@ -561,8 +561,10 @@ def _load() -> Settings:
         geoapify_api_key=os.getenv("GEOAPIFY_API_KEY"),
         geoapify_map_style=os.getenv("GEOAPIFY_MAP_STYLE") or None,
         soundraw_api_key=os.getenv("SOUNDRAW_API_KEY"),
-        azure_speech_key=os.getenv("AZURE_SPEECH_KEY"),
-        azure_speech_region=os.getenv("AZURE_SPEECH_REGION"),
+        # Shared Azure Speech credential — used by BOTH the roundtable persona TTS
+        # readback and workflow/video/voiceover.py's video narration.
+        roundtable_tts_key=os.getenv("ROUNDTABLE_TTS_KEY"),
+        roundtable_tts_region=os.getenv("ROUNDTABLE_TTS_REGION"),
         voiceover_default_voice=os.getenv("VOICEOVER_DEFAULT_VOICE", "en-US-JennyNeural"),
         higgsfield_api_key=os.getenv("HIGGSFIELD_API_KEY"),
         higgsfield_api_secret=os.getenv("HIGGSFIELD_API_SECRET"),
