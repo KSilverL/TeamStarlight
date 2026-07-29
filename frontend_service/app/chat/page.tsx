@@ -264,6 +264,17 @@ const INITIAL_MESSAGES: Message[] = [
 
 const platformMap = Object.fromEntries(PLATFORMS.map((p) => [p.id, p]));
 
+// The Facebook Page id(s) the user picked in their Brand Profile. Instagram-labelled drafts
+// publish to these Pages via /api/meta/post; an empty list means Facebook isn't set up yet.
+function getSelectedPageIds(): number[] {
+  try {
+    const ids = JSON.parse(localStorage.getItem("starlight_meta_page_ids") || "[]");
+    return Array.isArray(ids) ? ids.map(Number).filter((n) => Number.isFinite(n)) : [];
+  } catch {
+    return [];
+  }
+}
+
 // Human-readable labels for each MAF executor shown as live status messages.
 const NODE_LABELS: Record<string, string> = {
   dispatcher: "Validating brief…",
@@ -1590,6 +1601,7 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
   // Prefill the caption with the approved post copy when a text+video task threaded it on
   // (message.draft); a video-only task has none, so it starts empty for the user to write.
   const [caption, setCaption] = useState(() => message.draft?.text ?? "");
+  const [videoTitle, setVideoTitle] = useState("");
   const [postStatus, setPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
   const [postError, setPostError] = useState<string | null>(null);
   // Reference images carried from the compose box; the user can drop any before rendering.
@@ -1618,6 +1630,55 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
       if (!res.ok || data.error) {
         setPostStatus("error");
         setPostError(data.error ?? "Failed to post video to LinkedIn.");
+        return;
+      }
+      setPostStatus("posted");
+    } catch {
+      setPostStatus("error");
+      setPostError("Could not reach the backend.");
+    }
+  }
+
+  // Instagram-labelled storyboards publish the rendered MP4 to the connected Facebook Page.
+  // The proxy fetches the video bytes from the LLM service by jobId, so we only pass the id.
+  async function handlePostVideoToFacebook() {
+    if (!jobId || !caption.trim()) return;
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setPostStatus("error");
+      setPostError("Log in, then connect Facebook from your Brand Profile before posting.");
+      return;
+    }
+    const pageIds = getSelectedPageIds();
+    if (pageIds.length === 0) {
+      setPostStatus("error");
+      setPostError("Connect Facebook and pick a Page in your Brand Profile first.");
+      return;
+    }
+    setPostStatus("posting");
+    setPostError(null);
+    try {
+      const res = await fetch("/api/meta/post-video", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          // Graph captions a Page video from `description` on the /{page-id}/videos edge —
+          // `message` is the /feed and /photos field and is silently dropped there. Send the
+          // caption as both so the one Java endpoint can serve whichever edge the mime picks.
+          jobId,
+          message: caption.trim(),
+          title: videoTitle.trim(),
+          description: caption.trim(),
+          pageIds,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setPostStatus("error");
+        setPostError(data.error ?? "Failed to post video to Facebook.");
         return;
       }
       setPostStatus("posted");
@@ -1773,6 +1834,46 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
                   className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
                 >
                   {postStatus === "posting" ? "Uploading & posting…" : "Post Video to LinkedIn"}
+                </button>
+              </>
+            )}
+            {postStatus === "error" && postError && (
+              <p className="text-xs text-red-600 text-center">{postError}</p>
+            )}
+          </div>
+        )}
+
+        {/* Instagram-labelled storyboards publish to the connected Facebook Page. */}
+        {renderState === "done" && message.platform === "instagram" && (
+          <div className="px-4 pb-4 pt-1 border-t border-[#E8E3DA] space-y-2">
+            {postStatus === "posted" ? (
+              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+                ✓ Posted to Facebook
+              </div>
+            ) : (
+              <>
+                <input
+                  type="text"
+                  value={videoTitle}
+                  onChange={(e) => setVideoTitle(e.target.value)}
+                  placeholder="Video title (optional)"
+                  disabled={postStatus === "posting"}
+                  className="w-full bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-2 text-xs text-[#1B1A17] placeholder:text-[#9E9893] focus:outline-none focus:border-[#FF4800] disabled:opacity-60"
+                />
+                <textarea
+                  value={caption}
+                  onChange={(e) => setCaption(e.target.value)}
+                  placeholder="Write a caption for this video…"
+                  rows={2}
+                  disabled={postStatus === "posting"}
+                  className="w-full bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-2 text-xs text-[#1B1A17] placeholder:text-[#9E9893] resize-none focus:outline-none focus:border-[#FF4800] disabled:opacity-60"
+                />
+                <button
+                  onClick={handlePostVideoToFacebook}
+                  disabled={postStatus === "posting" || !caption.trim()}
+                  className="w-full bg-[#1877F2] hover:bg-[#166FE0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                >
+                  {postStatus === "posting" ? "Uploading & posting…" : "Post Video to Facebook"}
                 </button>
               </>
             )}
@@ -2482,6 +2583,85 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
     }
   }
 
+  // Instagram-labelled drafts publish to a connected Facebook Page (see the Brand Profile
+  // "Facebook Page" card). These reuse the same status states as the LinkedIn handlers — a
+  // given card is only ever one platform, so they never run against each other.
+  async function handlePostTextToFacebook() {
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setPostStatus("error");
+      setPostError("Log in, then connect Facebook from your Brand Profile before posting.");
+      return;
+    }
+    const pageIds = getSelectedPageIds();
+    if (pageIds.length === 0) {
+      setPostStatus("error");
+      setPostError("Connect Facebook and pick a Page in your Brand Profile first.");
+      return;
+    }
+    setPostStatus("posting");
+    setPostError(null);
+    try {
+      const form = new FormData();
+      form.append("message", captionText);
+      for (const id of pageIds) form.append("pageId", String(id));
+      const res = await fetch("/api/meta/post", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setPostStatus("error");
+        setPostError(data.error ?? "Failed to post to Facebook.");
+        return;
+      }
+      setPostStatus("posted");
+    } catch {
+      setPostStatus("error");
+      setPostError("Could not reach the backend.");
+    }
+  }
+
+  async function handlePostImageToFacebook() {
+    if (!imageFile) return;
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setImagePostStatus("error");
+      setImagePostError("Log in, then connect Facebook from your Brand Profile before posting.");
+      return;
+    }
+    const pageIds = getSelectedPageIds();
+    if (pageIds.length === 0) {
+      setImagePostStatus("error");
+      setImagePostError("Connect Facebook and pick a Page in your Brand Profile first.");
+      return;
+    }
+    setImagePostStatus("posting");
+    setImagePostError(null);
+    try {
+      const form = new FormData();
+      form.append("image", imageFile);
+      form.append("message", captionText);
+      for (const id of pageIds) form.append("pageId", String(id));
+      const res = await fetch("/api/meta/post", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setImagePostStatus("error");
+        setImagePostError(data.error ?? "Failed to post image to Facebook.");
+        return;
+      }
+      setImagePostStatus("posted");
+    } catch {
+      setImagePostStatus("error");
+      setImagePostError("Could not reach the backend.");
+    }
+  }
+
   return (
     <div className="w-full max-w-lg">
       <p className="text-sm text-[#6B6561] mb-2">{message.content}</p>
@@ -2605,6 +2785,60 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
                     className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
                   >
                     {imagePostStatus === "posting" ? "Uploading & posting…" : "Post Image to LinkedIn"}
+                  </button>
+                </div>
+              )}
+              {imagePostStatus === "error" && imagePostError && (
+                <p className="text-xs text-red-600 mt-2 text-center">{imagePostError}</p>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Instagram-labelled drafts publish to the connected Facebook Page (Brand Profile). */}
+        {approval === "approved" && message.platform === "instagram" && (
+          <div className="px-4 pb-4">
+            {postStatus === "posted" ? (
+              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+                ✓ Posted to Facebook
+              </div>
+            ) : (
+              <button
+                onClick={handlePostTextToFacebook}
+                disabled={postStatus === "posting"}
+                className="w-full bg-[#1877F2] hover:bg-[#166FE0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+              >
+                {postStatus === "posting" ? "Posting…" : "Post to Facebook"}
+              </button>
+            )}
+            {postStatus === "error" && postError && (
+              <p className="text-xs text-red-600 mt-2 text-center">{postError}</p>
+            )}
+
+            {/* Optional: attach an image and publish it with this caption as a photo post. */}
+            <div className="mt-3 pt-3 border-t border-[#E8E3DA]">
+              {imagePostStatus === "posted" ? (
+                <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+                  ✓ Image posted to Facebook
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => {
+                      setImageFile(e.target.files?.[0] ?? null);
+                      setImagePostStatus("idle");
+                      setImagePostError(null);
+                    }}
+                    className="block w-full text-xs text-[#6B6561] file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border file:border-[#E8E3DA] file:bg-[#F2EDE4] file:text-[#1B1A17] file:text-xs file:font-medium hover:file:bg-[#E8E3DA]"
+                  />
+                  <button
+                    onClick={handlePostImageToFacebook}
+                    disabled={!imageFile || imagePostStatus === "posting"}
+                    className="w-full bg-[#1877F2] hover:bg-[#166FE0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                  >
+                    {imagePostStatus === "posting" ? "Uploading & posting…" : "Post Image to Facebook"}
                   </button>
                 </div>
               )}

@@ -156,12 +156,12 @@ const SECTION_TITLES: Record<Section, string> = {
 export default function ProfilePage() {
   const [active, setActive] = useState<Section>("approval");
 
-  // The LinkedIn OAuth round-trip redirects here with ?linkedin=connected|error — land
-  // the user on the Brand Profile tab (where the Connected Accounts banner lives) instead
-  // of the default Approval Queue tab, so the result of the flow is actually visible.
+  // The LinkedIn and Facebook OAuth round-trips redirect here with ?linkedin= / ?meta=
+  // connected|error — land the user on the Brand Profile tab (where the Connected Accounts
+  // banner lives) instead of the default Approval Queue tab, so the result is actually visible.
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    if (params.get("linkedin")) {
+    if (params.get("linkedin") || params.get("meta")) {
       // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time client-only URL read on mount, not a state sync loop
       setActive("brand");
     }
