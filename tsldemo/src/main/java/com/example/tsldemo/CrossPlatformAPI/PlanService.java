@@ -1,5 +1,7 @@
 package com.example.tsldemo.CrossPlatformAPI;
 
+import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.util.Map;
 
 import org.springframework.beans.factory.annotation.Value;
@@ -86,8 +88,8 @@ public class PlanService {
 
     
     @SuppressWarnings("unchecked")
-    public Map<String, Object> getDuePlans(String date, Integer businessId) {
-        String uri = llmServiceBaseUrl + "/plans/due?date=" + date
+    public Map<String, Object> getDuePlans(LocalDate today, Integer businessId) {
+        String uri = llmServiceBaseUrl + "/plans/due?date=" + today
                 + (businessId != null ? "&business_id=" + businessId : "");
 
         return restClient.get()
