@@ -183,7 +183,7 @@ public class CrossPlatformController {
         return ResponseEntity.ok(Map.of("status", "scheduled"));
         
     }
-}
+
     @PostMapping("/meta/auth")
     public void metaAuth(HttpServletResponse response,
                          @RequestBody Long businessId,

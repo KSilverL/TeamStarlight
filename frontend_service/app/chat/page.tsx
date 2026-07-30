@@ -2973,9 +2973,6 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
           </div>
         )}
 
-        {/* Post / Schedule (LinkedIn only, once approved) */}
-        {approval === "approved" && message.platform === "linkedin" && (
-          <div className="px-4 pb-4 space-y-3">
         {/* A text+video task publishes as a single native video post (caption = this copy) from
             the storyboard card below, so this card offers no competing text/image post — just a note. */}
         {approval === "approved" && message.platform === "linkedin" && message.videoAlsoRequested && (
@@ -2987,8 +2984,9 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
           </div>
         )}
 
+        {/* Post / Schedule (LinkedIn only, once approved) */}
         {approval === "approved" && message.platform === "linkedin" && !message.videoAlsoRequested && (
-          <div className="px-4 pb-4">
+          <div className="px-4 pb-4 space-y-3">
             {postStatus === "posted" ? (
               <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
                 ✓ Posted to LinkedIn
