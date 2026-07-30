@@ -56,7 +56,9 @@ import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInVideoInitializ
 import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInVideoStatusRespDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInVideoUploadInstructionDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaAuthAccessRespDTO;
+import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaDataTokenDetails;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaDataUserInfo;
+import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaGranularScopes;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaIdentityRespDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaInstagramAccount;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaPageInstagramRespDTO;
@@ -66,6 +68,7 @@ import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaUserInfoDTO;
 import com.example.tsldemo.DTOs.ResponseToFrontEnd.GlobalCredListRespDTO;
 import com.example.tsldemo.ENUMS.PlatformEnum;
 import com.example.tsldemo.SessionAPI.SessionService;
+import tools.jackson.core.JacksonException;
 import tools.jackson.databind.ObjectMapper;
 
 import jakarta.servlet.http.HttpServletResponse;
@@ -773,7 +776,7 @@ public class CrossPlatformService {
         // Ask Graph what was actually granted and turn it into a message that names the fix.
         if (metaUserInfo == null || metaUserInfo.data() == null || metaUserInfo.data().length == 0) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                    explainNoPages(crossPlatformOAuth.getAccessToken()));
+                    explainNoPages(crossPlatformOAuth));
         }
 
         crossPlatformOAuth.setPageIdArray(Arrays.stream(metaUserInfo.data()).map(MetaDataUserInfo::pageId).toArray(Long[]::new));
@@ -836,7 +839,7 @@ public class CrossPlatformService {
 
         MetaUserInfoDTO pages = fetchMetaPages(oauth.getAccessToken());
         if (pages == null || pages.data() == null || pages.data().length == 0) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, explainNoPages(oauth.getAccessToken()));
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, explainNoPages(oauth));
         }
 
         List<InstagramTarget> targets = new ArrayList<>();
@@ -890,12 +893,28 @@ public class CrossPlatformService {
         URI uri = URI.create("https://graph.facebook.com/v25.0/me/accounts?fields="
                 + URLEncoder.encode(META_PAGE_FIELDS, StandardCharsets.UTF_8));
         try {
-            MetaUserInfoDTO pages = restClient.get()
+            String raw = restClient.get()
                 .uri(uri)
                 .header("Authorization", "Bearer " + userAccessToken)
                 .retrieve()
-                .body(MetaUserInfoDTO.class);
+                .body(String.class);
+
+            MetaUserInfoDTO pages = objectMapper.readValue(raw, MetaUserInfoDTO.class);
+
+            // Only logged when the list came back empty. A populated response carries a Page access
+            // token per Page and must never reach the logs; an empty one carries nothing secret and
+            // is the only place Graph explains itself (paging cursors, a summary, an inline warning).
+            if (pages == null || pages.data() == null || pages.data().length == 0) {
+                log.warn("Meta /me/accounts returned no Pages. Raw response: {}", raw);
+                MetaUserInfoDTO recovered = recoverPagesFromGrantedIds(userAccessToken);
+                if (recovered != null) {
+                    return withResolvedInstagramAccounts(recovered, userAccessToken);
+                }
+            }
             return withResolvedInstagramAccounts(pages, userAccessToken);
+        } catch (JacksonException e) {
+            throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,
+                    "Facebook returned a Page list that could not be read.", e);
         } catch (RestClientResponseException e) {
             // Graph rejects the token itself here — expired (user tokens last ~60 days), revoked
             // in Facebook's app settings, or invalidated by a password change. Left unhandled this
@@ -907,6 +926,83 @@ public class CrossPlatformService {
                     + "Profile and accept every permission the dialog asks for. (Facebook said: "
                     + e.getResponseBodyAsString() + ")", e);
         }
+    }
+
+    /** The Pages named in the token's own grant, fetched one node at a time. Null when that
+     * recovers nothing, so the caller can fall through to its normal "no Pages" diagnostic.
+     *
+     * /me/accounts can come back empty for a token that debug_token simultaneously reports as
+     * carrying pages_show_list over specific Page ids — the edge is built from the user's Page
+     * roles, so a Page reachable only through a Business Portfolio assignment is absent from it
+     * while still being perfectly readable, and postable, as a node. Asking for the ids Meta itself
+     * says the token covers is therefore both the recovery and the diagnosis: either the Pages
+     * resolve and the connect flow proceeds, or Graph states a reason, which is logged verbatim.
+     *
+     * debug_token is called with the user token on both sides rather than an app token: Meta
+     * accepts a developer's own token there, and it keeps this usable from the token alone. */
+    private MetaUserInfoDTO recoverPagesFromGrantedIds(String userAccessToken) {
+        String[] pageIds;
+        try {
+            MetaTokenDetails details = restClient.get()
+                .uri(uriBuilder -> uriBuilder
+                    .scheme("https")
+                    .host("graph.facebook.com")
+                    .path("/debug_token")
+                    .queryParam("input_token", userAccessToken)
+                    .queryParam("access_token", userAccessToken)
+                    .build())
+                .retrieve()
+                .body(MetaTokenDetails.class);
+
+            if (details == null || details.data() == null || details.data().granularScopes() == null) {
+                return null;
+            }
+            pageIds = Arrays.stream(details.data().granularScopes())
+                    .filter(g -> "pages_show_list".equals(g.scope()))
+                    .map(MetaGranularScopes::targetIds)
+                    .filter(Objects::nonNull)
+                    .flatMap(Arrays::stream)
+                    .distinct()
+                    .toArray(String[]::new);
+        } catch (Exception e) {
+            log.warn("Could not read the granted Page ids to recover an empty /me/accounts", e);
+            return null;
+        }
+
+        if (pageIds.length == 0) {
+            return null;
+        }
+        log.info("/me/accounts was empty but the token grants pages_show_list over {} — reading each Page directly",
+                Arrays.toString(pageIds));
+
+        List<MetaDataUserInfo> recovered = new ArrayList<>();
+        for (String pageId : pageIds) {
+            URI uri = URI.create("https://graph.facebook.com/v25.0/" + pageId + "?fields="
+                    + URLEncoder.encode(META_PAGE_FIELDS, StandardCharsets.UTF_8));
+            try {
+                MetaDataUserInfo page = restClient.get()
+                    .uri(uri)
+                    .header("Authorization", "Bearer " + userAccessToken)
+                    .retrieve()
+                    .body(MetaDataUserInfo.class);
+
+                if (page != null && page.pageId() != null) {
+                    recovered.add(page);
+                }
+            } catch (RestClientResponseException e) {
+                // The whole point of this path — Graph's refusal names the cause that the empty
+                // edge withheld, so it is logged in full rather than summarised away.
+                log.warn("Granted Page {} could not be read directly: {}", pageId, e.getResponseBodyAsString());
+            } catch (Exception e) {
+                log.warn("Granted Page {} could not be read directly: {}", pageId, e.toString());
+            }
+        }
+
+        if (recovered.isEmpty()) {
+            return null;
+        }
+        log.info("Recovered {} Page(s) that /me/accounts omitted", recovered.size());
+        return new MetaUserInfoDTO(recovered.toArray(MetaDataUserInfo[]::new), null);
     }
 
     /** Fills in the linked Instagram account for any Page the /me/accounts edge left blank.
@@ -1053,7 +1149,16 @@ public class CrossPlatformService {
      * granted fewer permissions than were asked for, or it granted them while the user picked no
      * Page. /me/permissions distinguishes the two, so the message can name the actual next step
      * instead of leaving the user staring at an empty Page list. */
-    private String explainNoPages(String accessToken) {
+    private String explainNoPages(CrossPlatformOAuth oauth) {
+        String accessToken = oauth.getAccessToken();
+
+        // Which Pages was this token actually granted over? /me/permissions only answers whether a
+        // permission was granted at all, which is why a token that carries pages_show_list over an
+        // empty asset selection is indistinguishable from a healthy one there — the two look the
+        // same right up until /me/accounts comes back empty. debug_token's granular_scopes is the
+        // only view that separates them: it lists the Page ids each permission actually covers.
+        String assetSelection = describeGrantedAssets(oauth);
+
         // Which account is on the other end of this token? Authorising with a personal profile
         // that doesn't administer the Page looks identical to skipping the Page picker, so name
         // the account and let the user tell the two apart at a glance.
@@ -1106,14 +1211,79 @@ public class CrossPlatformService {
         if (!declined.isEmpty()) {
             return connectedAs + "Facebook returned no Pages because these permissions were not granted: "
                     + String.join(", ", declined)
-                    + ". Click Reconnect Facebook and accept every permission the dialog asks for.";
+                    + ". Click Reconnect Facebook and accept every permission the dialog asks for."
+                    + assetSelection;
         }
 
         return connectedAs + "Facebook granted the page permissions but returned no Pages. In the consent dialog "
                 + "you must also choose which Pages the app may use — click Reconnect Facebook and, on "
                 + "the 'What Pages do you want to use with this app?' step, tick your Page (or 'Opt in to "
-                + "all current and future Pages'). Also confirm your account has full control of the Page, "
-                + "and that it has a role on the Meta app while the app is in Development mode.";
+                + "all current and future Pages'). Also confirm the Page is a real Facebook Page rather than "
+                + "a personal profile with Instagram attached, that your account has full control of it, "
+                + "and that it has a role on the Meta app while the app is in Development mode."
+                + assetSelection;
+    }
+
+    /** The Page ids this token was granted over, phrased for the end of a "no Pages" message.
+     *
+     * Empty string when it can't be read — this is an aid to an error message that already stands
+     * on its own, so a failure here must never replace the guidance the user came for. */
+    private String describeGrantedAssets(CrossPlatformOAuth oauth) {
+        if (oauth.getClientId() == null || oauth.getClientSecret() == null) {
+            return "";
+        }
+        try {
+            MetaTokenDetails details = restClient.get()
+                .uri(uriBuilder -> uriBuilder
+                    .scheme("https")
+                    .host("graph.facebook.com")
+                    .path("/debug_token")
+                    .queryParam("input_token", oauth.getAccessToken())
+                    .queryParam("access_token", oauth.getClientId() + "|" + oauth.getClientSecret())
+                    .build())
+                .retrieve()
+                .body(MetaTokenDetails.class);
+
+            if (details == null || details.data() == null) {
+                return "";
+            }
+            MetaDataTokenDetails data = details.data();
+
+            log.info("Meta token debug: type={} valid={} userId={} expiresAt={} dataAccessExpiresAt={} scopes={}",
+                    data.type(), data.isValid(), data.userId(), data.expiresAt(), data.dataAccessExpiresAt(),
+                    data.scope() == null ? "[]" : Arrays.toString(data.scope()));
+
+            String pageTargets = null;
+            if (data.granularScopes() != null) {
+                for (MetaGranularScopes granular : data.granularScopes()) {
+                    // "no target_ids" is NOT "every asset" — for an asset-scoped permission it means
+                    // the grant named no asset at all. Labelling it "all assets" reads as the
+                    // healthiest possible state when it is in fact the emptiest, so it is spelled
+                    // out as what it literally is and left uninterpreted.
+                    log.info("Meta granular scope: {} -> {}", granular.scope(),
+                            granular.targetIds() == null
+                                    ? "no target_ids on the grant"
+                                    : Arrays.toString(granular.targetIds()));
+                    if ("pages_show_list".equals(granular.scope())) {
+                        pageTargets = granular.targetIds() == null
+                                ? null
+                                : Arrays.toString(granular.targetIds());
+                    }
+                }
+            }
+
+            // "Granted over specific Pages, yet /me/accounts is empty" and "granted over nothing"
+            // are opposite problems with opposite fixes, so say which one this token is.
+            if (pageTargets == null) {
+                return " (Diagnostic: this token carries no Page selection at all — pages_show_list "
+                        + "was granted without any Page attached, so the Page picker step was skipped "
+                        + "or no Page was ticked.)";
+            }
+            return " (Diagnostic: this token's pages_show_list covers " + pageTargets + ".)";
+        } catch (Exception e) {
+            log.warn("Could not debug the Meta token while diagnosing an empty Page list", e);
+            return "";
+        }
     }
 
     public List<String> postToMeta(CrossPlatPostReqDTO requestDTO) throws IOException {

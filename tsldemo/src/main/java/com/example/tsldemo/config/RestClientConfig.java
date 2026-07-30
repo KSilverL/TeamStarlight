@@ -27,6 +27,15 @@ public class RestClientConfig {
      * redaction alone still left live page tokens in the logs. */
     private static final Pattern ACCESS_TOKEN = Pattern.compile("(access_token\"?\\s*[=:]\\s*\"?)[^\"&,\\s]+");
 
+    /** Credentials Meta accepts in the query string, which the URI log line would otherwise print
+     * in full. `access_token` on /debug_token is the app secret proof — literally "<app-id>|<app
+     * secret>" — so an unredacted URI leaks the app secret itself, not just a session token, and
+     * `input_token` beside it is the live user token. `client_secret` rides the code-for-token
+     * exchange the same way. Header redaction never covered any of these because Meta puts them in
+     * the URL. */
+    private static final Pattern QUERY_CREDENTIAL =
+            Pattern.compile("([?&](?:access_token|input_token|client_secret|code)=)[^&]+");
+
     @Bean
     public RestClient restClient() {
         ReactorClientHttpRequestFactory requestFactory = new ReactorClientHttpRequestFactory();
@@ -38,7 +47,7 @@ public class RestClientConfig {
                 .requestInterceptor((request, body, execution) -> {
 
                     System.out.println("=== OUTGOING REQUEST ===");
-                    System.out.println("URI: " + request.getURI());
+                    System.out.println("URI: " + redactQuery(request.getURI().toString()));
                     System.out.println("METHOD: " + request.getMethod());
                     // Copy before masking — request.getHeaders() is the live outgoing map, so
                     // redacting in place would strip the credential off the actual request.
@@ -53,6 +62,11 @@ public class RestClientConfig {
                     return execution.execute(request, body);
                 })
                 .build();
+    }
+
+    /** Strips credentials Meta carries in the query string out of a URI bound for the logs. */
+    static String redactQuery(String uri) {
+        return QUERY_CREDENTIAL.matcher(uri).replaceAll("$1<redacted>");
     }
 
     /** Renders a request body for the log without dumping credentials or megabytes of binary.
