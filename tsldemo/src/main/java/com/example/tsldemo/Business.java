@@ -86,5 +86,4 @@ public class Business {
 		sessions.add(s);
 		s.setUser(this);
 	}
-
 }

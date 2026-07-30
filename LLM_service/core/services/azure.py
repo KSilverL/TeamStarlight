@@ -43,6 +43,7 @@ from .base import (
     RealtimeVoiceSession,
     SafetyResult,
     SafetyService,
+    SynthesizedSpeech,
     VoiceoverService,
     VoiceService,
 )
@@ -589,6 +590,7 @@ class AzureLLM(LLMService):
         tone_hint: Optional[str],
         platform: str,
         skill: str = "",
+        direction: str = "",
         history: Optional[List[dict]] = None,
     ) -> dict:
         schema = json.dumps(StoryboardSpec.model_json_schema())
@@ -602,11 +604,18 @@ class AzureLLM(LLMService):
             "Return ONLY valid JSON (no markdown fences, no prose) matching the schema "
             f"exactly:\n{schema}" + style_guide
         )
+        # The roundtable's agreed video direction (when present) is the primary creative brief —
+        # the caption is supporting context, not the whole basis.
+        direction_block = (
+            f"\nAgreed video direction (from the content roundtable — follow this):\n{direction}"
+            if direction and direction.strip() else ""
+        )
         user = (
             f"Brand topic: {topic}\n"
             f"Approved post copy:\n{draft}\n"
             f"Tone: {tone_hint or 'brand voice'}\n"
             f"Target platform: {platform}"
+            f"{direction_block}"
         )
         messages = [{"role": "system", "content": system}, *(history or []),
                     {"role": "user", "content": user}]
@@ -1443,6 +1452,13 @@ class AzureSpeechVoiceover(VoiceoverService):
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
+    # Constant bitrate of the requested output format below (48 kbit/s), used to
+    # derive the clip duration from the byte length without ffprobe or a decode:
+    # for CBR MP3, seconds ≈ bytes * 8 / bitrate. Dragon HD voices synthesize
+    # through this same endpoint — only the SSML `<voice name>` differs.
+    _OUTPUT_FORMAT = "audio-24khz-48kbitrate-mono-mp3"
+    _OUTPUT_BITRATE_BPS = 48000
+
     def _synthesis_url(self) -> str:
         region = self._settings.azure_speech_region
         return f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
@@ -1458,7 +1474,7 @@ class AzureSpeechVoiceover(VoiceoverService):
             "</speak>"
         )
 
-    async def synthesize(self, *, text: str, voice: str) -> bytes:
+    async def synthesize(self, *, text: str, voice: str) -> SynthesizedSpeech:
         import httpx  # lazy import, matches the rest of core/services/*
 
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1467,9 +1483,11 @@ class AzureSpeechVoiceover(VoiceoverService):
                 headers={
                     "Ocp-Apim-Subscription-Key": self._settings.azure_speech_key,
                     "Content-Type": "application/ssml+xml",
-                    "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+                    "X-Microsoft-OutputFormat": self._OUTPUT_FORMAT,
                 },
                 content=self._ssml(text, voice).encode("utf-8"),
             )
             resp.raise_for_status()
-            return resp.content
+            audio = resp.content
+            duration_seconds = (len(audio) * 8) / self._OUTPUT_BITRATE_BPS
+            return SynthesizedSpeech(audio=audio, duration_seconds=duration_seconds)

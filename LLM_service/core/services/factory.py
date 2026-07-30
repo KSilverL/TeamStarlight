@@ -199,7 +199,13 @@ def get_music_generation() -> MusicGenerationService:
         s = get_settings()
         if s.mock_music_generation():
             return mock.MockMusicGeneration()
-        _require(s.has_soundraw, "Soundraw", "SOUNDRAW_API_KEY", "USE_MOCK_MUSIC_GENERATION=true")
+        # Prefer the local royalty-free library (offline, no key) when it's populated;
+        # Soundraw is the generative fallback and is enterprise-gated.
+        if s.has_music_library:
+            return media_assets.BundledMusicLibrary(s)
+        _require(s.has_soundraw, "Background music",
+                 "a populated MUSIC_LIBRARY_DIR/manifest.json (see assets/music/README.md), "
+                 "or SOUNDRAW_API_KEY", "USE_MOCK_MUSIC_GENERATION=true")
         return media_assets.SoundrawMusic(s)
     return _cached("music_generation", build)
 

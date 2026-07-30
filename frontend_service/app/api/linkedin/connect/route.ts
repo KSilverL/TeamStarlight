@@ -1,4 +1,5 @@
 import { NextRequest } from "next/server";
+import { redirectTo } from "@/app/api/_lib/redirect";
 
 const JAVA_SERVICE_URL = process.env.BACKEND_URL ?? "http://localhost:8081";
 
@@ -14,7 +15,7 @@ const JAVA_SERVICE_URL = process.env.BACKEND_URL ?? "http://localhost:8081";
 export async function GET(request: NextRequest) {
   const token = request.nextUrl.searchParams.get("token");
   if (!token) {
-    return Response.redirect(new URL("/login", request.url), 302);
+    return redirectTo("/login");
   }
 
   try {
@@ -31,8 +32,8 @@ export async function GET(request: NextRequest) {
       return Response.redirect(location, 302);
     }
 
-    return Response.redirect(new URL("/profile?linkedin=error", request.url), 302);
+    return redirectTo("/profile?linkedin=error");
   } catch {
-    return Response.redirect(new URL("/profile?linkedin=error", request.url), 302);
+    return redirectTo("/profile?linkedin=error");
   }
 }

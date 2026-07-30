@@ -6,13 +6,24 @@ code) matching `core.video_schema.StoryboardSpec`. Rendering the actual MP4
 (Remotion + headless Chromium) is intentionally **external** to this service; edit
 this file to retune the spec without touching code.
 
+## Follow the agreed video direction when one is given
+
+When the request includes an **agreed video direction** (the consensus from the
+content roundtable — the visual tone, pacing, key beats, and on-screen call to
+action), treat it as the primary creative brief: it was decided by the panel, not
+guessed from the caption. Let it drive which slide types you choose and their order —
+the hook beat it names, the proof/stat beat, the visual payoff, the closing CTA. The
+post copy is supporting context for wording; the direction governs the *shape* of the
+video. When no direction is given, compose from the topic and copy as usual.
+
 ## You are composing, not filling in a template
 
 You do not pick between two fixed video formats. You compose a **storyboard**: an
 ordered list of 2-8 `slides`, each one a typed building block from the registry
 below. Choose which slide types to use, how many, and in what order, based on what
-best tells this brand's story — a stat-heavy launch might lean on `counter_stat` and
-`collage`; a simple announcement might be just `hook` → `outro`.
+best tells this brand's story (and the agreed direction above, when present) — a
+stat-heavy launch might lean on `counter_stat` and `collage`; a simple announcement
+might be just `hook` → `outro`.
 
 You may **only** use the slide types defined here — the JSON Schema you're given
 enumerates them via the `type` discriminator. Never invent a new slide type.
@@ -197,5 +208,43 @@ You may suggest a `durationFrames` per slide (at 30fps) if a moment clearly need
 more or less time, but it's optional — when omitted, a sensible per-type default is
 used. Don't try to compute exact totals; the platform's typical short-form length
 (roughly 15-35 seconds total) is enforced downstream regardless of what you suggest.
+
+## Audio — music (on `audio`) + per-slide narration (on each slide)
+
+A later step generates a music track and a spoken voiceover and mixes them into the
+render — you only choose the direction, never a URL or audio file.
+
+### Per-slide narration (`narration` on each slide) — this is how the voice stays in sync
+
+Give **each slide its own `narration`**: one natural spoken sentence the voiceover says
+*while that slide is on screen*. This is what keeps the audio matched to the visuals —
+the narration for the stat slide plays over the stat slide, the outro line over the
+outro, and so on.
+
+- Write it to be **heard**, not read: natural spoken rhythm, and it should **complement**
+  the slide (add context, momentum, a reason to care), not just read the slide's headline
+  back verbatim.
+- Keep each line **tight** — usually one short sentence. The video automatically stretches
+  each slide to fit its line, so you never need to cram, but don't pad either.
+- Together the lines should tell one continuous story across the slides: open on the
+  hook's idea, build through the middle, land on the outro's call to action.
+- A slide may set `narration` to `null` for a beat that plays under music alone.
+
+Prefer this per-slide `narration` over the whole-video `audio.narrationScript` (the latter
+is a fallback for the rare case you want a single voiceover not tied to slides — leave it
+null when you give per-slide narration).
+
+### Music (`audio` block)
+
+Always include an `audio` object. Pick music that matches the brand's energy and the story:
+- `musicMood`: *inspiring*, *uplifting*, *energetic*, *calm*, *dramatic*, or *playful*.
+- `musicGenre`: *corporate*, *cinematic*, *electronic*, *acoustic*, *hiphop*, or *ambient*.
+- `musicEnergy`: *low*, *medium*, or *high* — match the `transition`/`backgroundStyle`
+  energy (a calm, faded, aurora video wants *low*; a punchy, slide/wipe video wants *high*).
+- `narrationVoice`: the voice persona that best fits the brand — *warm* (friendly,
+  approachable), *energetic* (upbeat, dynamic), *authoritative* (confident, serious), or
+  *friendly* (bright, casual). One voice narrates the whole video.
+
+Use ONLY the listed values for music fields — anything else is rejected server-side.
 
 Return only valid structured data — no explanation.

@@ -53,6 +53,7 @@ from LLM_service.workflow.roundtable.personas import (
     ROSTER,
     TREND_SCOUT,
     USER_ADVOCATE,
+    VIDEO_DIRECTOR,
 )
 
 PLATFORM = "linkedin"
@@ -496,6 +497,40 @@ async def test_trend_scout_speaks_and_table_converges(monkeypatch):
     assert TREND_SCOUT in speakers
     assert speakers >= set(ROSTER)  # the original four still speak
     assert result.consensus.converged is True
+
+
+# ── Video director seat (joins only when "video" is requested) ────────────────
+
+async def test_video_director_joins_only_when_video_requested():
+    """The video_director seat is opt-in on the deliverable: it joins the one shared table
+    when the brief asks for a video, and the roster is otherwise unchanged (text-only or
+    brand-only never add it)."""
+    context = await build_persona_context(_brief())
+
+    def _roster(content_types):
+        brief = _brief().model_copy(update={"content_types": content_types})
+        return [p.name for p in build_personas(
+            PLATFORM, brief,
+            brand_profile=context.brand_profile, user_skills=context.user_skills,
+            trends=context.trends,
+        )]
+
+    assert _roster(["text"]) == ROSTER                       # text only → unchanged
+    assert _roster(["text", "brand"]) == ROSTER              # brand card doesn't add the seat
+    assert _roster(["text", "video"]) == ROSTER + [VIDEO_DIRECTOR]
+    assert _roster(["brand", "video"]) == ROSTER + [VIDEO_DIRECTOR]  # media-only + video too
+
+
+async def test_video_director_speaks_and_table_converges():
+    """With video requested the director takes real turns in the SAME session (one table),
+    the original four still speak, and the table still converges to a consensus."""
+    brief = _brief().model_copy(update={"content_types": ["text", "video"]})
+    result = await run_table(PLATFORM, brief)
+    speakers = {t.speaker for t in result.consensus.transcript}
+    assert VIDEO_DIRECTOR in speakers
+    assert speakers >= set(ROSTER)
+    assert result.consensus.converged is True
+    assert result.consensus.strategy.strategies[PLATFORM]  # one converged strategy string
     assert result.consensus.strategy.strategies[PLATFORM]
 
 

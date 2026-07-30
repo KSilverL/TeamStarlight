@@ -1,0 +1,652 @@
+{
+  "tracks": [
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "corporate",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "corporate",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "corporate",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "cinematic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "cinematic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "cinematic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "electronic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "electronic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "electronic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "acoustic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "acoustic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "acoustic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "hiphop",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "hiphop",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "hiphop",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "ambient",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "ambient",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "inspiring",
+      "genre": "ambient",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "corporate",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "corporate",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "corporate",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "cinematic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "cinematic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "cinematic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "electronic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "electronic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "electronic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "acoustic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "acoustic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "acoustic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "hiphop",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "hiphop",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "hiphop",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "ambient",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "ambient",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "uplifting",
+      "genre": "ambient",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "corporate",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "corporate",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "corporate",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "cinematic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "cinematic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "cinematic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "electronic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "electronic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "electronic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "acoustic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "acoustic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "acoustic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "hiphop",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "hiphop",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "hiphop",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "ambient",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "ambient",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "energetic",
+      "genre": "ambient",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "corporate",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "corporate",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "corporate",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "cinematic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "cinematic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "cinematic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "electronic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "electronic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "electronic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "acoustic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "acoustic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "acoustic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "hiphop",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "hiphop",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "hiphop",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "ambient",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "ambient",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "calm",
+      "genre": "ambient",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "corporate",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "corporate",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "corporate",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "cinematic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "cinematic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "cinematic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "electronic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "electronic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "electronic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "acoustic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "acoustic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "acoustic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "hiphop",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "hiphop",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "hiphop",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "ambient",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "ambient",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "dramatic",
+      "genre": "ambient",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "corporate",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "corporate",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "corporate",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "cinematic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "cinematic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "cinematic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "electronic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "electronic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "electronic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "acoustic",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "acoustic",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "acoustic",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "hiphop",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "hiphop",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "hiphop",
+      "energy": "high"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "ambient",
+      "energy": "low"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "ambient",
+      "energy": "medium"
+    },
+    {
+      "file": "chill.mp3",
+      "mood": "playful",
+      "genre": "ambient",
+      "energy": "high"
+    }
+  ]
+}

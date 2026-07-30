@@ -99,5 +99,6 @@ class HumanGateExecutor(Executor):
                 needs_human_intervention=request.needs_human_intervention,
                 proposed_rules=[],
                 brief=request.brief,
+                strategy=request.strategy,  # forward the roundtable consensus (media direction)
             )
         )

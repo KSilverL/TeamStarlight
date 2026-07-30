@@ -19,7 +19,7 @@ public class CrossPlatformOAuth {
 	@JsonProperty("id")
     private Long id;
     @JsonProperty("businessId")
-    private int businessId;
+    private Long businessId;
     @JsonProperty("urn")
     private String urn;
     @JsonProperty("clientId")
@@ -36,5 +36,9 @@ public class CrossPlatformOAuth {
     private Instant expiresAt;
     @JsonProperty("state")
     private String state;
+    @JsonProperty("pageIdArray")
+    private Long[] pageIdArray;
+    @JsonProperty("pageNameArray")
+    private String[] pageNameArray;
 
 }

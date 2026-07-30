@@ -47,6 +47,7 @@ from .base import (
     SafetyResult,
     SafetyService,
     StoreService,
+    SynthesizedSpeech,
     VideoGenerationService,
     VoiceoverService,
     VoiceService,
@@ -412,13 +413,22 @@ def _mock_scene_component(*, broken: bool) -> str:
     )
 
 
-def _mock_storyboard(topic: str, draft: str, tone_hint: Optional[str], platform: str) -> dict:
-    """A deterministic 4-slide StoryboardSpec-shaped dict — one of each core slide
+def _mock_storyboard(
+    topic: str, draft: str, tone_hint: Optional[str], platform: str, direction: str = "",
+) -> dict:
+    """A deterministic 4-slide StoryboardSpec-shaped dict — one of each Phase 1 slide
     type, in a typical order (hook -> collage -> counter_stat -> outro), so
-    contract-parity / shape tests have something stable to assert on."""
+    contract-parity / shape tests have something stable to assert on. When `direction`
+    (the roundtable's agreed video direction) is given, it is echoed into the hook slide's
+    narration so tests can assert the direction reached the generator; empty `direction`
+    leaves the deterministic baseline output unchanged."""
     primary, secondary, accent = _MEDIA_PALETTE
     brand = _brand_name(topic)
     tagline = (tone_hint or "Crafted with intent").strip()[:48] or "Crafted with intent"
+    hook_narration = (
+        f"Introducing {brand}. Direction: {direction.strip()}"
+        if direction and direction.strip() else f"Introducing {brand}."
+    )
     return StoryboardSpec(
         brandName=brand,
         primaryColor=primary,
@@ -426,15 +436,24 @@ def _mock_storyboard(topic: str, draft: str, tone_hint: Optional[str], platform:
         accentColor=accent,
         platform=platform,
         slides=[
-            {"type": "hook", "headline": tagline, "imageQuery": topic, "shape": "circle"},
-            {"type": "collage", "headline": "Why It Matters", "imageQueries": [topic, "team", "product"]},
+            {"type": "hook", "headline": tagline, "imageQuery": topic, "shape": "circle",
+             "narration": hook_narration},
+            {"type": "collage", "headline": "Why It Matters", "imageQueries": [topic, "team", "product"],
+             "narration": f"Here's why {topic} matters for you."},
             {"type": "counter_stat", "sectionLabel": "By The Numbers", "stats": [
                 {"value": "100%", "label": "On brand", "icon": "★"},
                 {"value": "3", "label": "Platforms", "icon": "◆"},
                 {"value": "24/7", "label": "Always on", "icon": "●"},
-            ]},
-            {"type": "outro", "brandName": brand, "ctaLabel": "Learn More", "contact": "@brand · brand.com"},
+            ], "narration": "The numbers speak for themselves."},
+            {"type": "outro", "brandName": brand, "ctaLabel": "Learn More", "contact": "@brand · brand.com",
+             "narration": f"Learn more about {brand} today."},
         ],
+        audio={
+            "musicMood": "inspiring",
+            "musicGenre": "corporate",
+            "musicEnergy": "medium",
+            "narrationVoice": "warm",
+        },
     ).model_dump()
 
 
@@ -717,10 +736,11 @@ class MockLLM(LLMService):
         tone_hint: Optional[str],
         platform: str,
         skill: str = "",
+        direction: str = "",
         history: Optional[List[dict]] = None,
     ) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
-        return _mock_storyboard(topic, draft, tone_hint, platform)
+        return _mock_storyboard(topic, draft, tone_hint, platform, direction)
 
     async def generate_video_prompt(
         self,
@@ -1455,11 +1475,11 @@ class MockVoiceover(VoiceoverService):
     the file — works end to end without real credentials. Reuses `_silent_mp3`
     (already built for MockMusicGeneration; same ffprobe-decodability requirement)."""
 
-    async def synthesize(self, *, text: str, voice: str) -> bytes:
+    async def synthesize(self, *, text: str, voice: str) -> SynthesizedSpeech:
         await asyncio.sleep(_MOCK_LATENCY)
         words = len(text.split())
         duration_seconds = max(1.0, (words / _MOCK_SPEAKING_RATE_WPM) * 60)
-        return _silent_mp3(duration_seconds)
+        return SynthesizedSpeech(audio=_silent_mp3(duration_seconds), duration_seconds=duration_seconds)
 
 
 # Minimal but structurally-valid MP4 container (ftyp + mdat), used as the offline

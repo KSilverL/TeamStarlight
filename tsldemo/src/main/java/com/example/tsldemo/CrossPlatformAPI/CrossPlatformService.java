@@ -18,6 +18,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -42,6 +43,8 @@ import org.springframework.web.server.ResponseStatusException;
 import com.example.tsldemo.CrossPlatformOAuth;
 import com.example.tsldemo.Message;
 import com.example.tsldemo.Session;
+import com.example.tsldemo.DTOs.Request.CrossPlatPostReqDTO;
+import com.example.tsldemo.DTOs.Request.GlobalCrossPlatform.GlobalCredsReqDTO;
 import com.example.tsldemo.DTOs.Request.LinkedInCredsReqDTO;
 import com.example.tsldemo.DTOs.Request.LinkedInPostReqDTO;
 import com.example.tsldemo.DTOs.Request.LinkedInVideoPostReqDTO;
@@ -51,6 +54,13 @@ import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInUserInfoDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInVideoInitializeUploadRespDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInVideoStatusRespDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInVideoUploadInstructionDTO;
+import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaAuthAccessRespDTO;
+import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaDataUserInfo;
+import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaIdentityRespDTO;
+import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaPermissionsRespDTO;
+import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaTokenDetails;
+import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaUserInfoDTO;
+import com.example.tsldemo.DTOs.ResponseToFrontEnd.GlobalCredListRespDTO;
 import com.example.tsldemo.ENUMS.PlatformEnum;
 import com.example.tsldemo.SessionAPI.SessionService;
 
@@ -107,6 +117,12 @@ public class CrossPlatformService {
     @Value("${linkedin.redirect-uri:http://localhost:8081/linkedin/callback}")
     private String linkedInRedirectUri;
 
+    // Must match the Valid OAuth Redirect URI registered on the Meta app, and be identical in
+    // the auth request (authCodeMeta) and the token exchange (accessTokenMeta) — so both read it
+    // from here. Overridable via META_REDIRECT_URI for non-local deployments.
+    @Value("${meta.redirect-uri:http://localhost:8081/meta/callback}")
+    private String metaRedirectUri;
+
     @Value("${frontend.base-url:http://localhost:3000}")
     private String frontendBaseUrl;
     
@@ -119,6 +135,65 @@ public class CrossPlatformService {
     public CrossPlatformService(RestClient restClient, TaskScheduler taskScheduler) {
         this.restClient = restClient;
         this.taskScheduler = taskScheduler;
+    }
+
+    //////////////////////////////////////////////////////// GLOBAL METHODS ////////////////////////////////////////////////////////
+    public List<GlobalCredListRespDTO> getGlobalCredentials(Long businessId, List<PlatformEnum> platforms) {
+
+        List<GlobalCredListRespDTO> globalCredList = new ArrayList<>();
+        List<CrossPlatformOAuth> crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatformIn(businessId, platforms);
+        for (CrossPlatformOAuth cred : crossPlatformOAuth) {
+            GlobalCredListRespDTO globalCredentials = new GlobalCredListRespDTO();
+            globalCredentials.setBusinessId(cred.getBusinessId());
+            globalCredentials.setClientId(cred.getClientId());
+            globalCredentials.setClientSecret(cred.getClientSecret());
+            globalCredentials.setPageIdArray(cred.getPageIdArray());
+            globalCredentials.setPageNameArray(cred.getPageNameArray());
+            globalCredentials.setPlatform(cred.getPlatform());
+            System.out.println("Created some records, adding to list");
+            globalCredList.add(globalCredentials);
+        }
+        return globalCredList;
+    }
+
+    public void saveGlobalCredentials(GlobalCredsReqDTO[] creds) {
+
+        for (GlobalCredsReqDTO cred : creds) {
+            CrossPlatformOAuth crossPlatformOAuth = new CrossPlatformOAuth();
+            crossPlatformOAuth.setBusinessId(cred.businessId());
+            crossPlatformOAuth.setClientId(cred.clientId());
+            crossPlatformOAuth.setClientSecret(cred.clientSecret());
+            crossPlatformOAuth.setPlatform(cred.platform());
+
+            crossPlatformRepository.save(crossPlatformOAuth);
+        }
+    }
+
+    public void updateGlobalCredentials(GlobalCredsReqDTO[] creds) {
+
+        for (GlobalCredsReqDTO cred : creds) {
+            CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(cred.businessId(), cred.platform());
+
+            // Any stored access token was minted by the OLD app id/secret, so pointing the
+            // record at a different developer app invalidates it. Clear it (and the in-flight
+            // OAuth state) so the next /auth call re-runs consent instead of no-op'ing on a
+            // token the new app can't use.
+            if (!Objects.equals(crossPlatformOAuth.getClientId(), cred.clientId())
+                    || !Objects.equals(crossPlatformOAuth.getClientSecret(), cred.clientSecret())) {
+                crossPlatformOAuth.setAccessToken(null);
+                crossPlatformOAuth.setExpiresAt(null);
+                crossPlatformOAuth.setState(null);
+            }
+
+            crossPlatformOAuth.setClientId(cred.clientId());
+            crossPlatformOAuth.setClientSecret(cred.clientSecret());
+
+            crossPlatformRepository.save(crossPlatformOAuth);
+        }
+    }
+
+    public void deleteGlobalCredentials(Long businessId, List<PlatformEnum> platforms) {
+        crossPlatformRepository.deleteByBusinessIdAndPlatformIn(businessId, platforms);
     }
 
     //////////////////////////////////////////////////////// LINKEDIN METHODS ////////////////////////////////////////////////////////
@@ -196,7 +271,19 @@ public class CrossPlatformService {
      * round-trip finishes (success or failure) — the callback is hit directly by LinkedIn, so
      * this is the user's only way back into the SPA. */
     public void redirectToFrontend(HttpServletResponse response, boolean connected) throws IOException {
-        response.sendRedirect(frontendBaseUrl + "/profile?linkedin=" + (connected ? "connected" : "error"));
+        redirectToFrontend(response, "linkedin", connected);
+    }
+
+    /** Same as above, but keyed to a specific platform so both LinkedIn and Meta callbacks can
+     * bounce the browser back to the Brand Profile with their own status flag
+     * (?linkedin=… / ?meta=…). */
+    public void redirectToFrontend(HttpServletResponse response, String platform, boolean connected) throws IOException {
+        // 0.0.0.0 is a "bind to every interface" address — fine for a server to listen on, but a
+        // browser can't navigate to it (ERR_ADDRESS_INVALID). If FRONTEND_BASE_URL was set to it
+        // (an easy env slip, since API_HOST uses 0.0.0.0), rewrite the host to localhost so the
+        // OAuth round-trip can actually land the user back in the app.
+        String baseUrl = frontendBaseUrl.replace("://0.0.0.0", "://localhost");
+        response.sendRedirect(baseUrl + "/profile?" + platform + "=" + (connected ? "connected" : "error"));
     }
 
     /** The author URN every post/upload is attributed to — resolved fresh each call since the
@@ -545,7 +632,7 @@ public class CrossPlatformService {
         CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(businessId, PlatformEnum.LINKEDIN);
         if (crossPlatformOAuth == null) {
             crossPlatformOAuth = new CrossPlatformOAuth();
-            crossPlatformOAuth.setBusinessId(businessId);
+            crossPlatformOAuth.setBusinessId((long) businessId);
             crossPlatformOAuth.setPlatform(PlatformEnum.LINKEDIN);
         }
 
@@ -567,4 +654,240 @@ public class CrossPlatformService {
         }, when);
     }
     
+    //////////////////////////////////////////////////////// META METHODS ////////////////////////////////////////////////////////
+    /** {@code force} re-runs Facebook's consent screen even when a live token is already stored.
+     * The Brand Profile passes it because the user clicking "Connect/Reconnect Facebook" has
+     * explicitly asked for the dialog — usually to grant a Page the old token never covered. */
+    public void authCodeMeta(Long businessId, HttpServletResponse response, boolean force) throws IOException {
+
+        CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(businessId, PlatformEnum.META);
+        if (crossPlatformOAuth == null) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND,
+                    "No Meta app credentials on file for this business — save the app id/secret first.");
+        }
+
+        if (force || crossPlatformOAuth.getAccessToken() == null || crossPlatformOAuth.getExpiresAt() == null || !crossPlatformOAuth.getExpiresAt().isAfter(Instant.now())) {
+            String state = UUID.randomUUID().toString();
+
+            String authorizationUrl =
+                "https://www.facebook.com/v25.0/dialog/oauth"
+                + "?response_type=code"
+                + "&client_id=" + URLEncoder.encode(crossPlatformOAuth.getClientId(), StandardCharsets.UTF_8)
+                + "&redirect_uri=" + URLEncoder.encode(metaRedirectUri, StandardCharsets.UTF_8)
+                + "&state=" + URLEncoder.encode(state, StandardCharsets.UTF_8)
+                + "&scope=" + URLEncoder.encode("pages_show_list,pages_manage_posts,pages_read_engagement", StandardCharsets.UTF_8);
+
+            // Persist the state BEFORE redirecting, so the callback can always find it.
+            crossPlatformOAuth.setState(state);
+            crossPlatformRepository.save(crossPlatformOAuth);
+
+            response.sendRedirect(authorizationUrl);
+        } else {
+            // Already connected with a live token — send the user straight back into the app.
+            // Without this the response is an empty 200 with no Location, which the frontend
+            // proxy can only guess at.
+            redirectToFrontend(response, "meta", true);
+        }
+    }
+
+    public MetaAuthAccessRespDTO accessTokenMeta(String metaAuthCode, String state) {
+        RestClient restClient = RestClient.create();
+
+        CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByStateAndPlatform(state, PlatformEnum.META);
+
+        MetaAuthAccessRespDTO token = restClient.get()
+                .uri(uriBuilder -> uriBuilder
+                    .scheme("https")
+                    .host("graph.facebook.com")
+                    .path("/v25.0/oauth/access_token")
+                    .queryParam("client_id", crossPlatformOAuth.getClientId())
+                    .queryParam("redirect_uri", metaRedirectUri)
+                    .queryParam("client_secret", crossPlatformOAuth.getClientSecret())
+                    .queryParam("code", metaAuthCode)
+                    .build())
+                .retrieve()
+                .body(MetaAuthAccessRespDTO.class);
+
+        crossPlatformOAuth.setAccessToken(token.accessToken());
+        if (token.expiresIn() == null || token.expiresIn() == 0){
+            MetaTokenDetails tokenDetails = restClient.get()
+                .uri(uriBuilder -> uriBuilder
+                    .scheme("https")
+                    .host("graph.facebook.com")
+                    .path("/debug_token")
+                    .queryParam("input_token", token.accessToken())
+                    .queryParam("access_token", crossPlatformOAuth.getClientId() + "|" + crossPlatformOAuth.getClientSecret())
+                    .build())
+                .retrieve()
+                .body(MetaTokenDetails.class);
+            if (tokenDetails.data().dataAccessExpiresAt() != null){
+                crossPlatformOAuth.setExpiresAt(Instant.ofEpochSecond(tokenDetails.data().dataAccessExpiresAt()));
+            }
+        }
+        else {
+            crossPlatformOAuth.setExpiresAt(Instant.now().plusSeconds(token.expiresIn()));
+        }
+        crossPlatformRepository.save(crossPlatformOAuth);
+
+        return token;
+    }
+
+    public CrossPlatformOAuth saveMetaPagesInfo(Long businessId) {
+        CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(businessId, PlatformEnum.META);
+
+        System.out.println("Start Post Method");
+        System.out.println("PageId not found, retrieving data");
+        MetaUserInfoDTO metaUserInfo = restClient.get()
+            .uri("https://graph.facebook.com/v25.0/me/accounts")
+            .header("Authorization", "Bearer " + crossPlatformOAuth.getAccessToken())
+            .retrieve()
+            .body(MetaUserInfoDTO.class);
+
+        // Graph answers "no Pages" with a 200 and an empty data array rather than an error, so
+        // without this the UI just renders an empty picker and the user has nothing to act on.
+        // Ask Graph what was actually granted and turn it into a message that names the fix.
+        if (metaUserInfo == null || metaUserInfo.data() == null || metaUserInfo.data().length == 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    explainNoPages(crossPlatformOAuth.getAccessToken()));
+        }
+
+        crossPlatformOAuth.setPageIdArray(Arrays.stream(metaUserInfo.data()).map(MetaDataUserInfo::pageId).toArray(Long[]::new));
+        crossPlatformOAuth.setPageNameArray(Arrays.stream(metaUserInfo.data()).map(MetaDataUserInfo::pageName).toArray(String[]::new));
+        crossPlatformRepository.save(crossPlatformOAuth);
+
+        return crossPlatformOAuth;
+    }
+
+    /** Why did /me/accounts come back empty? Almost always one of two things: the consent dialog
+     * granted fewer permissions than were asked for, or it granted them while the user picked no
+     * Page. /me/permissions distinguishes the two, so the message can name the actual next step
+     * instead of leaving the user staring at an empty Page list. */
+    private String explainNoPages(String accessToken) {
+        // Which account is on the other end of this token? Authorising with a personal profile
+        // that doesn't administer the Page looks identical to skipping the Page picker, so name
+        // the account and let the user tell the two apart at a glance.
+        String connectedAs = "";
+        try {
+            MetaIdentityRespDTO me = restClient.get()
+                .uri("https://graph.facebook.com/v25.0/me?fields=id,name")
+                .header("Authorization", "Bearer " + accessToken)
+                .retrieve()
+                .body(MetaIdentityRespDTO.class);
+
+            if (me != null && me.name() != null) {
+                connectedAs = "Connected to Facebook as " + me.name() + " (id " + me.id() + "). ";
+            }
+        } catch (Exception e) {
+            log.warn("Could not read the Meta account identity while diagnosing an empty Page list", e);
+        }
+
+        List<String> declined = new ArrayList<>();
+        try {
+            MetaPermissionsRespDTO permissions = restClient.get()
+                .uri("https://graph.facebook.com/v25.0/me/permissions")
+                .header("Authorization", "Bearer " + accessToken)
+                .retrieve()
+                .body(MetaPermissionsRespDTO.class);
+
+            if (permissions != null && permissions.data() != null) {
+                declined = Arrays.stream(permissions.data())
+                        .filter(p -> !"granted".equalsIgnoreCase(p.status()))
+                        .map(MetaPermissionsRespDTO.MetaPermission::permission)
+                        .collect(Collectors.toList());
+
+                List<String> granted = Arrays.stream(permissions.data())
+                        .filter(p -> "granted".equalsIgnoreCase(p.status()))
+                        .map(MetaPermissionsRespDTO.MetaPermission::permission)
+                        .toList();
+
+                for (String required : List.of("pages_show_list", "pages_manage_posts", "pages_read_engagement")) {
+                    if (!granted.contains(required) && !declined.contains(required)) {
+                        declined.add(required + " (never granted)");
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // The permissions probe is best-effort — a failure here shouldn't mask the real
+            // problem, so fall through to the generic guidance below.
+            log.warn("Could not read Meta permissions while diagnosing an empty Page list", e);
+        }
+
+        if (!declined.isEmpty()) {
+            return connectedAs + "Facebook returned no Pages because these permissions were not granted: "
+                    + String.join(", ", declined)
+                    + ". Click Reconnect Facebook and accept every permission the dialog asks for.";
+        }
+
+        return connectedAs + "Facebook granted the page permissions but returned no Pages. In the consent dialog "
+                + "you must also choose which Pages the app may use — click Reconnect Facebook and, on "
+                + "the 'What Pages do you want to use with this app?' step, tick your Page (or 'Opt in to "
+                + "all current and future Pages'). Also confirm your account has full control of the Page, "
+                + "and that it has a role on the Meta app while the app is in Development mode.";
+    }
+
+    public List<String> postToMeta(CrossPlatPostReqDTO requestDTO) throws IOException {
+
+        System.out.println("Starting Post Meta Method");
+        System.out.println("businessId: " + requestDTO.getBusinessId());
+        System.out.println("message: " + requestDTO.getMessage());
+        System.out.println("media: " + requestDTO.getMedia());
+        System.out.println("pageId: " + requestDTO.getPageId());
+        List<CrossPlatformOAuth> crossPlatformOAuthList = crossPlatformRepository.findAll();
+        System.out.println("businessIdFromDB: " + crossPlatformOAuthList.get(0).getBusinessId());
+        CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(requestDTO.getBusinessId(), PlatformEnum.META);
+        System.out.println("Meta Credentials Found!");
+
+        MetaUserInfoDTO metaUserInfo = restClient.get()
+            .uri("https://graph.facebook.com/v25.0/me/accounts")
+            .header("Authorization", "Bearer " + crossPlatformOAuth.getAccessToken())
+            .retrieve()
+            .body(MetaUserInfoDTO.class);
+        
+        List<String> postIds = new ArrayList<>();
+        
+        for (Long pageId : requestDTO.getPageId()) {
+            // Body (Form) [No MetaPostReqDTO]
+            System.out.println("Create post body");
+            MultiValueMap<String, Object> form = new LinkedMultiValueMap<>();
+            form.add("message", requestDTO.getMessage());
+            form.add("access_token", Arrays.stream(metaUserInfo.data())
+                        .filter(page -> page.pageId().equals(pageId))
+                        .map(MetaDataUserInfo::pageAccessToken)
+                        .toList().get(0));
+
+            String url = "https://graph.facebook.com/v25.0/{page_id}/feed";
+
+            if (requestDTO.getMedia() != null && !requestDTO.getMedia().isEmpty()) {
+                String mime = "";
+                Tika tika = new Tika();
+                mime = tika.detect(requestDTO.getMedia().getInputStream());
+                form.add("file", requestDTO.getMedia().getResource());
+
+                if (mime.startsWith("image/")) {
+                    url = "https://graph.facebook.com/v25.0/{page_id}/photos";
+                }
+                else if (mime.startsWith("video/")) {
+                    url = "https://graph.facebook.com/v25.0/{page_id}/videos";
+                    form.add("title", requestDTO.getTitle());
+                    // This edge captions from `description` — the `message` added above is the
+                    // /feed and /photos field and is silently ignored here, so a caller that set
+                    // only `message` would publish a video with no caption at all. Fall back to
+                    // it rather than letting the caption vanish.
+                    form.add("description",
+                            requestDTO.getDescription() == null || requestDTO.getDescription().isBlank()
+                                    ? requestDTO.getMessage()
+                                    : requestDTO.getDescription());
+                }
+
+            }
+            postIds.add(restClient.post()
+                    .uri(url, pageId)
+                    .contentType(MediaType.MULTIPART_FORM_DATA)
+                    .body(form)
+                    .retrieve()
+                    .body(String.class));
+        }
+        return postIds;
+    }
+
 }
