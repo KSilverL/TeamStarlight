@@ -566,8 +566,13 @@ function PlanItemCard({ planId, item, editable, planActive, authHeaders, onUpdat
   // NEW: decide whether this item can show "Generate Draft Now" (untouched, still
   // "planned"), or should auto-load an already-existing draft (the cron already
   // executed it, or you generated it earlier and reloaded the page).
-  const canGenerateNow = planActive && item.status === "planned";
-  const canShowDraft = planActive && item.status !== "planned" && item.status !== "skipped";
+  const canShowDraft =
+    planActive &&
+    (
+      item.status === "generating" ||
+      item.status === "awaiting_review" ||
+      item.status === "done"
+    );
 
   return (
     <div className="bg-white border border-[#E8E3DA] rounded-xl px-4 py-3">
@@ -671,16 +676,16 @@ function PlanItemCard({ planId, item, editable, planActive, authHeaders, onUpdat
 
       {/* NEW: shows "Generate Draft Now" for untouched items, or auto-loads the
           draft (from the cron or an earlier manual run) for executed items. */}
-      {(canGenerateNow || canShowDraft) && (
-        <ItemDraftPreview
-          planId={planId}
-          itemId={item.item_id}
-          existingTaskId={item.task_id}
-          itemStatus={item.status}
-          authHeaders={authHeaders}
-          onError={onError}
-        />
-      )}
+		  {canShowDraft && (
+		    <ItemDraftPreview
+		      planId={planId}
+		      itemId={item.item_id}
+		      existingTaskId={item.task_id}
+		      itemStatus={item.status}
+		      authHeaders={authHeaders}
+		      onError={onError}
+		    />
+		  )}
     </div>
   );
 }
@@ -696,153 +701,194 @@ interface ItemDraftPreviewProps {
   onError: (msg: string | null) => void;
 }
 
-function ItemDraftPreview({ planId, itemId, existingTaskId, itemStatus, authHeaders, onError }: ItemDraftPreviewProps) {
-  const [status, setStatus] = useState<"idle" | "starting" | "generating" | "ready" | "approved" | "rejected">("idle");
+function ItemDraftPreview({
+  existingTaskId,
+  itemStatus,
+  authHeaders,
+  onError,
+}: ItemDraftPreviewProps) {
+  const [status, setStatus] = useState<
+    "idle" | "generating" | "ready" | "approved" | "rejected"
+  >("idle");
+
   const [statusLabel, setStatusLabel] = useState("");
   const [draftText, setDraftText] = useState<string | null>(null);
   const [taskId, setTaskId] = useState<string | null>(existingTaskId);
 
-  // Auto-connect on mount if this item already has a task (e.g. the cron executed
-  // it in the background, or you generated it earlier and reloaded the page) — the
-  // SSE stream replays its full history, so we still catch draft_ready even though
-  // we weren't watching when it first happened.
   useEffect(() => {
-    if (existingTaskId && (itemStatus === "generating" || itemStatus === "awaiting_review" || itemStatus === "done")) {
+    if (
+      existingTaskId &&
+      (
+        itemStatus === "generating" ||
+        itemStatus === "awaiting_review" ||
+        itemStatus === "done"
+      )
+    ) {
       setTaskId(existingTaskId);
-      setStatus(itemStatus === "done" ? "approved" : "generating");
+
+      setStatus(
+        itemStatus === "done"
+          ? "approved"
+          : "generating"
+      );
+
       watchTask(existingTaskId);
     }
+
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [existingTaskId, itemStatus]);
 
-  async function handleGenerateNow() {
-    setStatus("starting");
-    setStatusLabel("Starting draft…");
-    onError(null);
-    try {
-      const res = await fetch(`/api/plans/${planId}/items/${itemId}/execute`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({}),
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        onError(data.error ?? "Failed to start draft generation.");
-        setStatus("idle");
-        return;
-      }
-      const newTaskId = data.task?.task_id as string | undefined;
-      if (!newTaskId) {
-        onError("No task returned from execute.");
-        setStatus("idle");
-        return;
-      }
-      setTaskId(newTaskId);
-      setStatus("generating");
-      watchTask(newTaskId);
-    } catch {
-      onError("Could not reach the backend.");
-      setStatus("idle");
-    }
-  }
 
   function watchTask(id: string) {
     const es = new EventSource(`/api/tasks/${id}/events`);
+
     let lastSeq = -1;
 
     es.onmessage = (e) => {
       let event: Record<string, unknown>;
+
       try {
-        event = JSON.parse(e.data as string);
+        event = JSON.parse(e.data);
       } catch {
         return;
       }
+
       const seq = event.seq as number | undefined;
+
       if (typeof seq === "number") {
         if (seq <= lastSeq) return;
         lastSeq = seq;
       }
 
+
       const type = event.type as string;
       const evtStatus = event.status as string;
 
+
       if (type === "progress" && evtStatus === "running") {
-        setStatusLabel("Writing draft…");
+        setStatusLabel("Writing draft...");
       }
+
 
       if (type === "result" && evtStatus === "draft_ready") {
         setDraftText(event.draft as string);
-        setStatus((prev) => (prev === "approved" ? "approved" : "ready"));
+        setStatus("ready");
       }
+
 
       if (type === "result" && evtStatus === "final") {
         setStatus("approved");
       }
     };
 
+
     es.onerror = () => {
       es.close();
     };
   }
 
-  async function handleDecision(decision: "approve" | "reject") {
+
+  async function handleDecision(
+    decision: "approve" | "reject"
+  ) {
     if (!taskId) return;
-    const platform = "linkedin"; // adjust if an item can target multiple platforms per draft
+
+
     try {
       await fetch(`/api/tasks/${taskId}/review`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ verdicts: { [platform]: { decision } } }),
+        headers: {
+          "Content-Type": "application/json",
+          ...authHeaders(),
+        },
+        body: JSON.stringify({
+          verdicts: {
+            linkedin: {
+              decision,
+            },
+          },
+        }),
       });
-      setStatus(decision === "approve" ? "approved" : "rejected");
+
+
+      setStatus(
+        decision === "approve"
+          ? "approved"
+          : "rejected"
+      );
+
     } catch {
       onError("Could not submit the review decision.");
     }
   }
 
+
   if (status === "idle") {
     return (
-      <button
-        onClick={handleGenerateNow}
-        className="mt-3 text-xs font-medium text-[#FF4800] hover:underline"
-      >
-        ✨ Generate Draft Now
-      </button>
+      <div className="mt-3 text-xs text-[#9E9893] italic">
+        Waiting for scheduled generation...
+      </div>
     );
   }
 
+
   return (
     <div className="mt-3 pt-3 border-t border-[#E8E3DA]">
-      {(status === "starting" || (status === "generating" && !draftText)) && (
+
+      {status === "generating" && !draftText && (
         <div className="flex items-center gap-2 text-xs text-[#9E9893] italic">
-          <span className="w-1.5 h-1.5 rounded-full bg-[#FF4800] animate-pulse flex-shrink-0" />
-          {statusLabel || "Loading draft…"}
+          <span className="w-1.5 h-1.5 rounded-full bg-[#FF4800] animate-pulse" />
+          {statusLabel || "Generating draft..."}
         </div>
       )}
 
+
       {draftText && (
         <div className="bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg p-3">
-          <p className="text-sm text-[#1B1A17] whitespace-pre-wrap leading-relaxed mb-2">{draftText}</p>
+
+          <p className="text-sm whitespace-pre-wrap leading-relaxed mb-3">
+            {draftText}
+          </p>
+
+
           {status === "ready" && (
             <div className="flex gap-2">
+
               <button
                 onClick={() => handleDecision("approve")}
-                className="flex-1 bg-green-600 hover:bg-green-500 text-white text-xs font-medium py-1.5 rounded-lg transition-colors"
+                className="flex-1 bg-green-600 hover:bg-green-500 text-white text-xs py-1.5 rounded-lg"
               >
                 Approve
               </button>
+
+
               <button
                 onClick={() => handleDecision("reject")}
-                className="flex-1 bg-[#F2EDE4] hover:bg-[#E8E3DA] text-[#1B1A17] text-xs font-medium py-1.5 rounded-lg transition-colors border border-[#E8E3DA]"
+                className="flex-1 bg-[#F2EDE4] hover:bg-[#E8E3DA] text-xs py-1.5 rounded-lg"
               >
                 Reject
               </button>
+
             </div>
           )}
-          {status === "approved" && <p className="text-xs text-green-700 font-medium">✓ Approved</p>}
-          {status === "rejected" && <p className="text-xs text-[#9E9893] font-medium">Rejected</p>}
+
+
+          {status === "approved" && (
+            <p className="text-xs text-green-700 font-medium">
+              ✓ Approved
+            </p>
+          )}
+
+
+          {status === "rejected" && (
+            <p className="text-xs text-[#9E9893]">
+              Rejected
+            </p>
+          )}
+
         </div>
       )}
+
     </div>
   );
 }
