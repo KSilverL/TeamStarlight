@@ -58,12 +58,15 @@ import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInVideoUploadIns
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaAuthAccessRespDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaDataUserInfo;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaIdentityRespDTO;
+import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaInstagramAccount;
+import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaPageInstagramRespDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaPermissionsRespDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaTokenDetails;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaUserInfoDTO;
 import com.example.tsldemo.DTOs.ResponseToFrontEnd.GlobalCredListRespDTO;
 import com.example.tsldemo.ENUMS.PlatformEnum;
 import com.example.tsldemo.SessionAPI.SessionService;
+import tools.jackson.databind.ObjectMapper;
 
 import jakarta.servlet.http.HttpServletResponse;
 
@@ -134,6 +137,11 @@ public class CrossPlatformService {
     @Autowired SessionService sessionServ;
 
 	private final RestClient restClient;
+
+    // Used where a Graph response is read as text before being parsed, so the raw JSON can be
+    // logged for diagnosis. Constructed rather than injected, as elsewhere in this codebase —
+    // Boot 4 auto-configures the Jackson 3 mapper and there is no Jackson 2 bean to inject.
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Value("${linkedin.redirect-uri:http://localhost:8081/linkedin/callback}")
     private String linkedInRedirectUri;
@@ -784,6 +792,19 @@ public class CrossPlatformService {
         return crossPlatformOAuth;
     }
 
+    /** Null when at least one Page resolved an Instagram account, otherwise a message naming the
+     * step to take. Kept separate from the Page list itself because having no Instagram account is
+     * not an error — the Pages are still usable for Facebook posting, so this is advice, not a
+     * failure, and must not stop the picker from rendering. */
+    public String instagramNoticeFor(Long businessId) {
+        CrossPlatformOAuth oauth = crossPlatformRepository.findByBusinessIdAndPlatform(businessId, PlatformEnum.META);
+        if (oauth == null || oauth.getAccessToken() == null || oauth.getIgUserIdArray() == null) {
+            return null;
+        }
+        boolean anyLinked = Arrays.stream(oauth.getIgUserIdArray()).anyMatch(Objects::nonNull);
+        return anyLinked ? null : explainNoInstagram(oauth.getAccessToken());
+    }
+
     /** One publishable Instagram account: which account to address, and the Page token that
      * authorises it. Page tokens are short-lived and never stored, so this is only ever built
      * fresh from Graph and used immediately. */
@@ -860,17 +881,21 @@ public class CrossPlatformService {
      * access tokens are deliberately never persisted — they are re-read here each time so a
      * token revoked or rotated on Meta's side can't be used from stale local state. */
     private MetaUserInfoDTO fetchMetaPages(String userAccessToken) {
+        // Handed to RestClient as a finished URI rather than through a UriBuilder, because
+        // META_PAGE_FIELDS uses Graph's nested-field syntax — instagram_business_account{id,username}.
+        // Every builder/String overload treats those braces as a URI template variable and tries to
+        // expand them, which failed the whole call with "Not enough variable values available to
+        // expand 'id,username'". Percent-encoding the value and skipping the template step is what
+        // lets the braces reach Graph intact.
+        URI uri = URI.create("https://graph.facebook.com/v25.0/me/accounts?fields="
+                + URLEncoder.encode(META_PAGE_FIELDS, StandardCharsets.UTF_8));
         try {
-            return restClient.get()
-                .uri(uriBuilder -> uriBuilder
-                    .scheme("https")
-                    .host("graph.facebook.com")
-                    .path("/v25.0/me/accounts")
-                    .queryParam("fields", META_PAGE_FIELDS)
-                    .build())
+            MetaUserInfoDTO pages = restClient.get()
+                .uri(uri)
                 .header("Authorization", "Bearer " + userAccessToken)
                 .retrieve()
                 .body(MetaUserInfoDTO.class);
+            return withResolvedInstagramAccounts(pages, userAccessToken);
         } catch (RestClientResponseException e) {
             // Graph rejects the token itself here — expired (user tokens last ~60 days), revoked
             // in Facebook's app settings, or invalidated by a password change. Left unhandled this
@@ -882,6 +907,146 @@ public class CrossPlatformService {
                     + "Profile and accept every permission the dialog asks for. (Facebook said: "
                     + e.getResponseBodyAsString() + ")", e);
         }
+    }
+
+    /** Fills in the linked Instagram account for any Page the /me/accounts edge left blank.
+     *
+     * The edge is asked for instagram_business_account by field expansion, but Graph drops that
+     * key from the edge response in cases where asking the Page node for the very same field
+     * answers it — so a Page that genuinely has an Instagram account linked still comes back
+     * looking unlinked, which is what put a permanent "No Instagram" badge next to it. Querying
+     * the Page node is the flow Meta's own docs describe, so it is the authoritative answer here
+     * and the edge is treated as a fast path.
+     *
+     * Only Pages that came back blank are re-queried, so a fully-populated edge response costs
+     * nothing extra. A failure on any single Page leaves it null rather than failing the whole
+     * Page list — one unreadable Page must not cost the user the others. */
+    private MetaUserInfoDTO withResolvedInstagramAccounts(MetaUserInfoDTO pages, String userAccessToken) {
+        if (pages == null || pages.data() == null || pages.data().length == 0) {
+            return pages;
+        }
+
+        MetaDataUserInfo[] resolved = Arrays.stream(pages.data())
+                .map(page -> page.instagramBusinessAccount() != null
+                        ? page
+                        : new MetaDataUserInfo(
+                                page.pageAccessToken(),
+                                page.category(),
+                                page.categoryList(),
+                                page.pageName(),
+                                page.pageId(),
+                                page.tasks(),
+                                fetchInstagramAccountForPage(page, userAccessToken)))
+                .toArray(MetaDataUserInfo[]::new);
+
+        // Deliberately logs only the id/name/linked-ness — the Page access token is in this same
+        // object and must never reach the logs.
+        for (MetaDataUserInfo page : resolved) {
+            log.info("Meta Page {} ({}) -> Instagram account {}", page.pageId(), page.pageName(),
+                    page.instagramBusinessAccount() == null
+                            ? "none"
+                            : page.instagramBusinessAccount().igUserId()
+                              + " (@" + page.instagramBusinessAccount().username() + ")");
+        }
+
+        return new MetaUserInfoDTO(resolved, pages.paging());
+    }
+
+    /** The Instagram account linked to one Page, or null if there genuinely isn't one.
+     *
+     * Tries the user token before the Page token because Meta documents instagram_business_account
+     * as requiring "a User access token from someone able to perform appropriate tasks on the
+     * Page" — asking with a Page token can come back empty for a Page that is in fact linked. The
+     * Page token is still worth a second attempt, since it is the stronger credential for the
+     * Page's own fields and answers connected_instagram_account where the user token may not. */
+    private MetaInstagramAccount fetchInstagramAccountForPage(MetaDataUserInfo page, String userAccessToken) {
+        List<String> tokens = page.pageAccessToken() == null || page.pageAccessToken().equals(userAccessToken)
+                ? List.of(userAccessToken)
+                : List.of(userAccessToken, page.pageAccessToken());
+
+        for (int i = 0; i < tokens.size(); i++) {
+            MetaInstagramAccount account = readInstagramLinkage(page.pageId(), tokens.get(i),
+                    i == 0 ? "user token" : "page token");
+            if (account != null) {
+                return account;
+            }
+        }
+        return null;
+    }
+
+    private MetaInstagramAccount readInstagramLinkage(Long pageId, String token, String tokenKind) {
+        URI uri = URI.create("https://graph.facebook.com/v25.0/" + pageId + "?fields="
+                + URLEncoder.encode("instagram_business_account{id,username},connected_instagram_account{id,username}",
+                        StandardCharsets.UTF_8));
+        try {
+            // Read as text first and log it: this response carries no access token, so it is safe
+            // to log in full, and "which of the two fields did Meta actually populate" is the one
+            // question that cannot be answered from the parsed result when both come back null.
+            String raw = restClient.get()
+                .uri(uri)
+                .header("Authorization", "Bearer " + token)
+                .retrieve()
+                .body(String.class);
+            log.info("Instagram linkage for Page {} via {}: {}", pageId, tokenKind, raw);
+
+            MetaPageInstagramRespDTO body = objectMapper.readValue(raw, MetaPageInstagramRespDTO.class);
+            return body.instagramBusinessAccount() != null
+                    ? body.instagramBusinessAccount()
+                    : body.connectedInstagramAccount();
+        } catch (Exception e) {
+            log.warn("Could not read the Instagram account for Page {} via {}: {}", pageId, tokenKind, e.toString());
+            return null;
+        }
+    }
+
+    /** Why does no Page have an Instagram account, when the user believes they linked one?
+     *
+     * Two very different causes look identical in the Page list — the Instagram permissions were
+     * never granted on this token (Graph then omits the field rather than erroring), or they were
+     * granted but the account isn't a professional one linked to the Page. Only the first is
+     * visible from here, so check it and let the message say which of the two to go and fix. */
+    private String explainNoInstagram(String accessToken) {
+        List<String> missing = new ArrayList<>();
+        try {
+            MetaPermissionsRespDTO permissions = restClient.get()
+                .uri("https://graph.facebook.com/v25.0/me/permissions")
+                .header("Authorization", "Bearer " + accessToken)
+                .retrieve()
+                .body(MetaPermissionsRespDTO.class);
+
+            if (permissions != null && permissions.data() != null) {
+                List<String> granted = Arrays.stream(permissions.data())
+                        .filter(p -> "granted".equalsIgnoreCase(p.status()))
+                        .map(MetaPermissionsRespDTO.MetaPermission::permission)
+                        .toList();
+
+                for (String required : List.of("instagram_basic", "instagram_content_publish")) {
+                    if (!granted.contains(required)) {
+                        missing.add(required);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Could not read Meta permissions while diagnosing a missing Instagram account", e);
+        }
+
+        if (!missing.isEmpty()) {
+            return "No Instagram account could be read because this Facebook connection is missing "
+                    + String.join(" and ", missing)
+                    + ". Click Reconnect Facebook and accept every permission the dialog asks for — "
+                    + "including the Instagram step.";
+        }
+
+        // The permissions are fine, so Graph is reporting the Page as genuinely unlinked. Two
+        // things produce that and neither is visible from here, so name both rather than asserting
+        // the one that happens to be more common — picking the Instagram account in the Facebook
+        // consent dialog is a third thing again, and does not link it to the Page.
+        return "The Instagram permissions are granted, but Facebook still reports no Instagram "
+                + "account on this Page. Two things to check, in Meta Business Suite: the Instagram "
+                + "account must be a professional one (Settings > Account type — a personal account "
+                + "cannot be published to through the API), and it must be linked to this specific "
+                + "Page (Settings > Linked accounts). Selecting the account in the Facebook consent "
+                + "dialog is not the same as linking it. Then click Refresh Pages.";
     }
 
     /** Why did /me/accounts come back empty? Almost always one of two things: the consent dialog

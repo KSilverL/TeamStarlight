@@ -21,4 +21,10 @@ public class MetaPageInfo {
     @JsonProperty("igUserIds")
     String[] igUserIds;
 
+    /** Set only when no Page resolved an Instagram account, and names the step that would fix it
+     * (grant the Instagram permissions, or link a professional account to the Page). Advisory
+     * rather than an error — the Pages above are still usable for Facebook posting. */
+    @JsonProperty("instagramNotice")
+    String instagramNotice;
+
 }

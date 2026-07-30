@@ -147,6 +147,7 @@ public class CrossPlatformController {
             response.setPageIds(crossPlatformOAuth.getPageIdArray());
             response.setPageNames(crossPlatformOAuth.getPageNameArray());
             response.setIgUserIds(crossPlatformOAuth.getIgUserIdArray());
+            response.setInstagramNotice(crossPlatformService.instagramNoticeFor(businessId));
             return ResponseEntity.ok(response);
         } catch (ResponseStatusException e) {
             // Spring Boot 4 drops the exception's reason from the default error body, so letting

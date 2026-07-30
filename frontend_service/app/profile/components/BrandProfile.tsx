@@ -145,6 +145,9 @@ export default function BrandProfile() {
   const [fbSelectedPageIds, setFbSelectedPageIds] = useState<number[]>([]);
   const [fbPagesLoading, setFbPagesLoading] = useState(false);
   const [fbPagesError, setFbPagesError] = useState<string | null>(null);
+  // Why no Page resolved an Instagram account. Separate from fbPagesError because the Page list
+  // loaded fine — this only explains a missing Instagram badge, and clears once one appears.
+  const [fbInstagramNotice, setFbInstagramNotice] = useState<string | null>(null);
 
   const totalSources = (websiteAdded ? 1 : 0) + (pdfFile ? 1 : 0) + (pptFile ? 1 : 0);
 
@@ -307,6 +310,9 @@ export default function BrandProfile() {
           igLinked: Boolean(igUserIds[i]),
         }))
       );
+      // Advice, not an error — the Pages still render and still work for Facebook posting, so
+      // this goes in its own slot rather than through setFbPagesError.
+      setFbInstagramNotice(typeof data.instagramNotice === "string" ? data.instagramNotice : null);
       setFbStatus("connected");
     } catch {
       setFbPagesError("Could not reach the backend.");
@@ -501,6 +507,11 @@ export default function BrandProfile() {
             {fbSelectedPageIds.length === 0 && (
               <p className="text-xs text-[#9E9893] mt-2">
                 Select at least one Page to enable posting from the chat.
+              </p>
+            )}
+            {fbInstagramNotice && (
+              <p className="text-xs text-[#6B655F] bg-[#F3F1EC] border border-[#E8E3DA] rounded-lg px-3 py-2 mt-3">
+                {fbInstagramNotice}
               </p>
             )}
           </div>
