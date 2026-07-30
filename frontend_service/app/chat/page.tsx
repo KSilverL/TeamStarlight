@@ -797,9 +797,7 @@ export default function ChatPage() {
         return;
       }
       taskId = data.task_id as string;
-	  if (data.title) {
-	    applySessionTitle(data.title as string);
-	  }
+	  
     } catch {
       pushMessage({ role: "assistant", content: "Could not reach the workflow backend." });
       return;
@@ -904,34 +902,43 @@ export default function ChatPage() {
       // If the user wants a text draft, show the DraftCard for manual approval.
       // If they only want brand/video assets, auto-approve so media_producer runs
       // immediately — they never asked to review the underlying text copy.
-      if (type === "result" && status === "draft_ready") {
-        if (contentTypes.includes("text")) {
-          pushMessage({
-            role: "assistant",
-            content: `Here's your ${platform} draft — approve or request changes:`,
-            variant: "text-preview",
-            platform: platform as Platform,
-            draft: { text: event.draft as string },
-            workflowTaskId: taskId,
-            needsHumanIntervention: (event.needs_human_intervention as boolean) ?? false,
-            approval: "pending",
-            // When a video was also requested, the single publish is the native video post
-            // (caption = this copy) from the storyboard card below — so hide this card's own
-            // text/image post buttons to avoid a competing second post.
-            videoAlsoRequested: contentTypes.includes("video"),
-          });
-          if (sessionIdRef.current) {
-            persistMessage(sessionIdRef.current, "assistant", event.draft as string);
-          }
-        } else {
-          // Auto-approve: submit verdict immediately so media_producer can run.
-          fetch(`/api/tasks/${taskId}/review`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ verdicts: { [platform as string]: { decision: "approve" } } }),
-          }).catch(() => {});
-        }
-      }
+	  if (type === "result" && status === "draft_ready") {
+	  	          // The title is already assigned by this point (dispatcher/scout stage
+	  	          // has run) — fetch it once, the first time we see draft_ready.
+	  	          if (!sessionTitleRef.current) {
+	  	            fetch(`/api/tasks/${taskId}`)
+	  	              .then((r) => r.json())
+	  	              .then((snapshot) => {
+	  	                if (snapshot.title) {
+	  	                  applySessionTitle(snapshot.title as string);
+	  	                }
+	  	              })
+	  	              .catch(() => {});
+	  	          }
+
+	  	          if (contentTypes.includes("text")) {
+	  	            pushMessage({
+	  	              role: "assistant",
+	  	              content: `Here's your ${platform} draft — approve or request changes:`,
+	  	              variant: "text-preview",
+	  	              platform: platform as Platform,
+	  	              draft: { text: event.draft as string },
+	  	              workflowTaskId: taskId,
+	  	              needsHumanIntervention: (event.needs_human_intervention as boolean) ?? false,
+	  	              approval: "pending",
+	  	            });
+	  	            if (sessionIdRef.current) {
+	  	              persistMessage(sessionIdRef.current, "assistant", event.draft as string);
+	  	            }
+	  	          } else {
+	  	            // Auto-approve: submit verdict immediately so media_producer can run.
+	  	            fetch(`/api/tasks/${taskId}/review`, {
+	  	              method: "POST",
+	  	              headers: { "Content-Type": "application/json" },
+	  	              body: JSON.stringify({ verdicts: { [platform as string]: { decision: "approve" } } }),
+	  	            }).catch(() => {});
+	  	          }
+	  	        }
 
       // final: approved draft + media assets from media_producer.
       if (type === "result" && status === "final") {
@@ -2868,9 +2875,8 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
           </div>
         )}
 
-        {/* Post / Schedule (LinkedIn only, once approved) */}
-        {approval === "approved" && message.platform === "linkedin" && (
-          <div className="px-4 pb-4 space-y-3">
+		{/* Post / Schedule (LinkedIn only, once approved) */}
+
         {/* A text+video task publishes as a single native video post (caption = this copy) from
             the storyboard card below, so this card offers no competing text/image post — just a note. */}
         {approval === "approved" && message.platform === "linkedin" && message.videoAlsoRequested && (
@@ -2961,39 +2967,39 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
               </>
             )}
 
-            {/* Optional: attach an image and publish it with this caption as an image post. */}
-            <div className="mt-3 pt-3 border-t border-[#E8E3DA]">
-              {imagePostStatus === "posted" ? (
-                <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
-                  ✓ Image posted to LinkedIn
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  <input
-                    type="file"
-                    accept="image/*"
-                    onChange={(e) => {
-                      setImageFile(e.target.files?.[0] ?? null);
-                      setImagePostStatus("idle");
-                      setImagePostError(null);
-                    }}
-                    className="block w-full text-xs text-[#6B6561] file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border file:border-[#E8E3DA] file:bg-[#F2EDE4] file:text-[#1B1A17] file:text-xs file:font-medium hover:file:bg-[#E8E3DA]"
-                  />
-                  <button
-                    onClick={handlePostImageToLinkedIn}
-                    disabled={!imageFile || imagePostStatus === "posting"}
-                    className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-                  >
-                    {imagePostStatus === "posting" ? "Uploading & posting…" : "Post Image to LinkedIn"}
-                  </button>
-                </div>
-              )}
-              {imagePostStatus === "error" && imagePostError && (
-                <p className="text-xs text-red-600 mt-2 text-center">{imagePostError}</p>
-              )}
-            </div>
-          </div>
-        )}
+    {/* Optional: attach an image and publish it with this caption as an image post. */}
+    <div className="mt-3 pt-3 border-t border-[#E8E3DA]">
+      {imagePostStatus === "posted" ? (
+        <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+          ✓ Image posted to LinkedIn
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <input
+            type="file"
+            accept="image/*"
+            onChange={(e) => {
+              setImageFile(e.target.files?.[0] ?? null);
+              setImagePostStatus("idle");
+              setImagePostError(null);
+            }}
+            className="block w-full text-xs text-[#6B6561] file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border file:border-[#E8E3DA] file:bg-[#F2EDE4] file:text-[#1B1A17] file:text-xs file:font-medium hover:file:bg-[#E8E3DA]"
+          />
+          <button
+            onClick={handlePostImageToLinkedIn}
+            disabled={!imageFile || imagePostStatus === "posting"}
+            className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+          >
+            {imagePostStatus === "posting" ? "Uploading & posting…" : "Post Image to LinkedIn"}
+          </button>
+        </div>
+      )}
+      {imagePostStatus === "error" && imagePostError && (
+        <p className="text-xs text-red-600 mt-2 text-center">{imagePostError}</p>
+      )}
+    </div>
+  </div>
+)}
 
         {/* Instagram-labelled drafts publish to the connected Facebook Page (Brand Profile). */}
         {approval === "approved" && message.platform === "instagram" && (
