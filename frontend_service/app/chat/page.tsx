@@ -11,6 +11,7 @@ interface SessionSummary {
   createdAt: string;
   status: string;
   targetPlatforms: string[] | null;
+  title?: string | null;
 }
 
 interface DBMessage {
@@ -188,6 +189,10 @@ interface Message {
   // Workflow-specific fields — set when the message originates from the MAF pipeline.
   workflowTaskId?: string;
   needsHumanIntervention?: boolean;
+  // Set on a text draft (variant "text-preview") when the same task also asked for a video:
+  // the real publish is the native video post (video + this copy as caption), so the draft
+  // card hides its own text/image post buttons and points the user to the video card below.
+  videoAlsoRequested?: boolean;
   videoStoryboard?: VideoStoryboard;
   // User-attached reference images (base64 data URLs) for image-to-video generation
   // (Higgsfield backend). Threaded from the compose box onto the storyboard message so
@@ -262,6 +267,17 @@ const INITIAL_MESSAGES: Message[] = [
 ];
 
 const platformMap = Object.fromEntries(PLATFORMS.map((p) => [p.id, p]));
+
+// The Facebook Page id(s) the user picked in their Brand Profile. Instagram-labelled drafts
+// publish to these Pages via /api/meta/post; an empty list means Facebook isn't set up yet.
+function getSelectedPageIds(): number[] {
+  try {
+    const ids = JSON.parse(localStorage.getItem("starlight_meta_page_ids") || "[]");
+    return Array.isArray(ids) ? ids.map(Number).filter((n) => Number.isFinite(n)) : [];
+  } catch {
+    return [];
+  }
+}
 
 // Human-readable labels for each MAF executor shown as live status messages.
 const NODE_LABELS: Record<string, string> = {
@@ -520,6 +536,10 @@ export default function ChatPage() {
   const [pastSessions, setPastSessions] = useState<SessionSummary[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
+  const [sessionTitle, setSessionTitle] = useState<string | null>(null);
+  // Guards against later prompts in the same session overwriting the name —
+  // the session is named once, from the first task's title.
+  const sessionTitleRef = useRef<string | null>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -544,6 +564,9 @@ export default function ChatPage() {
   async function loadSession(session: SessionSummary) {
     if (loadingSessionId) return;
     setLoadingSessionId(session.id);
+	sessionTitleRef.current = session.title ?? null;
+	setSessionTitle(session.title ?? null);
+	
     try {
       const token = localStorage.getItem("starlight_token");
       const res = await fetch(`/api/sessions/${session.id}/messages`, {
@@ -580,6 +603,15 @@ export default function ChatPage() {
     } finally {
       setLoadingSessionId(null);
     }
+  }
+  
+  function applySessionTitle(title: string) {
+    if (sessionTitleRef.current) return; // already named this session
+    sessionTitleRef.current = title;
+    setSessionTitle(title);
+    setPastSessions((prev) =>
+      prev.map((s) => (s.id === sessionIdRef.current ? { ...s, title } : s))
+    );
   }
 
   function formatDate(isoString: string) {
@@ -817,6 +849,9 @@ export default function ChatPage() {
         return;
       }
       taskId = data.task_id as string;
+	  if (data.title) {
+	    applySessionTitle(data.title as string);
+	  }
     } catch {
       pushMessage({ role: "assistant", content: "Could not reach the workflow backend." });
       return;
@@ -872,12 +907,20 @@ export default function ChatPage() {
 
       // speaker_scheduled: the moderator handed the mic over — announce the upcoming
       // speaker on the stage (this is also what creates the stage, before anyone speaks).
+      // The round-0 "moderator" event is the convening announcement (emitted the moment the
+      // table starts, while the manager is still planning): create the stage so it shows
+      // "The moderator is convening the table…" instead of dead air, but give nobody the floor.
       if (type === "speaker_scheduled") {
         const tableId = event.table_id as string;
-        scheduleRoundtableSpeaker(taskId, tableId, {
-          speaker: event.speaker as string,
-          roundIndex: event.round_index as number,
-        });
+        const speaker = event.speaker as string;
+        if (speaker === MODERATOR) {
+          upsertRoundtable(taskId, tableId, () => ({}));
+        } else {
+          scheduleRoundtableSpeaker(taskId, tableId, {
+            speaker,
+            roundIndex: event.round_index as number,
+          });
+        }
       }
 
       // agent_utterance: one roundtable persona (or the user) spoke — grow that table's stage.
@@ -943,6 +986,10 @@ export default function ChatPage() {
             workflowTaskId: taskId,
             needsHumanIntervention: (event.needs_human_intervention as boolean) ?? false,
             approval: "pending",
+            // When a video was also requested, the single publish is the native video post
+            // (caption = this copy) from the storyboard card below — so hide this card's own
+            // text/image post buttons to avoid a competing second post.
+            videoAlsoRequested: contentTypes.includes("video"),
           });
           if (sessionIdRef.current) {
             persistMessage(sessionIdRef.current, "assistant", event.draft as string);
@@ -988,6 +1035,9 @@ export default function ChatPage() {
             workflowTaskId: taskId,
             approval: "approved",
             referenceImages: pendingRefsRef.current.length ? pendingRefsRef.current : undefined,
+            // Carry the approved copy so the video card prefills its caption with it — a text+video
+            // task then publishes as one native video post with the generated copy as the caption.
+            draft: contentTypes.includes("text") ? { text: event.draft as string } : undefined,
           });
         }
       }
@@ -1217,7 +1267,7 @@ export default function ChatPage() {
                       } disabled:opacity-50`}
                     >
                       <p className="font-medium text-xs truncate">
-                        {isLoading ? "Loading…" : formatDate(s.createdAt)}
+                        {isLoading ? "Loading…" : (s.title ?? formatDate(s.createdAt))}
                       </p>
                       {s.targetPlatforms && s.targetPlatforms.length > 0 && (
                         <p className="text-[10px] text-[#9E9893] mt-0.5 truncate">
@@ -1348,14 +1398,15 @@ export default function ChatPage() {
               </svg>
             </button>
             <div>
-              <h1 className="font-semibold text-sm text-[#1B1A17]">
-                {activeSessionId ? `Session ${activeSessionId}` : "New Session"}
-              </h1>
+			  <h1 className="font-semibold text-sm text-[#1B1A17]">
+			    {sessionTitle ?? (activeSessionId ? `Session ${activeSessionId}` : "New Session")}
+			  </h1>
               <p className="text-xs text-[#9E9893] mt-0.5">
                 {selectedPlatforms.length} platform
                 {selectedPlatforms.length !== 1 ? "s" : ""} ·{" "}
                 {contentTypes.length ? contentTypes.join(", ") : "no"} content
               </p>
+			  
             </div>
           </div>
           <div className="flex items-center gap-1.5">
@@ -1655,11 +1706,17 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
-  const [caption, setCaption] = useState("");
+  // Prefill the caption with the approved post copy when a text+video task threaded it on
+  // (message.draft); a video-only task has none, so it starts empty for the user to write.
+  const [caption, setCaption] = useState(() => message.draft?.text ?? "");
+  const [videoTitle, setVideoTitle] = useState("");
   const [postStatus, setPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
   const [postError, setPostError] = useState<string | null>(null);
   // Reference images carried from the compose box; the user can drop any before rendering.
   const [refs, setRefs] = useState<string[]>(message.referenceImages ?? []);
+  // instagram posting
+  const [igPostStatus, setIgPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
+  const [igPostError, setIgPostError] = useState<string | null>(null);
 
   async function handlePostVideoToLinkedIn() {
     if (!jobId || !caption.trim()) return;
@@ -1684,6 +1741,78 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
       if (!res.ok || data.error) {
         setPostStatus("error");
         setPostError(data.error ?? "Failed to post video to LinkedIn.");
+        return;
+      }
+      setPostStatus("posted");
+    } catch {
+      setPostStatus("error");
+      setPostError("Could not reach the backend.");
+    }
+  }
+  
+  async function handlePostVideoToInstagram() {
+    if (!jobId) return;
+    setIgPostStatus("posting");
+    setIgPostError(null);
+    try {
+      const res = await fetch("/api/instagram/post-video", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jobId, caption: caption ?? "" }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setIgPostStatus("error");
+        setIgPostError(data.error ?? "Failed to post video to Instagram.");
+        return;
+      }
+      setIgPostStatus("posted");
+    } catch (err) {
+      setIgPostStatus("error");
+      setIgPostError("Could not reach the backend.");
+    }
+  }
+
+  // Instagram-labelled storyboards publish the rendered MP4 to the connected Facebook Page.
+  // The proxy fetches the video bytes from the LLM service by jobId, so we only pass the id.
+  async function handlePostVideoToFacebook() {
+    if (!jobId || !caption.trim()) return;
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setPostStatus("error");
+      setPostError("Log in, then connect Facebook from your Brand Profile before posting.");
+      return;
+    }
+    const pageIds = getSelectedPageIds();
+    if (pageIds.length === 0) {
+      setPostStatus("error");
+      setPostError("Connect Facebook and pick a Page in your Brand Profile first.");
+      return;
+    }
+    setPostStatus("posting");
+    setPostError(null);
+    try {
+      const res = await fetch("/api/meta/post-video", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          // Graph captions a Page video from `description` on the /{page-id}/videos edge —
+          // `message` is the /feed and /photos field and is silently dropped there. Send the
+          // caption as both so the one Java endpoint can serve whichever edge the mime picks.
+          jobId,
+          message: caption.trim(),
+          title: videoTitle.trim(),
+          description: caption.trim(),
+          pageIds,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setPostStatus("error");
+        setPostError(data.error ?? "Failed to post video to Facebook.");
         return;
       }
       setPostStatus("posted");
@@ -1839,6 +1968,70 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
                   className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
                 >
                   {postStatus === "posting" ? "Uploading & posting…" : "Post Video to LinkedIn"}
+                </button>
+              </>
+            )}
+            {postStatus === "error" && postError && (
+              <p className="text-xs text-red-600 text-center">{postError}</p>
+            )}
+          </div>
+        )}
+		
+		{renderState === "done" && downloadUrl && (
+		  <div className="px-4 pb-4 pt-1 border-t border-[#E8E3DA] space-y-2">
+		    {igPostStatus === "posted" ? (
+		      <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+		        ✓ Posted to Instagram
+		      </div>
+		    ) : (
+				<button
+				  type="button"
+				  onClick={handlePostVideoToInstagram}
+				  // disabled={igPostStatus === "posting"}
+				  className="w-full bg-gradient-to-r from-purple-600 to-pink-600 hover:opacity-90 disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+				>
+				  {igPostStatus === "posting" ? "Uploading & posting…" : "Post Video to Instagram"}
+				</button>
+		    )}
+
+		    {igPostStatus === "error" && igPostError && (
+		      <p className="text-xs text-red-600 text-center">{igPostError}</p>
+		    )}
+		  </div>
+		)}
+
+
+        {/* Instagram-labelled storyboards publish to the connected Facebook Page. */}
+        {renderState === "done" && message.platform === "instagram" && (
+          <div className="px-4 pb-4 pt-1 border-t border-[#E8E3DA] space-y-2">
+            {postStatus === "posted" ? (
+              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+                ✓ Posted to Facebook
+              </div>
+            ) : (
+              <>
+                <input
+                  type="text"
+                  value={videoTitle}
+                  onChange={(e) => setVideoTitle(e.target.value)}
+                  placeholder="Video title (optional)"
+                  disabled={postStatus === "posting"}
+                  className="w-full bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-2 text-xs text-[#1B1A17] placeholder:text-[#9E9893] focus:outline-none focus:border-[#FF4800] disabled:opacity-60"
+                />
+                <textarea
+                  value={caption}
+                  onChange={(e) => setCaption(e.target.value)}
+                  placeholder="Write a caption for this video…"
+                  rows={2}
+                  disabled={postStatus === "posting"}
+                  className="w-full bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-2 text-xs text-[#1B1A17] placeholder:text-[#9E9893] resize-none focus:outline-none focus:border-[#FF4800] disabled:opacity-60"
+                />
+                <button
+                  onClick={handlePostVideoToFacebook}
+                  disabled={postStatus === "posting" || !caption.trim()}
+                  className="w-full bg-[#1877F2] hover:bg-[#166FE0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                >
+                  {postStatus === "posting" ? "Uploading & posting…" : "Post Video to Facebook"}
                 </button>
               </>
             )}
@@ -2496,6 +2689,9 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
   const platform = platformMap[message.platform!];
   const draft = message.draft!;
   const approval = message.approval;
+
+  // "now" = post immediately, "schedule" = pick a date/time first
+  const [postMode, setPostMode] = useState<"now" | "schedule">("now");
   const [postStatus, setPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
   const [postError, setPostError] = useState<string | null>(null);
   // Image posting is tracked separately from the text post so the two buttons don't clobber
@@ -2542,16 +2738,31 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
     }
   }
 
+  // Scheduling fields — native date/time inputs give a built-in calendar UI
+  const [scheduleDate, setScheduleDate] = useState(""); // "2026-07-18"
+  const [scheduleTime, setScheduleTime] = useState(""); // "10:00"
+  const [scheduleStatus, setScheduleStatus] = useState<"idle" | "scheduling" | "scheduled" | "error">("idle");
+  const [scheduleError, setScheduleError] = useState<string | null>(null);
+
+  function fullText() {
+    return draft.hashtags && draft.hashtags.length > 0
+      ? `${draft.text}\n\n${draft.hashtags.join(" ")}`
+      : draft.text;
+  }
+
   async function handlePostToLinkedIn() {
     const token = localStorage.getItem("starlight_token");
     if (!token) {
       setPostStatus("error");
-      setPostError("Log in, then connect LinkedIn from your Brand Profile before posting.");
+      setPostError(
+        "Log in, then connect LinkedIn from your Brand Profile before posting."
+      );
       return;
     }
+
     setPostStatus("posting");
     setPostError(null);
-    const text = captionText;
+
     try {
       const res = await fetch("/api/linkedin/post", {
         method: "POST",
@@ -2559,12 +2770,94 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ message: text }),
+        body: JSON.stringify({ message: fullText() }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok || data.error) {
+        setPostStatus("error");
+        setPostError(data.error ?? "Failed to post to LinkedIn.");
+        return;
+      }
+
+      setPostStatus("posted");
+    } catch {
+      setPostStatus("error");
+      setPostError("Could not reach the backend.");
+    }
+  }
+
+  async function handleSchedulePost() {
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setScheduleStatus("error");
+      setScheduleError("Log in, then connect LinkedIn from your Brand Profile before scheduling.");
+      return;
+    }
+    if (!scheduleDate || !scheduleTime) {
+      setScheduleStatus("error");
+      setScheduleError("Pick a date and time first.");
+      return;
+    }
+    setScheduleStatus("scheduling");
+    setScheduleError(null);
+
+    const scheduled_time = `${scheduleDate}T${scheduleTime}:00`;
+
+    try {
+      const res = await fetch("/api/linkedin/scheduled-posts", {   // ← changed here
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ message: fullText(), scheduled_time }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setScheduleStatus("error");
+        setScheduleError(data.error ?? "Failed to schedule the post.");
+        return;
+      }
+      setScheduleStatus("scheduled");
+    } catch {
+      setScheduleStatus("error");
+      setScheduleError("Could not reach the backend.");
+    }
+  }
+  
+  // Instagram-labelled drafts publish to a connected Facebook Page (see the Brand Profile
+  // "Facebook Page" card). These reuse the same status states as the LinkedIn handlers — a
+  // given card is only ever one platform, so they never run against each other.
+  async function handlePostTextToFacebook() {
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setPostStatus("error");
+      setPostError("Log in, then connect Facebook from your Brand Profile before posting.");
+      return;
+    }
+    const pageIds = getSelectedPageIds();
+    if (pageIds.length === 0) {
+      setPostStatus("error");
+      setPostError("Connect Facebook and pick a Page in your Brand Profile first.");
+      return;
+    }
+    setPostStatus("posting");
+    setPostError(null);
+    try {
+      const form = new FormData();
+      form.append("message", captionText);
+      for (const id of pageIds) form.append("pageId", String(id));
+      const res = await fetch("/api/meta/post", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
       });
       const data = await res.json();
       if (!res.ok || data.error) {
         setPostStatus("error");
-        setPostError(data.error ?? "Failed to post to LinkedIn.");
+        setPostError(data.error ?? "Failed to post to Facebook.");
         return;
       }
       setPostStatus("posted");
@@ -2574,14 +2867,51 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
     }
   }
 
+  async function handlePostImageToFacebook() {
+    if (!imageFile) return;
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setImagePostStatus("error");
+      setImagePostError("Log in, then connect Facebook from your Brand Profile before posting.");
+      return;
+    }
+    const pageIds = getSelectedPageIds();
+    if (pageIds.length === 0) {
+      setImagePostStatus("error");
+      setImagePostError("Connect Facebook and pick a Page in your Brand Profile first.");
+      return;
+    }
+    setImagePostStatus("posting");
+    setImagePostError(null);
+    try {
+      const form = new FormData();
+      form.append("image", imageFile);
+      form.append("message", captionText);
+      for (const id of pageIds) form.append("pageId", String(id));
+      const res = await fetch("/api/meta/post", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setImagePostStatus("error");
+        setImagePostError(data.error ?? "Failed to post image to Facebook.");
+        return;
+      }
+      setImagePostStatus("posted");
+    } catch {
+      setImagePostStatus("error");
+      setImagePostError("Could not reach the backend.");
+    }
+  }
+
   return (
     <div className="w-full max-w-lg">
       <p className="text-sm text-[#6B6561] mb-2">{message.content}</p>
       <div className="bg-white border border-[#E8E3DA] rounded-2xl overflow-hidden shadow-sm">
         {/* Platform header */}
-        <div
-          className={`flex items-center justify-between px-4 py-2.5 ${platform.headerClass}`}
-        >
+        <div className={`flex items-center justify-between px-4 py-2.5 ${platform.headerClass}`}>
           <span className="text-sm font-semibold">{platform.label}</span>
           {approval === "approved" && (
             <span className="text-xs bg-green-500 text-white px-2 py-0.5 rounded-full font-medium">
@@ -2625,7 +2955,7 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
           )}
         </div>
 
-        {/* Actions */}
+        {/* Approve / Reject */}
         {approval === "pending" && (
           <div className="flex gap-2 px-4 pb-4">
             <button
@@ -2643,23 +2973,97 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
           </div>
         )}
 
+        {/* Post / Schedule (LinkedIn only, once approved) */}
         {approval === "approved" && message.platform === "linkedin" && (
+          <div className="px-4 pb-4 space-y-3">
+        {/* A text+video task publishes as a single native video post (caption = this copy) from
+            the storyboard card below, so this card offers no competing text/image post — just a note. */}
+        {approval === "approved" && message.platform === "linkedin" && message.videoAlsoRequested && (
+          <div className="px-4 pb-4">
+            <div className="rounded-lg bg-[#F8F5EE] border border-[#E8E3DA] px-3 py-2 text-xs text-[#6B6561]">
+              This copy will be published as the caption of your video post below — render and
+              post it there to publish once.
+            </div>
+          </div>
+        )}
+
+        {approval === "approved" && message.platform === "linkedin" && !message.videoAlsoRequested && (
           <div className="px-4 pb-4">
             {postStatus === "posted" ? (
               <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
                 ✓ Posted to LinkedIn
               </div>
+            ) : scheduleStatus === "scheduled" ? (
+              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+                ✓ Scheduled for {scheduleDate} at {scheduleTime}
+              </div>
             ) : (
-              <button
-                onClick={handlePostToLinkedIn}
-                disabled={postStatus === "posting"}
-                className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-              >
-                {postStatus === "posting" ? "Posting…" : "Post to LinkedIn"}
-              </button>
-            )}
-            {postStatus === "error" && postError && (
-              <p className="text-xs text-red-600 mt-2 text-center">{postError}</p>
+              <>
+                {/* Mode toggle */}
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setPostMode("now")}
+                    className={`flex-1 text-sm font-medium py-1.5 rounded-lg transition-colors ${
+                      postMode === "now"
+                        ? "bg-[#0A66C2] text-white"
+                        : "bg-[#F2EDE4] text-[#6B6561] border border-[#E8E3DA]"
+                    }`}
+                  >
+                    Post Now
+                  </button>
+                  <button
+                    onClick={() => setPostMode("schedule")}
+                    className={`flex-1 text-sm font-medium py-1.5 rounded-lg transition-colors ${
+                      postMode === "schedule"
+                        ? "bg-[#0A66C2] text-white"
+                        : "bg-[#F2EDE4] text-[#6B6561] border border-[#E8E3DA]"
+                    }`}
+                  >
+                    Schedule
+                  </button>
+                </div>
+
+                {postMode === "now" ? (
+                  <button
+                    onClick={handlePostToLinkedIn}
+                    disabled={postStatus === "posting"}
+                    className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                  >
+                    {postStatus === "posting" ? "Posting…" : "Post to LinkedIn"}
+                  </button>
+                ) : (
+                  <div className="space-y-2">
+                    <div className="flex gap-2">
+                      <input
+                        type="date"
+                        value={scheduleDate}
+                        onChange={(e) => setScheduleDate(e.target.value)}
+                        className="flex-1 bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-1.5 text-sm text-[#1B1A17] focus:outline-none focus:border-[#0A66C2]"
+                      />
+                      <input
+                        type="time"
+                        value={scheduleTime}
+                        onChange={(e) => setScheduleTime(e.target.value)}
+                        className="flex-1 bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-1.5 text-sm text-[#1B1A17] focus:outline-none focus:border-[#0A66C2]"
+                      />
+                    </div>
+                    <button
+                      onClick={handleSchedulePost}
+                      disabled={scheduleStatus === "scheduling"}
+                      className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                    >
+                      {scheduleStatus === "scheduling" ? "Scheduling…" : "Schedule Post"}
+                    </button>
+                  </div>
+                )}
+
+                {postStatus === "error" && postError && (
+                  <p className="text-xs text-red-600 text-center">{postError}</p>
+                )}
+                {scheduleStatus === "error" && scheduleError && (
+                  <p className="text-xs text-red-600 text-center">{scheduleError}</p>
+                )}
+              </>
             )}
 
             {/* Optional: attach an image and publish it with this caption as an image post. */}
@@ -2686,6 +3090,60 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
                     className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
                   >
                     {imagePostStatus === "posting" ? "Uploading & posting…" : "Post Image to LinkedIn"}
+                  </button>
+                </div>
+              )}
+              {imagePostStatus === "error" && imagePostError && (
+                <p className="text-xs text-red-600 mt-2 text-center">{imagePostError}</p>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Instagram-labelled drafts publish to the connected Facebook Page (Brand Profile). */}
+        {approval === "approved" && message.platform === "instagram" && (
+          <div className="px-4 pb-4">
+            {postStatus === "posted" ? (
+              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+                ✓ Posted to Facebook
+              </div>
+            ) : (
+              <button
+                onClick={handlePostTextToFacebook}
+                disabled={postStatus === "posting"}
+                className="w-full bg-[#1877F2] hover:bg-[#166FE0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+              >
+                {postStatus === "posting" ? "Posting…" : "Post to Facebook"}
+              </button>
+            )}
+            {postStatus === "error" && postError && (
+              <p className="text-xs text-red-600 mt-2 text-center">{postError}</p>
+            )}
+
+            {/* Optional: attach an image and publish it with this caption as a photo post. */}
+            <div className="mt-3 pt-3 border-t border-[#E8E3DA]">
+              {imagePostStatus === "posted" ? (
+                <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+                  ✓ Image posted to Facebook
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => {
+                      setImageFile(e.target.files?.[0] ?? null);
+                      setImagePostStatus("idle");
+                      setImagePostError(null);
+                    }}
+                    className="block w-full text-xs text-[#6B6561] file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border file:border-[#E8E3DA] file:bg-[#F2EDE4] file:text-[#1B1A17] file:text-xs file:font-medium hover:file:bg-[#E8E3DA]"
+                  />
+                  <button
+                    onClick={handlePostImageToFacebook}
+                    disabled={!imageFile || imagePostStatus === "posting"}
+                    className="w-full bg-[#1877F2] hover:bg-[#166FE0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                  >
+                    {imagePostStatus === "posting" ? "Uploading & posting…" : "Post Image to Facebook"}
                   </button>
                 </div>
               )}

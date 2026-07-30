@@ -1,12 +1,12 @@
 """
-Backend status-event schema (the SSE wire format, MIGRATION_PLAN §7.2).
+Backend status-event schema (the SSE wire format).
 
 As the MAF workflow runs, the api.py SSE bridge emits a **progress** event for
 every executor (running → done, or interrupted/error) so the frontend can render
 the "editorial newsroom live" — "the red-team reviewer is checking your content…".
 When a draft is ready (and again as a FinalDraft lands) a **result** event carries
-the produced content. The §7.2 envelope is reused verbatim; only the phase taxonomy
-follows the new executors.
+the produced content. Every event shares one envelope (type/node/phase/platform/
+status/ts); the phase taxonomy follows the executors.
 
     GET /tasks/{id}/events   (text/event-stream)
     data: <event dict defined here>
@@ -25,6 +25,7 @@ AGENT_UTTERANCE_AUDIO = "agent_utterance_audio"  # the TTS clip for an already-e
 SPEAKER_SCHEDULED = "speaker_scheduled"  # "the manager just handed the mic to a participant"
 DISCUSSION_CONSENSUS = "discussion_consensus"  # the table converged (a RESULT status)
 ROUND_CONTROL = "round_control"     # step mode: the table is asking the user what to do next
+SESSION_TITLE = "session_title"     # the short title for this session (history sidebar)
 
 # ── Progress `status` lifecycle ───────────────────────────────────────────────
 RUNNING = "running"          # executor entered
@@ -34,13 +35,13 @@ ERROR = "error"              # executor raised an exception
 
 # ── executor id → newsroom phase ──────────────────────────────────────────────
 NODE_PHASE: dict[str, str] = {
-    "dispatcher": "dispatch",   # 总编导
-    "strategist": "strategist", # 内容策略师
-    "creator": "create",        # 人格创作者 (per-platform fan-out)
-    "reviewer": "review",       # 红队审核员
-    "human_gate": "review",     # RequestPort 人工审批
-    "archivist": "archive",     # 品牌档案馆长
-    "media_producer": "produce",  # 媒体制作人 (animated card + video spec)
+    "dispatcher": "dispatch",
+    "strategist": "strategist",
+    "creator": "create",         # per-platform fan-out
+    "reviewer": "review",
+    "human_gate": "review",      # RequestPort human approval
+    "archivist": "archive",
+    "media_producer": "produce",  # animated card + video storyboard
 }
 
 
@@ -83,10 +84,28 @@ def result_event(
     return event
 
 
-# ── Roundtable discussion events (Phase 4) ────────────────────────────────────
-# One table == one platform, so `table_id` and `platform` carry the same value. Both
-# builders keep the §7.2 envelope keys (type/node/phase/platform/status/ts) so the SSE
-# stream stays uniform, and add the discussion-specific fields on top.
+def session_title_event(*, task_id: str, title: str) -> dict:
+    """The short, human-readable title for this session, for the frontend's history sidebar.
+    Generated OFF the hot path (a cheap-tier LLM call fired concurrently at task start), so it
+    arrives a beat after the run begins — the `running` snapshot already carries a deterministic
+    fallback title, and this event upgrades it in place once the polished version lands. Emitted
+    at most once per task; also readable on the task snapshot's `title`."""
+    return {
+        "type": SESSION_TITLE,
+        "node": "session",
+        "phase": "intake",
+        "platform": None,
+        "status": "done",
+        "ts": time.time(),
+        "task_id": task_id,
+        "title": title,
+    }
+
+
+# ── Roundtable discussion events ──────────────────────────────────────────────
+# One table == one platform, so `table_id` and `platform` carry the same value. The
+# builders keep the shared envelope keys (type/node/phase/platform/status/ts) so the
+# SSE stream stays uniform, and add the discussion-specific fields on top.
 
 def agent_utterance_event(
     *,

@@ -14,6 +14,7 @@ import pytest
 from pydantic import ValidationError
 
 from LLM_service.core.video_schema import (
+    AudioSpec,
     BarChartSlideSpec,
     CollageSlideSpec,
     ComparisonTableSlideSpec,
@@ -329,7 +330,7 @@ def test_map_pin_query_is_optional():
     assert with_query.pins[0].query == "Aviva Stadium, Dublin, Ireland"
 
 
-# ── Phase 3: slide variants + optional creative fields (batch a) ──────────────
+# ── Slide variants + optional creative fields (batch a) ───────────────────────
 
 def test_hook_variant_and_background_default_and_validate():
     # Defaults reproduce the pre-variant look; legacy payloads (no variant/kicker/
@@ -399,7 +400,7 @@ def test_batch_a_fields_survive_asset_resolution_round_trip():
     assert dumped["slides"][2]["variant"] == "sweep" and dumped["slides"][2]["tagline"] == "hi"
 
 
-# ── Phase 3: chart variants + palette/source/annotation (batch b) ─────────────
+# ── Chart variants + palette/source/annotation (batch b) ──────────────────────
 
 def test_chart_variants_default_and_validate():
     assert PieChartSlideSpec(slices=[{"label": "a", "value": 1}, {"label": "b", "value": 2}]).variant == "classic"
@@ -453,7 +454,7 @@ def test_line_and_bar_duration_max_bumped_for_variants():
     assert clamp_duration("bar_chart", 300) == 300
 
 
-# ── Phase 3: collage / node / table / map variants (batch c) ──────────────────
+# ── Collage / node / table / map variants (batch c) ───────────────────────────
 
 def test_collage_layout_extends_and_captions_optional():
     legacy = CollageSlideSpec(imageQueries=["a"])
@@ -506,7 +507,7 @@ def test_batch_c_fields_survive_asset_resolution_round_trip():
     assert slides[2]["variant"] == "versus"
 
 
-# ── Phase 4: cross-slide transitions + duration math ──────────────────────────
+# ── Cross-slide transitions + duration math ───────────────────────────────────
 
 def test_storyboard_transition_default_and_validate():
     assert _spec().transition == "none"
@@ -540,6 +541,80 @@ def test_transition_survives_asset_resolution_round_trip():
         renderable = asyncio.run(resolve_storyboard_assets(storyboard, job_dir=Path(d) / "job"))
     assert renderable.transition == "slide"
     assert renderable.model_dump()["transition"] == "slide"
+
+
+# ── Agent-selected audio (background music + narration) ──────────────────────
+
+def test_audio_spec_defaults_and_music_only():
+    default = AudioSpec()
+    assert default.musicMood == "inspiring" and default.musicGenre == "corporate"
+    assert default.musicEnergy == "medium" and default.narrationVoice == "warm"
+    assert default.narrationScript is None  # music-only until a script is authored
+
+
+def test_audio_spec_rejects_out_of_vocab_values():
+    for kwargs in (
+        {"musicMood": "spooky"},
+        {"musicGenre": "polka"},
+        {"musicEnergy": "extreme"},
+        {"narrationVoice": "robotic"},
+    ):
+        with pytest.raises(ValidationError):
+            AudioSpec(**kwargs)
+
+
+def test_storyboard_audio_is_optional_and_legacy_json_still_validates():
+    # A storyboard persisted before `audio` existed (no key) validates, audio=None.
+    assert _spec().audio is None
+    withaudio = _spec(audio={
+        "musicMood": "energetic", "musicGenre": "electronic", "musicEnergy": "high",
+        "narrationScript": "Meet the future.", "narrationVoice": "energetic",
+    })
+    assert withaudio.audio.musicMood == "energetic"
+    assert withaudio.audio.narrationScript == "Meet the future."
+
+
+# ── Per-slide, slide-synced narration ────────────────────────────────────────
+
+def test_slides_accept_optional_narration():
+    sb = StoryboardSpec(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        platform="linkedin",
+        slides=[
+            {"type": "hook", "headline": "Hi", "narration": "Here's the opener."},
+            {"type": "counter_stat", "stats": [{"value": "1", "label": "a", "icon": "★"}],
+             "narration": "The numbers matter."},
+            {"type": "outro", "brandName": "X", "ctaLabel": "Go"},  # no narration → None
+        ],
+    )
+    assert sb.slides[0].narration == "Here's the opener."
+    assert sb.slides[1].narration == "The numbers matter."
+    assert sb.slides[2].narration is None  # optional everywhere
+
+
+def test_legacy_storyboard_without_narration_still_validates():
+    # A storyboard authored before per-slide narration existed (no `narration` key).
+    sb = _spec()
+    assert all(s.narration is None for s in sb.slides)
+
+
+def test_renderable_storyboard_accepts_per_slide_voiceover_paths():
+    renderable = RenderableStoryboard(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        width=1080, height=1920,
+        slides=[
+            {"type": "hook", "headline": "Hi", "durationFrames": 90},
+            {"type": "outro", "brandName": "X", "ctaLabel": "Go", "durationFrames": 90},
+        ],
+        voiceoverSlidePaths=["voiceover/0.mp3", None],
+    )
+    assert renderable.voiceoverSlidePaths == ["voiceover/0.mp3", None]
+    # Absent (pre-feature props JSON) defaults to None, distinct from the global track.
+    assert RenderableStoryboard(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        width=1080, height=1920,
+        slides=[{"type": "outro", "brandName": "X", "ctaLabel": "Go", "durationFrames": 90}],
+    ).voiceoverSlidePaths is None
 
 
 def test_renderable_storyboard_round_trips_theme():

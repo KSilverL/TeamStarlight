@@ -19,6 +19,8 @@ public class Session {
 	private String updatedAt;
 	private String status;
 	private String phase;
+	private static boolean complete = false;
+	private String title;
 
 	@ElementCollection
 	@CollectionTable(name = "session_target_platforms", joinColumns = @JoinColumn(name = "session_id"))
@@ -48,6 +50,13 @@ public class Session {
 		
 	}
 	
+
+	public String getTitle() {
+	    return title;
+	}
+	public void setTitle(String title) {
+	    this.title = title;
+	}
 
 //	@JsonProperty("userId")
 //	public int getUserId() {
@@ -117,6 +126,14 @@ public class Session {
 	
 	public void setUser(Business b) {
 		this.user = b;
+	}
+
+	public boolean isComplete() {
+		return complete;
+	}
+
+	public void setComplete(boolean complete) {
+		this.complete = complete;
 	}
 	
 }

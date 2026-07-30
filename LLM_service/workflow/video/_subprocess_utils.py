@@ -1,6 +1,6 @@
 """
 Shared subprocess-resolution helpers for the video render pipeline. Kept in their
-own tiny module so render.py and codegen.py (and Phase 2's Lambda backend) can each
+own tiny module so render.py, codegen.py, and lambda_render.py can each
 import from here without importing each other.
 """
 

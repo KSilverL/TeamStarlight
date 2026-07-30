@@ -199,7 +199,13 @@ def get_music_generation() -> MusicGenerationService:
         s = get_settings()
         if s.mock_music_generation():
             return mock.MockMusicGeneration()
-        _require(s.has_soundraw, "Soundraw", "SOUNDRAW_API_KEY", "USE_MOCK_MUSIC_GENERATION=true")
+        # Prefer the local royalty-free library (offline, no key) when it's populated;
+        # Soundraw is the generative fallback and is enterprise-gated.
+        if s.has_music_library:
+            return media_assets.BundledMusicLibrary(s)
+        _require(s.has_soundraw, "Background music",
+                 "a populated MUSIC_LIBRARY_DIR/manifest.json (see assets/music/README.md), "
+                 "or SOUNDRAW_API_KEY", "USE_MOCK_MUSIC_GENERATION=true")
         return media_assets.SoundrawMusic(s)
     return _cached("music_generation", build)
 
@@ -257,8 +263,8 @@ def get_video_generation() -> VideoGenerationService:
 
 def get_checkpoint_storage() -> CheckpointStorage:
     """The MAF CheckpointStorage that persists workflow supersteps so a RequestPort
-    pause survives a process restart (replaces the in-process MemorySaver). Mock =
-    in-memory; production = the Postgres `workflow_checkpoints` table (§8.2).
+    pause survives a process restart. Mock = in-memory; production = the Postgres
+    `workflow_checkpoints` table.
 
     Cached as one singleton per process so every task's workflow shares the same
     durable store; reset_services() drops it (tests get a clean store)."""

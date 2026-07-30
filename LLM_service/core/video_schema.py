@@ -1,12 +1,11 @@
 """
-Dynamic storyboard schema for the video-creation agent (supersedes the old fixed
-3-scene `media_schema.BrandVideoProps`).
+Dynamic storyboard schema for the video-creation agent.
 
 Rather than picking between hardcoded templates, the LLM composes a `StoryboardSpec`
 — an ordered list of typed `slides`, each one drawn from a small, fixed registry of
-slide *types* (`hook`, `counter_stat`, `collage`, `outro` from Phase 1, plus
-`pie_chart`, `line_chart`, `bar_chart`, `node_diagram`, `comparison_table` from
-Phase 2). This is a Pydantic discriminated union: the `type` field on each slide
+slide *types* (`hook`, `counter_stat`, `collage`, `outro`, plus the chart types
+`pie_chart`, `line_chart`, `bar_chart`, `node_diagram`, `comparison_table`).
+This is a Pydantic discriminated union: the `type` field on each slide
 selects which model validates it (`Field(discriminator="type")`). Adding a new
 slide type later means adding one more model to `SlideSpec`'s Union — the LLM only
 ever sees types this module declares, so it can never compose something nothing can
@@ -51,8 +50,8 @@ class StatItem(BaseModel):
 # Per-slide-type duration budget at FPS=30: (default, min, max). The LLM may suggest
 # a durationFrames; workflow/video/assets.py clamps it into this range before the
 # renderable storyboard is built, so Remotion never sees an unbounded value. These
-# are a tunable starting point (extrapolated from the old fixed "12s / 3-scene"
-# spec), not a validated constant — adjust after watching a few real renders.
+# are a tunable starting point, not a validated constant — adjust after watching a
+# few real renders.
 DURATION_BUDGET: Dict[str, Tuple[int, int, int]] = {
     "hook": (90, 60, 150),
     "counter_stat": (150, 90, 240),
@@ -125,9 +124,20 @@ def aspect_for_platform(platform: str) -> Tuple[int, int]:
 # a "solid" default, so pre-variant props render identically.
 BackgroundStyle = Literal["solid", "gradient", "orbs", "grid"]
 
+# Per-slide narration line the voiceover speaks WHILE this slide is on screen — the
+# unit that keeps the audio synced to the visuals (workflow/video/voiceover.py
+# synthesizes one clip per slide, and jobs.py stretches the slide so the line always
+# fits). Optional everywhere: a slide with no narration plays under music alone.
+_NARRATION_DESC = (
+    "One natural spoken sentence the voiceover says while THIS slide is on screen — "
+    "it should complement the slide's on-screen text, not just read it aloud. Keep it "
+    "tight (the video stretches to fit, so don't cram). Omit/null for a slide with no narration."
+)
+
 
 class HookSlideSpec(BaseModel):
     type: Literal["hook"] = "hook"
+    narration: Optional[str] = Field(None, description=_NARRATION_DESC)
     headline: str = Field(description="3-7 words, the scroll-stopping opening line")
     subtext: Optional[str] = Field(None, description="One short supporting line, optional")
     kicker: Optional[str] = Field(
@@ -152,6 +162,7 @@ class HookSlideSpec(BaseModel):
 
 class CounterStatSlideSpec(BaseModel):
     type: Literal["counter_stat"] = "counter_stat"
+    narration: Optional[str] = Field(None, description=_NARRATION_DESC)
     sectionLabel: Optional[str] = Field(None, description="Short header, e.g. 'Why It Matters'")
     stats: List[StatItem] = Field(min_length=1, max_length=4, description="1-4 stats, shown as counting cards")
     variant: Literal["cards", "orbit", "ticker"] = Field(
@@ -171,6 +182,7 @@ class CounterStatSlideSpec(BaseModel):
 
 class CollageSlideSpec(BaseModel):
     type: Literal["collage"] = "collage"
+    narration: Optional[str] = Field(None, description=_NARRATION_DESC)
     headline: Optional[str] = Field(None, description="Optional short header above the collage")
     imageQueries: List[str] = Field(
         min_length=1, max_length=4,
@@ -189,6 +201,7 @@ class CollageSlideSpec(BaseModel):
 
 class OutroSlideSpec(BaseModel):
     type: Literal["outro"] = "outro"
+    narration: Optional[str] = Field(None, description=_NARRATION_DESC)
     brandName: str = Field(description="1-2 words, ALL CAPS")
     ctaLabel: str = Field(description="Action verb + 1-2 nouns, e.g. 'Start Free Trial'")
     contact: Optional[str] = Field(None, description="'@handle · domain.com' format")
@@ -203,7 +216,7 @@ class OutroSlideSpec(BaseModel):
     durationFrames: Optional[int] = Field(None, description="Suggested frames at 30fps; clamped server-side")
 
 
-# ── Phase 2: data/chart slide specs ─────────────────────────────────────────
+# ── Data/chart slide specs ──────────────────────────────────────────────────
 # All values here are LLM-authored (no live data source feeds these slides) — the
 # LLM invents plausible illustrative numbers from the brief, same as it already
 # does for counter_stat.stats.
@@ -220,6 +233,7 @@ PaletteName = Literal["brand", "vivid", "pastel", "duotone", "heat", "ocean", "m
 
 class PieChartSlideSpec(BaseModel):
     type: Literal["pie_chart"] = "pie_chart"
+    narration: Optional[str] = Field(None, description=_NARRATION_DESC)
     headline: Optional[str] = Field(None, description="Optional short header above the chart")
     slices: List[PieSlice] = Field(min_length=2, max_length=6, description="2-6 segments")
     calloutText: Optional[str] = Field(None, description="Short stat callout, e.g. '+63% since 2020'")
@@ -243,6 +257,7 @@ class ChartSeries(BaseModel):
 
 class LineChartSlideSpec(BaseModel):
     type: Literal["line_chart"] = "line_chart"
+    narration: Optional[str] = Field(None, description=_NARRATION_DESC)
     headline: Optional[str] = Field(None, description="Optional short header above the chart")
     xLabels: List[str] = Field(min_length=2, max_length=8, description="X-axis labels, e.g. years '2021'..'2025'")
     series: List[ChartSeries] = Field(min_length=1, max_length=2, description="1-2 lines to compare")
@@ -279,6 +294,7 @@ class BarItem(BaseModel):
 
 class BarChartSlideSpec(BaseModel):
     type: Literal["bar_chart"] = "bar_chart"
+    narration: Optional[str] = Field(None, description=_NARRATION_DESC)
     headline: Optional[str] = Field(None, description="Optional short header above the chart")
     bars: List[BarItem] = Field(min_length=2, max_length=6, description="2-6 bars")
     variant: Literal["columns", "race", "lollipop"] = Field(
@@ -299,6 +315,7 @@ class BarChartSlideSpec(BaseModel):
 
 class NodeDiagramSlideSpec(BaseModel):
     type: Literal["node_diagram"] = "node_diagram"
+    narration: Optional[str] = Field(None, description=_NARRATION_DESC)
     headline: Optional[str] = Field(None, description="Optional short header above the diagram")
     nodes: List[str] = Field(
         min_length=3, max_length=6,
@@ -320,6 +337,7 @@ class ComparisonRow(BaseModel):
 
 class ComparisonTableSlideSpec(BaseModel):
     type: Literal["comparison_table"] = "comparison_table"
+    narration: Optional[str] = Field(None, description=_NARRATION_DESC)
     headline: Optional[str] = Field(None, description="Optional short header above the table")
     columns: List[str] = Field(min_length=1, max_length=4, description="1-4 column headers")
     rows: List[ComparisonRow] = Field(min_length=2, max_length=5, description="2-5 rows, revealed one by one")
@@ -371,6 +389,7 @@ class MapPin(BaseModel):
 
 class MapSlideSpec(BaseModel):
     type: Literal["map"] = "map"
+    narration: Optional[str] = Field(None, description=_NARRATION_DESC)
     headline: Optional[str] = Field(None, description="Optional short header above the map")
     region: str = Field(
         pattern=r"^[A-Z]{2}$",
@@ -385,7 +404,7 @@ class MapSlideSpec(BaseModel):
     durationFrames: Optional[int] = Field(None, description="Suggested frames at 30fps; clamped server-side")
 
 
-# ── Phase 3: bespoke, LLM-authored scene (autonomous video-agent plan) ──────
+# ── Bespoke, LLM-authored scene ─────────────────────────────────────────────
 # Unlike the fixed types above (a hand-written React component per type), `generated`
 # lets the storyboard LLM ask for a BESPOKE scene when none of the fixed types fit —
 # `description` is its creative brief to the separate scene-codegen agent
@@ -400,6 +419,7 @@ class MapSlideSpec(BaseModel):
 # safe static template slide, so a bad generation never blocks the whole video.
 class GeneratedSlideSpec(BaseModel):
     type: Literal["generated"] = "generated"
+    narration: Optional[str] = Field(None, description=_NARRATION_DESC)
     description: str = Field(
         description="What this bespoke scene should show/communicate — the creative "
         "brief handed to the scene-codegen agent. Use for the storyboard's one "
@@ -453,6 +473,44 @@ SLIDE_TYPES = frozenset({
 _HEX_COLOR = r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$"
 
 
+# ── Agent-selected audio (background music + narration) ─────────────────────
+# The LLM authors these alongside the visual storyboard (generate_video_storyboard).
+# Music mood/genre/energy are constrained to small curated vocabularies rather than
+# free text: Soundraw's real accepted values aren't verified against a live account in
+# this repo (see media_assets.SoundrawMusic), so a fixed enum keeps the LLM's choice
+# safe and predictable. `narrationVoice` is a provider-agnostic PERSONA the LLM picks;
+# workflow/video/voiceover.py maps it to a concrete Azure Neural voice id — the LLM
+# never sees or invents a raw voice name.
+MusicMood = Literal["inspiring", "uplifting", "energetic", "calm", "dramatic", "playful"]
+MusicGenre = Literal["corporate", "cinematic", "electronic", "acoustic", "hiphop", "ambient"]
+MusicEnergy = Literal["low", "medium", "high"]
+NarrationVoice = Literal["warm", "energetic", "authoritative", "friendly"]
+
+
+class AudioSpec(BaseModel):
+    """The storyboard's audio direction, authored by the LLM. Optional on
+    StoryboardSpec (None → the legacy fixed-music, no-narration behavior), so any
+    storyboard JSON persisted before this field existed still validates and renders
+    unchanged. workflow/video/{music,voiceover}.py consume these; the resolved track
+    PATHS (not this spec) are what reach the renderer via RenderableStoryboard."""
+
+    musicMood: MusicMood = Field("inspiring", description="Emotional tone of the backing track")
+    musicGenre: MusicGenre = Field("corporate", description="Musical style of the backing track")
+    musicEnergy: MusicEnergy = Field("medium", description="Pace/intensity of the backing track")
+    narrationScript: Optional[str] = Field(
+        None,
+        description="Fallback ONLY: a single spoken voiceover for the whole video, used when "
+        "you don't give per-slide narration. Prefer per-slide `narration` (on each slide) so the "
+        "voice stays synced to what's on screen — leave this null when you do.",
+    )
+    narrationVoice: NarrationVoice = Field(
+        "warm",
+        description="Voice persona for the narration: 'warm' (friendly, approachable), "
+        "'energetic' (upbeat, dynamic), 'authoritative' (confident, serious), or 'friendly' "
+        "(bright, casual). Ignored when narrationScript is null.",
+    )
+
+
 class StoryboardSpec(BaseModel):
     """What the LLM produces (`generate_video_storyboard`) and what `FinalDraft`
     carries. Image queries are not resolved yet at this point — see
@@ -495,6 +553,12 @@ class StoryboardSpec(BaseModel):
     slides: List[SlideSpec] = Field(
         min_length=2, max_length=8,
         description="An ordered storyboard composed from the slide registry — choose the types, order, and count that best fit the brief",
+    )
+    audio: Optional[AudioSpec] = Field(
+        None,
+        description="Background-music direction plus an optional narration script/voice for the "
+        "whole video. Always author this: pick music that matches the brand's energy and write a "
+        "short spoken narration (set narrationScript to null only for a deliberately silent piece).",
     )
 
 
@@ -694,6 +758,15 @@ class RenderableStoryboard(BaseModel):
     # Job-relative path (e.g. "music.mp3"), resolved by workflow/video/music.py.
     # None when generation failed or was skipped — the render is silent, not blocked.
     musicLocalPath: Optional[str] = None
-    # Job-relative path (e.g. "voiceover.mp3"), resolved by workflow/video/voiceover.py.
-    # None when no narration_text was supplied or synthesis failed — never blocked.
+    # Job-relative path (e.g. "voiceover.mp3") for a SINGLE whole-video narration
+    # track — the legacy/fallback path (caller-supplied narration_text, or a storyboard
+    # with only AudioSpec.narrationScript). None when unused. When per-slide narration
+    # drives the render, voiceoverSlidePaths below is set instead and this stays None.
     voiceoverLocalPath: Optional[str] = None
+    # Per-slide narration paths (e.g. "voiceover/0.mp3"), index-aligned to `slides` —
+    # resolved by workflow/video/voiceover.py, one clip per slide that carried a
+    # `narration` line (None for a slide with no narration or a failed synth). This is
+    # the slide-synced path: the TS side plays each inside its own slide sequence. None
+    # (the whole field) when no per-slide narration was produced — pre-feature props
+    # JSON still validates and falls back to voiceoverLocalPath.
+    voiceoverSlidePaths: Optional[List[Optional[str]]] = None

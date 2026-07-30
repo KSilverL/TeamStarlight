@@ -1,9 +1,9 @@
 """
-Human-in-the-loop via the RequestPort (replaces test_interrupts).
+Human-in-the-loop via the RequestPort.
 
-Covers the three things the LangGraph interrupt used to: the workflow pauses at the
-human gate, the pause is persisted to the checkpoint store, and a HumanVerdict
-resumes it. Also covers reject → re-dispatch and approve-after-edit.
+Covers three things: the workflow pauses at the human gate, the pause is
+persisted to the checkpoint store, and a HumanVerdict resumes it. Also covers
+reject → re-dispatch and approve-after-edit.
 """
 
 from __future__ import annotations

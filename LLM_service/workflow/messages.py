@@ -43,8 +43,8 @@ DEFAULT_CONTENT_TYPES = ["text"]  # not-default-on for brand/video; the backend 
 
 
 class Brief(BaseModel):
-    """The structured creative brief — the workflow input. In M3 the intake layer
-    (voice/text) produces this; for M1 it is constructed directly."""
+    """The structured creative brief — the workflow input. Usually produced by the
+    intake layer (voice/text); tests and callers may construct it directly."""
 
     topic: str
     target_platforms: List[str]
@@ -141,7 +141,11 @@ class ApprovedDraft(BaseModel):
     """human_gate / archivist → media_producer: a draft the human approved (directly
     or after an edit), on its way to media production. Carries the `brief` so the
     media_producer can derive the brand card / video from `topic` + `tone_hint`, and
-    any `proposed_rules` the archivist distilled (passed straight through to FinalDraft)."""
+    any `proposed_rules` the archivist distilled (passed straight through to FinalDraft).
+
+    `strategy` carries the roundtable's per-platform consensus forward (it is otherwise
+    dropped at the gate) — on a text+video run it holds the agreed VIDEO direction, so the
+    media_producer's storyboard reflects the discussion, not just the final caption."""
 
     platform: str
     draft: str
@@ -150,6 +154,7 @@ class ApprovedDraft(BaseModel):
     needs_human_intervention: bool = False
     proposed_rules: List[BrandRule] = Field(default_factory=list)
     brief: Brief
+    strategy: str = ""
 
 
 class FinalDraft(BaseModel):

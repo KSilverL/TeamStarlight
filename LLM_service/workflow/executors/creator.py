@@ -1,22 +1,19 @@
-"""creator (人格创作者) — the per-platform copywriter.
+"""creator — the per-platform copywriter.
 
-This single executor realises the MAF fan-out: on a CreativeStrategy it drafts
-every target platform concurrently and emits one Draft per platform (instead of N
-separate executor nodes). On a ReviewOutcome (a rejected draft routed back by the
-circuit-breaker edge, or a human reject) it re-drafts just that one platform with
-an incremented attempt counter.
+A single executor that fans out: on a CreativeStrategy it drafts every target
+platform concurrently and emits one Draft per platform. On a ReviewOutcome (a
+rejected draft routed back by the circuit-breaker edge, or a human reject) it
+re-drafts just that one platform with an incremented attempt counter.
 
-Injection has three layers (MIGRATION_PLAN §5.4):
-  - static : the platform skill file `skills/<platform>.md` (char limit, tone, examples) —
-             wired in M4.
-  - dynamic: the brand's Brand_Voice_Profile (must_do / must_avoid / examples) from the
-             store, ONLY for a branded user. A no-brand user (business_id is None) skips
-             the store entirely and relies on `brief.tone_hint` — so the no-brand path
-             never reads the DB and can't fail on a misconfigured store.
-  - per-user: the current user's learned rules (the per-`user_id` channel), filtered to
-             this platform (platform-specific + cross-platform) and rendered into a MUST
-             DO / MUST AVOID block. Read in memory, never persisted here; skipped when
-             there is no user_id or no record (behaviour then matches the status quo).
+Its prompt is built from three layers:
+  - static : the platform skill file `skills/<platform>.md` (char limit, tone, examples).
+  - brand  : the Brand_Voice_Profile (must_do / must_avoid / examples) from the
+             store, ONLY for a branded user. A no-brand user (business_id is None)
+             skips the store entirely and relies on `brief.tone_hint`, so that path
+             can't fail on a misconfigured store.
+  - per-user: the user's learned rules (the per-`user_id` channel), filtered to
+             this platform and rendered into a MUST DO / MUST AVOID block. Read
+             only; skipped when there is no user_id or no record.
 """
 
 import asyncio

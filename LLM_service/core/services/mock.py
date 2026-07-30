@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import html as _html
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import AsyncIterator, Dict, List, Optional
 
 from agent_framework import (
@@ -31,6 +32,7 @@ from agent_framework._types import ResponseStream
 
 from ...skills import parse_char_limit
 from ..config import get_settings
+from ..plan_schema import PlanClarification, PlanItemSpec, PostingPlanSpec
 from ..skill_schema import SkillCandidate, SkillRule, UserSkillDoc
 from ..trend_schema import Trend, select_current_trends
 from ..video_schema import StoryboardSpec
@@ -45,6 +47,7 @@ from .base import (
     SafetyResult,
     SafetyService,
     StoreService,
+    SynthesizedSpeech,
     VideoGenerationService,
     VoiceoverService,
     VoiceService,
@@ -90,6 +93,7 @@ _PLATFORM_FOCUS: Dict[str, str] = {
     "x": "emotional resonance and brevity",
     "instagram": "visual storytelling and lifestyle",
     "tiktok": "playful, trend-native hooks",
+    "facebook": "community connection and shareable storytelling",
 }
 
 _MOCK_LATENCY = 0.0  # bump for demos; kept 0 so tests are instant
@@ -97,6 +101,13 @@ _MOCK_LATENCY = 0.0  # bump for demos; kept 0 so tests are instant
 
 def _focus(platform: str) -> str:
     return _PLATFORM_FOCUS.get(platform.lower(), "general audience engagement")
+
+
+def _first_bullet(block: str) -> str:
+    """The first "- " bullet in a pre-rendered prompt block, or "" — the deterministic
+    lever the mock uses to prove a context block (trends / brand / user) was injected;
+    an empty block yields "" so the output stays byte-identical (degrade-to-empty)."""
+    return next((ln[2:] for ln in block.splitlines() if ln.startswith("- ")), "")
 
 
 def _alias(platform: str) -> str:
@@ -402,13 +413,22 @@ def _mock_scene_component(*, broken: bool) -> str:
     )
 
 
-def _mock_storyboard(topic: str, draft: str, tone_hint: Optional[str], platform: str) -> dict:
+def _mock_storyboard(
+    topic: str, draft: str, tone_hint: Optional[str], platform: str, direction: str = "",
+) -> dict:
     """A deterministic 4-slide StoryboardSpec-shaped dict — one of each Phase 1 slide
     type, in a typical order (hook -> collage -> counter_stat -> outro), so
-    contract-parity / shape tests have something stable to assert on."""
+    contract-parity / shape tests have something stable to assert on. When `direction`
+    (the roundtable's agreed video direction) is given, it is echoed into the hook slide's
+    narration so tests can assert the direction reached the generator; empty `direction`
+    leaves the deterministic baseline output unchanged."""
     primary, secondary, accent = _MEDIA_PALETTE
     brand = _brand_name(topic)
     tagline = (tone_hint or "Crafted with intent").strip()[:48] or "Crafted with intent"
+    hook_narration = (
+        f"Introducing {brand}. Direction: {direction.strip()}"
+        if direction and direction.strip() else f"Introducing {brand}."
+    )
     return StoryboardSpec(
         brandName=brand,
         primaryColor=primary,
@@ -416,15 +436,24 @@ def _mock_storyboard(topic: str, draft: str, tone_hint: Optional[str], platform:
         accentColor=accent,
         platform=platform,
         slides=[
-            {"type": "hook", "headline": tagline, "imageQuery": topic, "shape": "circle"},
-            {"type": "collage", "headline": "Why It Matters", "imageQueries": [topic, "team", "product"]},
+            {"type": "hook", "headline": tagline, "imageQuery": topic, "shape": "circle",
+             "narration": hook_narration},
+            {"type": "collage", "headline": "Why It Matters", "imageQueries": [topic, "team", "product"],
+             "narration": f"Here's why {topic} matters for you."},
             {"type": "counter_stat", "sectionLabel": "By The Numbers", "stats": [
                 {"value": "100%", "label": "On brand", "icon": "★"},
                 {"value": "3", "label": "Platforms", "icon": "◆"},
                 {"value": "24/7", "label": "Always on", "icon": "●"},
-            ]},
-            {"type": "outro", "brandName": brand, "ctaLabel": "Learn More", "contact": "@brand · brand.com"},
+            ], "narration": "The numbers speak for themselves."},
+            {"type": "outro", "brandName": brand, "ctaLabel": "Learn More", "contact": "@brand · brand.com",
+             "narration": f"Learn more about {brand} today."},
         ],
+        audio={
+            "musicMood": "inspiring",
+            "musicGenre": "corporate",
+            "musicEnergy": "medium",
+            "narrationVoice": "warm",
+        },
     ).model_dump()
 
 
@@ -453,7 +482,15 @@ class MockLLM(LLMService):
         }
 
     async def plan_strategy(
-        self, *, topic: str, platform: str, user_intent: str, trends: str = ""
+        self,
+        *,
+        topic: str,
+        platform: str,
+        user_intent: str,
+        trends: str = "",
+        skill: str = "",
+        brand_block: str = "",
+        user_block: str = "",
     ) -> str:
         await asyncio.sleep(_MOCK_LATENCY)
         intent = user_intent or "raise awareness"
@@ -461,11 +498,19 @@ class MockLLM(LLMService):
             f"On {platform}, lead with {_focus(platform)}. "
             f"Anchor it to '{topic}' and aim to {intent}."
         )
-        # Deterministic trend fusion: weave the block's FIRST trend line in verbatim, so
-        # tests can assert the injection; empty block leaves the strategy byte-identical.
-        first = next((ln[2:] for ln in trends.splitlines() if ln.startswith("- ")), "")
-        if first:
-            strategy += f" If it genuinely fits, ride this current trend: {first}"
+        # Deterministic context fusion (same lever for every block): weave each block's
+        # FIRST bullet in verbatim so tests can assert the injection; an empty block leaves
+        # the strategy byte-identical (degrade-to-empty). `skill` is free-form house style,
+        # not a bulleted block, so it steers the (real) prompt but not the mock's fixed text.
+        brand_first = _first_bullet(brand_block)
+        if brand_first:
+            strategy += f" Honour the brand voice: {brand_first}."
+        user_first = _first_bullet(user_block)
+        if user_first:
+            strategy += f" Reflect this user's preference: {user_first}."
+        trend_first = _first_bullet(trends)
+        if trend_first:
+            strategy += f" If it genuinely fits, ride this current trend: {trend_first}"
         return strategy
 
     async def suggest_topic(
@@ -481,6 +526,137 @@ class MockLLM(LLMService):
         if first:
             topic += f", riding {first}"
         return topic
+
+    async def name_session(self, *, topic: str, user_intent: str) -> str:
+        await asyncio.sleep(_MOCK_LATENCY)
+        # Deterministic short title: the first handful of the topic's words, cleaned. Mirrors the
+        # caller's fallback so mock/offline runs still surface a tidy sidebar title.
+        words = (topic or user_intent or "New session").split()
+        return " ".join(words[:6]).strip(" ,.;:—-") or "New session"
+
+    async def clarify_campaign(
+        self,
+        *,
+        goal: str,
+        platforms: List[str],
+        start_date: str,
+        end_date: str,
+        cadence_hint: str = "",
+        tone_hint: Optional[str] = None,
+        brand_block: str = "",
+        user_block: str = "",
+        trends: str = "",
+        skill: str = "",
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        plats = platforms or ["linkedin"]
+        recommended_cadence = (
+            cadence_hint
+            or f"~2 posts/week per platform across {', '.join(plats)}"
+        )
+        # Clarify's whole purpose is to gather info up front, so it always asks — unless
+        # the caller already pinned the cadence, in which case one lighter question.
+        if cadence_hint:
+            questions = [
+                "Are there any key dates or launches this campaign should build toward?"
+            ]
+        else:
+            questions = [
+                "How often can you realistically produce content each week?",
+                "Are there any key dates or launches this campaign should build toward?",
+            ]
+        return PlanClarification(
+            recommended_cadence=recommended_cadence,
+            follow_up_questions=questions,
+        ).model_dump()
+
+    async def plan_campaign(
+        self,
+        *,
+        goal: str,
+        platforms: List[str],
+        start_date: str,
+        end_date: str,
+        cadence_hint: str = "",
+        tone_hint: Optional[str] = None,
+        brand_block: str = "",
+        user_block: str = "",
+        trends: str = "",
+        skill: str = "",
+        feedback: str = "",
+        answers: str = "",
+        prior_plan: str = "",
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        lo, hi = date.fromisoformat(start_date), date.fromisoformat(end_date)
+        # Deterministic schedule: one slot every 3 days from the window start, capped
+        # at 8 — enough spread to exercise due-date logic without a fixture per test.
+        slot_dates: List[date] = []
+        d = lo
+        while d <= hi and len(slot_dates) < 8:
+            slot_dates.append(d)
+            d += timedelta(days=3)
+        plats = platforms or ["linkedin"]
+        # Same deterministic trend lever as plan_strategy / suggest_topic: the block's
+        # FIRST trend line lands verbatim (in the first slot's rationale); an empty
+        # block leaves the plan byte-identical. Brand/user blocks are presence levers.
+        first = next((ln[2:] for ln in trends.splitlines() if ln.startswith("- ")), "")
+        items = []
+        for i, slot in enumerate(slot_dates):
+            platform = plats[i % len(plats)]
+            rationale = f"Slot {i + 1}: steady cadence toward '{goal}' on {platform}."
+            if first and i == 0:
+                rationale += f" Rides current trend: {first}"
+            items.append(
+                PlanItemSpec(
+                    planned_date=slot.isoformat(),
+                    time_of_day="morning" if i % 2 == 0 else "18:00",
+                    platforms=[platform],
+                    topic=f"{goal} — {_focus(platform)} angle",
+                    angle=_focus(platform),
+                    rationale=rationale,
+                )
+            )
+        summary = (
+            f"Campaign plan for '{goal}': {len(items)} posts from {start_date} "
+            f"to {end_date}, rotating {', '.join(plats)}."
+        )
+        if cadence_hint:
+            summary += f" Cadence: {cadence_hint}."
+        if brand_block:
+            summary += " Aligned with the brand voice profile."
+        if user_block:
+            summary += " Tuned to this user's learned preferences."
+        if first:
+            summary += f" Trend anchor: {first}"
+        # A refine pass (prior_plan + feedback/answers) is observably distinct from a
+        # fresh create: mark the summary so tests can assert regeneration happened.
+        refining = bool(feedback or answers or prior_plan)
+        if feedback:
+            summary = f"Revised per feedback ({feedback}). " + summary
+        if answers:
+            summary += " Tuned to your answers."
+        # Cadence the "agent chose": echo an explicit hint, else derive one deterministically
+        # (this is the pace surfaced to the user when they left cadence_hint blank).
+        recommended_cadence = (
+            cadence_hint
+            or f"~2 posts/week per platform across {', '.join(plats)}"
+        )
+        # Follow-up clarifiers only when there's no explicit cadence AND the user hasn't
+        # yet answered/pushed back — so a blank-cadence create surfaces questions and a
+        # refine drops them.
+        follow_up_questions: List[str] = []
+        if not cadence_hint and not refining:
+            follow_up_questions = [
+                "How often can you realistically produce content each week?",
+                "Are there any key dates or launches this campaign should build toward?",
+            ]
+        return PostingPlanSpec(
+            strategy_summary=summary,
+            recommended_cadence=recommended_cadence,
+            follow_up_questions=follow_up_questions,
+            items=items,
+        ).model_dump()
 
     async def write_copy(
         self,
@@ -560,10 +736,11 @@ class MockLLM(LLMService):
         tone_hint: Optional[str],
         platform: str,
         skill: str = "",
+        direction: str = "",
         history: Optional[List[dict]] = None,
     ) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
-        return _mock_storyboard(topic, draft, tone_hint, platform)
+        return _mock_storyboard(topic, draft, tone_hint, platform, direction)
 
     async def generate_video_prompt(
         self,
@@ -815,8 +992,8 @@ class MockLLM(LLMService):
 # The roundtable runs real MAF Magentic agents; each persona is an `Agent` backed by a
 # chat client. This mock implements the installed `BaseChatClient` contract and returns
 # deterministic, scripted text keyed by (agent_name, call_index) — so a discussion is
-# fully reproducible offline (the production counterpart, an OpenAIChatClient, lands in
-# Phase 2). The agent name encodes the persona role; `call_index` advances each turn.
+# fully reproducible offline (the production counterpart is AzureChatClient).
+# The agent name encodes the persona role; `call_index` advances each turn.
 
 _ROUNDTABLE_PERSONA_LINES: Dict[str, List[str]] = {
     "platform_editor": [
@@ -955,6 +1132,7 @@ class MockStore(StoreService):
         self._user_skills: Dict[str, dict] = {}
         self._video_jobs: Dict[str, dict] = {}
         self._trends: Optional[dict] = None  # the rolling `current` snapshot; None → fixture
+        self._posting_plans: Dict[str, dict] = {}
 
     async def get_profile(self, *, business_id: Optional[str]) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
@@ -1045,6 +1223,36 @@ class MockStore(StoreService):
         stored = self._video_jobs.get(job_id)
         return dict(stored) if stored is not None else None
 
+    async def upsert_posting_plan(self, *, plan: dict) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        # deepcopy, not dict(): plan docs nest an items list, and a shared reference
+        # would let a caller mutate the "stored" doc after the fact.
+        self._posting_plans[plan["plan_id"]] = copy.deepcopy(plan)
+
+    async def get_posting_plan(self, *, plan_id: str) -> Optional[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        stored = self._posting_plans.get(plan_id)
+        return copy.deepcopy(stored) if stored is not None else None
+
+    async def list_posting_plans(
+        self,
+        *,
+        business_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        out: List[dict] = []
+        for doc in self._posting_plans.values():
+            if business_id is not None and doc.get("business_id") != business_id:
+                continue
+            if user_id is not None and doc.get("user_id") != user_id:
+                continue
+            if status is not None and doc.get("status") != status:
+                continue
+            out.append(copy.deepcopy(doc))
+        return out
+
 
 # ── Voice ──────────────────────────────────────────────────────────────────────
 
@@ -1053,7 +1261,7 @@ class MockVoice(VoiceService):
         await asyncio.sleep(_MOCK_LATENCY)
         # Deterministic "transcription": the offline script provides the spoken words,
         # so a faithful transcript is the verbatim text. This makes a voice intake
-        # produce a CreativeBrief identical to the same words typed (§4.4).
+        # produce a CreativeBrief identical to the same words typed.
         return {"session_id": session_id, "transcript": user_audio.strip()}
 
 
@@ -1267,11 +1475,11 @@ class MockVoiceover(VoiceoverService):
     the file — works end to end without real credentials. Reuses `_silent_mp3`
     (already built for MockMusicGeneration; same ffprobe-decodability requirement)."""
 
-    async def synthesize(self, *, text: str, voice: str) -> bytes:
+    async def synthesize(self, *, text: str, voice: str) -> SynthesizedSpeech:
         await asyncio.sleep(_MOCK_LATENCY)
         words = len(text.split())
         duration_seconds = max(1.0, (words / _MOCK_SPEAKING_RATE_WPM) * 60)
-        return _silent_mp3(duration_seconds)
+        return SynthesizedSpeech(audio=_silent_mp3(duration_seconds), duration_seconds=duration_seconds)
 
 
 # Minimal but structurally-valid MP4 container (ftyp + mdat), used as the offline
