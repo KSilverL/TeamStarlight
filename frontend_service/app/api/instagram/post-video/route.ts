@@ -1,44 +1,61 @@
 import { NextRequest } from "next/server";
+import { extractJavaError } from "@/app/api/_lib/upstream";
 
-const JAVA_BACKEND_URL = process.env.JAVA_BACKEND_URL ?? "http://backend:8081";
+// BACKEND_URL is what docker-compose actually sets for this service; the previous
+// JAVA_BACKEND_URL was never defined anywhere and silently fell through to its default.
+const JAVA_SERVICE_URL = process.env.BACKEND_URL ?? "http://localhost:8081";
 
+// Starts publishing a finished video render job to Instagram as a Reel. Returns 202 with a
+// publishJobId to poll at GET /api/instagram/post-video/[publishJobId] — Instagram transcodes
+// asynchronously and can take minutes, far longer than a browser will hold a request open.
+// Credential and permission errors are still reported synchronously in this response.
 export async function POST(request: NextRequest) {
   const body = await request.json();
-  const jobId: string = body.jobId ?? "";
-  const caption: string = body.caption ?? "";
+  // Forwarded, not trusted: the backend derives the business from this token and ignores
+  // anything the body claims, so a caller cannot publish through another business's account.
+  const authHeader = request.headers.get("Authorization");
 
-  if (!jobId.trim()) {
+  if (!body.jobId || typeof body.jobId !== "string") {
     return Response.json({ error: "jobId is required" }, { status: 400 });
+  }
+  if (!Array.isArray(body.pageIds) || body.pageIds.length === 0) {
+    return Response.json(
+      {
+        error:
+          "Connect Facebook and pick a Page in your Brand Profile first — an Instagram post is published through the Page its account is linked to.",
+      },
+      { status: 400 }
+    );
   }
 
   try {
-    const form = new FormData();
-    form.append("job_id", jobId);
-    form.append("caption", caption);
-
-    const upstream = await fetch(`${JAVA_BACKEND_URL}/instagram/post-video`, {
+    const upstream = await fetch(`${JAVA_SERVICE_URL}/instagram/post-video`, {
       method: "POST",
-      body: form,
+      headers: {
+        "Content-Type": "application/json",
+        ...(authHeader ? { Authorization: authHeader } : {}),
+      },
+      body: JSON.stringify({
+        jobId: body.jobId,
+        caption: typeof body.caption === "string" ? body.caption : "",
+        pageIds: body.pageIds,
+      }),
     });
 
     if (!upstream.ok) {
-      const text = await upstream.text();
-      return new Response(JSON.stringify({ error: text }), {
-        status: upstream.status,
-        headers: { "Content-Type": "application/json" },
-      });
+      const text = await upstream.text().catch(() => "");
+      // The backend reports credential and Graph failures as {"error": "..."} naming the fix;
+      // relay that rather than flattening it to a generic message.
+      return Response.json(
+        { error: extractJavaError(text) || "Failed to post video to Instagram" },
+        { status: upstream.status }
+      );
     }
 
-    const mediaId = await upstream.text();
-    return new Response(JSON.stringify({ mediaId }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
+    const data = await upstream.json();
+    return Response.json(data, { status: upstream.status });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Instagram backend unreachable";
-    return new Response(JSON.stringify({ error: message }), {
-      status: 502,
-      headers: { "Content-Type": "application/json" },
-    });
+    return Response.json({ error: message }, { status: 502 });
   }
 }

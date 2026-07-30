@@ -40,5 +40,11 @@ public class CrossPlatformOAuth {
     private Long[] pageIdArray;
     @JsonProperty("pageNameArray")
     private String[] pageNameArray;
+    /** Instagram Business account id per Page, index-aligned with {@link #pageIdArray}. A null
+     * entry means that Page has no Instagram account linked and cannot be published to — the
+     * slot is still occupied so the three arrays stay parallel. Instagram publishing is
+     * addressed by this id; the Page id only identifies which token to use. */
+    @JsonProperty("igUserIdArray")
+    private String[] igUserIdArray;
 
 }

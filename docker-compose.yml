@@ -33,13 +33,32 @@ services:
       - "8081:8081"
     environment:
       - LLM_SERVICE_BASE_URL=http://llm:8080
-      # Supabase credentials — override here or in a .env file if needed.
-      # Defaults are already baked into application.properties.
+      # Everything below uses the bare `- VAR` pass-through form on purpose. The `VAR=${VAR:-}`
+      # form would set the variable to an empty string when it is unset, and Spring only falls
+      # back to a `${VAR:default}` default when the property is *unresolvable* — an empty value
+      # overrides the default and yields a blank password / blank JDBC URL. Bare form omits the
+      # variable entirely when unset, so the defaults in application.properties actually apply.
+      #
+      # Postgres — host/user have defaults in application.properties; the password does not.
+      # Missing it surfaces as a Postgres auth failure for user "citus" at startup.
+      - POSTGRES_JDBC_URL
+      - POSTGRES_USER
+      - POSTGRES_PASSWORD
+      # JWT signing secret. The in-code default is a known placeholder — set this for anything
+      # that is not a throwaway local run.
+      - JWT_SECRET
       # LinkedIn/Meta OAuth — must match the redirect URI registered on the respective Developer
       # app, and where to send the browser back to after the OAuth round-trip.
       - LINKEDIN_REDIRECT_URI=${LINKEDIN_REDIRECT_URI:-http://localhost:8081/linkedin/callback}
       - META_REDIRECT_URI=${META_REDIRECT_URI:-http://localhost:8081/meta/callback}
       - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-http://localhost:3000}
+      # Azure Blob Storage — staging for Instagram Reels publishing (Graph fetches the MP4
+      # from a SAS URL rather than accepting raw bytes).
+      - AZURE_STORAGE_CONNECTION_STRING
+      - AZURE_STORAGE_CONTAINER
+      # Outbound mail (PlanScheduler "your post is drafting" notifications).
+      - MAIL_USERNAME
+      - MAIL_PASSWORD
     depends_on:
       - llm
 
@@ -133,17 +152,3 @@ services:
       - HIGGSFIELD_IMAGE_MODEL=${HIGGSFIELD_IMAGE_MODEL}
       - HIGGSFIELD_TEXT_MODEL=${HIGGSFIELD_TEXT_MODEL}
       - HIGGSFIELD_MAX_DURATION_S=15
-
-  frontend:
-    build:
-      context: frontend_service
-      dockerfile: Dockerfile
-    ports:
-      - "3000:3000"
-    environment:
-      - BRAND_VIDEO_AGENT_URL=http://backend:8081
-      - TEXT_AGENT_URL=http://backend:8081
-      - BACKEND_URL=http://backend:8081
-    depends_on:
-      - llm
-      - backend

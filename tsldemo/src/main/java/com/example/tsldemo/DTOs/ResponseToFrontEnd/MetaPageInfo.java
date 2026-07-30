@@ -15,4 +15,10 @@ public class MetaPageInfo {
     @JsonProperty("pageNames")
     String[] pageNames;
 
+    /** Index-aligned with pageIds; null where that Page has no Instagram account linked. Lets the
+     * Page picker mark which Pages an Instagram post can actually go through, instead of the user
+     * discovering it only when publishing fails. */
+    @JsonProperty("igUserIds")
+    String[] igUserIds;
+
 }

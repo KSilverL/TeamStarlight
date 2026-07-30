@@ -37,6 +37,7 @@ import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.util.StreamUtils;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientResponseException;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.server.ResponseStatusException;
 
@@ -76,6 +77,26 @@ public class CrossPlatformService {
 
     // The one scope that separates a token that can publish from one that can only sign in.
     private static final String POSTING_SCOPE = "w_member_social";
+
+    /** Meta permissions requested at consent. Instagram publishing rides on the Facebook Page
+     * connection rather than a separate login: instagram_basic resolves the Page's linked
+     * Instagram account, instagram_content_publish allows creating and publishing media on it.
+     *
+     * Single source of truth on purpose — the consent URL and the "why did I get no Pages"
+     * diagnostic both read this list, and they previously each hardcoded their own copy, so a
+     * scope added for publishing would not have been reported as missing when it was declined. */
+    private static final List<String> META_SCOPES = List.of(
+            "pages_show_list",
+            "pages_manage_posts",
+            "pages_read_engagement",
+            "instagram_basic",
+            "instagram_content_publish");
+
+    /** Fields to request on the /me/accounts edge. instagram_business_account is NOT in Graph's
+     * default field set, so it has to be named explicitly — and naming any field at all replaces
+     * the default set, hence the others are respelled here rather than being inherited. */
+    private static final String META_PAGE_FIELDS =
+            "id,name,access_token,category,category_list,tasks,instagram_business_account{id,username}";
 
     // LinkedIn's own stated bounds for an organic video upload (Videos API docs).
     private static final long MIN_VIDEO_BYTES = 75L * 1024;
@@ -675,7 +696,7 @@ public class CrossPlatformService {
                 + "&client_id=" + URLEncoder.encode(crossPlatformOAuth.getClientId(), StandardCharsets.UTF_8)
                 + "&redirect_uri=" + URLEncoder.encode(metaRedirectUri, StandardCharsets.UTF_8)
                 + "&state=" + URLEncoder.encode(state, StandardCharsets.UTF_8)
-                + "&scope=" + URLEncoder.encode("pages_show_list,pages_manage_posts,pages_read_engagement", StandardCharsets.UTF_8);
+                + "&scope=" + URLEncoder.encode(String.join(",", META_SCOPES), StandardCharsets.UTF_8);
 
             // Persist the state BEFORE redirecting, so the callback can always find it.
             crossPlatformOAuth.setState(state);
@@ -737,11 +758,7 @@ public class CrossPlatformService {
 
         System.out.println("Start Post Method");
         System.out.println("PageId not found, retrieving data");
-        MetaUserInfoDTO metaUserInfo = restClient.get()
-            .uri("https://graph.facebook.com/v25.0/me/accounts")
-            .header("Authorization", "Bearer " + crossPlatformOAuth.getAccessToken())
-            .retrieve()
-            .body(MetaUserInfoDTO.class);
+        MetaUserInfoDTO metaUserInfo = fetchMetaPages(crossPlatformOAuth.getAccessToken());
 
         // Graph answers "no Pages" with a 200 and an empty data array rather than an error, so
         // without this the UI just renders an empty picker and the user has nothing to act on.
@@ -753,9 +770,118 @@ public class CrossPlatformService {
 
         crossPlatformOAuth.setPageIdArray(Arrays.stream(metaUserInfo.data()).map(MetaDataUserInfo::pageId).toArray(Long[]::new));
         crossPlatformOAuth.setPageNameArray(Arrays.stream(metaUserInfo.data()).map(MetaDataUserInfo::pageName).toArray(String[]::new));
+        // Index-aligned with the two arrays above, null where a Page has no Instagram account
+        // linked. Stored so the Brand Profile can show which Pages can carry an Instagram post
+        // without re-querying Graph; the id is still re-resolved at publish time, since the user
+        // can link or unlink an account at any point after connecting.
+        crossPlatformOAuth.setIgUserIdArray(Arrays.stream(metaUserInfo.data())
+                .map(page -> page.instagramBusinessAccount() == null
+                        ? null
+                        : page.instagramBusinessAccount().igUserId())
+                .toArray(String[]::new));
         crossPlatformRepository.save(crossPlatformOAuth);
 
         return crossPlatformOAuth;
+    }
+
+    /** One publishable Instagram account: which account to address, and the Page token that
+     * authorises it. Page tokens are short-lived and never stored, so this is only ever built
+     * fresh from Graph and used immediately. */
+    public record InstagramTarget(Long pageId, String pageName, String igUserId, String username,
+                                 String pageAccessToken) {}
+
+    /** Resolves the Instagram accounts reachable from the given Pages, for this business only.
+     *
+     * The businessId comes from the caller's JWT, and the Pages are looked up under that
+     * business's own Meta connection — so naming another business's Page id here resolves
+     * nothing rather than posting to it.
+     *
+     * Fails with a message naming the actual next step rather than returning an empty list,
+     * because every empty case has a different fix: no Meta connection at all, a Page that isn't
+     * administered by this token, or a Page with no Instagram account linked to it. */
+    public List<InstagramTarget> resolveInstagramTargets(long businessId, List<Long> pageIds) {
+        if (pageIds == null || pageIds.isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "No Facebook Page selected. Pick a Page in your Brand Profile — an Instagram post "
+                    + "is published through the Page its account is linked to.");
+        }
+
+        CrossPlatformOAuth oauth = crossPlatformRepository.findByBusinessIdAndPlatform(businessId, PlatformEnum.META);
+        if (oauth == null || oauth.getAccessToken() == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Facebook is not connected for this business. Connect Facebook from your Brand "
+                    + "Profile first — Instagram publishing uses that connection.");
+        }
+
+        MetaUserInfoDTO pages = fetchMetaPages(oauth.getAccessToken());
+        if (pages == null || pages.data() == null || pages.data().length == 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, explainNoPages(oauth.getAccessToken()));
+        }
+
+        List<InstagramTarget> targets = new ArrayList<>();
+        List<String> unlinked = new ArrayList<>();
+        for (Long pageId : pageIds) {
+            MetaDataUserInfo page = Arrays.stream(pages.data())
+                    .filter(p -> Objects.equals(p.pageId(), pageId))
+                    .findFirst()
+                    .orElse(null);
+
+            if (page == null) {
+                // Either the id isn't this business's Page, or consent no longer covers it.
+                // Both are the user's to fix, and neither should leak whose Page it might be.
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                        "Facebook Page " + pageId + " is not available on this connection. Reconnect "
+                        + "Facebook and make sure that Page is ticked in the consent dialog.");
+            }
+            if (page.instagramBusinessAccount() == null) {
+                unlinked.add(page.pageName() == null ? String.valueOf(pageId) : page.pageName());
+                continue;
+            }
+            targets.add(new InstagramTarget(
+                    page.pageId(),
+                    page.pageName(),
+                    page.instagramBusinessAccount().igUserId(),
+                    page.instagramBusinessAccount().username(),
+                    page.pageAccessToken()));
+        }
+
+        if (targets.isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "No Instagram account is linked to " + String.join(", ", unlinked) + ". In Meta "
+                    + "Business Suite, link an Instagram professional (Business or Creator) account to "
+                    + "the Page, then reconnect Facebook here. Personal Instagram accounts cannot be "
+                    + "published to through the API.");
+        }
+        return targets;
+    }
+
+    /** The Pages this token administers, with the Page access token and linked Instagram account
+     * for each. Both the connect flow and every publish path need exactly this, and the Page
+     * access tokens are deliberately never persisted — they are re-read here each time so a
+     * token revoked or rotated on Meta's side can't be used from stale local state. */
+    private MetaUserInfoDTO fetchMetaPages(String userAccessToken) {
+        try {
+            return restClient.get()
+                .uri(uriBuilder -> uriBuilder
+                    .scheme("https")
+                    .host("graph.facebook.com")
+                    .path("/v25.0/me/accounts")
+                    .queryParam("fields", META_PAGE_FIELDS)
+                    .build())
+                .header("Authorization", "Bearer " + userAccessToken)
+                .retrieve()
+                .body(MetaUserInfoDTO.class);
+        } catch (RestClientResponseException e) {
+            // Graph rejects the token itself here — expired (user tokens last ~60 days), revoked
+            // in Facebook's app settings, or invalidated by a password change. Left unhandled this
+            // escapes as a bare 500, which tells the user nothing; the fix is always to reconnect.
+            log.warn("Meta rejected /me/accounts: {}", e.getResponseBodyAsString());
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Facebook rejected the stored connection for this business — the access token has "
+                    + "most likely expired or been revoked. Click Reconnect Facebook in your Brand "
+                    + "Profile and accept every permission the dialog asks for. (Facebook said: "
+                    + e.getResponseBodyAsString() + ")", e);
+        }
     }
 
     /** Why did /me/accounts come back empty? Almost always one of two things: the consent dialog
@@ -800,7 +926,7 @@ public class CrossPlatformService {
                         .map(MetaPermissionsRespDTO.MetaPermission::permission)
                         .toList();
 
-                for (String required : List.of("pages_show_list", "pages_manage_posts", "pages_read_engagement")) {
+                for (String required : META_SCOPES) {
                     if (!granted.contains(required) && !declined.contains(required)) {
                         declined.add(required + " (never granted)");
                     }
@@ -837,12 +963,8 @@ public class CrossPlatformService {
         CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(requestDTO.getBusinessId(), PlatformEnum.META);
         System.out.println("Meta Credentials Found!");
 
-        MetaUserInfoDTO metaUserInfo = restClient.get()
-            .uri("https://graph.facebook.com/v25.0/me/accounts")
-            .header("Authorization", "Bearer " + crossPlatformOAuth.getAccessToken())
-            .retrieve()
-            .body(MetaUserInfoDTO.class);
-        
+        MetaUserInfoDTO metaUserInfo = fetchMetaPages(crossPlatformOAuth.getAccessToken());
+
         List<String> postIds = new ArrayList<>();
         
         for (Long pageId : requestDTO.getPageId()) {

@@ -146,6 +146,7 @@ public class CrossPlatformController {
             MetaPageInfo response = new MetaPageInfo();
             response.setPageIds(crossPlatformOAuth.getPageIdArray());
             response.setPageNames(crossPlatformOAuth.getPageNameArray());
+            response.setIgUserIds(crossPlatformOAuth.getIgUserIdArray());
             return ResponseEntity.ok(response);
         } catch (ResponseStatusException e) {
             // Spring Boot 4 drops the exception's reason from the default error body, so letting
@@ -183,7 +184,7 @@ public class CrossPlatformController {
         return ResponseEntity.ok(Map.of("status", "scheduled"));
         
     }
-}
+
     @PostMapping("/meta/auth")
     public void metaAuth(HttpServletResponse response,
                          @RequestBody Long businessId,

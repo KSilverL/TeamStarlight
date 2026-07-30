@@ -1635,9 +1635,12 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
   const [postError, setPostError] = useState<string | null>(null);
   // Reference images carried from the compose box; the user can drop any before rendering.
   const [refs, setRefs] = useState<string[]>(message.referenceImages ?? []);
-  // instagram posting
+  // instagram posting. Publishing is a background job on the backend (Instagram transcodes
+  // asynchronously), so "posting" means "job accepted and being polled", not "request in flight".
   const [igPostStatus, setIgPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
   const [igPostError, setIgPostError] = useState<string | null>(null);
+  const [igPublishJobId, setIgPublishJobId] = useState<string | null>(null);
+  const [igStage, setIgStage] = useState<string | null>(null);
 
   async function handlePostVideoToLinkedIn() {
     if (!jobId || !caption.trim()) return;
@@ -1671,15 +1674,36 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
     }
   }
   
+  // Publishes the rendered MP4 as a Reel on the Instagram account linked to the selected
+  // Facebook Page(s) — Instagram has no separate connection of its own here, it rides on the
+  // Meta one from the Brand Profile.
   async function handlePostVideoToInstagram() {
-    if (!jobId) return;
+    if (!jobId || igPostStatus === "posting") return;
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setIgPostStatus("error");
+      setIgPostError("Log in, then connect Facebook from your Brand Profile before posting.");
+      return;
+    }
+    const pageIds = getSelectedPageIds();
+    if (pageIds.length === 0) {
+      setIgPostStatus("error");
+      setIgPostError(
+        "Connect Facebook and pick a Page in your Brand Profile first — Instagram posts publish through the Page the account is linked to."
+      );
+      return;
+    }
     setIgPostStatus("posting");
     setIgPostError(null);
+    setIgStage("Starting");
     try {
       const res = await fetch("/api/instagram/post-video", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jobId, caption: caption ?? "" }),
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ jobId, caption: caption ?? "", pageIds }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
@@ -1687,12 +1711,42 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
         setIgPostError(data.error ?? "Failed to post video to Instagram.");
         return;
       }
-      setIgPostStatus("posted");
-    } catch (err) {
+      // 202 + a job id: the publish has been accepted, not finished. The effect below polls it.
+      setIgStage(data.stage ?? null);
+      setIgPublishJobId(data.publishJobId as string);
+    } catch {
       setIgPostStatus("error");
       setIgPostError("Could not reach the backend.");
     }
   }
+
+  useEffect(() => {
+    if (igPostStatus !== "posting" || !igPublishJobId) return;
+
+    // Instagram's own transcode is the slow part and it moves in tens of seconds, so there is
+    // nothing to gain from polling faster than the render poll above.
+    const poll = setInterval(async () => {
+      const token = localStorage.getItem("starlight_token");
+      if (!token) return;
+      try {
+        const res = await fetch(`/api/instagram/post-video/${igPublishJobId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const data = await res.json();
+        if (data.stage) setIgStage(data.stage as string);
+        if (data.status === "done") {
+          setIgPostStatus("posted");
+        } else if (data.status === "error" || (!res.ok && data.error)) {
+          setIgPostStatus("error");
+          setIgPostError(data.error ?? "Publishing to Instagram failed.");
+        }
+      } catch {
+        // transient network error — keep polling
+      }
+    }, 3000);
+
+    return () => clearInterval(poll);
+  }, [igPostStatus, igPublishJobId]);
 
   // Instagram-labelled storyboards publish the rendered MP4 to the connected Facebook Page.
   // The proxy fetches the video bytes from the LLM service by jobId, so we only pass the id.
@@ -1898,21 +1952,32 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
           </div>
         )}
 		
-		{renderState === "done" && downloadUrl && (
+		{/* Instagram-labelled storyboards only. This previously rendered for every finished
+		    render, so a LinkedIn video also offered a "Post to Instagram" button. */}
+		{renderState === "done" && downloadUrl && message.platform === "instagram" && (
 		  <div className="px-4 pb-4 pt-1 border-t border-[#E8E3DA] space-y-2">
 		    {igPostStatus === "posted" ? (
 		      <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
 		        ✓ Posted to Instagram
 		      </div>
 		    ) : (
-				<button
-				  type="button"
-				  onClick={handlePostVideoToInstagram}
-				  // disabled={igPostStatus === "posting"}
-				  className="w-full bg-gradient-to-r from-purple-600 to-pink-600 hover:opacity-90 disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-				>
-				  {igPostStatus === "posting" ? "Uploading & posting…" : "Post Video to Instagram"}
-				</button>
+				<>
+				  <button
+				    type="button"
+				    onClick={handlePostVideoToInstagram}
+				    // Without this a second click starts a second publish of the same job, and
+				    // Instagram has no idempotency key — it really does post twice.
+				    disabled={igPostStatus === "posting"}
+				    className="w-full bg-gradient-to-r from-purple-600 to-pink-600 hover:opacity-90 disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+				  >
+				    {igPostStatus === "posting" ? "Publishing…" : "Post Video to Instagram"}
+				  </button>
+				  {/* Instagram's transcode can run for minutes, so say what is happening rather
+				      than leaving a disabled button with no explanation. */}
+				  {igPostStatus === "posting" && igStage && (
+				    <p className="text-xs text-[#6B655F] text-center">{igStage}</p>
+				  )}
+				</>
 		    )}
 
 		    {igPostStatus === "error" && igPostError && (
@@ -2869,8 +2934,6 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
         )}
 
         {/* Post / Schedule (LinkedIn only, once approved) */}
-        {approval === "approved" && message.platform === "linkedin" && (
-          <div className="px-4 pb-4 space-y-3">
         {/* A text+video task publishes as a single native video post (caption = this copy) from
             the storyboard card below, so this card offers no competing text/image post — just a note. */}
         {approval === "approved" && message.platform === "linkedin" && message.videoAlsoRequested && (
@@ -2883,7 +2946,7 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
         )}
 
         {approval === "approved" && message.platform === "linkedin" && !message.videoAlsoRequested && (
-          <div className="px-4 pb-4">
+          <div className="px-4 pb-4 space-y-3">
             {postStatus === "posted" ? (
               <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
                 ✓ Posted to LinkedIn

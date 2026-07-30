@@ -41,7 +41,13 @@ public class VideoStorageService {
         blobClient.upload(new ByteArrayInputStream(bytes), size, true);
 
         BlobSasPermission permission = new BlobSasPermission().setReadPermission(true);
-        OffsetDateTime expiry = OffsetDateTime.now().plusMinutes(15);
+        // Must outlast the whole publish, not just the upload: Instagram fetches this URL itself
+        // and keeps re-reading it while it transcodes, so an expiry shorter than the publish
+        // timeout in InstagramAPIService would pull the file out from under a slow transcode.
+        // That timeout is per-account and a single upload can be published to several accounts in
+        // sequence, so this has to cover the sum, not one of them. Read-only access to one
+        // unguessable blob name, so the longer window costs little.
+        OffsetDateTime expiry = OffsetDateTime.now().plusMinutes(60);
 
         BlobServiceSasSignatureValues sasValues =
                 new BlobServiceSasSignatureValues(expiry, permission);

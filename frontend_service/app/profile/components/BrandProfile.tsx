@@ -138,7 +138,10 @@ export default function BrandProfile() {
   const [fbConnecting, setFbConnecting] = useState(false);
   const [fbConnectError, setFbConnectError] = useState<string | null>(null);
   const [fbStatus, setFbStatus] = useState<"connected" | "error" | null>(null);
-  const [fbPages, setFbPages] = useState<{ id: number; name: string }[]>([]);
+  // igLinked: whether this Page has an Instagram professional account attached. Undefined means
+  // "not known yet" — the cached selection restored on mount carries names only, and claiming
+  // "no Instagram" from missing cache data would be a worse lie than saying nothing.
+  const [fbPages, setFbPages] = useState<{ id: number; name: string; igLinked?: boolean }[]>([]);
   const [fbSelectedPageIds, setFbSelectedPageIds] = useState<number[]>([]);
   const [fbPagesLoading, setFbPagesLoading] = useState(false);
   const [fbPagesError, setFbPagesError] = useState<string | null>(null);
@@ -295,7 +298,15 @@ export default function BrandProfile() {
       }
       const ids: number[] = Array.isArray(data.pageIds) ? data.pageIds.map(Number) : [];
       const names: string[] = Array.isArray(data.pageNames) ? data.pageNames.map(String) : [];
-      setFbPages(ids.map((id, i) => ({ id, name: names[i] ?? String(id) })));
+      // Index-aligned with pageIds; null entries are Pages with no Instagram account linked.
+      const igUserIds: (string | null)[] = Array.isArray(data.igUserIds) ? data.igUserIds : [];
+      setFbPages(
+        ids.map((id, i) => ({
+          id,
+          name: names[i] ?? String(id),
+          igLinked: Boolean(igUserIds[i]),
+        }))
+      );
       setFbStatus("connected");
     } catch {
       setFbPagesError("Could not reach the backend.");
@@ -470,6 +481,20 @@ export default function BrandProfile() {
                     className="accent-[#1877F2]"
                   />
                   <span>{p.name}</span>
+                  {/* Only shown once Pages have actually been loaded — see igLinked above. */}
+                  {p.igLinked === true && (
+                    <span className="text-[10px] bg-purple-50 text-purple-700 border border-purple-200 px-1.5 py-0.5 rounded-full font-medium">
+                      Instagram linked
+                    </span>
+                  )}
+                  {p.igLinked === false && (
+                    <span
+                      className="text-[10px] bg-[#F3F1EC] text-[#6B655F] border border-[#E8E3DA] px-1.5 py-0.5 rounded-full font-medium"
+                      title="Link an Instagram professional account to this Page in Meta Business Suite, then reconnect Facebook, to publish Instagram posts through it."
+                    >
+                      No Instagram
+                    </span>
+                  )}
                 </label>
               ))}
             </div>

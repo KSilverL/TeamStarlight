@@ -288,6 +288,10 @@ public class ApiDTOS {
 	        String creationId
 	) {}
 	
-	public record InstagramStatusResponse(String status_code) {}
+	/** Media container processing state. `status_code` is the machine-readable label
+	 * (IN_PROGRESS / FINISHED / ERROR / EXPIRED / PUBLISHED); `status` is Instagram's
+	 * human-readable explanation, which is where an unsupported codec, duration or aspect
+	 * ratio is actually named. Both must be requested explicitly in the `fields` parameter. */
+	public record InstagramStatusResponse(String status_code, String status) {}
 	
 }
