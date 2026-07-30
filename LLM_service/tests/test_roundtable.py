@@ -354,6 +354,44 @@ async def test_multi_platform():
         assert rounds == sorted(rounds)
 
 
+async def test_agent_utterance_audio_follows_each_persona_turn():
+    """Each persona turn gets a matching TTS readback event — fired in the background
+    (never inline on the turn-completion path, see runner._synthesize_turn_audio), so
+    tests must drain the tracked background tasks before asserting completeness. The
+    user's own turns (no PERSONA_VOICES entry) never get one — we don't read the
+    human's words back to them."""
+    import base64
+
+    from LLM_service.workflow.roundtable import runner as roundtable_runner
+    from LLM_service.workflow.roundtable.personas import PERSONA_VOICES
+
+    collected: list[dict] = []
+    await run_table(PLATFORM, _brief(), on_event=lambda ev: collected.append(ev))
+
+    # Fire-and-forget tasks may still be in flight the instant run_table returns —
+    # drain them (the same set _synthesize_turn_audio registers into) before asserting.
+    pending = list(roundtable_runner._background_tasks)
+    if pending:
+        await asyncio.gather(*pending)
+
+    utterances = [e for e in collected if e["type"] == "agent_utterance"]
+    audio_events = {
+        (e["speaker"], e["round_index"]): e
+        for e in collected if e["type"] == "agent_utterance_audio"
+    }
+    assert utterances  # sanity: the table actually produced turns
+
+    for turn in utterances:
+        key = (turn["speaker"], turn["round_index"])
+        if turn["speaker"] not in PERSONA_VOICES:
+            assert key not in audio_events  # e.g. a user turn — never synthesized
+            continue
+        audio = audio_events[key]
+        assert audio["table_id"] == turn["table_id"]
+        decoded = base64.b64decode(audio["audio_b64"])
+        assert len(decoded) > 0  # MockVoiceover's real (silent) mp3 bytes, not a placeholder
+
+
 async def test_multi_platform_streams_over_sse():
     """The service-level fan-out publishes every table's events onto one SSE task, tagged by
     table_id, and records one consensus per platform."""

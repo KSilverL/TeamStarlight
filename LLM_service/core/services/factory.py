@@ -241,8 +241,8 @@ def get_voiceover_generation() -> VoiceoverService:
         s = get_settings()
         if s.mock_voiceover():
             return mock.MockVoiceover()
-        _require(s.has_azure_speech, "Azure Speech",
-                 "AZURE_SPEECH_KEY and AZURE_SPEECH_REGION", "USE_MOCK_VOICEOVER=true")
+        _require(s.has_roundtable_tts, "Azure Speech",
+                 "ROUNDTABLE_TTS_KEY and ROUNDTABLE_TTS_REGION", "USE_MOCK_VOICEOVER=true")
         return azure.AzureSpeechVoiceover(s)
     return _cached("voiceover_generation", build)
 

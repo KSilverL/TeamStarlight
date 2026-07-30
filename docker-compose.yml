@@ -126,6 +126,19 @@ services:
       - CODEGEN_PLAN_MAX_TOKENS=${CODEGEN_PLAN_MAX_TOKENS}
       - CODEGEN_PLAN_REASONING_EFFORT=${CODEGEN_PLAN_REASONING_EFFORT}
 
+      # Voiceover (Azure Speech TTS) — off by default (mock), opt-in per render via
+      # POST /tasks/{id}/render-video's narration_text field either way.
+      - ROUNDTABLE_TTS_KEY=${ROUNDTABLE_TTS_KEY}
+      - ROUNDTABLE_TTS_REGION=${ROUNDTABLE_TTS_REGION}
+      # Cloud (Remotion Lambda) video rendering — off by default (VIDEO_RENDER_BACKEND
+      # defaults to "local", the subprocess path this image is already built for).
+      # Uncomment once a function + stable site are deployed (see .env.example).
+      # - AWS_REGION=${AWS_REGION}
+      # - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      # - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      # - REMOTION_LAMBDA_FUNCTION_NAME=${REMOTION_LAMBDA_FUNCTION_NAME}
+      # - REMOTION_LAMBDA_SERVE_URL=${REMOTION_LAMBDA_SERVE_URL}
+
       # Higgsfield
       - USE_MOCK_VIDEO_GENERATION=false
       - HIGGSFIELD_API_KEY=${HIGGSFIELD_API_KEY}

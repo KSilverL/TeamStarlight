@@ -153,6 +153,9 @@ interface RoundtableTurn {
   role: string;
   text: string;
   roundIndex: number;
+  // Set once the (asynchronous, background-synthesized) agent_utterance_audio event
+  // for this same turn arrives — a data: URL, playable directly in an <audio> tag.
+  audioUrl?: string;
 }
 
 // The discussion feed interleaves completed turns with the moderator's mic handoffs
@@ -478,6 +481,41 @@ export default function ChatPage() {
   // round_control events for the same table update the SAME card instead of spawning new ones.
   const roundtableMsgIdRef = useRef<Map<string, string>>(new Map());
 
+  // Roundtable auto-play: when on, each persona's TTS clip plays automatically as it
+  // arrives (agent_utterance_audio always lands after that persona's text turn, since
+  // synthesis is fire-and-forget in the background — so "auto-play" is inherently
+  // "after they've spoken"). Off by default, matching today's click-to-play behaviour.
+  // A ref mirrors the state so the SSE handler (a stable closure set up once per
+  // workflow run) always reads the live value instead of the one captured at connect time.
+  const [autoPlayRoundtableAudio, setAutoPlayRoundtableAudio] = useState(false);
+  const autoPlayRoundtableAudioRef = useRef(false);
+  function toggleAutoPlayRoundtableAudio() {
+    autoPlayRoundtableAudioRef.current = !autoPlayRoundtableAudioRef.current;
+    setAutoPlayRoundtableAudio(autoPlayRoundtableAudioRef.current);
+  }
+  // One shared sequential queue across every table on the page, so two persona clips
+  // (possibly from different concurrent tables) never overlap into a garble.
+  const roundtableAudioQueueRef = useRef<string[]>([]);
+  const roundtableAudioPlayingRef = useRef(false);
+  function playNextRoundtableAudio() {
+    if (roundtableAudioPlayingRef.current) return;
+    const next = roundtableAudioQueueRef.current.shift();
+    if (!next) return;
+    roundtableAudioPlayingRef.current = true;
+    const audio = new Audio(next);
+    const advance = () => {
+      roundtableAudioPlayingRef.current = false;
+      playNextRoundtableAudio();
+    };
+    audio.addEventListener("ended", advance);
+    audio.addEventListener("error", advance);
+    audio.play().catch(advance);
+  }
+  function enqueueRoundtableAudio(url: string) {
+    roundtableAudioQueueRef.current.push(url);
+    playNextRoundtableAudio();
+  }
+
   /** Fire-and-forget: persist a message to the backend. Non-fatal if it fails. */
   async function persistMessage(sessionId: string, role: "user" | "assistant", content: string) {
     const token = localStorage.getItem("starlight_token");
@@ -732,6 +770,20 @@ export default function ChatPage() {
     }));
   }
 
+  /** agent_utterance_audio: the background TTS clip for an already-shown turn arrived —
+   *  find it by (speaker, roundIndex) and attach the clip; the turn itself doesn't move. */
+  function attachRoundtableTurnAudio(
+    taskId: string, tableId: string, speaker: string, roundIndex: number, audioUrl: string
+  ) {
+    upsertRoundtable(taskId, tableId, (m) => ({
+      roundtableFeed: (m.roundtableFeed ?? []).map((item) =>
+        item.kind === "turn" && item.turn.speaker === speaker && item.turn.roundIndex === roundIndex
+          ? { ...item, turn: { ...item.turn, audioUrl } }
+          : item
+      ),
+    }));
+  }
+
   function finalizeRoundtable(tableId: string, strategy: Record<string, unknown> | undefined) {
     const existingId = roundtableMsgIdRef.current.get(tableId);
     if (!existingId) return;
@@ -880,6 +932,25 @@ export default function ChatPage() {
           text: event.text as string,
           roundIndex: event.round_index as number,
         });
+      }
+
+      // agent_utterance_audio: the TTS clip for a turn already shown — arrives later,
+      // synthesized in the background so it never held up the text discussion.
+      if (type === "agent_utterance_audio") {
+        const audioB64 = event.audio_b64 as string | undefined;
+        if (audioB64) {
+          const dataUrl = `data:audio/mpeg;base64,${audioB64}`;
+          attachRoundtableTurnAudio(
+            taskId,
+            event.table_id as string,
+            event.speaker as string,
+            event.round_index as number,
+            dataUrl
+          );
+          if (autoPlayRoundtableAudioRef.current) {
+            enqueueRoundtableAudio(dataUrl);
+          }
+        }
       }
 
       // discussion_consensus: the table converged on a strategy before drafting starts.
@@ -1366,7 +1437,15 @@ export default function ChatPage() {
             }
 
             if (msg.variant === "roundtable") {
-              return <RoundtableStage key={msg.id} message={msg} formatTime={formatTime} />;
+              return (
+                <RoundtableStage
+                  key={msg.id}
+                  message={msg}
+                  formatTime={formatTime}
+                  autoPlayAudio={autoPlayRoundtableAudio}
+                  onToggleAutoPlayAudio={toggleAutoPlayRoundtableAudio}
+                />
+              );
             }
 
             if (msg.variant === "html-preview" && msg.html) {
@@ -1975,6 +2054,8 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
 interface RoundtableStageProps {
   message: Message;
   formatTime: (d: Date) => string;
+  autoPlayAudio: boolean;
+  onToggleAutoPlayAudio: () => void;
 }
 
 // The always-present AI seats; trend_scout joins only when it actually appears in the
@@ -2092,7 +2173,9 @@ const CLAMP_3: React.CSSProperties = {
  * keeps the full transcript, moderator announcements included; below it live the step-mode
  * round controls (manual mode) and the always-available raise-hand seat.
  */
-function RoundtableStage({ message, formatTime }: RoundtableStageProps) {
+function RoundtableStage({
+  message, formatTime, autoPlayAudio, onToggleAutoPlayAudio,
+}: RoundtableStageProps) {
   const [handRaised, setHandRaised] = useState(false);
   const [sayText, setSayText] = useState("");
   const [speakText, setSpeakText] = useState("");
@@ -2291,9 +2374,28 @@ function RoundtableStage({ message, formatTime }: RoundtableStageProps) {
               <span className="text-[10px] font-semibold uppercase tracking-wider text-[#9E9893]">
                 Minutes
               </span>
-              <span className="text-[10px] text-[#BDB6AE]">
-                {turnCount} {turnCount === 1 ? "turn" : "turns"}
-              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={onToggleAutoPlayAudio}
+                  title={
+                    autoPlayAudio
+                      ? "Auto-play voice: on — each persona's clip plays as it arrives"
+                      : "Auto-play voice: off — click a clip's play button to hear it"
+                  }
+                  className={`flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded-full border transition-colors ${
+                    autoPlayAudio
+                      ? "bg-[#1B1A17] text-white border-[#1B1A17]"
+                      : "bg-white text-[#9E9893] border-[#E8E3DA] hover:text-[#1B1A17]"
+                  }`}
+                >
+                  <span aria-hidden>{autoPlayAudio ? "\u{1F50A}" : "\u{1F507}"}</span>
+                  Auto-play
+                </button>
+                <span className="text-[10px] text-[#BDB6AE]">
+                  {turnCount} {turnCount === 1 ? "turn" : "turns"}
+                </span>
+              </div>
             </div>
             <div className="flex-1 overflow-y-auto p-3 space-y-2">
               {feed.length === 0 && (
@@ -2332,6 +2434,9 @@ function RoundtableStage({ message, formatTime }: RoundtableStageProps) {
                     <p className="text-xs text-[#1B1A17] whitespace-pre-wrap leading-relaxed">
                       {item.turn.text}
                     </p>
+                    {item.turn.audioUrl && (
+                      <audio controls src={item.turn.audioUrl} className="mt-1 h-7 w-full" />
+                    )}
                   </div>
                 );
               })}
