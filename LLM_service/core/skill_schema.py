@@ -50,3 +50,20 @@ class SkillCandidate(BaseModel):
     platform: Optional[str] = None
     suggested_kind: Literal["positive", "negative"]
     rationale: str
+
+
+def render_user_skills(doc: Optional["UserSkillDoc"]) -> str:
+    """Render this user's learned rules as a prompt block (empty when none). Lives in
+    core so both the roundtable's `user_advocate` seat AND the linear strategist / plan
+    layer share ONE renderer (like `render_trends`); `workflow/roundtable/personas.py`
+    re-exports it for back-compat."""
+    if not doc or not doc.rules:
+        return ""
+    prefers = [r.text for r in doc.rules if r.kind == "positive"]
+    avoids = [r.text for r in doc.rules if r.kind == "negative"]
+    parts: List[str] = []
+    if prefers:
+        parts.append("USER PREFERS:\n" + "\n".join(f"- {t}" for t in prefers))
+    if avoids:
+        parts.append("USER AVOIDS:\n" + "\n".join(f"- {t}" for t in avoids))
+    return "\n\n".join(parts)

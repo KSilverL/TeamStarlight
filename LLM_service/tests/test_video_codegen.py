@@ -1,5 +1,5 @@
 """
-Bespoke Remotion scene codegen (Phase 1 of the autonomous video-agent plan):
+Bespoke Remotion scene codegen:
 workflow/video/codegen.py's self-repair loop (generate -> typecheck -> preview-render
 -> retry-on-error -> fallback), MockLLM.generate_scene_component's deterministic
 BROKEN_CODEGEN_MARKER lever, and assets.py's integration (a `generated` slide
@@ -255,7 +255,7 @@ async def test_generate_scene_returns_none_when_visual_qa_never_approves(scratch
 
 
 async def test_generate_scene_runs_two_stage_and_threads_plan_and_fixes(scratch_settings, monkeypatch):
-    """Phase 5: plan_scene_design runs once up front; its plan is passed as
+    """plan_scene_design runs once up front; its plan is passed as
     design_plan to every generate call; and a QA rejection's `fixes` are folded
     into the next attempt's prior_error."""
     monkeypatch.setattr(codegen, "_run_typecheck", _ok_typecheck)
@@ -351,7 +351,7 @@ async def test_generate_scene_names_components_uniquely_per_slide(scratch_settin
     assert a.componentName != b.componentName
 
 
-# ── codegen.ensure_job_entry_point (Phase 2 fix: the FULL render, not just the
+# ── codegen.ensure_job_entry_point (the FULL render, not just the
 # preview, needs a per-job entry point when `generated` slides are present) ──────
 
 def test_ensure_job_entry_point_returns_none_without_generated_slides(scratch_settings):
@@ -393,7 +393,7 @@ async def test_ensure_job_entry_point_typechecks_for_real_against_real_project()
     tmp_path), this one targets the REAL video_renderer/ project so a real `tsc
     --noEmit` can confirm the generated entry point + a real generated component
     actually type-check together — the same validation approach used to manually
-    verify Phase 1 end-to-end. Skipped if the real project's node_modules isn't
+    verify the loop end-to-end. Skipped if the real project's node_modules isn't
     installed (CI/dev boxes that haven't run `npm install` in video_renderer/)."""
     real_settings = Settings()  # default: repo-root sibling video_renderer/
     renderer_dir = real_settings.resolved_video_renderer_dir

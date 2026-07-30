@@ -1,11 +1,11 @@
 """
-Dual-entry intake (new in M3).
+Dual-entry intake.
 
 The whole point: the voice and text entries share one conversation state machine,
 one system prompt + function set, and one CreativeBrief product — only the transport
 differs. These tests prove that the same script produces an identical brief whether
 typed or spoken (mock), that the multi-turn slot-filling and copilot suggest_topic tool work,
-and that the brief feeds the M1/M2 workflow with zero changes. Fully mocked/offline.
+and that the brief feeds the workflow with zero changes. Fully mocked/offline.
 """
 
 from __future__ import annotations
@@ -206,7 +206,7 @@ async def test_prior_context_none_leaves_behaviour_unchanged():
 
 
 async def test_prior_context_folds_into_prompt_and_rides_onto_brief(monkeypatch):
-    """Case 2: a non-empty recap folds a 前情提要 block into the fill_brief system prompt (so the
+    """Case 2: a non-empty recap folds a recap block into the fill_brief system prompt (so the
     LLM resolves against it), the conversation still completes, and the recap rides onto the brief."""
     llm = factory.get_llm()  # cached singleton the intake engine will call
     captured: dict = {}
@@ -236,8 +236,8 @@ async def test_prior_context_folds_into_prompt_and_rides_onto_brief(monkeypatch)
 
 
 def test_render_prior_context_empty_is_blank_nonempty_has_block():
-    """The renderer is the Phase-5 degrade point: an empty recap produces no block (prompt
-    unchanged); a recap with signal produces the 前情提要 section."""
+    """The renderer is the degrade point: an empty recap produces no block (prompt
+    unchanged); a recap with signal produces the recap section."""
     assert _render_prior_context(PriorSessionContext(parent_session_id="sess-prev")) == ""
     block = _render_prior_context(_PRIOR)
     assert block.startswith("\n") and "前情提要" in block
@@ -299,7 +299,7 @@ async def test_copilot_topic_suggestion_waits_for_the_goal():
 
 
 async def test_copilot_suggest_topic_rides_trends_when_enabled(monkeypatch):
-    """Phase 4 (trend scout spread): with TREND_SCOUT_ENABLED, suggest_topic — which fires
+    """Trend scout spread: with TREND_SCOUT_ENABLED, suggest_topic — which fires
     exactly when the user doesn't know what to post — proposes from today's trends (the
     MockStore fixture's first pick lands verbatim in the suggested topic). Toggle off
     (the test above) stays trend-free."""

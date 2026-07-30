@@ -43,8 +43,8 @@ DEFAULT_CONTENT_TYPES = ["text"]  # not-default-on for brand/video; the backend 
 
 
 class Brief(BaseModel):
-    """The structured creative brief — the workflow input. In M3 the intake layer
-    (voice/text) produces this; for M1 it is constructed directly."""
+    """The structured creative brief — the workflow input. Usually produced by the
+    intake layer (voice/text); tests and callers may construct it directly."""
 
     topic: str
     target_platforms: List[str]

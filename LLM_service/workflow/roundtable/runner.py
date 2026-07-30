@@ -1,11 +1,11 @@
 """
-Roundtable runner (§6 / §1 stage-chaining). `run_table` drives ONE table's Magentic workflow,
-collects the transcript from the event stream, and emits a `RoundtableConsensus` whose
-`.strategy` is the existing `CreativeStrategy` — the strategist drop-in. `run_tables` (Phase 5)
+Roundtable runner. `run_table` drives ONE table's Magentic workflow, collects the
+transcript from the event stream, and emits a `RoundtableConsensus` whose
+`.strategy` is the existing `CreativeStrategy` — the strategist drop-in. `run_tables`
 fans that out: one table per target platform, run concurrently, summarised into a
 `list[RoundtableConsensus]`.
 
-Event mapping is per the Phase 0 probe (docs/roundtable_api_notes.md):
+Event mapping is per docs/roundtable_api_notes.md:
   - `group_chat` / GroupChatRequestSentEvent  → the round index + participant of the upcoming
     turn; re-emitted to callers as a `speaker_scheduled` event (the moderator's announcement).
   - `executor_invoked` / AgentExecutorResponse → a persona's spoken text (executor_id +
@@ -75,6 +75,12 @@ def _task_prompt(brief: Brief, platform: str) -> str:
     )
 
 
+# The speaker name on the round-0 convening announcement (a `speaker_scheduled` event emitted
+# the moment a table starts, before the manager's plan phase). It is NOT a persona seat — it is
+# the moderator's own voice, and the frontend keys its moderator avatar on exactly this string.
+MODERATOR_SPEAKER = "moderator"
+
+
 # The Magentic orchestrator yields this sentinel (not a synthesized answer) when a table hits
 # its round/reset cap before the manager declares consensus — see agent_framework_orchestrations
 # `_check_within_limits_or_complete`. Treat it as "no real consensus" and recover from the
@@ -108,8 +114,8 @@ async def run_table(
 ) -> RoundtableResult:
     """Run one platform's table to convergence and return its consensus. `build` can be
     injected (tests); otherwise the context is read from the store and the table is built.
-    Passing `task_id` seats the user (Phase 3): queued utterances for (task_id, platform)
-    become `user` turns when the manager yields the mic. `on_event` (Phase 4), if given, is
+    Passing `task_id` seats the user: queued utterances for (task_id, platform)
+    become `user` turns when the manager yields the mic. `on_event`, if given, is
     called with an `agent_utterance` event as each turn completes and a `discussion_consensus`
     event at convergence — the caller pipes these onto the existing SSE channel. `before_round`
     (the per-round user-interjection hook) is forwarded to the manager when this builds the table."""
@@ -125,6 +131,15 @@ async def run_table(
     seen: set = set()              # (speaker, round) dedupe — guard duplicate stream events
     consensus_text = ""
     current_round = 0
+
+    if on_event is not None:
+        # Convening announcement (round 0, the moderator): the LLM manager's plan phase and
+        # its first progress ledger run BEFORE any real mic handoff, so this is the client's
+        # only signal that the table exists during that window — without it the stream shows
+        # nothing between task start and the first speaker_scheduled.
+        on_event(speaker_scheduled_event(
+            table_id=platform, speaker=MODERATOR_SPEAKER, round_index=0,
+        ))
 
     async for ev in build.workflow.run(_task_prompt(brief, platform), stream=True):
         etype = getattr(ev, "type", None)
@@ -161,7 +176,7 @@ async def run_table(
                 round_index=current_round,
             )
             transcript.append(turn)
-            if on_event is not None:  # stream this turn as it completes (Phase 4)
+            if on_event is not None:  # stream this turn as it completes
                 on_event(agent_utterance_event(
                     table_id=platform, speaker=turn.speaker, role=turn.role,
                     text=turn.text, round_index=turn.round_index,
@@ -179,7 +194,7 @@ async def run_table(
         rounds_used=rounds_used,
         converged=converged,
     )
-    if on_event is not None:  # the table converged — emit the consensus result (Phase 4)
+    if on_event is not None:  # the table converged — emit the consensus result
         on_event(discussion_consensus_event(
             table_id=platform, strategy=strategy.strategies,
             rounds_used=rounds_used, converged=consensus.converged, turns=len(transcript),
@@ -203,7 +218,7 @@ async def run_tables(
     checkpoint, and user-utterance queue, so the discussions never cross-talk; every emitted
     event carries its `table_id`, so the shared SSE stream stays separable per table.
 
-    The brand/user context (the read side, §6.5) is read once and shared across tables — the
+    The brand/user context (the learning loop's read side) is read once and shared across tables — the
     only per-table difference is the platform style skill the platform_editor injects.
 
     Cost note: total LLM calls ≈ N_platforms × personas_per_table × rounds, so personas run on

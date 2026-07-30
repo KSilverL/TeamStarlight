@@ -17,9 +17,14 @@ import com.example.tsldemo.auth.JwtUtil;
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.ObjectMapper;
 
+import com.example.tsldemo.ApiDTOS.IntakeRequest;
+import com.example.tsldemo.ApiDTOS.IntakeResponse;
+import com.example.tsldemo.ApiDTOS.IntakeTurnRequest;
+import com.example.tsldemo.ApiDTOS.Output;
+import com.example.tsldemo.ApiDTOS.TaskSnapshot;
 import com.example.tsldemo.Message;
 import com.example.tsldemo.Session;
-import com.example.tsldemo.DTOs.Request.IntakeReqDTO;
+import com.example.tsldemo.AgentAPI.NewsroomRunner;
 import com.example.tsldemo.DTOs.ResponseReceived.IntakeRespDTO;
 import com.example.tsldemo.DTOs.ResponseToFrontEnd.FrontIntakeRespDTO;
 
@@ -46,19 +51,23 @@ public class SessionController {
 	@Value("${llm.service.base-url:http://localhost:8080}")
 	private String llmServiceBaseUrl;
 
-	public SessionController(SessionService service) {
+	private final NewsroomRunner newsroomRunner;
+	
+	public SessionController(SessionService service, NewsroomRunner newsroomRunner) {
 		this.service = service;
+		this.newsroomRunner = newsroomRunner;
+
 	}
 
 	// Must call this first to create a session before any other
 	@PostMapping("/api/sessions")
-	public IntakeRespDTO addSession(
-			@RequestBody IntakeReqDTO intakeDTO,
+	public IntakeResponse addSession(
+			@RequestBody IntakeRequest intakeDTO,
 			@RequestHeader(value = "Authorization", required = false) String authHeader) {
 		
 		int businessId = jwtUtil.extractBusinessId(authHeader);
 		
-		return service.createSession(intakeDTO, businessId);
+		return service.sendSessionToAgent(intakeDTO, businessId);
 	}
 	
 	
@@ -76,11 +85,6 @@ public class SessionController {
 	
 	}
 	
-	@GetMapping("/sessions")
-	public List<Session> getAllSessions() {
-		return service.getSessions();
-	}
-	
 	
 	private static class MessageRequest {
 		public String role;
@@ -93,6 +97,7 @@ public class SessionController {
 			request.role != null ? request.role : "user",
 			request.content != null ? request.content : ""
 		);
+		
 		service.updateSession(id, msg);
 		return msg;
 	}
@@ -109,5 +114,32 @@ public class SessionController {
 		
 	}
 	
+	
+	@PostMapping("/intakeTurn/{sessionId}")
+	public IntakeResponse addIntakeTurnResponse(
+			@PathVariable String sessionId,
+            @RequestBody IntakeTurnRequest request) throws Exception {
+		
+		IntakeResponse response = service.getIntakeTurn(request, sessionId);
+		
+		Message assistantTurn = new Message("assistant", response.assistantMessage);
+		
+		Session session = service.getSessionBy(sessionId).get();
+		session.setComplete(response.complete);
+		
+		service.updateSession(sessionId, assistantTurn);
+		
+		if (response.complete) {
+			newsroomRunner.run(sessionId);
+		}
+        
+		return response;
+		
+	}
+	
+	@DeleteMapping("api/session/{id}")
+	public Session deleteSession(@PathVariable String id) {
+		return service.deleteSession(id);
+	}
 	
 }

@@ -1,4 +1,4 @@
-"""Voice intake (MIGRATION_PLAN §4.4) — the spoken entry.
+"""Voice intake — the spoken entry.
 
 Same conversation state machine, same system prompt + function definitions, same
 CreativeBrief as text. The ONLY difference is the transport: `_ingest` turns a
@@ -40,7 +40,7 @@ class VoiceIntake(ConversationalIntake):
 class MockVoiceIntake(VoiceIntake):
     """Always-mock voice intake for offline tests/dev: pins transcription to the
     deterministic MockVoice regardless of the global toggle, so the voice path runs
-    with no audio backend (§4.4)."""
+    with no audio backend."""
 
     def __init__(self) -> None:
         super().__init__()

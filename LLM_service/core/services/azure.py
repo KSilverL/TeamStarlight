@@ -1,7 +1,7 @@
 """
 Azure-backed production implementations (LLM / Safety / Voice).
 
-All three are wired to real backends (M4): `AzureLLM` → Azure OpenAI / Foundry chat
+All three are wired to real backends: `AzureLLM` → Azure OpenAI / Foundry chat
 (the dispatcher/strategist/creator prompt-building lives here so executors stay
 logic-free); `AzureSafety` → Azure AI Content Safety `analyze_text`; `AzureVoice` →
 the Voice Live API WebSocket (STT for one spoken turn). The factory refuses to hand
@@ -33,6 +33,7 @@ from agent_framework._types import ResponseStream
 from pydantic import TypeAdapter, ValidationError
 
 from ..config import Settings
+from ..plan_schema import PlanClarification, PostingPlanSpec
 from ..skill_schema import SkillCandidate, SkillRule
 from ..video_schema import StoryboardSpec, TemplateSlideSpec, VideoPromptSpec
 from .base import (
@@ -61,15 +62,15 @@ def _voice_live_ws_url(settings: Settings) -> str:
         f"?api-version={settings.azure_voicelive_api_version}&model={settings.azure_voicelive_model}"
     )
 
-# Discriminated-union storyboard JSON is meaningfully harder for the model to nail
-# on the first try than the old fixed shape — bounded retry, re-prompting with the
-# validation error, before failing loudly.
+# Discriminated-union storyboard JSON is hard for the model to nail on the first
+# try — bounded retry, re-prompting with the validation error, before failing loudly.
 _VIDEO_STORYBOARD_MAX_ATTEMPTS = 3
+_PLAN_CAMPAIGN_MAX_ATTEMPTS = 3
 
 
 def _strip_fences(text: str) -> str:
     """Drop an accidental ```html / ```json … ``` wrapper the model may add around a
-    raw HTML document or JSON object (ported from demos/brand_agent's post-processing)."""
+    raw HTML document or JSON object."""
     s = text.strip()
     if s.startswith("```"):
         newline = s.find("\n")
@@ -79,7 +80,7 @@ def _strip_fences(text: str) -> str:
     return s.strip()
 
 
-# ── Scene-codegen prompt assets (video-agent Phase 5) ─────────────────────────
+# ── Scene-codegen prompt assets ───────────────────────────────────────────────
 
 # The design-system exports a generated scene may import — mirrors the barrel at
 # video_renderer/src/design/index.ts. Using them yields consistent, on-brand motion
@@ -166,11 +167,10 @@ class AzureLLM(LLMService):
                 # scene-codegen loop in particular used to burn a whole retry
                 # attempt (a real compile + preview render) on one transient HTTP
                 # blip because nothing retried at this layer.
-                # 300s (not the old 120s): a reasoning-tier codegen call
-                # (CODEGEN_REASONING_EFFORT) can legitimately run past 120s, and at
-                # 120s a real slow-but-successful call was getting killed and
-                # retried up to max_retries times, compounding into a multi-minute
-                # timeout storm that surfaced as an uncaught exception.
+                # 300s: a reasoning-tier codegen call (CODEGEN_REASONING_EFFORT)
+                # can legitimately run past 120s; a tighter timeout kills a
+                # slow-but-successful call, and the SDK then retries it up to
+                # max_retries times — compounding into a multi-minute timeout storm.
                 max_retries=3,
                 timeout=300.0,
             )
@@ -246,12 +246,48 @@ class AzureLLM(LLMService):
         }
 
     async def plan_strategy(
-        self, *, topic: str, platform: str, user_intent: str, trends: str = ""
+        self,
+        *,
+        topic: str,
+        platform: str,
+        user_intent: str,
+        trends: str = "",
+        skill: str = "",
+        brand_block: str = "",
+        user_block: str = "",
     ) -> str:
+        # A senior strategist brief, not a one-liner: the creator drafts straight off this,
+        # so it must carry a real point of view. Still STRATEGY (the angle), never the copy.
         system = (
-            f"You are a content strategist. Produce a short {platform} content *strategy* "
-            "(the angle, not the copy)."
+            f"You are a senior {platform} content strategist. Produce a sharp, opinionated "
+            f"content *strategy* for this brief (the angle and plan, NOT the finished copy). "
+            "Keep it tight — a few lines, no preamble — and cover:\n"
+            "- AUDIENCE: who this is for on this platform and their state of mind.\n"
+            "- ANGLE: the single most compelling hook/entry point (commit to ONE).\n"
+            "- KEY MESSAGE: the one thing they should remember.\n"
+            "- DIFFERENTIATION: why this beats the obvious, generic take.\n"
+            "- FORMAT: the native structure that fits this platform (and a CTA direction).\n"
+            "Do not write the actual post. Be specific to THIS topic and goal — no filler."
         )
+        if skill:
+            # The same platform style guide the creator writes against, so the strategy is
+            # already shaped to the platform's format/length/tone conventions.
+            system += (
+                "\n\nRespect this platform's house style when shaping the angle and format:\n\n"
+                + skill
+            )
+        if brand_block:
+            # Dynamic layer (branded users): steer the angle by the brand's learned voice.
+            system += (
+                "\n\nThis brand has a learned voice. Let it steer the angle (honour MUST DO, "
+                "steer clear of MUST AVOID):\n\n" + brand_block
+            )
+        if user_block:
+            # Per-user layer: this user's learned preferences from past runs.
+            system += (
+                "\n\nThis user has learned preferences from past posts. Favour them:\n\n"
+                + user_block
+            )
         if trends:
             # Same fusion-with-rejection-permission framing as the roundtable's trend_scout
             # seat — a forced trend is worse than none.
@@ -288,6 +324,175 @@ class AzureLLM(LLMService):
             [{"role": "system", "content": system}, {"role": "user", "content": user}]
         )
         return raw.strip()
+
+    async def name_session(self, *, topic: str, user_intent: str) -> str:
+        system = (
+            "You name a social-media content session for a history sidebar. Read the topic and "
+            "goal and return a SINGLE short title of at most 6 words, in the SAME language as the "
+            "input. Return the bare title only — no quotes, no trailing punctuation, no markdown, "
+            "no prefix like 'Title:'."
+        )
+        user = f"Topic: {topic}\nGoal: {user_intent}"
+        # Cheap summary tier (PREFERENCE_SUMMARY_MODEL / ROUNDTABLE_PERSONA_MODEL), falling back to
+        # the main deployment when neither is set — this is off-path decoration, so it must not
+        # compete with the manager/persona deployments on the intake→roundtable hot path.
+        raw = await self._complete(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model=self._settings.preference_summary_model,
+        )
+        return raw.strip()
+
+    async def clarify_campaign(
+        self,
+        *,
+        goal: str,
+        platforms: List[str],
+        start_date: str,
+        end_date: str,
+        cadence_hint: str = "",
+        tone_hint: Optional[str] = None,
+        brand_block: str = "",
+        user_block: str = "",
+        trends: str = "",
+        skill: str = "",
+    ) -> dict:
+        schema = json.dumps(PlanClarification.model_json_schema())
+        style_guide = f"\n\n{skill}" if skill else ""
+        system = (
+            "You are a social-media campaign strategist. BEFORE designing any schedule, "
+            "you gather what you need: propose a preliminary posting cadence and ask up "
+            "to 3 SHORT questions whose answers would let you tailor the plan (key dates "
+            "or launches, content-production capacity, the primary conversion action, the "
+            "audience). Never ask which platforms to use — they are given. Return ONLY "
+            "valid JSON (no markdown fences, no prose) matching this schema exactly:\n"
+            f"{schema}" + style_guide
+        )
+        if not cadence_hint:
+            system += (
+                "\n\nNo cadence was given: propose the frequency you are leaning toward in "
+                "`recommended_cadence`, reasoning from this brand, this product, each "
+                "platform's norms, and the user's past habits below."
+            )
+        if trends:
+            system += "\n\n" + trends
+        for block in (brand_block, user_block):
+            if block:
+                system += f"\n\n{block}"
+        user = (
+            f"Campaign goal: {goal}\n"
+            f"Platforms: {', '.join(platforms)}\n"
+            f"Window: {start_date} to {end_date}\n"
+            f"Cadence: {cadence_hint or 'your call — propose one'}\n"
+            f"Tone: {tone_hint or 'brand voice'}"
+        )
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": user}]
+        last_error: Exception = ValueError("clarify_campaign: no attempts made")
+        for _ in range(_PLAN_CAMPAIGN_MAX_ATTEMPTS):
+            raw = await self._complete(messages)
+            try:
+                data = json.loads(_strip_fences(raw))
+                return PlanClarification(**data).model_dump()
+            except (json.JSONDecodeError, ValidationError) as exc:
+                last_error = exc
+                messages = messages + [
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content": (
+                        f"Your previous JSON was invalid: {exc}. Return corrected JSON "
+                        "only, matching the schema exactly."
+                    )},
+                ]
+        raise last_error
+
+    async def plan_campaign(
+        self,
+        *,
+        goal: str,
+        platforms: List[str],
+        start_date: str,
+        end_date: str,
+        cadence_hint: str = "",
+        tone_hint: Optional[str] = None,
+        brand_block: str = "",
+        user_block: str = "",
+        trends: str = "",
+        skill: str = "",
+        feedback: str = "",
+        answers: str = "",
+        prior_plan: str = "",
+    ) -> dict:
+        schema = json.dumps(PostingPlanSpec.model_json_schema())
+        style_guide = f"\n\n{skill}" if skill else ""
+        system = (
+            "You are a social-media campaign strategist. Design a posting PLAN — a "
+            "dated schedule of post slots (strategy, not copy): for each slot say the "
+            "date, the platform(s), the topic, the specific angle, and WHY that topic "
+            "on that date (the rationale). Every planned_date must fall between "
+            f"{start_date} and {end_date} inclusive. Also set `recommended_cadence` to "
+            "the posting frequency you chose and `follow_up_questions` to at most 3 "
+            "clarifiers (empty if the brief is self-sufficient). Return ONLY valid JSON "
+            "(no markdown fences, no prose) matching this schema exactly:\n"
+            f"{schema}" + style_guide
+        )
+        if not cadence_hint:
+            # No explicit pace: the agent decides. Reason from the brand/product/platform
+            # and the user's past habits, and report the choice in recommended_cadence.
+            system += (
+                "\n\nNo cadence was given: CHOOSE the posting frequency yourself — pick "
+                "what best fits this brand, this product, and each platform's norms, "
+                "weighing the brand voice profile and the user's past habits below. Put "
+                "the pace you chose in `recommended_cadence` so the user can see and "
+                "adjust it."
+            )
+        if trends:
+            # Same fusion-with-rejection-permission framing as plan_strategy.
+            system += (
+                "\n\nBelow are current, broad cultural/industry trends. Where ONE has a "
+                "genuine, creative connection to a slot, fuse it into that slot's angle "
+                "and say so in the rationale; if none genuinely fits, use none — a "
+                "forced trend is worse than none.\n\n" + trends
+            )
+        for block in (brand_block, user_block):
+            if block:
+                system += f"\n\n{block}"
+        if prior_plan:
+            # Refine pass: revise the prior draft in place, honouring the user's feedback
+            # and answers, and drop any question they have now answered.
+            system += (
+                "\n\nThis is a REVISION of an existing draft (below). Keep what works and "
+                "change only what the user's feedback/answers ask for; do not restart from "
+                "scratch. Drop any follow_up_question the user has already answered.\n\n"
+                "## PREVIOUS DRAFT\n" + prior_plan
+            )
+        user = (
+            f"Campaign goal: {goal}\n"
+            f"Platforms: {', '.join(platforms)}\n"
+            f"Window: {start_date} to {end_date}\n"
+            f"Cadence: {cadence_hint or 'your call — pick a pace that serves the goal'}\n"
+            f"Tone: {tone_hint or 'brand voice'}"
+        )
+        if answers:
+            user += f"\n\nAnswers to earlier questions:\n{answers}"
+        if feedback:
+            user += f"\n\nUser feedback on the previous draft:\n{feedback}"
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": user}]
+        last_error: Exception = ValueError("plan_campaign: no attempts made")
+        for _ in range(_PLAN_CAMPAIGN_MAX_ATTEMPTS):
+            raw = await self._complete(messages)
+            try:
+                data = json.loads(_strip_fences(raw))
+                return PostingPlanSpec(**data).model_dump()
+            except (json.JSONDecodeError, ValidationError) as exc:
+                last_error = exc
+                messages = messages + [
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content": (
+                        f"Your previous JSON was invalid: {exc}. Return corrected JSON "
+                        "only, matching the schema exactly."
+                    )},
+                ]
+        raise last_error
 
     async def write_copy(
         self,
@@ -530,7 +735,7 @@ class AzureLLM(LLMService):
         }
 
     async def plan_scene_design(self, *, description: str, data: dict) -> str:
-        """Stage 1 of two-stage codegen (video-agent Phase 5): a short visual concept
+        """Stage 1 of two-stage codegen: a short visual concept
         for a `generated` scene BEFORE any code is written. Returns 5-8 plain-text
         bullets (layout regions, motion beats, palette/backdrop choice) that ride
         along in every generate/repair call for the slide — so repairs fix code
@@ -873,7 +1078,7 @@ class AzureLLM(LLMService):
 class AzureChatClient(BaseChatClient):
     """Production chat client for one roundtable seat (a persona, or the LLM manager),
     backed by the Azure OpenAI v1 surface — the same plain `AsyncOpenAI(base_url=…)` as
-    AzureLLM (the M4 endpoint gotcha in CLAUDE.md: do NOT use AsyncAzureOpenAI). The
+    AzureLLM (the endpoint gotcha in CLAUDE.md: do NOT use AsyncAzureOpenAI). The
     `model` is the deployment for this seat's tier (persona = mini, manager = stronger).
 
     Like the other Azure impls, the network call goes through one overridable seam
@@ -1237,7 +1442,7 @@ class _AzureRealtimeSession(RealtimeVoiceSession):
 # when this was written) — same caveat SoundrawMusic (media_assets.py) carries for
 # the same reason. The REST TTS endpoint/SSML/header shape below matches Azure
 # Speech's documented v1 API; confirm with one real call before trusting it in
-# production (see the implementation plan's Phase 3 verification steps).
+# production.
 
 class AzureSpeechVoiceover(VoiceoverService):
     """Text-to-speech via Azure Speech's REST endpoint (not the Voice Live

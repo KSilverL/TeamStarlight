@@ -102,7 +102,7 @@ async def test_plan_strategy_parity():
 
 
 async def test_plan_strategy_trends_parity():
-    """Phase 4: both impls accept the pre-rendered trends block and still return a str;
+    """Both impls accept the pre-rendered trends block and still return a str;
     the mock weaves the block's first trend line in verbatim (the testable lever), and
     an empty block leaves the strategy byte-identical to the no-trends call."""
     block = render_trends([Trend(
@@ -137,6 +137,17 @@ async def test_suggest_topic_parity():
     with_trends = await mock.MockLLM().suggest_topic(**kw, trends=block)
     assert "A split-screen meme is peaking" in with_trends
     assert await mock.MockLLM().suggest_topic(**kw, trends="") == m
+
+
+async def test_name_session_parity():
+    """The session title is a SHORT single line by contract (it labels a history-sidebar
+    entry): both impls return a non-empty single-line str, and the mock is deterministic."""
+    kw = dict(topic="Summer oat milk latte launch", user_intent="drive Gen-Z trials")
+    m = await mock.MockLLM().name_session(**kw)
+    a = await azure_llm("Summer Oat Milk Launch").name_session(**kw)
+    assert isinstance(m, str) and isinstance(a, str) and m and a
+    assert "\n" not in m and "\n" not in a
+    assert await mock.MockLLM().name_session(**kw) == m  # deterministic
 
 
 @pytest.mark.parametrize("platform", ["linkedin", "instagram", "x", "tiktok"])
@@ -190,6 +201,52 @@ async def test_generate_video_storyboard_parity():
             assert "type" in slide
 
 
+_PLAN_KEYS = {"strategy_summary", "recommended_cadence", "follow_up_questions", "items"}
+_PLAN_ITEM_KEYS = {"planned_date", "time_of_day", "platforms", "topic", "angle", "rationale"}
+
+
+async def test_plan_campaign_parity():
+    kw = dict(goal="grow subscription signups", platforms=["linkedin", "instagram"],
+              start_date="2026-08-01", end_date="2026-08-14")
+    m = await mock.MockLLM().plan_campaign(**kw)
+    canned = json.dumps({
+        "strategy_summary": "Two weeks: educate first, convert last.",
+        "items": [
+            {"planned_date": "2026-08-03", "time_of_day": "morning",
+             "platforms": ["linkedin"], "topic": "Why subscriptions beat one-off buying",
+             "angle": "educate", "rationale": "Tuesday morning reach on LinkedIn."},
+            {"planned_date": "2026-08-12", "platforms": ["instagram"],
+             "topic": "Subscriber results in numbers", "angle": "proof",
+             "rationale": "Close the window with conversion proof."},
+        ],
+    })
+    a = await azure_llm(canned).plan_campaign(**kw)
+    for out in (m, a):
+        assert isinstance(out, dict) and set(out) == _PLAN_KEYS
+        assert isinstance(out["strategy_summary"], str)
+        assert isinstance(out["items"], list) and out["items"]
+        for item in out["items"]:
+            assert set(item) == _PLAN_ITEM_KEYS
+            assert isinstance(item["platforms"], list) and item["platforms"]
+
+
+_CLARIFY_KEYS = {"recommended_cadence", "follow_up_questions"}
+
+
+async def test_clarify_campaign_parity():
+    kw = dict(goal="grow subscription signups", platforms=["linkedin", "instagram"],
+              start_date="2026-08-01", end_date="2026-08-14")
+    m = await mock.MockLLM().clarify_campaign(**kw)
+    canned = json.dumps({
+        "recommended_cadence": "LinkedIn 3×/wk; Instagram 2×/wk",
+        "follow_up_questions": ["Any launch dates?", "How much content can you make weekly?"],
+    })
+    a = await azure_llm(canned).clarify_campaign(**kw)
+    for out in (m, a):
+        assert isinstance(out, dict) and set(out) == _CLARIFY_KEYS
+        assert isinstance(out["recommended_cadence"], str)
+        assert isinstance(out["follow_up_questions"], list)
+        assert len(out["follow_up_questions"]) <= 3
 async def test_generate_video_prompt_parity():
     """Both impls return the VideoPromptSpec shape ({prompt, motion}) for the premium
     Higgsfield path, with and without reference images (image-to-video vs text-to-video)."""
@@ -584,7 +641,7 @@ async def test_trends_ttl_and_variety_parity():
         assert texts == ["news one", "meme one"]
 
 
-# ── Roundtable chat client + build parity (Phase 2) ───────────────────────────
+# ── Roundtable chat client + build parity ─────────────────────────────────────
 
 def azure_chat_client(reply: str) -> azure.AzureChatClient:
     """An AzureChatClient whose single completion seam returns a canned reply."""

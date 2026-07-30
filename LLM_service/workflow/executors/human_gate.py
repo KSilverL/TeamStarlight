@@ -5,13 +5,13 @@ Every draft that clears the reviewer (approved) OR trips the circuit breaker
 `ctx.request_info(...)`, persisting state to the checkpoint store, and waits for a
 HumanVerdict. A draft that arrived un-approved is flagged
 `needs_human_intervention` so the frontend can surface it differently (the
-transparency selling point, MIGRATION_PLAN §5.5).
+transparency selling point).
 
 On resume:
   - approve            → hand off to the media_producer as an ApprovedDraft (it emits
     the FinalDraft, enriched with the animated card + video spec).
   - approve_after_edit → hand off to the media_producer too, carrying the human's edited
-    text as the draft. Brand-voice rule distillation no longer happens here — it moved to
+    text as the draft. Brand-voice rule distillation does not happen here — it is
     the confirmation-gated service step (POST /tasks/{id}/confirm-learning), so learning
     only runs once the user opts in, and is then transcript-aware.
   - reject             → re-dispatch this platform to the creator for a fresh attempt.

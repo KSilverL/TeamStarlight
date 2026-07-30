@@ -1,5 +1,5 @@
 """
-Live Azure wiring smoke tests (M4) — the "切一个验一个" checks.
+Live Azure wiring smoke tests — flip one service to production at a time and verify it.
 
 These actually call real Azure backends, so they are SKIPPED unless an operator opts
 in with RUN_LIVE_AZURE=1 and supplies credentials under the LIVE_* namespace. (The

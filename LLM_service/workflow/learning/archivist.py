@@ -1,5 +1,5 @@
 """
-The archivist (品牌档案馆长) — now a service-level component, not an in-graph executor.
+The archivist — a service-level learning component (not an in-graph executor).
 
 Given a completed conversation (the roundtable transcript, the approved drafts, the AI drafts
 the human reviewed, and their verdicts), it uses the LLM to distil DB-ready preference skills
@@ -19,11 +19,14 @@ the existing per-user types — no new store schema.
 
 from __future__ import annotations
 
+import logging
 from typing import List, Optional
 
 from ...core.services import factory
 from ..messages import Brief
 from .summarizer import preference_candidates, summarize_preferences
+
+logger = logging.getLogger(__name__)
 
 
 async def _store_brand_skills(
@@ -115,9 +118,22 @@ async def archive_conversation(
     """Distil the conversation into brand + user preference skills and store them directly.
     `transcript` is the roundtable discussion (when one ran); `conversation` is the intake
     transcript — the user channel learns from both, so a non-roundtable run still learns.
-    Returns {"brand_rules": [...written...], "preference_summary": {...}|None}."""
-    brand_rules = await _store_brand_skills(brief, outputs, original_drafts, transcript)
-    preference_summary = await _store_user_skills(
-        brief, transcript, conversation, verdicts, source_task_id
-    )
+    Returns {"brand_rules": [...written...], "preference_summary": {...}|None}.
+
+    The two channels are independent and best-effort: a failure in one (a malformed LLM
+    response, a store hiccup) is logged and degraded to "learned nothing on that channel",
+    never raised — so it can't lose the other channel's work or turn an opt-in learning
+    step into a 500."""
+    try:
+        brand_rules = await _store_brand_skills(brief, outputs, original_drafts, transcript)
+    except Exception:
+        logger.warning("brand-voice learning channel failed; skipping", exc_info=True)
+        brand_rules = []
+    try:
+        preference_summary = await _store_user_skills(
+            brief, transcript, conversation, verdicts, source_task_id
+        )
+    except Exception:
+        logger.warning("per-user learning channel failed; skipping", exc_info=True)
+        preference_summary = None
     return {"brand_rules": brand_rules, "preference_summary": preference_summary}

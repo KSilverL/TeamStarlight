@@ -1,7 +1,7 @@
 """
-Four-scenario showcase (MIGRATION_PLAN §10 M4) — non-interactive.
+Non-interactive scenario showcase.
 
-Runs all four user journeys end-to-end and narrates the outcome, so the whole system
+Runs the user journeys end-to-end and narrates the outcome, so the whole system
 is demonstrable in one command (no stdin, auto-resolves the human gate):
 
     /opt/anaconda3/envs/TeamProject/bin/python3 -m LLM_service.scenarios
@@ -10,6 +10,7 @@ is demonstrable in one command (no stdin, auto-resolves the human gate):
   2. No-brand user     — steers on tone_hint only (never touches the store).
   3. Vague idea        — copilot_mode VOICE intake → a topic is suggested → workflow.
   4. Brand training    — edit → archivist distils a rule → kept → next run reflects it.
+  5. Roundtable        — the multi-persona discussion stage feeding the creator.
 
 Plus the circuit-breaker transparency flag and the HTML preview card. This showcase is
 deterministic — it runs fully mocked regardless of LLM_service/.env (it does not load

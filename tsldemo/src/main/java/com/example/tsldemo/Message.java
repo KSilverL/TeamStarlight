@@ -24,6 +24,8 @@ public class Message {
 	private String content;
 	@JsonProperty
 	private String timestamp;
+	@JsonProperty
+	private boolean scheduled = false;
 	
 	@ManyToOne
 	@JoinColumn(name = "session_id")
@@ -34,8 +36,16 @@ public class Message {
 		this.timestamp = LocalDateTime.now().toString();
 		this.role = role;
 		this.content = content;
-
 	}
+	
+	public Message(String role, String content, String timestamp) {
+		this.timestamp = timestamp;
+		this.role = role;
+		this.content = content;
+		scheduled = true;
+		
+	}
+	
 	
 	public Message() {}
 	
@@ -72,9 +82,31 @@ public class Message {
 		return session;
 	}
 	
+	public boolean isScheduled() {
+		return scheduled;
+	}
 	
 	public void setSession(Session session) {
 		this.session = session;
 	}
 	
+	//temp function
+	@Override
+	public String toString() {
+	    return "{"
+	        + "\"messageId\": " + id + ", "
+	        + "\"role\": \"" + role + "\", "
+	        + "\"variant\": \"" + (variant != null ? variant : "") + "\", "
+	        + "\"content\": \"" + escape(content) + "\", "
+	        + "\"timestamp\": \"" + timestamp + "\", "
+	        + "\"sessionId\": \"" + (session != null ? session.getId() : null) + "\""
+	        + "}";
+	}
+	
+	private String escape(String s) {
+	    if (s == null) return "";
+	    return s.replace("\"", "\\\"")
+	            .replace("\n", "\\n")
+	            .replace("\r", "\\r");
+	}
 }

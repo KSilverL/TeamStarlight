@@ -1,7 +1,7 @@
 """
-SSE progress stream + the api surface (replaces test_status_events / test_api).
+SSE progress stream + the api surface.
 
-Covers the §7.2 event envelope bridged from the MAF workflow to SSE
+Covers the event envelope bridged from the MAF workflow to SSE
 (`GET /tasks/{id}/events`), the RequestPort resume endpoint (`POST /review`), the
 confirm-learning archivist (`POST /confirm-learning`), and the durability guarantee:
 the workflow's checkpoint persists on the RequestPort pause and a fresh workflow
@@ -57,13 +57,49 @@ async def test_draft_ready_result_streamed_per_platform():
     assert ready == {"linkedin", "instagram"}
 
 
-async def test_events_follow_the_72_envelope():
+async def test_events_follow_the_envelope():
     svc = WorkflowService()
     await svc.start(_START, task_id="t1")
     for e in svc.buffered_events("t1"):
         assert _ENVELOPE_KEYS <= set(e)
         assert e["type"] in ("progress", "result")
         assert isinstance(e["ts"], float)
+
+
+async def test_session_title_set_immediately_then_upgraded_off_path():
+    """The history-sidebar title is off the hot path: the `running` snapshot carries a
+    deterministic topic-derived title instantly (zero added latency), and a concurrent cheap-tier
+    call upgrades it in place — landing on the snapshot and as one `session_title` SSE event."""
+    svc = WorkflowService()
+    inputs = {"topic": "our brand new ethiopia single origin harvest celebration",
+              "target_platforms": ["linkedin"]}
+    running = await svc.start(inputs, task_id="tt", background=True)
+    # Zero-latency: the running snapshot already carries a deterministic title (no LLM waited on).
+    fallback = running["title"]
+    assert fallback
+
+    task = svc._tasks["tt"]
+    await task.title_runner   # let the concurrent, off-path cheap-tier upgrade land
+    await task.runner         # let the run itself drive to the gate
+
+    snap = await svc.get("tt")
+    assert snap["title"]
+    titles = [e for e in svc.buffered_events("tt") if e["type"] == "session_title"]
+    # The mock upgrade (first 6 words) differs from the truncated fallback → exactly one event,
+    # and the snapshot title matches the upgraded one.
+    assert len(titles) == 1
+    assert titles[0]["title"] == snap["title"] != fallback
+
+
+async def test_session_title_present_on_inline_run_without_extra_event():
+    """Inline runs (CLI/tests) get the deterministic title on the snapshot but spawn no concurrent
+    upgrade — so no stray task is left pending and no session_title event is emitted."""
+    svc = WorkflowService()
+    await svc.start(_START, task_id="t_inline")  # background defaults to False
+    snap = await svc.get("t_inline")
+    assert snap["title"] == "ethiopia harvest"
+    assert svc._tasks["t_inline"].title_runner is None
+    assert not [e for e in svc.buffered_events("t_inline") if e["type"] == "session_title"]
 
 
 # ── B. Review resume → completion + final results ────────────────────────────
@@ -158,7 +194,7 @@ async def test_api_start_persists_a_workflow_checkpoint():
     assert checkpoints
 
 
-# ── D2. Roundtable discussion streams over the same SSE channel (Phase 4) ─────
+# ── D2. Roundtable discussion streams over the same SSE channel ───────────────
 
 _RT_START = {
     "topic": "spring single-origin coffee launch",
@@ -217,6 +253,23 @@ async def test_roundtable_announces_each_speaker_before_their_turn():
             and s["round_index"] == e["round_index"]
             for s in events[:i]
         ), f"utterance by {e['speaker']} (round {e['round_index']}) was never announced"
+
+
+async def test_roundtable_convening_is_announced_before_any_turn():
+    """The moment a table starts it emits a round-0 `moderator` speaker_scheduled — the
+    client's "the table is convening" signal while the (production) manager is still in its
+    silent plan phase, so the stream is never dead air between task start and the first
+    real mic handoff."""
+    svc = WorkflowService()
+    await svc.run_roundtable(_RT_START, "linkedin", task_id="rt_convene", max_rounds=4)
+    events = svc.buffered_events("rt_convene")
+
+    discussion = [e for e in events if e["type"] in ("speaker_scheduled", "agent_utterance")]
+    opener = discussion[0]
+    assert opener["type"] == "speaker_scheduled"
+    assert opener["speaker"] == "moderator" and opener["round_index"] == 0
+    assert opener["table_id"] == "linkedin"
+    assert _ENVELOPE_KEYS <= set(opener)
 
 
 async def test_roundtable_user_utterance_appears_in_the_stream():

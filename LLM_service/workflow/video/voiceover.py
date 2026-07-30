@@ -1,5 +1,5 @@
 """
-Voiceover resolution (Phase 3 of the autonomous video-agent plan): synthesizes an
+Voiceover resolution: synthesizes an
 optional narration track from caller-supplied text and writes it into the job
 directory — mirrors music.py's degrade-gracefully shape (a failure here never
 aborts the render, the video just comes out without narration).

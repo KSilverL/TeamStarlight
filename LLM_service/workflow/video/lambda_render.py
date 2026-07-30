@@ -1,5 +1,5 @@
 """
-Remotion Lambda render backend (autonomous video-agent plan, Phase 2): triggers a
+Remotion Lambda render backend: triggers a
 cloud render on AWS Lambda instead of the local `npx remotion render` subprocess
 (render.py's `_render_local`), so compilation and encoding happen on Lambda and the
 output lands in S3 — never on this process's local disk.
@@ -20,7 +20,7 @@ the same reason. The Node scripts' call shapes ARE confirmed against the install
 @remotion/lambda[-client] package's own TypeScript declarations (checked directly
 in node_modules), so this isn't a guess at the API — just not yet exercised against
 real AWS infrastructure. Confirm with one real render before trusting this in
-production (see the implementation plan's Phase 2 verification steps).
+production.
 """
 
 from __future__ import annotations

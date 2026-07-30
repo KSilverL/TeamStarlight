@@ -10,10 +10,8 @@ Default is mock so the system never accidentally hits paid/real APIs without an
 explicit opt-in. One-click production: set `USE_MOCK=false`. Gradual rollout:
 keep `USE_MOCK=true` and flip individual services with `USE_MOCK_LLM=false`, etc.
 
-The toggle set tracks the MAF "virtual newsroom" service contracts
-(LLM / Safety / Store / Voice) — see core/services/base.py. The legacy RAG/image
-toggles are gone; `USE_MOCK_STORE` (PostgreSQL) replaces `USE_MOCK_RAG`, and
-`USE_MOCK_VOICE` is new for the voice intake layer.
+The toggle set tracks the service contracts in core/services/base.py
+(LLM / Safety / Store / Voice, plus the render-pipeline asset services).
 
 `get_settings()` is cached; tests call `reset_settings()` after monkeypatching env.
 """
@@ -150,8 +148,9 @@ class Settings:
     azure_content_safety_key: Optional[str] = None
 
     # ── PostgreSQL (brand profiles + user skills + workflow checkpoints) ───────
-    # One database, three tables (§8): brand_profiles + user_skills +
-    # workflow_checkpoints. Each stores whole documents in a JSONB `doc` column.
+    # One database; brand_profiles + user_skills + workflow_checkpoints (and the
+    # video_jobs/trends/posting_plans tables) each store whole documents in a
+    # JSONB `doc` column.
     # DSN comes from DATABASE_URL (preferred, e.g. a Supabase connection string),
     # falling back to POSTGRES_DSN — see _load().
     postgres_dsn: Optional[str] = None     # postgresql://user:pass@host:5432/newsroom
@@ -164,6 +163,7 @@ class Settings:
     postgres_sslmode: Optional[str] = None
     postgres_video_jobs_table: str = "video_jobs"
     postgres_trends_table: str = "trends"
+    postgres_posting_plans_table: str = "posting_plans"
 
     # ── Voice Live API (voice intake) ──────────────────────────────────────────
     azure_voicelive_endpoint: Optional[str] = None
@@ -174,10 +174,10 @@ class Settings:
                                                       # (must be one the deployment supports).
 
     # ── Roundtable (multi-persona discussion stage) ────────────────────────────
-    # ROUNDTABLE_ENABLED gates the drop-in replacement of `strategist` (wired in Phase 6);
-    # off → the pipeline behaves exactly as today. max_rounds is the per-table hard cap
+    # ROUNDTABLE_ENABLED gates the drop-in replacement of `strategist`; off → the
+    # pipeline runs the plain linear graph. max_rounds is the per-table hard cap
     # that stops an infinite debate. The two model tiers (cheap personas / stronger
-    # manager) are read in the production path (Phase 2); the mock path ignores them.
+    # manager) are read in the production path; the mock path ignores them.
     roundtable_enabled: bool = False
     # Each persona turn is now a short, single-point contribution (see roundtable/personas.py),
     # so the table can afford MANY more short exchanges — the cap is raised accordingly. It is
@@ -197,6 +197,12 @@ class Settings:
     # point (a sentence or two) instead of an essay — faster turns + the intended discussion feel.
     # Blank/None → omit (use for a non-gpt-5 persona model). Manager unaffected.
     roundtable_persona_verbosity: Optional[str] = "low"
+    # Reasoning effort for the LLM manager's own calls (the facts/plan phase before the first
+    # turn, every round's progress ledger, the final consensus). The project default is "low" —
+    # the roundtable latency lever: it shrinks the silent plan phase before the first turn AND
+    # every between-turn round boundary, at some risk to ledger/selection quality. Set an explicit
+    # value (minimal/medium/high) to override; the _load() fallback also resolves blank → "low".
+    roundtable_manager_reasoning_effort: Optional[str] = "low"
     # The personas run on a cheaper, rate-limit-friendlier model; only the LLM manager keeps
     # the main (gpt-5.4) deployment. The personas may live on a SEPARATE Azure resource
     # (its own endpoint + key); when those are unset they fall back to the main resource and
@@ -240,9 +246,11 @@ class Settings:
     # No key → map slides render the bundled vector outline instead; never blocking.
     geoapify_api_key: Optional[str] = None
     # Explicit basemap-style override. None (default) → the style is picked from the
-    # storyboard's theme (workflow/video/assets.py _MAP_STYLE_BY_THEME). See
+    # storyboard's theme (media_assets.MAP_STYLE_BY_THEME: light→osm-bright, dark→dark-matter).
+    # Kept in sync with _load()'s `GEOAPIFY_MAP_STYLE or None`, so a directly-constructed
+    # Settings follows the theme exactly like a loaded one. See
     # https://apidocs.geoapify.com/docs/maps/map-tiles/ for the preset names.
-    geoapify_map_style: Optional[str] = "osm-liberty"
+    geoapify_map_style: Optional[str] = None
 
     # ── Background music ────────────────────────────────────────────────────────
     # Soundraw is a generative option but is enterprise-gated; the default real
@@ -367,10 +375,6 @@ class Settings:
     map_qa_enabled: bool = True
     map_qa_max_attempts: int = 2
 
-    # ── Backend status webhook (legacy transport; SSE replaces it in M2) ───────
-    webhook_url: str = "http://localhost:9999/status"
-    webhook_enabled: Optional[bool] = None
-
     # ── Per-service resolution: override > global > default ─────────────────────
     def mock_llm(self) -> bool:
         return self.use_mock if self.use_mock_llm is None else self.use_mock_llm
@@ -401,11 +405,6 @@ class Settings:
 
     def mock_video_generation(self) -> bool:
         return self.use_mock if self.use_mock_video_generation is None else self.use_mock_video_generation
-
-    def notify_via_webhook(self) -> bool:
-        """Whether status events are POSTed to the backend webhook. Defaults to
-        production-only; WEBHOOK_ENABLED overrides (e.g. to test the receiver)."""
-        return (not self.use_mock) if self.webhook_enabled is None else self.webhook_enabled
 
     # ── Credential presence checks (used by production impls / factory) ─────────
     @property
@@ -473,15 +472,6 @@ class Settings:
     @property
     def has_higgsfield(self) -> bool:
         return bool(self.higgsfield_api_key and self.higgsfield_api_secret)
-
-    @property
-    def has_remotion_lambda(self) -> bool:
-        """Whether enough is configured to attempt a Lambda render: a function to
-        invoke, and a stable serve URL for the (common) no-`generated`-slide case.
-        A `generated`-slide job additionally needs `resolved_video_renderer_dir` to
-        exist locally (it deploys a fresh site from that project), checked at
-        render time, not here."""
-        return bool(self.remotion_lambda_function_name and self.remotion_lambda_serve_url)
 
     @property
     def resolved_video_renderer_dir(self) -> Path:
@@ -557,6 +547,7 @@ def _load() -> Settings:
         postgres_sslmode=os.getenv("POSTGRES_SSLMODE"),
         postgres_video_jobs_table=os.getenv("POSTGRES_VIDEO_JOBS_TABLE", "video_jobs"),
         postgres_trends_table=os.getenv("POSTGRES_TRENDS_TABLE", "trends"),
+        postgres_posting_plans_table=os.getenv("POSTGRES_POSTING_PLANS_TABLE", "posting_plans"),
         azure_voicelive_endpoint=os.getenv("AZURE_VOICELIVE_ENDPOINT"),
         azure_voicelive_model=os.getenv("AZURE_VOICELIVE_MODEL", "gpt-realtime"),
         azure_voicelive_api_version=os.getenv("AZURE_VOICELIVE_API_VERSION", "2026-04-10"),
@@ -575,6 +566,9 @@ def _load() -> Settings:
         ),
         roundtable_persona_model=os.getenv("ROUNDTABLE_PERSONA_MODEL"),
         roundtable_manager_model=os.getenv("ROUNDTABLE_MANAGER_MODEL"),
+        roundtable_manager_reasoning_effort=(
+            os.getenv("ROUNDTABLE_MANAGER_REASONING_EFFORT", "").strip() or "low"
+        ),
         roundtable_persona_endpoint=os.getenv("AZURE_PERSONA_ENDPOINT"),
         roundtable_persona_api_key=os.getenv("AZURE_PERSONA_API_KEY"),
         roundtable_user_turn_timeout=_env_float("ROUNDTABLE_USER_TURN_TIMEOUT", 300.0),
@@ -624,8 +618,6 @@ def _load() -> Settings:
         ),
         map_qa_enabled=True if map_qa is None else map_qa,
         map_qa_max_attempts=_env_int("MAP_QA_MAX_ATTEMPTS", 2),
-        webhook_url=os.getenv("WEBHOOK_URL", "http://localhost:9999/status"),
-        webhook_enabled=_env_bool("WEBHOOK_ENABLED"),
     )
 
 

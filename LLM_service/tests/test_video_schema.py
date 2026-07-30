@@ -330,7 +330,7 @@ def test_map_pin_query_is_optional():
     assert with_query.pins[0].query == "Aviva Stadium, Dublin, Ireland"
 
 
-# ── Phase 3: slide variants + optional creative fields (batch a) ──────────────
+# ── Slide variants + optional creative fields (batch a) ───────────────────────
 
 def test_hook_variant_and_background_default_and_validate():
     # Defaults reproduce the pre-variant look; legacy payloads (no variant/kicker/
@@ -400,7 +400,7 @@ def test_batch_a_fields_survive_asset_resolution_round_trip():
     assert dumped["slides"][2]["variant"] == "sweep" and dumped["slides"][2]["tagline"] == "hi"
 
 
-# ── Phase 3: chart variants + palette/source/annotation (batch b) ─────────────
+# ── Chart variants + palette/source/annotation (batch b) ──────────────────────
 
 def test_chart_variants_default_and_validate():
     assert PieChartSlideSpec(slices=[{"label": "a", "value": 1}, {"label": "b", "value": 2}]).variant == "classic"
@@ -454,7 +454,7 @@ def test_line_and_bar_duration_max_bumped_for_variants():
     assert clamp_duration("bar_chart", 300) == 300
 
 
-# ── Phase 3: collage / node / table / map variants (batch c) ──────────────────
+# ── Collage / node / table / map variants (batch c) ───────────────────────────
 
 def test_collage_layout_extends_and_captions_optional():
     legacy = CollageSlideSpec(imageQueries=["a"])
@@ -507,7 +507,7 @@ def test_batch_c_fields_survive_asset_resolution_round_trip():
     assert slides[2]["variant"] == "versus"
 
 
-# ── Phase 4: cross-slide transitions + duration math ──────────────────────────
+# ── Cross-slide transitions + duration math ───────────────────────────────────
 
 def test_storyboard_transition_default_and_validate():
     assert _spec().transition == "none"

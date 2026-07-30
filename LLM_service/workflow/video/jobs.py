@@ -37,6 +37,12 @@ from .voiceover import (
 _NARRATION_TAIL_PAD_FRAMES = 12
 
 
+# Strong references to detached render tasks. asyncio only holds tasks weakly, so a
+# fire-and-forget task with no other reference can be garbage-collected mid-render;
+# keeping it here (and discarding on completion) prevents that.
+_RUNNING_JOBS: set[asyncio.Task] = set()
+
+
 def _job_dir(settings: Settings, job_id: str) -> Path:
     return settings.resolved_video_jobs_dir / job_id
 
@@ -144,6 +150,11 @@ async def start_render_job(
 ) -> dict:
     """Create a `pending` video job row and kick off the render in the background.
     Returns the freshly created job document (id, task_id, platform, status=pending, ...).
+    `narration_text` (optional) is the script to synthesize into a
+    voiceover track; omitted/None means no narration. It is never auto-generated
+    from the approved draft — the caller supplies it. `reference_images` (optional) are
+    the user's attached images, passed to the Higgsfield backend as image-to-video
+    references; ignored by the Remotion (local/lambda) backends.
     Narration is on by default: the storyboard LLM authors a script + voice persona on
     `storyboard.audio`, which is used unless `narration_text`/`narration_voice` override
     it, or `narration_enabled=False` suppresses narration entirely. `reference_images`
@@ -155,20 +166,17 @@ async def start_render_job(
     doc = await store.create_video_job(
         job_id=job_id, task_id=task_id, platform=platform, storyboard=storyboard.model_dump(),
     )
-    asyncio.create_task(
+    job_task = asyncio.create_task(
         _run_job(
             job_id, storyboard, settings,
             narration_text=narration_text, narration_voice=narration_voice,
             narration_enabled=narration_enabled, reference_images=reference_images,
         )
     )
+    _RUNNING_JOBS.add(job_task)
+    job_task.add_done_callback(_RUNNING_JOBS.discard)
     return doc
 
 
 async def get_render_job(*, job_id: str) -> Optional[dict]:
     return await factory.get_store().get_video_job(job_id=job_id)
-
-
-def render_job_output_path(job: dict) -> Optional[Path]:
-    output_path = job.get("output_path")
-    return Path(output_path) if output_path else None

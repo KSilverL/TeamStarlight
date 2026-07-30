@@ -10,7 +10,7 @@ the seat itself stays tool-free).
 
 Trends are deliberately BROAD — no domain tagging, no read-time topic filtering. `category`
 exists for VARIETY (spread the sample across news/meme/format/...), never for filtering;
-fit judgment happens at fusion time, in the debate (see §3.1/§3.2 of the plan).
+fit judgment happens at fusion time, in the debate.
 
 Lives in `core/` (the shared layer) like `core/skill_schema.py` / `core/video_schema.py`,
 so both `core/services/*` and `workflow/roundtable/*` can import it without a layering
@@ -83,7 +83,7 @@ def select_current_trends(
     treated as non-expiring rather than raising (degrade, never fail).
 
     Variety: round-robin across categories in first-appearance order, preserving
-    each category's own order — a spread sample, NOT a filter (§3.1)."""
+    each category's own order — a spread sample, NOT a filter."""
     now = now or datetime.now(timezone.utc)
 
     fresh: List[Trend] = []
