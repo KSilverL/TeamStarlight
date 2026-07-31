@@ -124,6 +124,80 @@ async def test_mock_review_scene_preview_rejects_subject_mismatch_on_first_attem
     assert second["approved"] is True
 
 
+# ── AzureLLM wire shaping for the codegen calls ───────────────────────────────
+
+def _capturing_azure_llm(settings, reply):
+    """An AzureLLM whose `_complete` seam records the kwargs it was handed."""
+    from LLM_service.core.services import azure
+
+    llm = azure.AzureLLM(settings)
+    seen = {}
+
+    async def _complete(messages, **kw):
+        seen.update(kw)
+        return reply
+
+    llm._complete = _complete  # type: ignore[assignment]
+    return llm, seen
+
+
+async def test_every_codegen_call_disables_sdk_retries():
+    """The openai SDK retries APITimeoutError, so at the client's 300s timeout one
+    long reasoning call would cost 4 x 300s before raising. codegen.py's own loop
+    retries at a far better altitude, so the transport layer must not."""
+    settings = Settings(codegen_max_retries=0)
+
+    llm, seen = _capturing_azure_llm(settings, "- a plan")
+    await llm.plan_scene_design(description="d", data={})
+    assert seen["max_retries"] == 0
+
+    llm, seen = _capturing_azure_llm(settings, "export default function X() {}")
+    await llm.generate_scene_component(
+        description="d", data={}, width=1080, height=1920, fps=30, duration_frames=90,
+    )
+    assert seen["max_retries"] == 0
+
+    llm, seen = _capturing_azure_llm(settings, '{"approved": true, "feedback": "", "fixes": []}')
+    await llm.review_scene_preview(description="d", image_bytes=b"png")
+    assert seen["max_retries"] == 0
+
+    llm, seen = _capturing_azure_llm(settings, '{"type": "hook", "headline": "H"}')
+    await llm.convert_generated_to_template(description="d", data={})
+    assert seen["max_retries"] == 0
+
+
+async def test_review_and_convert_calls_are_token_capped():
+    """Both previously sent no max_completion_tokens at all, leaving them unbounded
+    on a reasoning deployment — review once per accepted attempt, convert on the
+    slide that already spent the whole budget."""
+    settings = Settings(codegen_review_max_tokens=4096, codegen_convert_max_tokens=2048)
+
+    llm, seen = _capturing_azure_llm(settings, '{"approved": true, "feedback": "", "fixes": []}')
+    await llm.review_scene_preview(description="d", image_bytes=b"png")
+    assert seen["max_tokens"] == 4096
+
+    llm, seen = _capturing_azure_llm(settings, '{"type": "hook", "headline": "H"}')
+    await llm.convert_generated_to_template(description="d", data={})
+    assert seen["max_tokens"] == 2048
+
+
+async def test_convert_to_template_steers_away_from_reasoning():
+    """Picking a slide `type` and copying data into its fields is schema-filling,
+    not reasoning — despite the ~23KB schema in the prompt. Setting reasoning_effort
+    also makes _complete drop the temperature a reasoning deployment shouldn't get."""
+    settings = Settings(codegen_convert_reasoning_effort="minimal")
+    llm, seen = _capturing_azure_llm(settings, '{"type": "hook", "headline": "H"}')
+    await llm.convert_generated_to_template(description="d", data={})
+    assert seen["reasoning_effort"] == "minimal"
+
+    # Blank effort -> non-reasoning deployment, so the temperature still applies.
+    settings = Settings(codegen_convert_reasoning_effort=None)
+    llm, seen = _capturing_azure_llm(settings, '{"type": "hook", "headline": "H"}')
+    await llm.convert_generated_to_template(description="d", data={})
+    assert seen["reasoning_effort"] is None
+    assert seen["temperature"] == 0.2
+
+
 # ── codegen.generate_scene: the self-repair loop ──────────────────────────────
 
 async def test_generate_scene_succeeds_on_first_attempt(scratch_settings, monkeypatch):
@@ -254,6 +328,107 @@ async def test_generate_scene_returns_none_when_visual_qa_never_approves(scratch
     assert result is None
 
 
+# ── LLM-call failures degrade the slide, never the render job ─────────────────
+# Regression guard: generate_scene_component/review_scene_preview used to be the
+# only unguarded awaits in the loop, so an APITimeoutError on a long reasoning-tier
+# call escaped past the attempt budget AND the template fallback, and jobs.py's
+# blanket handler failed the whole render with "unexpected error: Request timed out".
+
+
+async def test_generate_scene_treats_a_generate_timeout_as_a_spent_attempt(
+    scratch_settings, monkeypatch,
+):
+    """A timeout produces no source at all, so the next attempt must re-run the
+    generate stage cleanly — NOT prompt a repair against source never written."""
+    monkeypatch.setattr(codegen, "_run_typecheck", _ok_typecheck)
+    monkeypatch.setattr(codegen, "_run_preview_render", _ok_preview)
+    seen = {"attempts": [], "prior_errors": []}
+
+    class _TimesOutOnceLLM:
+        async def plan_scene_design(self, **kw):
+            return "- a plan"
+
+        async def generate_scene_component(self, *, attempt=1, prior_error=None, **kw):
+            seen["attempts"].append(attempt)
+            seen["prior_errors"].append(prior_error)
+            if attempt == 1:
+                raise TimeoutError("Request timed out.")
+            return "export default function X() { return null; }"
+
+        async def review_scene_preview(self, **kw):
+            return {"approved": True, "feedback": "", "fixes": []}
+
+    monkeypatch.setattr(codegen.factory, "get_llm", lambda: _TimesOutOnceLLM())
+    spec = GeneratedSlideSpec(description="whatever", data={})
+    result = await codegen.generate_scene(
+        job_id="job-timeout-1", slide_index=0, spec=spec, width=1080, height=1920, fps=30,
+        settings=scratch_settings, max_attempts=3,
+    )
+    assert isinstance(result, RenderGeneratedSlide)
+    assert seen["attempts"] == [1, 2]
+    assert seen["prior_errors"] == [None, None]
+
+
+async def test_generate_scene_falls_back_when_every_generate_call_fails(
+    scratch_settings, monkeypatch,
+):
+    """The budget still bounds it and the caller still gets None (-> template
+    fallback), rather than the exception propagating into the render job."""
+    monkeypatch.setattr(codegen, "_run_typecheck", _ok_typecheck)
+    monkeypatch.setattr(codegen, "_run_preview_render", _ok_preview)
+    calls = {"n": 0}
+
+    class _AlwaysTimesOutLLM:
+        async def plan_scene_design(self, **kw):
+            return "- a plan"
+
+        async def generate_scene_component(self, **kw):
+            calls["n"] += 1
+            raise TimeoutError("Request timed out.")
+
+        async def review_scene_preview(self, **kw):  # never reached
+            raise AssertionError("review should not run without source")
+
+    monkeypatch.setattr(codegen.factory, "get_llm", lambda: _AlwaysTimesOutLLM())
+    spec = GeneratedSlideSpec(description="whatever", data={})
+    result = await codegen.generate_scene(
+        job_id="job-timeout-2", slide_index=0, spec=spec, width=1080, height=1920, fps=30,
+        settings=scratch_settings, max_attempts=2,
+    )
+    assert result is None
+    assert calls["n"] == 2  # bounded by max_attempts, not retried forever
+
+
+async def test_generate_scene_accepts_the_candidate_when_visual_qa_call_fails(
+    scratch_settings, monkeypatch,
+):
+    """Fails OPEN, unlike a failed generate: this candidate already typechecked and
+    preview-rendered, so an unreachable reviewer must not cost it the slide."""
+    monkeypatch.setattr(codegen, "_run_typecheck", _ok_typecheck)
+    monkeypatch.setattr(codegen, "_run_preview_render", _ok_preview)
+    calls = {"generate": 0}
+
+    class _ReviewerDownLLM:
+        async def plan_scene_design(self, **kw):
+            return "- a plan"
+
+        async def generate_scene_component(self, **kw):
+            calls["generate"] += 1
+            return "export default function X() { return null; }"
+
+        async def review_scene_preview(self, **kw):
+            raise TimeoutError("Request timed out.")
+
+    monkeypatch.setattr(codegen.factory, "get_llm", lambda: _ReviewerDownLLM())
+    spec = GeneratedSlideSpec(description="whatever", data={})
+    result = await codegen.generate_scene(
+        job_id="job-timeout-3", slide_index=0, spec=spec, width=1080, height=1920, fps=30,
+        settings=scratch_settings, max_attempts=3,
+    )
+    assert isinstance(result, RenderGeneratedSlide)
+    assert calls["generate"] == 1  # accepted on the first attempt, no wasted retry
+
+
 async def test_generate_scene_runs_two_stage_and_threads_plan_and_fixes(scratch_settings, monkeypatch):
     """plan_scene_design runs once up front; its plan is passed as
     design_plan to every generate call; and a QA rejection's `fixes` are folded
@@ -337,6 +512,150 @@ async def test_generate_scene_respects_a_shared_budget_across_calls(scratch_sett
         settings=scratch_settings, max_attempts=3, budget=budget,
     )
     assert second is None  # no budget left, falls back without even trying
+
+
+# ── CodegenBudget: the wall-clock half ────────────────────────────────────────
+# An attempt count bounds cost, not duration: on a reasoning deployment one attempt
+# can run minutes, so a budget that looks cheap in attempts can still hold a render
+# job open indefinitely. These use a monkeypatched clock — no real sleeping.
+
+def test_codegen_budget_without_a_deadline_is_attempts_only():
+    """The pre-deadline behaviour stays reachable (CODEGEN_MAX_TOTAL_SECONDS=0)."""
+    budget = codegen.CodegenBudget(total_attempts=2)
+    assert budget.expired is False
+    assert budget.take() is True
+
+
+def test_codegen_budget_expires_on_wall_clock_with_attempts_left(monkeypatch):
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(codegen.time, "monotonic", lambda: clock["t"])
+
+    budget = codegen.CodegenBudget(total_attempts=50, max_seconds=600.0)
+    assert budget.take() is True
+
+    clock["t"] += 599.0
+    assert budget.expired is False
+    assert budget.take() is True
+
+    clock["t"] += 2.0  # past the deadline, still 48 attempts unspent
+    assert budget.expired is True
+    assert budget.take() is False
+    assert budget.remaining == 48
+
+
+def test_codegen_budget_deadline_is_immune_to_wall_clock_jumps(monkeypatch):
+    """Uses time.monotonic, so an NTP correction mid-render can't expire (or
+    indefinitely extend) a deadline — time.time() would."""
+    clock = {"t": 500.0}
+    monkeypatch.setattr(codegen.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(codegen.time, "time", lambda: 1_000_000.0)
+
+    budget = codegen.CodegenBudget(total_attempts=5, max_seconds=300.0)
+    monkeypatch.setattr(codegen.time, "time", lambda: 2_000_000.0)  # clock jumps forward
+    assert budget.expired is False
+    assert budget.take() is True
+
+
+async def test_generate_scene_stops_at_the_deadline_and_falls_back(scratch_settings, monkeypatch):
+    """A slide whose attempts each burn real time gives up on the deadline rather
+    than running the full attempt budget — and still degrades (returns None ->
+    template fallback) instead of raising."""
+    monkeypatch.setattr(codegen, "_run_typecheck", _ok_typecheck)
+    monkeypatch.setattr(codegen, "_run_preview_render", _ok_preview)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(codegen.time, "monotonic", lambda: clock["t"])
+    calls = {"n": 0}
+
+    class _SlowRejectingLLM:
+        async def plan_scene_design(self, **kw):
+            return "- a plan"
+
+        async def generate_scene_component(self, **kw):
+            calls["n"] += 1
+            clock["t"] += 200.0  # each attempt costs 200s of wall clock
+            return "export default function X() { return null; }"
+
+        async def review_scene_preview(self, **kw):
+            return {"approved": False, "feedback": "nope", "fixes": []}
+
+    monkeypatch.setattr(codegen.factory, "get_llm", lambda: _SlowRejectingLLM())
+    budget = codegen.CodegenBudget(total_attempts=20, max_seconds=500.0)
+    spec = GeneratedSlideSpec(description="whatever", data={})
+    result = await codegen.generate_scene(
+        job_id="job-deadline", slide_index=0, spec=spec, width=1080, height=1920, fps=30,
+        settings=scratch_settings, max_attempts=20, budget=budget,
+    )
+    assert result is None
+    assert calls["n"] == 3  # 200s, 400s, 600s -> the 4th take() is past the deadline
+    assert budget.remaining == 17  # stopped by the clock, not by attempts
+
+
+async def test_deadline_is_shared_across_slides_like_the_attempt_budget(
+    scratch_settings, monkeypatch,
+):
+    """Bespoke slides resolve sequentially against ONE clock, so a slide that eats
+    the deadline starves its siblings — same contract as the attempt budget."""
+    monkeypatch.setattr(codegen, "_run_typecheck", _ok_typecheck)
+    monkeypatch.setattr(codegen, "_run_preview_render", _ok_preview)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(codegen.time, "monotonic", lambda: clock["t"])
+    budget = codegen.CodegenBudget(total_attempts=20, max_seconds=100.0)
+    spec = GeneratedSlideSpec(description="fine", data={})
+
+    first = await codegen.generate_scene(
+        job_id="jobD", slide_index=0, spec=spec, width=1080, height=1920, fps=30,
+        settings=scratch_settings, max_attempts=3, budget=budget,
+    )
+    assert isinstance(first, RenderGeneratedSlide)
+
+    clock["t"] += 150.0  # the first slide ran past the shared deadline
+    second = await codegen.generate_scene(
+        job_id="jobD", slide_index=1, spec=spec, width=1080, height=1920, fps=30,
+        settings=scratch_settings, max_attempts=3, budget=budget,
+    )
+    assert second is None
+
+
+def _storyboard_with(n_generated: int) -> StoryboardSpec:
+    slides = [{"type": "generated", "description": f"s{i}", "data": {}} for i in range(n_generated)]
+    slides.append({"type": "outro", "brandName": "X", "ctaLabel": "Go"})
+    return StoryboardSpec(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        platform="linkedin", slides=slides,
+    )
+
+
+@pytest.mark.parametrize("n_generated, expected_seconds", [(2, 900.0), (5, 1500.0)])
+async def test_resolve_storyboard_assets_scales_the_deadline_per_generated_slide(
+    tmp_path, monkeypatch, n_generated, expected_seconds,
+):
+    """Mirrors the attempt budget's floor-and-scale rule: the configured total is a
+    FLOOR, so a storyboard with many bespoke slides doesn't starve the later ones."""
+    seen = {}
+
+    async def fake_generate_scene(**kw):
+        seen.setdefault("budget", kw["budget"])
+        return RenderGeneratedSlide(componentName="G", data=kw["spec"].data, durationFrames=100)
+
+    monkeypatch.setattr(codegen, "generate_scene", fake_generate_scene)
+    settings = Settings(video_renderer_dir=str(tmp_path), codegen_max_total_seconds=900.0)
+    await resolve_storyboard_assets(_storyboard_with(n_generated), job_dir=tmp_path, settings=settings)
+    assert seen["budget"].max_seconds == expected_seconds
+
+
+async def test_resolve_storyboard_assets_can_disable_the_deadline(tmp_path, monkeypatch):
+    """CODEGEN_MAX_TOTAL_SECONDS=0 restores attempt-only bounding."""
+    seen = {}
+
+    async def fake_generate_scene(**kw):
+        seen.setdefault("budget", kw["budget"])
+        return RenderGeneratedSlide(componentName="G", data=kw["spec"].data, durationFrames=100)
+
+    monkeypatch.setattr(codegen, "generate_scene", fake_generate_scene)
+    settings = Settings(video_renderer_dir=str(tmp_path), codegen_max_total_seconds=0.0)
+    await resolve_storyboard_assets(_storyboard_with(2), job_dir=tmp_path, settings=settings)
+    assert seen["budget"].max_seconds is None
+    assert seen["budget"].expired is False
 
 
 async def test_generate_scene_names_components_uniquely_per_slide(scratch_settings, monkeypatch):

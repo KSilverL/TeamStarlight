@@ -43,7 +43,7 @@ def azure_llm(reply: str) -> azure.AzureLLM:
 
     async def _complete(
         messages, *, model=None, temperature=None, max_tokens=None,
-        reasoning_effort=None, verbosity=None,
+        reasoning_effort=None, verbosity=None, max_retries=None,
     ):
         return reply
 

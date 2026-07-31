@@ -180,6 +180,7 @@ class AzureLLM(LLMService):
         self, messages: List[dict], *, model: Optional[str] = None,
         temperature: Optional[float] = None, max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None, verbosity: Optional[str] = None,
+        max_retries: Optional[int] = None,
     ) -> str:
         """Single seam through which all chat traffic flows (overridable in tests).
         `model` overrides the deployment for one call (e.g. the cheap summary tier);
@@ -193,8 +194,15 @@ class AzureLLM(LLMService):
         set, `temperature` is DROPPED even if the caller passed one — a reasoning
         deployment rejects (or ignores) a custom temperature, which is exactly why
         AzureChatClient (the roundtable path) never sends one; callers that opt
-        into reasoning_effort are asserting this is a reasoning-tier call."""
+        into reasoning_effort are asserting this is a reasoning-tier call.
+        `max_retries` overrides the client's SDK-level retry count for THIS call
+        only (`with_options` copies the client but keeps the same underlying httpx
+        connection pool, so this is not a per-call connection leak). The codegen
+        path passes 0 — see Settings.codegen_max_retries for why retrying a
+        300s-timeout reasoning call is actively harmful."""
         client = self._ensure_client()
+        if max_retries is not None:
+            client = client.with_options(max_retries=max_retries)
         kwargs: dict = {
             "model": model or self._settings.azure_chat_deployment,
             "messages": messages,
@@ -725,6 +733,8 @@ class AzureLLM(LLMService):
         raw = await self._complete(
             [{"role": "system", "content": system}, {"role": "user", "content": user_content}],
             model=self._settings.codegen_model,
+            max_tokens=self._settings.codegen_review_max_tokens,
+            max_retries=self._settings.codegen_max_retries,
         )
         data = json.loads(_strip_fences(raw))
         fixes = data.get("fixes")
@@ -757,6 +767,7 @@ class AzureLLM(LLMService):
                 model=self._settings.codegen_model,
                 reasoning_effort=self._settings.codegen_plan_reasoning_effort,
                 temperature=0.8, max_tokens=self._settings.codegen_plan_max_tokens,
+                max_retries=self._settings.codegen_max_retries,
             )
             return raw.strip()
         except Exception:
@@ -858,6 +869,7 @@ class AzureLLM(LLMService):
             reasoning_effort=self._settings.codegen_reasoning_effort,
             temperature=0.3 if attempt == 1 else 0.5,
             max_tokens=self._settings.codegen_max_tokens,
+            max_retries=self._settings.codegen_max_retries,
         )
         return _strip_fences(raw)
 
@@ -867,7 +879,14 @@ class AzureLLM(LLMService):
         """One-shot degradation for an exhausted `generated` slide (workflow/video/
         fallback.py): re-express the brief + data as the best-fitting FIXED slide.
         Returns the raw parsed dict; the caller validates against the template-only
-        union and degrades any invalid answer to a hook card, so no retry loop here."""
+        union and degrades any invalid answer to a hook card, so no retry loop here.
+
+        The heaviest prompt in the pipeline (the full ~23KB TemplateSlideSpec schema)
+        for the cheapest task (pick a `type`, copy the data into its fields), and it
+        runs on a slide that has ALREADY spent the whole codegen budget — so it is
+        explicitly steered away from reasoning and capped. Both were previously
+        unset, which on a reasoning deployment made this an unbounded call sitting
+        directly in the render's critical path."""
         schema = json.dumps(TypeAdapter(TemplateSlideSpec).json_schema())
         system = (
             "A bespoke video scene could not be generated. Re-express its creative "
@@ -889,7 +908,10 @@ class AzureLLM(LLMService):
         raw = await self._complete(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
             model=self._settings.codegen_model,
+            reasoning_effort=self._settings.codegen_convert_reasoning_effort,
             temperature=0.2,
+            max_tokens=self._settings.codegen_convert_max_tokens,
+            max_retries=self._settings.codegen_max_retries,
         )
         return json.loads(_strip_fences(raw))
 

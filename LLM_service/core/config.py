@@ -342,6 +342,15 @@ class Settings:
     # storyboard with several struggling slides could otherwise spend
     # max_attempts-per-slide x N-slides worth of real cost.
     codegen_max_total_attempts: int = 9
+    # The wall-clock half of the same budget (codegen.CodegenBudget). An attempt
+    # count bounds COST but says nothing about DURATION: on a reasoning-tier
+    # deployment one attempt can run minutes, so a budget that looks cheap in
+    # attempts can still hold a render job open far past what anyone will wait for
+    # — and nothing else in the pipeline caps it (jobs.py runs the render detached,
+    # the client just polls). Like the attempt budget this is a FLOOR, scaled up per
+    # `generated` slide in assets.py. Checked between attempts only, so the real
+    # bound is this plus one in-flight attempt. 0/blank disables the deadline.
+    codegen_max_total_seconds: float = 900.0
     # Deployment for the scene-codegen LLM calls (generate_scene_component,
     # plan_scene_design, review_scene_preview, convert_generated_to_template).
     # None -> falls back to azure_chat_deployment, same pattern as
@@ -372,6 +381,32 @@ class Settings:
     # deep-reasoning task — mirrors the roundtable personas' "minimal" so the
     # budget goes to the visible bullets, not hidden reasoning tokens.
     codegen_plan_reasoning_effort: Optional[str] = "minimal"
+    # SDK-level retries for the codegen calls ONLY (every other call site keeps the
+    # client's max_retries=3). 0 by default because the openai SDK retries
+    # APITimeoutError: at the client's 300s timeout, a reasoning-tier codegen call
+    # that runs long costs 4 x 300s = 20 MINUTES before it finally raises. codegen.py
+    # already owns retrying at a much better altitude — its own loop re-prompts with
+    # the error and re-validates, and CodegenBudget bounds the total — so a
+    # transport-level retry here only multiplies wall clock. Raise it only if you see
+    # genuinely transient 429/5xx (which this also stops retrying).
+    codegen_max_retries: int = 0
+    # review_scene_preview's max_completion_tokens. The visible answer is a tiny JSON
+    # object, but this call sent NO cap at all, so on a reasoning deployment it was
+    # unbounded. Deliberately generous (not the ~512 the output needs): no
+    # reasoning_effort is steered here, so the cap must clear the hidden-reasoning
+    # floor by a wide margin or the response comes back EMPTY (see
+    # ROUNDTABLE_PERSONA_MAX_TOKENS). This is a runaway ceiling, not a tight budget.
+    codegen_review_max_tokens: int = 4096
+    # convert_generated_to_template's max_completion_tokens. Also previously
+    # uncapped — and it's the most expensive prompt in the pipeline, since it dumps
+    # the whole ~23KB TemplateSlideSpec JSON schema into the system message.
+    codegen_convert_max_tokens: int = 4096
+    # ...and it is schema-filling, not reasoning: the slide type is nearly determined
+    # by the brief, so "minimal" keeps the budget on the visible JSON. Setting this
+    # also DROPS the temperature=0.2 that call used to send (see AzureLLM._complete —
+    # a reasoning deployment should not get a custom temperature). Blank -> send no
+    # reasoning_effort, restoring the temperature.
+    codegen_convert_reasoning_effort: Optional[str] = "minimal"
     # Visual QA pass for `map` slides (workflow/video/map_qa.py): preview-still +
     # vision review per map slide, with a bounded zoom-out repair on rejection.
     # Cost per attempt ≈ one `remotion still` (5-20s) + one vision call, so
@@ -618,12 +653,19 @@ def _load() -> Settings:
         remotion_lambda_site_name_prefix=os.getenv("REMOTION_LAMBDA_SITE_NAME_PREFIX", "storyboard-job"),
         remotion_lambda_output_bucket=os.getenv("REMOTION_LAMBDA_OUTPUT_BUCKET"),
         codegen_max_total_attempts=_env_int("CODEGEN_MAX_TOTAL_ATTEMPTS", 9),
+        codegen_max_total_seconds=_env_float("CODEGEN_MAX_TOTAL_SECONDS", 900.0),
         codegen_model=os.getenv("CODEGEN_MODEL"),
         codegen_reasoning_effort=(os.getenv("CODEGEN_REASONING_EFFORT") or "").strip() or None,
         codegen_max_tokens=_env_int("CODEGEN_MAX_TOKENS", 12000),
         codegen_plan_max_tokens=_env_int("CODEGEN_PLAN_MAX_TOKENS", 1536),
         codegen_plan_reasoning_effort=(
             os.getenv("CODEGEN_PLAN_REASONING_EFFORT", "minimal").strip() or None
+        ),
+        codegen_max_retries=_env_int("CODEGEN_MAX_RETRIES", 0),
+        codegen_review_max_tokens=_env_int("CODEGEN_REVIEW_MAX_TOKENS", 4096),
+        codegen_convert_max_tokens=_env_int("CODEGEN_CONVERT_MAX_TOKENS", 4096),
+        codegen_convert_reasoning_effort=(
+            os.getenv("CODEGEN_CONVERT_REASONING_EFFORT", "minimal").strip() or None
         ),
         map_qa_enabled=True if map_qa is None else map_qa,
         map_qa_max_attempts=_env_int("MAP_QA_MAX_ATTEMPTS", 2),
