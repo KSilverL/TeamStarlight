@@ -56,6 +56,7 @@ import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInVideoStatusRes
 import com.example.tsldemo.DTOs.ResponseReceived.LinkedIn.LinkedInVideoUploadInstructionDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaAuthAccessRespDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaDataUserInfo;
+import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaGranularScopes;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaIdentityRespDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaPermissionsRespDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaTokenDetails;
@@ -675,7 +676,12 @@ public class CrossPlatformService {
                 + "&client_id=" + URLEncoder.encode(crossPlatformOAuth.getClientId(), StandardCharsets.UTF_8)
                 + "&redirect_uri=" + URLEncoder.encode(metaRedirectUri, StandardCharsets.UTF_8)
                 + "&state=" + URLEncoder.encode(state, StandardCharsets.UTF_8)
-                + "&scope=" + URLEncoder.encode("pages_show_list,pages_manage_posts,pages_read_engagement", StandardCharsets.UTF_8);
+                + "&scope=" + URLEncoder.encode("pages_show_list,pages_manage_posts,pages_read_engagement", StandardCharsets.UTF_8)
+                // Without this, a dialog re-run for an account that already granted the scopes
+                // short-circuits on "Continue as …" and never re-shows the "What Pages do you
+                // want to use with this app?" step — which is exactly the step a user clicking
+                // Reconnect needs, since granted scopes with no Page selected yields no Pages.
+                + (force ? "&auth_type=rerequest" : "");
 
             // Persist the state BEFORE redirecting, so the callback can always find it.
             crossPlatformOAuth.setState(state);
@@ -735,34 +741,98 @@ public class CrossPlatformService {
     public CrossPlatformOAuth saveMetaPagesInfo(Long businessId) {
         CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(businessId, PlatformEnum.META);
 
-        System.out.println("Start Post Method");
-        System.out.println("PageId not found, retrieving data");
+        MetaDataUserInfo[] pages = listPostablePages(crossPlatformOAuth);
+
+        // Graph answers "no Pages" with a 200 and an empty data array rather than an error, so
+        // without this the UI just renders an empty picker and the user has nothing to act on.
+        // Ask Graph what was actually granted and turn it into a message that names the fix.
+        if (pages.length == 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    explainNoPages(crossPlatformOAuth));
+        }
+
+        crossPlatformOAuth.setPageIdArray(Arrays.stream(pages).map(MetaDataUserInfo::pageId).toArray(Long[]::new));
+        crossPlatformOAuth.setPageNameArray(Arrays.stream(pages).map(MetaDataUserInfo::pageName).toArray(String[]::new));
+        crossPlatformRepository.save(crossPlatformOAuth);
+
+        return crossPlatformOAuth;
+    }
+
+    /** The Pages this connection can publish to.
+     *
+     * <p>/me/accounts is the usual source, but it lists Pages by the *account's* own roles and
+     * comes back empty for a Page held through a Business portfolio — even when the connection's
+     * granular grant explicitly names that Page. The grant is the authority on what the token may
+     * act on, so when the account listing is empty, read the granted Pages by id instead. */
+    private MetaDataUserInfo[] listPostablePages(CrossPlatformOAuth crossPlatformOAuth) {
         MetaUserInfoDTO metaUserInfo = restClient.get()
             .uri("https://graph.facebook.com/v25.0/me/accounts")
             .header("Authorization", "Bearer " + crossPlatformOAuth.getAccessToken())
             .retrieve()
             .body(MetaUserInfoDTO.class);
 
-        // Graph answers "no Pages" with a 200 and an empty data array rather than an error, so
-        // without this the UI just renders an empty picker and the user has nothing to act on.
-        // Ask Graph what was actually granted and turn it into a message that names the fix.
-        if (metaUserInfo == null || metaUserInfo.data() == null || metaUserInfo.data().length == 0) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                    explainNoPages(crossPlatformOAuth.getAccessToken()));
+        if (metaUserInfo != null && metaUserInfo.data() != null && metaUserInfo.data().length > 0) {
+            return metaUserInfo.data();
         }
 
-        crossPlatformOAuth.setPageIdArray(Arrays.stream(metaUserInfo.data()).map(MetaDataUserInfo::pageId).toArray(Long[]::new));
-        crossPlatformOAuth.setPageNameArray(Arrays.stream(metaUserInfo.data()).map(MetaDataUserInfo::pageName).toArray(String[]::new));
-        crossPlatformRepository.save(crossPlatformOAuth);
+        List<MetaDataUserInfo> granted = new ArrayList<>();
+        for (String pageId : pageIdsFromGrant(crossPlatformOAuth)) {
+            try {
+                MetaDataUserInfo page = restClient.get()
+                    .uri("https://graph.facebook.com/v25.0/{pageId}?fields=id,name,access_token", pageId)
+                    .header("Authorization", "Bearer " + crossPlatformOAuth.getAccessToken())
+                    .retrieve()
+                    .body(MetaDataUserInfo.class);
 
-        return crossPlatformOAuth;
+                // No page token means the grant names the Page but Graph won't hand over the
+                // credential to act on it — treat it as not connected rather than half-adding it.
+                if (page != null && page.pageAccessToken() != null) {
+                    granted.add(page);
+                }
+            } catch (Exception e) {
+                log.warn("Granted Facebook Page {} could not be read directly", pageId, e);
+            }
+        }
+        return granted.toArray(MetaDataUserInfo[]::new);
+    }
+
+    /** The Page ids the connection's granular grant covers. Empty means either no Page was picked
+     * in the consent dialog or the grant covers all Pages — Facebook only lists ids when the user
+     * chose specific Pages. */
+    private String[] pageIdsFromGrant(CrossPlatformOAuth crossPlatformOAuth) {
+        MetaGranularScopes pageScope = pageShowListGrant(crossPlatformOAuth);
+        return pageScope == null || pageScope.targetIds() == null ? new String[0] : pageScope.targetIds();
+    }
+
+    private MetaGranularScopes pageShowListGrant(CrossPlatformOAuth crossPlatformOAuth) {
+        try {
+            MetaTokenDetails details = restClient.get()
+                .uri("https://graph.facebook.com/debug_token?input_token={token}&access_token={app}",
+                        crossPlatformOAuth.getAccessToken(),
+                        crossPlatformOAuth.getClientId() + "|" + crossPlatformOAuth.getClientSecret())
+                .retrieve()
+                .body(MetaTokenDetails.class);
+
+            if (details == null || details.data() == null || details.data().granularScopes() == null) {
+                return null;
+            }
+            return Arrays.stream(details.data().granularScopes())
+                    .filter(s -> "pages_show_list".equals(s.scope()))
+                    .findFirst()
+                    .orElse(null);
+        } catch (Exception e) {
+            log.warn("Could not read the Meta token's granular scopes", e);
+            return null;
+        }
     }
 
     /** Why did /me/accounts come back empty? Almost always one of two things: the consent dialog
      * granted fewer permissions than were asked for, or it granted them while the user picked no
      * Page. /me/permissions distinguishes the two, so the message can name the actual next step
      * instead of leaving the user staring at an empty Page list. */
-    private String explainNoPages(String accessToken) {
+    private String explainNoPages(CrossPlatformOAuth crossPlatformOAuth) {
+        String accessToken = crossPlatformOAuth.getAccessToken();
+
         // Which account is on the other end of this token? Authorising with a personal profile
         // that doesn't administer the Page looks identical to skipping the Page picker, so name
         // the account and let the user tell the two apart at a glance.
@@ -818,6 +888,31 @@ public class CrossPlatformService {
                     + ". Click Reconnect Facebook and accept every permission the dialog asks for.";
         }
 
+        // /me/permissions only reports that pages_show_list was granted — under granular
+        // permissions the grant also carries WHICH Pages it covers, and that is the difference
+        // between "you skipped the Page picker" and "this account administers no Page at all".
+        // Those two need opposite fixes, so ask the grant before guessing.
+        MetaGranularScopes pageScope = pageShowListGrant(crossPlatformOAuth);
+
+        // The grant names Pages, yet neither /me/accounts nor a direct read produced a usable
+        // Page token (listPostablePages already tried both before we got here).
+        if (pageScope != null && pageScope.targetIds() != null && pageScope.targetIds().length > 0) {
+            return connectedAs + "Facebook says this connection covers Page(s) "
+                    + String.join(", ", pageScope.targetIds())
+                    + ", but it will not issue a token to post as them. That points at the Page rather than "
+                    + "the consent screen: confirm the account has a Facebook (not just Instagram) admin "
+                    + "role with full control of that Page, that the Page is published and not restricted, "
+                    + "and — while the Meta app is in Development mode — that the account holds a role on "
+                    + "the app itself.";
+        }
+
+        if (pageScope != null) {
+            return connectedAs + "Facebook granted access to all current and future Pages, yet returned "
+                    + "no Pages — so this Facebook account does not administer any Page. Create a Page "
+                    + "(facebook.com/pages/create), or reconnect using the account that manages the Page "
+                    + "you want to post to, then click Load Pages again.";
+        }
+
         return connectedAs + "Facebook granted the page permissions but returned no Pages. In the consent dialog "
                 + "you must also choose which Pages the app may use — click Reconnect Facebook and, on "
                 + "the 'What Pages do you want to use with this app?' step, tick your Page (or 'Opt in to "
@@ -827,33 +922,54 @@ public class CrossPlatformService {
 
     public List<String> postToMeta(CrossPlatPostReqDTO requestDTO) throws IOException {
 
-        System.out.println("Starting Post Meta Method");
-        System.out.println("businessId: " + requestDTO.getBusinessId());
-        System.out.println("message: " + requestDTO.getMessage());
-        System.out.println("media: " + requestDTO.getMedia());
-        System.out.println("pageId: " + requestDTO.getPageId());
-        List<CrossPlatformOAuth> crossPlatformOAuthList = crossPlatformRepository.findAll();
-        System.out.println("businessIdFromDB: " + crossPlatformOAuthList.get(0).getBusinessId());
-        CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(requestDTO.getBusinessId(), PlatformEnum.META);
-        System.out.println("Meta Credentials Found!");
+        log.info("Meta post requested by business {} for pages {}",
+                requestDTO.getBusinessId(), Arrays.toString(requestDTO.getPageId()));
 
-        MetaUserInfoDTO metaUserInfo = restClient.get()
-            .uri("https://graph.facebook.com/v25.0/me/accounts")
-            .header("Authorization", "Bearer " + crossPlatformOAuth.getAccessToken())
-            .retrieve()
-            .body(MetaUserInfoDTO.class);
-        
+        CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(requestDTO.getBusinessId(), PlatformEnum.META);
+        if (crossPlatformOAuth == null || crossPlatformOAuth.getAccessToken() == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "This business has not connected Facebook yet — connect it in your Brand Profile first.");
+        }
+
+        Long[] requestedPageIds = requestDTO.getPageId();
+        if (requestedPageIds == null || requestedPageIds.length == 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "No Facebook Page was selected — pick a Page in your Brand Profile first.");
+        }
+
+        MetaDataUserInfo[] pages = listPostablePages(crossPlatformOAuth);
+
+        // Graph answers "no Pages" with a 200 and an empty data array. Posting then died on an
+        // ArrayIndexOutOfBounds while looking up the Page token, which reached the browser as a
+        // bare 500 that said nothing about the actual problem — the same empty-Page-list state
+        // the Brand Profile already explains. Reuse that explanation here.
+        if (pages.length == 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    explainNoPages(crossPlatformOAuth));
+        }
+
         List<String> postIds = new ArrayList<>();
-        
-        for (Long pageId : requestDTO.getPageId()) {
+
+        for (Long pageId : requestedPageIds) {
+            // Publishing to a Page uses that Page's own token, not the user token, so a Page the
+            // current token no longer covers (revoked, or a stale id cached in the browser) has
+            // to be named — otherwise the user has no way to tell which selection went bad.
+            String pageAccessToken = Arrays.stream(pages)
+                    .filter(page -> Objects.equals(page.pageId(), pageId))
+                    .map(MetaDataUserInfo::pageAccessToken)
+                    .findFirst()
+                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                            "Facebook Page " + pageId + " is not one this connection can post to. "
+                            + "Pages available on the current connection: "
+                            + Arrays.stream(pages)
+                                    .map(p -> p.pageName() + " (" + p.pageId() + ")")
+                                    .collect(Collectors.joining(", "))
+                            + ". Reload the Page list in your Brand Profile and pick one of these."));
+
             // Body (Form) [No MetaPostReqDTO]
-            System.out.println("Create post body");
             MultiValueMap<String, Object> form = new LinkedMultiValueMap<>();
             form.add("message", requestDTO.getMessage());
-            form.add("access_token", Arrays.stream(metaUserInfo.data())
-                        .filter(page -> page.pageId().equals(pageId))
-                        .map(MetaDataUserInfo::pageAccessToken)
-                        .toList().get(0));
+            form.add("access_token", pageAccessToken);
 
             String url = "https://graph.facebook.com/v25.0/{page_id}/feed";
 

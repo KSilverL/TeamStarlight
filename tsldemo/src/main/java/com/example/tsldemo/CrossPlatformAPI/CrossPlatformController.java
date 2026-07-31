@@ -208,6 +208,12 @@ public class CrossPlatformController {
         try {
             List<String> postIdList = crossPlatformService.postToMeta(requestDTO);
             return ResponseEntity.ok(Map.of("Meta Post ok: ", postIdList));
+        } catch (ResponseStatusException e) {
+            // Same reason as /meta/addPageInfo: Spring Boot 4 drops the reason from the default
+            // error body, and the reason IS the payload here — it names the connection or Page
+            // problem the user has to fix, so return it in a body the frontend can relay.
+            return ResponseEntity.status(e.getStatusCode())
+                    .body(Map.of("error", e.getReason() == null ? "Could not post to Facebook." : e.getReason()));
         } catch (ResourceAccessException e) {
             // The upload never got an answer — a read timeout on a slow video, or Graph dropping
             // the connection. An unhandled throw would surface as a bare 500, which tells the
