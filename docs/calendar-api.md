@@ -1,9 +1,9 @@
 # TeamStarlight Calendar API Documentation
 
-This document covers all REST endpoints involved in the content calendar feature across three service layers:
+This document covers the REST endpoints behind the content calendar across three service layers:
 
-- **Frontend** (Next.js, `http://localhost:3000`) — the calendar grid UI and Schedule Post modal
-- **Backend** (Spring Boot, `http://localhost:8080`) — manages scheduled post persistence and job scheduling via Quartz
+- **Frontend** (Next.js, `http://localhost:3000`) — the calendar grid UI, the Schedule Post modal, and thin proxy routes under `/api/schedule/*`
+- **Backend** (Spring Boot, `http://localhost:8081`) — persists scheduled posts and publishes them
 - **LLM Service** (MAF, `http://localhost:8080`) — generates platform-optimised content on demand inside the modal chat
 
 ---
@@ -12,9 +12,9 @@ This document covers all REST endpoints involved in the content calendar feature
 
 The calendar feature has two distinct sub-flows:
 
-**1. Calendar CRUD** — The frontend reads and writes scheduled posts through the Spring Boot backend. The backend persists posts and manages a Quartz job per post, which fires at the scheduled date/time to publish the content to the target social platform.
+**1. Calendar CRUD** — The frontend reads and writes scheduled posts through the Spring Boot backend, which persists each one as a row in `scheduled_post`. A recurring sweeper publishes the rows that have come due.
 
-**2. Modal Content Generation** — When the user opens the Schedule Post modal for a day and types a prompt, the frontend sends the request to the backend, which forwards it to the LLM service to generate platform-specific copy. The generated draft is returned inline in the modal chat. Once the user selects a draft and clicks "Schedule Post", the first flow takes over and the post is saved.
+**2. Modal Content Generation** — When the user opens the Schedule Post modal for a day and types a prompt, the frontend calls the LLM service directly through its own `/api/text` proxy. The generated draft is returned inline in the modal chat. Once the user selects a draft and clicks "Schedule Post", the first flow takes over and the post is saved.
 
 ```
                    ┌─────────────────────────────────────────────┐
@@ -26,19 +26,40 @@ The calendar feature has two distinct sub-flows:
     ┌───────────────────────────────┼────────────────────────────────────┐
     │                               │                                    │
     ▼                               ▼                                    ▼
-Frontend ──── GET/POST/PATCH/  ──► Backend ──── POST /generate-text ──► LLM Service
-             DELETE /posts           │                                    │
-                                     │◄───────────────────────────────────┘
-                                     │         { text, hashtags }
-                                     │
+Frontend ──── GET/POST/PATCH/  ──► Backend                        /api/text ──► LLM Service
+             DELETE                  │                                    │
+        /api/schedule/posts          │◄───────────────────────────────────┘
+                                     │              { text }
                                      ▼
-                              Quartz Scheduler
-                         (fires at post.date + post.time)
+                         scheduled_post (Postgres)
                                      │
-                                     ▼
-                           Social Platform APIs
-                      (Instagram, LinkedIn, TikTok, X)
+                    ┌────────────────┴─────────────────┐
+                    ▼                                  ▼
+          ScheduledPostSweeper                 Facebook Graph API
+       (every 60s, publishes due               holds its own schedule
+        LinkedIn posts; confirms               via scheduled_publish_time
+        Facebook ones went live)
+                    │                                  │
+                    ▼                                  ▼
+              LinkedIn API                      Facebook Page feed
 ```
+
+### Two publishing models
+
+| | LinkedIn | Facebook |
+|---|---|---|
+| Who holds the schedule | Us (`scheduled_post` + sweeper) | Facebook, via `published=false` + `scheduled_publish_time` |
+| Survives backend downtime | Publishes late, up to the missed-window cutoff | Publishes on time regardless — Graph doesn't need us |
+| What the sweeper does at publish time | Posts to the LinkedIn API | Reads back `is_published` to confirm Facebook did it |
+| Lead-time limits | None | 10 minutes to 6 months (Graph's own bounds) |
+
+A Facebook post scheduled less than 10 minutes out falls back to the sweeper automatically, because Graph rejects a `scheduled_publish_time` that close.
+
+### Why a sweeper rather than one timer per post
+
+The previous implementation called `taskScheduler.schedule(runnable, instant)`, so the only record of a pending post was a runnable in a thread pool queue. That meant a restart, redeploy or crash silently dropped every pending post; nothing could be listed, edited or cancelled; and a failure at publish time died on the scheduler thread with no status change and no notification. Persisting the intent and sweeping for due rows fixes all four at once.
+
+Minute granularity is the trade-off: a post can publish up to one sweep late.
 
 ---
 
@@ -50,12 +71,35 @@ Frontend ──── GET/POST/PATCH/  ──► Backend ──── POST /gene
 - [A3. Create Scheduled Post](#a3-create-scheduled-post)
 - [A4. Update Scheduled Post](#a4-update-scheduled-post)
 - [A5. Delete Scheduled Post](#a5-delete-scheduled-post)
+- [A6. Schedule a LinkedIn Post (legacy alias)](#a6-schedule-a-linkedin-post-legacy-alias)
 
-**B - Content Generation in Modal (Frontend → Backend → LLM Service)**
+**B - Content Generation in Modal (Frontend → LLM Service)**
 - [B1. Generate Post Content](#b1-generate-post-content)
 
-**C - LLM Service Content Generation (Backend → LLM Service)**
-- [C1. Generate Platform Content](#c1-generate-platform-content)
+---
+
+## Authentication
+
+Every endpoint in section A requires `Authorization: Bearer <jwt>`. The backend derives the
+business from the token and never from the request body, so a caller can only see and act on its
+own schedule. A post id belonging to another business returns `404`, not `403` — the schedule's
+existence isn't disclosed either.
+
+## Timezones
+
+`scheduled_at` is the single source of truth: an absolute instant, stored as UTC.
+
+`date` and `time` are the wall-clock strings the user picked, resolved into the post's own
+`timezone` by the server. The frontend renders those directly rather than deriving them from
+`scheduled_at`, so a post placed on the 15th shows on the 15th for every viewer.
+
+On write, send either:
+- `scheduled_time` as a bare wall-clock string (`"2026-07-18T10:00:00"`) **plus** `timezone`, or
+- `scheduled_time` with an offset (`"2026-07-18T10:00:00+01:00"`), which needs no `timezone`
+
+Omitting both leaves the server to apply its configured `app.timezone` (default `Europe/Dublin`).
+Never rely on the server's JVM zone: it is UTC inside the container, which is what previously made
+a 10:00 post publish at 11:00 Irish summer time.
 
 ---
 
@@ -63,70 +107,86 @@ Frontend ──── GET/POST/PATCH/  ──► Backend ──── POST /gene
 
 ### ScheduledPost
 
-The core object used across all calendar endpoints.
-
-| Field      | Type   | Description                                                                |
-|------------|--------|----------------------------------------------------------------------------|
-| `id`       | string | UUID assigned by the backend on creation                                   |
-| `date`     | string | ISO date string, e.g. `"2026-06-15"`. Stored and compared as local date — not UTC |
-| `time`     | string | 24-hour time string, e.g. `"09:00"`. Combined with `date` for the Quartz trigger |
-| `platform` | string | One of `"instagram"`, `"linkedin"`, `"tiktok"`, `"x"`                     |
-| `text`     | string | Main post body copy, including any platform-specific formatting (e.g. TikTok script structure) |
-| `hashtags` | string[] | Hashtags to append. Intentionally empty for LinkedIn                    |
-| `status`   | string | Lifecycle state of the post. See status values below                      |
-| `sessionId`| string | Optional. The content generation session this post originated from        |
-| `createdAt`| string | ISO 8601 timestamp                                                         |
-| `updatedAt`| string | ISO 8601 timestamp                                                         |
+| Field              | Type     | Description                                                                 |
+|--------------------|----------|-----------------------------------------------------------------------------|
+| `id`               | string   | Row id assigned by the backend on creation                                  |
+| `platform`         | string   | `"linkedin"` or `"facebook"`                                                |
+| `date`             | string   | ISO date, e.g. `"2026-06-15"`, in the post's own `timezone`                 |
+| `time`             | string   | 24-hour time, e.g. `"09:00"`, in the post's own `timezone`                  |
+| `scheduled_at`     | string   | The publish moment as an ISO-8601 instant — the authoritative value          |
+| `timezone`         | string   | IANA zone the time was chosen in, e.g. `"Europe/Dublin"`                    |
+| `message`          | string   | Post body copy                                                              |
+| `hashtags`         | string[] | Appended to `message` at publish time. Empty for LinkedIn by convention      |
+| `page_ids`         | number[] | Facebook Page ids to publish to. Empty for LinkedIn                         |
+| `status`           | string   | Lifecycle state. See below                                                  |
+| `native_scheduled` | boolean  | True when Facebook is holding the schedule rather than our sweeper           |
+| `platform_post_ids`| string[] | Platform's own ids — one per Page for Facebook, one element for LinkedIn     |
+| `last_error`       | string   | Why the last attempt failed, verbatim from the platform. Null when healthy   |
+| `created_at`       | string   | ISO-8601 instant                                                            |
+| `updated_at`       | string   | ISO-8601 instant                                                            |
 
 ### Post Status Values
 
-| Value       | Meaning                                                         |
-|-------------|-----------------------------------------------------------------|
-| `scheduled` | Post is queued; Quartz job is registered and will fire on time  |
-| `published` | Quartz job fired and the post was successfully pushed to the platform |
-| `failed`    | Quartz job fired but the publish call to the platform failed    |
-| `cancelled` | Post was deleted before its scheduled time                      |
+| Value        | Meaning                                                                     |
+|--------------|-----------------------------------------------------------------------------|
+| `scheduled`  | Waiting for its time. The only state that can be edited or cancelled          |
+| `publishing` | Claimed by a sweep and currently being published. Transient                  |
+| `published`  | Live on the platform                                                        |
+| `failed`     | Every attempt failed, or it missed its window while the service was down     |
+| `cancelled`  | Cancelled by the user before it fired                                       |
+
+### Retry and failure behaviour
+
+| Event | Backend action |
+|---|---|
+| Publish attempt fails | `attempts` incremented, retried after 5 minutes, up to 3 attempts. `scheduled_at` is left alone so the calendar keeps showing the intended time |
+| All attempts fail | `status: "failed"`, `last_error` set, and the business is emailed |
+| Post comes due more than 6 hours late (LinkedIn only) | `status: "failed"` with a "missed its scheduled time" reason, rather than publishing badly out of context. Configurable via `app.scheduling.missed-cutoff-minutes` |
+| Facebook post comes due | Sweeper waits 5 minutes, then reads `is_published` back from Graph. Unconfirmed posts go through the same retry path |
+| App dies mid-publish | The row is left in `publishing`; a later sweep returns it to `scheduled` after 30 minutes and retries |
+
+Concurrency: the sweeper claims each row with a conditional `UPDATE … WHERE status = 'SCHEDULED'`,
+so overlapping sweeps — or two app instances — can never publish the same post twice.
 
 ---
 
 ## A - Scheduled Posts
 
+The frontend proxies these through `/api/schedule/posts` on port 3000, which forwards the
+`Authorization` header unchanged. The proxy additionally accepts `date` + `time` as separate
+fields (the calendar holds them as separate controls) and composes them into `scheduled_time`.
+
 ### A1. List Scheduled Posts
 
-**Description**  
-Returns all scheduled posts for the authenticated user. Supports filtering by date range and platform. The frontend calls this on calendar mount and after each successful schedule action to populate the month grid. Posts are returned as a flat array — the frontend groups them by `date` locally for the day-cell rendering.
+**Description**
+Returns the calling business's scheduled posts, optionally bounded to a date range. The calendar
+calls this on mount, on every month change, and after each successful schedule or cancel. Posts
+come back as a flat array; the frontend groups them by `date` for the day-cell rendering.
 
-**Endpoint**  
-`/api/calendar/posts`
+**Endpoint**
+`/schedule/posts` (backend) · `/api/schedule/posts` (frontend proxy)
 
-**Base URL**  
-`http://localhost:8080`
-
-**Method**  
+**Method**
 `GET`
 
 **Query Parameters**
 
-| Parameter   | Type   | Required | Description                                                                 |
-|-------------|--------|----------|-----------------------------------------------------------------------------|
-| `from`      | string | No       | ISO date string. Returns only posts on or after this date (e.g. `"2026-06-01"`) |
-| `to`        | string | No       | ISO date string. Returns only posts on or before this date (e.g. `"2026-06-30"`) |
-| `date`      | string | No       | ISO date string. Returns only posts on this specific day. Overrides `from`/`to` when provided |
-| `platform`  | string | No       | Filter by platform. One of `"instagram"`, `"linkedin"`, `"tiktok"`, `"x"` |
-| `status`    | string | No       | Filter by post lifecycle status                                             |
+| Parameter  | Type   | Required | Description                                                        |
+|------------|--------|----------|--------------------------------------------------------------------|
+| `from`     | string | No       | ISO date. Posts on or after the start of this day                  |
+| `to`       | string | No       | ISO date. Posts on or before the end of this day                   |
+| `timezone` | string | No       | IANA zone the `from`/`to` day boundaries are resolved in           |
 
-**Example Request — Fetch all posts for June 2026**
+Send `timezone` alongside a range. Without it the boundaries are resolved in the server's
+configured zone, and a post late on the last day of a month can fall outside the range that
+should contain it.
 
-```http
-GET /api/calendar/posts?from=2026-06-01&to=2026-06-30 HTTP/1.1
-Host: localhost:8080
-```
-
-**Example Request — Fetch posts for a specific day (used by the modal)**
+**Example Request**
 
 ```http
-GET /api/calendar/posts?date=2026-06-15 HTTP/1.1
-Host: localhost:8080
+GET /schedule/posts?from=2026-06-01&to=2026-06-30&timezone=Europe/Dublin HTTP/1.1
+Host: localhost:8081
+Authorization: Bearer <jwt>
 ```
 
 **Example Successful Response** — `200 OK`
@@ -135,28 +195,38 @@ Host: localhost:8080
 {
   "posts": [
     {
-      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "id": "41",
+      "platform": "facebook",
       "date": "2026-06-15",
       "time": "09:00",
-      "platform": "instagram",
-      "text": "🌿 Summer refresh starts in the kitchen. Our Bamboo Collection is made for sun-filled mornings and sustainable choices. ☀️\n\nShop the look — link in bio.",
-      "hashtags": ["#EcoHome", "#BambooKitchen", "#SummerRefresh", "#SustainableLiving"],
+      "scheduled_at": "2026-06-15T08:00:00Z",
+      "timezone": "Europe/Dublin",
+      "message": "Summer refresh starts in the kitchen. Our Bamboo Collection is made for sun-filled mornings and sustainable choices.",
+      "hashtags": ["#EcoHome", "#BambooKitchen"],
+      "page_ids": [102938475610234],
       "status": "scheduled",
-      "sessionId": "sess-7f3a1b2c",
-      "createdAt": "2026-06-12T10:15:00Z",
-      "updatedAt": "2026-06-12T10:15:00Z"
+      "native_scheduled": true,
+      "platform_post_ids": ["102938475610234_8891726354"],
+      "last_error": null,
+      "created_at": "2026-06-12T10:15:00Z",
+      "updated_at": "2026-06-12T10:15:00Z"
     },
     {
-      "id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+      "id": "42",
+      "platform": "linkedin",
       "date": "2026-06-15",
       "time": "14:00",
-      "platform": "linkedin",
-      "text": "Sustainability and style aren't mutually exclusive. EcoHome Solutions' Bamboo Kitchen Collection proves that carbon-negative manufacturing can produce premium homewares.",
+      "scheduled_at": "2026-06-15T13:00:00Z",
+      "timezone": "Europe/Dublin",
+      "message": "Sustainability and style aren't mutually exclusive.",
       "hashtags": [],
+      "page_ids": [],
       "status": "scheduled",
-      "sessionId": "sess-7f3a1b2c",
-      "createdAt": "2026-06-12T10:15:30Z",
-      "updatedAt": "2026-06-12T10:15:30Z"
+      "native_scheduled": false,
+      "platform_post_ids": [],
+      "last_error": null,
+      "created_at": "2026-06-12T10:15:30Z",
+      "updated_at": "2026-06-12T10:15:30Z"
     }
   ],
   "total": 2
@@ -166,328 +236,155 @@ Host: localhost:8080
 **Example Unsuccessful Response** — `400 Bad Request`
 
 ```json
-{
-  "error": "INVALID_DATE_RANGE",
-  "message": "\"to\" date must be on or after \"from\" date",
-  "details": {
-    "from": "2026-06-30",
-    "to": "2026-06-01"
-  }
-}
+{ "error": "\"to\" must be on or after \"from\"." }
 ```
 
 ---
 
 ### A2. Get Scheduled Post
 
-**Description**  
-Returns a single scheduled post by its ID. Used when the frontend needs to display or verify the full details of a specific post, for example when editing from a day cell popup.
+**Endpoint**
+`/schedule/posts/{id}` · **Method** `GET`
 
-**Endpoint**  
-`/api/calendar/posts/{postId}`
-
-**Base URL**  
-`http://localhost:8080`
-
-**Method**  
-`GET`
-
-**Path Parameters**
-
-| Parameter | Type   | Required | Description              |
-|-----------|--------|----------|--------------------------|
-| `postId`  | string | Yes      | UUID of the scheduled post |
-
-**Query Parameters**  
-None
-
-**Example Request**
-
-```http
-GET /api/calendar/posts/a1b2c3d4-e5f6-7890-abcd-ef1234567890 HTTP/1.1
-Host: localhost:8080
-```
-
-**Example Successful Response** — `200 OK`
+Returns one post in the shape above. `404` when no post with that id belongs to the caller.
 
 ```json
-{
-  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "date": "2026-06-15",
-  "time": "09:00",
-  "platform": "instagram",
-  "text": "🌿 Summer refresh starts in the kitchen. Our Bamboo Collection is made for sun-filled mornings and sustainable choices. ☀️\n\nShop the look — link in bio.",
-  "hashtags": ["#EcoHome", "#BambooKitchen", "#SummerRefresh", "#SustainableLiving"],
-  "status": "scheduled",
-  "sessionId": "sess-7f3a1b2c",
-  "createdAt": "2026-06-12T10:15:00Z",
-  "updatedAt": "2026-06-12T10:15:00Z"
-}
-```
-
-**Example Unsuccessful Response** — `404 Not Found`
-
-```json
-{
-  "error": "POST_NOT_FOUND",
-  "message": "No scheduled post found with id a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-}
+{ "error": "No scheduled post found with id 41." }
 ```
 
 ---
 
 ### A3. Create Scheduled Post
 
-**Description**  
-Saves a new post to the calendar and registers a Quartz job to publish it at the given `date` + `time`. This is called by the frontend when the user clicks "Schedule Post" in the modal, after selecting a draft from the inline chat.
+**Description**
+Saves a new post and, for Facebook, immediately places the schedule with Graph. The time must be
+in the future — the old implementation had no such check, and `taskScheduler.schedule()` runs a
+past instant *immediately*, so a mistyped year published straight to the live account.
 
-The backend must validate that the `date` + `time` combination is in the future before accepting the request. On success, a Quartz trigger is created with the job key `post:{postId}` set to fire at the specified local datetime.
-
-**Endpoint**  
-`/api/calendar/posts`
-
-**Base URL**  
-`http://localhost:8080`
-
-**Method**  
-`POST`
-
-**Query Parameters**  
-None
+**Endpoint**
+`/schedule/posts` · **Method** `POST`
 
 **Request Body**
 
-| Field       | Type     | Required | Description                                                              |
-|-------------|----------|----------|--------------------------------------------------------------------------|
-| `date`      | string   | Yes      | ISO date string, e.g. `"2026-06-15"`                                    |
-| `time`      | string   | Yes      | 24-hour time string, e.g. `"09:00"`                                     |
-| `platform`  | string   | Yes      | One of `"instagram"`, `"linkedin"`, `"tiktok"`, `"x"`                  |
-| `text`      | string   | Yes      | Post body copy                                                           |
-| `hashtags`  | string[] | Yes      | Array of hashtag strings (can be empty for platforms like LinkedIn)      |
-| `sessionId` | string   | No       | The content generation session ID this draft came from. Used for traceability |
+| Field            | Type     | Required | Description                                                        |
+|------------------|----------|----------|--------------------------------------------------------------------|
+| `platform`       | string   | Yes      | `"linkedin"` or `"facebook"` (`"meta"` also accepted)              |
+| `scheduled_time` | string   | Yes      | Wall-clock or offset-qualified — see [Timezones](#timezones)        |
+| `timezone`       | string   | No       | IANA zone. Ignored when `scheduled_time` carries an offset          |
+| `message`        | string   | Yes      | Post body copy                                                     |
+| `hashtags`       | string[] | No       | Appended to `message` at publish time                              |
+| `page_ids`       | number[] | For Facebook | Pages to publish to                                            |
 
 **Example Request**
 
 ```http
-POST /api/calendar/posts HTTP/1.1
-Host: localhost:8080
+POST /schedule/posts HTTP/1.1
+Host: localhost:8081
+Authorization: Bearer <jwt>
 Content-Type: application/json
 
 {
-  "date": "2026-06-15",
-  "time": "09:00",
-  "platform": "instagram",
-  "text": "🌿 Summer refresh starts in the kitchen. Our Bamboo Collection is made for sun-filled mornings and sustainable choices. ☀️\n\nShop the look — link in bio.",
-  "hashtags": ["#EcoHome", "#BambooKitchen", "#SummerRefresh", "#SustainableLiving"],
-  "sessionId": "sess-7f3a1b2c"
+  "platform": "facebook",
+  "scheduled_time": "2026-06-15T09:00:00",
+  "timezone": "Europe/Dublin",
+  "message": "Summer refresh starts in the kitchen.",
+  "hashtags": ["#EcoHome", "#BambooKitchen"],
+  "page_ids": [102938475610234]
 }
 ```
 
 **Example Successful Response** — `201 Created`
+Returns the created post in the A1 shape.
+
+**Example Unsuccessful Responses** — `400 Bad Request`
 
 ```json
-{
-  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "date": "2026-06-15",
-  "time": "09:00",
-  "platform": "instagram",
-  "text": "🌿 Summer refresh starts in the kitchen. Our Bamboo Collection is made for sun-filled mornings and sustainable choices. ☀️\n\nShop the look — link in bio.",
-  "hashtags": ["#EcoHome", "#BambooKitchen", "#SummerRefresh", "#SustainableLiving"],
-  "status": "scheduled",
-  "sessionId": "sess-7f3a1b2c",
-  "createdAt": "2026-06-12T10:15:00Z",
-  "updatedAt": "2026-06-12T10:15:00Z"
-}
+{ "error": "That time has already passed — pick a time in the future." }
 ```
-
-**Example Unsuccessful Response** — `400 Bad Request`
-
 ```json
-{
-  "error": "SCHEDULED_TIME_IN_PAST",
-  "message": "The scheduled date and time must be in the future",
-  "details": {
-    "date": "2026-06-10",
-    "time": "08:00",
-    "serverTime": "2026-06-12T10:15:00Z"
-  }
-}
+{ "error": "Pick at least one Facebook Page to schedule this post to." }
 ```
-
-**Example Unsuccessful Response** — `422 Unprocessable Entity`
-
 ```json
-{
-  "error": "VALIDATION_ERROR",
-  "message": "One or more fields failed validation",
-  "details": [
-    {
-      "field": "platform",
-      "message": "must be one of: instagram, linkedin, tiktok, x",
-      "rejectedValue": "snapchat"
-    }
-  ]
-}
+{ "error": "Scheduling is only supported for LinkedIn and Facebook right now — got \"snapchat\"." }
 ```
 
 ---
 
 ### A4. Update Scheduled Post
 
-**Description**  
-Updates an existing scheduled post. Supports partial updates via `PATCH` — only include the fields that need to change. Common use cases are rescheduling (changing `date` or `time`) and editing post copy.
+**Description**
+Partial update — send only the fields that change; a field left out is left alone. Only posts in
+`scheduled` can be patched.
 
-If `date` or `time` is updated the backend must cancel the existing Quartz job and register a new one with the updated trigger time. Updates are only permitted when the post has `status: "scheduled"` — posts that have already been published or failed cannot be modified.
+When Facebook is holding the schedule (`native_scheduled: true`), a time or content change is
+pushed to Graph as part of the same request, so the row and the thing that actually publishes
+can't drift apart. Changing `page_ids` on such a post is rejected: the posts already sitting on
+the old Pages would be orphaned. Cancel and re-create instead.
 
-**Endpoint**  
-`/api/calendar/posts/{postId}`
+Rescheduling resets `attempts` and clears `last_error` — a new time is a fresh start, not a
+continuation of a failed run.
 
-**Base URL**  
-`http://localhost:8080`
+**Endpoint**
+`/schedule/posts/{id}` · **Method** `PATCH`
 
-**Method**  
-`PATCH`
+**Request Body** — all optional: `scheduled_time`, `timezone`, `message`, `hashtags`, `page_ids`
 
-**Path Parameters**
-
-| Parameter | Type   | Required | Description              |
-|-----------|--------|----------|--------------------------|
-| `postId`  | string | Yes      | UUID of the scheduled post |
-
-**Query Parameters**  
-None
-
-**Request Body** — all fields optional; include only what is changing
-
-| Field      | Type     | Required | Description                                                              |
-|------------|----------|----------|--------------------------------------------------------------------------|
-| `date`     | string   | No       | New ISO date string                                                      |
-| `time`     | string   | No       | New 24-hour time string                                                  |
-| `platform` | string   | No       | New target platform                                                      |
-| `text`     | string   | No       | Updated post body copy                                                   |
-| `hashtags` | string[] | No       | Updated hashtag array                                                    |
-
-**Example Request — Reschedule to a later time**
+**Example Request**
 
 ```http
-PATCH /api/calendar/posts/a1b2c3d4-e5f6-7890-abcd-ef1234567890 HTTP/1.1
-Host: localhost:8080
+PATCH /schedule/posts/42 HTTP/1.1
+Authorization: Bearer <jwt>
 Content-Type: application/json
 
-{
-  "date": "2026-06-16",
-  "time": "10:30"
-}
-```
-
-**Example Request — Edit copy only**
-
-```http
-PATCH /api/calendar/posts/a1b2c3d4-e5f6-7890-abcd-ef1234567890 HTTP/1.1
-Host: localhost:8080
-Content-Type: application/json
-
-{
-  "text": "🌿 Summer refresh starts in the kitchen. Bamboo. Carbon-negative. Built to last. ☀️\n\nShop the collection — link in bio.",
-  "hashtags": ["#EcoHome", "#BambooKitchen", "#SustainableLiving"]
-}
+{ "scheduled_time": "2026-06-16T10:30:00", "timezone": "Europe/Dublin" }
 ```
 
 **Example Successful Response** — `200 OK`
-
-```json
-{
-  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "date": "2026-06-16",
-  "time": "10:30",
-  "platform": "instagram",
-  "text": "🌿 Summer refresh starts in the kitchen. Bamboo. Carbon-negative. Built to last. ☀️\n\nShop the collection — link in bio.",
-  "hashtags": ["#EcoHome", "#BambooKitchen", "#SustainableLiving"],
-  "status": "scheduled",
-  "sessionId": "sess-7f3a1b2c",
-  "createdAt": "2026-06-12T10:15:00Z",
-  "updatedAt": "2026-06-12T11:42:00Z"
-}
-```
+Returns the updated post in the A1 shape.
 
 **Example Unsuccessful Response** — `409 Conflict`
 
 ```json
-{
-  "error": "POST_NOT_EDITABLE",
-  "message": "Post a1b2c3d4 cannot be updated because it has already been published",
-  "currentStatus": "published"
-}
-```
-
-**Example Unsuccessful Response** — `404 Not Found`
-
-```json
-{
-  "error": "POST_NOT_FOUND",
-  "message": "No scheduled post found with id a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-}
+{ "error": "This post is published and can no longer be updated." }
 ```
 
 ---
 
 ### A5. Delete Scheduled Post
 
-**Description**  
-Cancels and deletes a scheduled post. The backend cancels the associated Quartz job before deleting the record. Only posts with `status: "scheduled"` can be deleted — posts that are already `published` are immutable records and cannot be removed via this endpoint.
+**Description**
+Cancels the post. For a Facebook post the Graph-side scheduled post is deleted **first** — if
+that fails the row is not marked cancelled, because Facebook would publish it anyway and the
+calendar would be claiming otherwise.
 
-**Endpoint**  
-`/api/calendar/posts/{postId}`
+Cancelled posts are kept as rows rather than deleted outright, so the calendar can show what was
+called off.
 
-**Base URL**  
-`http://localhost:8080`
-
-**Method**  
-`DELETE`
-
-**Path Parameters**
-
-| Parameter | Type   | Required | Description              |
-|-----------|--------|----------|--------------------------|
-| `postId`  | string | Yes      | UUID of the scheduled post |
-
-**Query Parameters**  
-None
-
-**Request Body**  
-None
-
-**Example Request**
-
-```http
-DELETE /api/calendar/posts/a1b2c3d4-e5f6-7890-abcd-ef1234567890 HTTP/1.1
-Host: localhost:8080
-```
+**Endpoint**
+`/schedule/posts/{id}` · **Method** `DELETE`
 
 **Example Successful Response** — `204 No Content`
-
-```
-(empty body)
-```
 
 **Example Unsuccessful Response** — `409 Conflict`
 
 ```json
-{
-  "error": "POST_NOT_DELETABLE",
-  "message": "Post a1b2c3d4 cannot be deleted because it has already been published. Published posts are kept as an audit record.",
-  "currentStatus": "published"
-}
+{ "error": "This post is published and can no longer be cancelled." }
 ```
 
-**Example Unsuccessful Response** — `404 Not Found`
+---
+
+### A6. Schedule a LinkedIn Post (legacy alias)
+
+`POST /linkedin/schedule-post` with `{ "message": "...", "scheduled_time": "2026-07-18T10:00:00" }`
+still works and now creates a `scheduled_post` row like any other. It returns the row id so the
+caller can manage it through section A:
 
 ```json
-{
-  "error": "POST_NOT_FOUND",
-  "message": "No scheduled post found with id a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-}
+{ "status": "scheduled", "id": "43", "scheduled_at": "2026-07-18T09:00:00Z" }
 ```
+
+It has no `timezone` parameter, so its wall-clock time is always resolved in the server's
+configured `app.timezone`. Prefer A3, which takes the browser's zone.
 
 ---
 
@@ -495,194 +392,77 @@ Host: localhost:8080
 
 ### B1. Generate Post Content
 
-**Description**  
-Generates platform-optimised post copy from a free-text prompt. This endpoint is called from the Schedule Post modal when the user sends a chat message describing what they want to post. The backend forwards the request to the LLM service (C1) and streams or returns the generated draft back to the frontend.
+**Description**
+The modal calls the frontend's existing `/api/text` proxy, which forwards to the LLM service's
+`POST /generate-text`. This does **not** go through the newsroom workflow or the human gate —
+it's a one-shot generator, so there is no `task_id`. The LLM service applies the platform's
+house-style skill (`skills/<platform>.md`):
 
-The response includes structured `text` (the post body) and `hashtags` (as a separate array) so the frontend can display them with distinct styling in the chat bubble and attach the `draftData` payload needed for the "Use this content" button.
-
-This endpoint replaces the mock `generateContent` function in `SchedulePostModal.tsx`.
-
-**Endpoint**  
-`/api/calendar/generate`
-
-**Base URL**  
-`http://localhost:8080`
-
-**Method**  
-`POST`
-
-**Query Parameters**  
-None
-
-**Request Body**
-
-| Field       | Type   | Required | Description                                                                    |
-|-------------|--------|----------|--------------------------------------------------------------------------------|
-| `prompt`    | string | Yes      | The user's free-text description of what to post                               |
-| `platform`  | string | Yes      | The target platform. One of `"instagram"`, `"linkedin"`, `"tiktok"`, `"x"`    |
-| `date`      | string | Yes      | ISO date string for the intended post date. Provides temporal context to the LLM (e.g. seasonal relevance) |
-| `sessionId` | string | No       | If this generation is linked to an existing content session, include it for traceability |
-| `brandContext` | object | No   | Brand profile snapshot to ground the generation. If omitted, the backend falls back to the user's saved brand profile |
-
-`brandContext` object (all fields optional):
-
-| Field          | Type   | Description                                |
-|----------------|--------|--------------------------------------------|
-| `businessName` | string | The business name                          |
-| `tone`         | string | Brand voice description                    |
-| `topics`       | string | Current campaign or content focus          |
-| `avoid`        | string | Language or framing to avoid               |
-
-**Example Request**
-
-```http
-POST /api/calendar/generate HTTP/1.1
-Host: localhost:8080
-Content-Type: application/json
-
-{
-  "prompt": "Highlight the antimicrobial properties of bamboo and why it's better than plastic for kitchen use",
-  "platform": "instagram",
-  "date": "2026-06-15",
-  "brandContext": {
-    "businessName": "EcoHome Solutions",
-    "tone": "warm, aspirational, educational",
-    "topics": "Bamboo Kitchen Collection",
-    "avoid": "greenwashing language, aggressive CTAs"
-  }
-}
-```
-
-**Example Successful Response** — `200 OK`
-
-```json
-{
-  "messageId": "gen-1718200000000",
-  "platform": "instagram",
-  "text": "✨ Did you know bamboo is naturally antimicrobial — no chemical treatment needed?\n\nAt EcoHome Solutions, we believe your kitchen tools should protect your family, not harm them. Our Bamboo Kitchen Collection keeps bacteria out and beauty in. 🌿\n\nShop the full collection — link in bio.",
-  "hashtags": [
-    "#EcoHome",
-    "#BambooKitchen",
-    "#SustainableLiving",
-    "#HomeInspo",
-    "#ZeroWaste"
-  ],
-  "generatedAt": "2026-06-12T10:20:00Z"
-}
-```
-
-**Example Unsuccessful Response** — `400 Bad Request`
-
-```json
-{
-  "error": "VALIDATION_ERROR",
-  "message": "prompt must not be blank"
-}
-```
-
-**Example Unsuccessful Response** — `503 Service Unavailable`
-
-```json
-{
-  "error": "LLM_SERVICE_UNAVAILABLE",
-  "message": "The content generation service is temporarily unavailable. Please try again shortly.",
-  "retryAfterSeconds": 10
-}
-```
-
----
-
-## C - LLM Service Content Generation
-
-This endpoint is called **by the Spring Boot backend only** in response to B1. It is not intended to be called directly by the frontend.
-
-### C1. Generate Platform Content
-
-**Description**  
-Generates a single platform-specific post draft from a user prompt. Unlike the newsroom workflow used in the main chat interface (which runs the full dispatcher → strategist → creator fan-out → reviewer → human-gate run via `POST /tasks`), this is one of the MAF service's **standalone, one-shot media generators** — it does **not** go through the workflow or human gate, so there is no `task_id`. It is the same `POST /generate-text` endpoint the frontend's "Text" content button uses. The LLM service applies the platform's house-style skill (`skills/<platform>.md`) so the copy follows each platform's conventions:
-
-- **Instagram**: visual, emoji-heavy, CTA with "link in bio"
 - **LinkedIn**: formal, thought-leadership framing, no hashtags
+- **Facebook**: conversational, community-oriented
+- **Instagram**: visual, emoji-heavy, CTA with "link in bio"
 - **TikTok**: Hook / Body / CTA / Sound script format
 - **X**: concise, direct, 1–2 hashtags only
 
-The backend folds the brand profile (and any date/seasonal context) into the `prompt` it forwards. The modal's inline chat is multi-turn: pass the prior turns as `history` so a follow-up ("make it punchier", "shorter") continues the thread. The full contract lives in the repo-root [`API.md`](../API.md).
+The modal's chat is multi-turn: prior turns are passed as `history` so a follow-up ("make it
+punchier", "shorter") continues the thread. The full contract lives in the repo-root
+[`API.md`](../API.md).
 
-**Endpoint**  
-`/generate-text`
+**Endpoint**
+`/api/text` (frontend proxy) → `/generate-text` (LLM service)
 
-**Base URL**  
-`http://localhost:8080`
-
-**Method**  
+**Method**
 `POST`
-
-**Query Parameters**  
-None
 
 **Request Body**
 
-| Field      | Type     | Required | Description                                                                                   |
-|------------|----------|----------|-----------------------------------------------------------------------------------------------|
-| `prompt`   | string   | Yes      | The user's description of what to post (the backend folds brand context + date into this)     |
-| `platform` | string   | Yes      | One of `"instagram"`, `"linkedin"`, `"tiktok"`, `"x"`                                          |
-| `history`  | object[] | No       | Prior conversation turns for a multi-turn follow-up: `[{ "role": "user"\|"assistant"\|"system", "content": "..." }]`. Omit or send `[]` for a fresh single-turn generation |
-
-**Example Request**
-
-```http
-POST /generate-text HTTP/1.1
-Host: localhost:8080
-Content-Type: application/json
-
-{
-  "prompt": "EcoHome Solutions (warm, aspirational, educational; avoid greenwashing). Highlight the antimicrobial properties of bamboo and why it's better than plastic for kitchen use. Intended for 2026-06-15.",
-  "platform": "instagram",
-  "history": []
-}
-```
+| Field      | Type     | Required | Description                                                                     |
+|------------|----------|----------|---------------------------------------------------------------------------------|
+| `prompt`   | string   | Yes      | The user's description of what to post                                          |
+| `platform` | string   | Yes      | One of `linkedin`, `facebook`, `instagram`, `tiktok`, `x`                       |
+| `history`  | object[] | No       | Prior turns: `[{ "role": "user"\|"assistant", "content": "..." }]`               |
 
 **Example Successful Response** — `200 OK`
 
 ```json
 {
-  "text": "✨ Did you know bamboo is naturally antimicrobial — no chemical treatment needed?\n\nAt EcoHome Solutions, we believe your kitchen tools should protect your family, not harm them. Our Bamboo Kitchen Collection keeps bacteria out and beauty in. 🌿\n\nShop the full collection — link in bio.\n\n#EcoHome #BambooKitchen #SustainableLiving #HomeInspo #ZeroWaste",
-  "platform": "instagram"
+  "text": "Did you know bamboo is naturally antimicrobial — no chemical treatment needed?\n\n#EcoHome #BambooKitchen",
+  "platform": "facebook"
 }
 ```
 
-> **Note:** The MAF `/generate-text` endpoint returns only `{ text, platform }` — hashtags are
-> embedded in `text` rather than returned as a separate array. The backend (B1) is responsible
-> for splitting hashtags out of the copy into the `hashtags` array the frontend expects.
+> **Note:** `/generate-text` returns hashtags embedded in `text`, not as a separate array. The
+> modal splits a trailing run of hashtag-only lines off into the `hashtags` field before
+> scheduling, so a `#1` inside a sentence stays in the body.
 
 **Example Unsuccessful Response** — `400 Bad Request`
 
 ```json
-{
-  "error": "prompt is required"
-}
-```
-
-**Example Unsuccessful Response** — `500 Internal Server Error`
-
-```json
-{
-  "error": "Azure OpenAI chat request failed"
-}
+{ "error": "prompt is required" }
 ```
 
 ---
 
-## Quartz Job Lifecycle
+## Configuration
 
-When a post is created via A3, the backend registers a Quartz job with the following behaviour:
+| Property | Default | Purpose |
+|---|---|---|
+| `app.timezone` | `Europe/Dublin` | Zone a bare wall-clock time means when the caller sends no offset or `timezone` |
+| `app.scheduling.sweep-interval-ms` | `60000` | How often to look for due posts |
+| `app.scheduling.sweep-initial-delay-ms` | `20000` | Delay before the first sweep, to stay out of startup's way |
+| `app.scheduling.missed-cutoff-minutes` | `360` | How late a LinkedIn post can be before it's failed instead of published |
 
-| Event                   | Backend action                                               |
-|-------------------------|--------------------------------------------------------------|
-| `POST /api/calendar/posts` | Creates Quartz job with key `post:{postId}`, trigger set to `date` + `time` |
-| `PATCH` changes `date` or `time` | Cancels old Quartz trigger; registers new trigger with updated time |
-| `DELETE /api/calendar/posts/{postId}` | Cancels and removes the Quartz job |
-| Quartz job fires (publish time reached) | Backend calls the social platform API; sets `status` to `"published"` on success or `"failed"` on error |
-| Platform API call fails | Backend sets `status: "failed"` and logs the error; no automatic retry in v1 |
+Each is overridable by the matching env var (`APP_TIMEZONE`, `SCHEDULING_SWEEP_INTERVAL_MS`,
+`SCHEDULING_SWEEP_INITIAL_DELAY_MS`, `SCHEDULING_MISSED_CUTOFF_MINUTES`).
 
-> **Note:** The social platform publishing calls (Instagram Graph API, LinkedIn API, TikTok Content Posting API, X API v2) are made by the Spring Boot backend at publish time and are out of scope for this document.
+---
+
+## Known limitations
+
+- **Text only.** Scheduled posts carry `message` + `hashtags`. Scheduling an image or video needs
+  the media persisted somewhere the sweeper can reach at publish time; the immediate-post paths
+  (`/linkedin/post-image`, `/linkedin/post-video`, `/meta/post`) are unaffected.
+- **Only LinkedIn and Facebook.** The modal will draft copy for Instagram, TikTok and X, but
+  won't queue it — there is no publishing integration behind those yet.
+- **No token-expiry pre-check.** A LinkedIn token that expires between scheduling and publishing
+  surfaces as a failed post with the platform's own error, not as a warning at schedule time.

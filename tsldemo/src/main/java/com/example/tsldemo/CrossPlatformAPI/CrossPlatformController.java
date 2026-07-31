@@ -9,6 +9,8 @@ import com.example.tsldemo.ENUMS.PlatformEnum;
 import com.example.tsldemo.DTOs.Request.LinkedInCredsReqDTO;
 import com.example.tsldemo.DTOs.Request.LinkedInPostReqDTO;
 import com.example.tsldemo.DTOs.Request.LinkedInVideoPostReqDTO;
+import com.example.tsldemo.DTOs.Request.ScheduledPostReqDTO;
+import com.example.tsldemo.ScheduledPost;
 import com.example.tsldemo.auth.JwtUtil;
 
 import jakarta.servlet.http.HttpServletResponse;
@@ -29,10 +31,14 @@ import java.util.Map;
 public class CrossPlatformController {
 
     private final CrossPlatformService crossPlatformService;
+    private final ScheduledPostService scheduledPostService;
     private final JwtUtil jwtUtil;
 
-    public CrossPlatformController(CrossPlatformService crossPlatformService, JwtUtil jwtUtil) {
+    public CrossPlatformController(CrossPlatformService crossPlatformService,
+                                   ScheduledPostService scheduledPostService,
+                                   JwtUtil jwtUtil) {
         this.crossPlatformService = crossPlatformService;
+        this.scheduledPostService = scheduledPostService;
         this.jwtUtil = jwtUtil;
     }
 
@@ -167,21 +173,34 @@ public class CrossPlatformController {
         return ResponseEntity.ok("LinkedIn company credentials added successfully.");
     }
     
+    /**
+     * Schedules a LinkedIn text post.
+     *
+     * <p>Kept as an alias for the browser code that already calls it; the schedule itself now
+     * lives in the {@code scheduled_post} table and is published by the sweeper, so — unlike
+     * the in-memory timer this replaced — it survives a restart and can be listed, edited and
+     * cancelled through {@code /schedule/posts}. The row id is returned so callers can do that.
+     */
     @PostMapping("/linkedin/schedule-post")
     public ResponseEntity<?> linkedInSchedulePost(
             @RequestBody LinkedInPostReqDTO requestDTO,
             @RequestHeader(value = "Authorization", required = false) String authHeader) {
 
-    	int businessId = requireBusinessId(authHeader);
+        int businessId = requireBusinessId(authHeader);
 
-        LinkedInPostReqDTO secureDto = new LinkedInPostReqDTO(
+        ScheduledPost post = scheduledPostService.create(businessId, new ScheduledPostReqDTO(
+                "linkedin",
+                requestDTO.scheduledTime() == null ? null : requestDTO.scheduledTime().toString(),
+                null,
                 requestDTO.message(),
-                requestDTO.scheduledTime()
-        );
+                List.of(),
+                List.of()
+        ));
 
-        crossPlatformService.schedulePostToLinkedIn(businessId, secureDto);
-        return ResponseEntity.ok(Map.of("status", "scheduled"));
-        
+        return ResponseEntity.ok(Map.of(
+                "status", "scheduled",
+                "id", String.valueOf(post.getId()),
+                "scheduled_at", post.getScheduledAt().toString()));
     }
 
     @PostMapping("/meta/auth")
@@ -203,8 +222,18 @@ public class CrossPlatformController {
         }
     }
 
+    /** Publishes immediately to the selected Page(s).
+     *
+     * <p>The business id comes from the JWT and overwrites whatever the multipart body carried.
+     * It used to be taken from the body outright, which meant anything that could reach this
+     * port could post as any business by changing one form field — the LinkedIn endpoints have
+     * always derived it from the token, and this now matches them. */
     @PostMapping("/meta/post")
-    public ResponseEntity<?> metaPost(@ModelAttribute CrossPlatPostReqDTO requestDTO) throws IOException {
+    public ResponseEntity<?> metaPost(
+            @ModelAttribute CrossPlatPostReqDTO requestDTO,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) throws IOException {
+
+        requestDTO.setBusinessId((long) requireBusinessId(authHeader));
         try {
             List<String> postIdList = crossPlatformService.postToMeta(requestDTO);
             return ResponseEntity.ok(Map.of("Meta Post ok: ", postIdList));

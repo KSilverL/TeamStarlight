@@ -57,8 +57,10 @@ export async function POST(request: NextRequest) {
     for (const id of pageIds) upstreamForm.append("pageId", id);
     upstreamForm.append("media", videoBlob, `${jobId}.mp4`);
 
+    // Java derives the business from this token, not from the `businessId` form field.
     const upstream = await fetch(`${JAVA_SERVICE_URL}/meta/post`, {
       method: "POST",
+      headers: { Authorization: authHeader as string },
       body: upstreamForm,
     });
 

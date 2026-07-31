@@ -659,9 +659,10 @@ Spring Boot 4 / Java 25, package-by-feature (`SignInAPI/`, `LoginAPI/`, `Session
   in this document.
 - **Its own `compose.yaml`** stands up a *different*, local Postgres container that the app
   never actually connects to (no env wiring links them) — safe to ignore or treat as legacy.
-- Only implements a fraction of what `docs/*.md` (approval-queue, brand-profile, calendar/Quartz
-  scheduling, the newer MAF `/tasks` proxy) describe — those are documented target features with
-  zero corresponding Java code today (see §13).
+- Only implements a fraction of what `docs/*.md` (approval-queue, brand-profile, the newer MAF
+  `/tasks` proxy) describe — those are documented target features with zero corresponding Java
+  code today (see §13). The calendar is the exception: it is now implemented, though not the way
+  `docs/calendar-api.md` originally described it (see §13.3).
 
 ---
 
@@ -857,13 +858,20 @@ don't exist.
    frontend's own `genBrand()` function that would call that route is dead code — never invoked
    (see §14). Functionally, the main `LLM_service`'s `/generate` and the workflow's
    `media_producer` now cover what the demo agents used to do.
-3. **`docs/*.md` describe a larger Java backend than exists.** `docs/approval-queue-api.md`,
-   `docs/brand-profile-api.md`, and `docs/calendar-api.md` describe endpoint groups
-   (`/api/approval/posts*`, `/api/brand`, `/api/calendar/*` + Quartz scheduling) with **no
-   corresponding entities, controllers, or repositories anywhere in `tsldemo/src/main`**. Same
-   for `docs/chat-api.md`'s target design of the Java backend proxying the MAF `/tasks*` surface
-   with SSE relay — the current Java code still only wraps the older `/intake` and
-   `/generate-text` endpoints. Treat these three docs as **design targets**, not current state.
+3. **`docs/*.md` describe a larger Java backend than exists.** `docs/approval-queue-api.md` and
+   `docs/brand-profile-api.md` describe endpoint groups (`/api/approval/posts*`, `/api/brand`)
+   with **no corresponding entities, controllers, or repositories anywhere in
+   `tsldemo/src/main`**. Same for `docs/chat-api.md`'s target design of the Java backend proxying
+   the MAF `/tasks*` surface with SSE relay — the current Java code still only wraps the older
+   `/intake` and `/generate-text` endpoints. Treat these docs as **design targets**, not current
+   state.
+
+   `docs/calendar-api.md` is no longer in that category: the content calendar is implemented
+   (`ScheduledPost` entity, `ScheduledPostService`/`Controller`/`Sweeper`, `/schedule/posts`),
+   and that doc has been rewritten to describe what was actually built. Note it is *not* the
+   Quartz + `/api/calendar/*` design it originally specified — scheduling is a persisted table
+   swept once a minute, and Facebook posts are handed to Graph's own `scheduled_publish_time`
+   rather than held server-side at all.
 4. **`system.md`'s architecture diagram is mostly accurate** but predates the dynamic storyboard
    schema (still shows "Media Producer → HTML card + BrandVideoProps JSON spec" in its Backing
    Services diagram) and doesn't show the video-render subprocess step at all. The diagrams in

@@ -48,8 +48,11 @@ export async function POST(request: NextRequest) {
     }
 
     // No Content-Type header — fetch sets the multipart boundary from the FormData.
+    // The Authorization header is what Java scopes the post to; `businessId` in the body is
+    // now only a fallback for callers that predate that and is ignored when the token is present.
     const upstream = await fetch(`${JAVA_SERVICE_URL}/meta/post`, {
       method: "POST",
+      headers: { Authorization: authHeader as string },
       body: upstreamForm,
     });
 

@@ -2803,16 +2803,24 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
     setScheduleStatus("scheduling");
     setScheduleError(null);
 
-    const scheduled_time = `${scheduleDate}T${scheduleTime}:00`;
-
     try {
-      const res = await fetch("/api/linkedin/scheduled-posts", {   // ← changed here
+      // Goes through the shared scheduling API so this draft lands in the same persisted queue
+      // the content calendar reads — one place to see, edit and cancel it, and a schedule that
+      // survives a backend restart. The browser's timezone rides along so "10:00" means 10:00
+      // where the user is, not in whatever zone the server runs in.
+      const res = await fetch("/api/schedule/posts", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ message: fullText(), scheduled_time }),
+        body: JSON.stringify({
+          platform: "linkedin",
+          message: fullText(),
+          date: scheduleDate,
+          time: scheduleTime,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {

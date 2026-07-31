@@ -1,5 +1,5 @@
 // Mock data & PLATFORM_CONFIG
-import type { Platform, PostStatus, ScheduledPost } from "./types";
+import type { Platform, PostStatus } from "./types";
 
 export const PLATFORM_CONFIG: Record<
   Platform,
@@ -10,6 +10,12 @@ export const PLATFORM_CONFIG: Record<
     abbr: "IG",
     badge: "bg-gradient-to-r from-purple-600 to-pink-600",
     dot: "bg-pink-500",
+  },
+  facebook: {
+    label: "Facebook",
+    abbr: "f",
+    badge: "bg-[#1877F2]",
+    dot: "bg-[#1877F2]",
   },
   linkedin: {
     label: "LinkedIn",
@@ -141,79 +147,3 @@ export const DEFAULT_BRAND = {
     "Always emphasise carbon-negative production and the decade-long lifespan of our products.",
 };
 
-export const SEED_SCHEDULED_POSTS: ScheduledPost[] = [
-  {
-    id: "sc1",
-    date: "2026-06-15",
-    time: "09:00",
-    platform: "instagram",
-    text: "🌿 Summer refresh starts in the kitchen. Our Bamboo Collection is made for sun-filled mornings and sustainable choices. ☀️\n\nShop the look — link in bio.",
-    hashtags: [
-      "#EcoHome",
-      "#BambooKitchen",
-      "#SummerRefresh",
-      "#SustainableLiving",
-    ],
-    status: "scheduled",
-  },
-  {
-    id: "sc2",
-    date: "2026-06-15",
-    time: "14:00",
-    platform: "linkedin",
-    text: "Sustainability and style aren't mutually exclusive. EcoHome Solutions' Bamboo Kitchen Collection proves that carbon-negative manufacturing can produce premium homewares. We're proud to be leading this shift.",
-    hashtags: [],
-    status: "scheduled",
-  },
-  {
-    id: "sc3",
-    date: "2026-06-17",
-    time: "10:30",
-    platform: "x",
-    text: "Bamboo: grows back in 90 days. Plastic: hangs around for 500 years. The choice is obvious. 🌱 #EcoHome #SustainableLiving",
-    hashtags: ["#EcoHome", "#SustainableLiving"],
-    status: "scheduled",
-  },
-  {
-    id: "sc4",
-    date: "2026-06-18",
-    time: "18:00",
-    platform: "tiktok",
-    text: "Hook: You've been doing your kitchen all wrong 😤🎋\nBody: Plastic utensils leach chemicals. Bamboo doesn't. Here's why the switch is easier than you think.\nCTA: Shop our Bamboo Collection — link in bio!\nSound: Lo-fi summer beats",
-    hashtags: ["#BambooLife", "#KitchenTok", "#SustainableSwap", "#EcoTok"],
-    status: "scheduled",
-  },
-  {
-    id: "sc5",
-    date: "2026-06-20",
-    time: "11:00",
-    platform: "instagram",
-    text: "🏡 A home that reflects your values.\n\nEvery piece in our Bamboo Kitchen Collection is crafted to last a decade and leave a lighter footprint. Because conscious living should feel effortless.",
-    hashtags: [
-      "#ConsciousLiving",
-      "#EcoHome",
-      "#BambooKitchen",
-      "#ZeroWaste",
-      "#HomeInspo",
-    ],
-    status: "scheduled",
-  },
-  {
-    id: "sc6",
-    date: "2026-06-22",
-    time: "09:00",
-    platform: "linkedin",
-    text: "The sustainable homewares market is expected to grow 12% YoY through 2030. At EcoHome Solutions, we're not just watching that trend — we're building it. New content series launching this week.",
-    hashtags: [],
-    status: "scheduled",
-  },
-  {
-    id: "sc7",
-    date: "2026-06-25",
-    time: "16:00",
-    platform: "x",
-    text: "Your kitchen deserves better. 🌿 Bamboo over plastic — always. Shop the EcoHome Collection → #BambooKitchen #EcoHome",
-    hashtags: ["#BambooKitchen", "#EcoHome"],
-    status: "scheduled",
-  },
-];

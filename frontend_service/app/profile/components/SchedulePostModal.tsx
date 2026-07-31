@@ -2,77 +2,52 @@
 
 import { useState, useRef, useEffect } from "react";
 import { PLATFORM_CONFIG } from "../data";
+import { formatDisplayDate } from "../format";
+import { isSchedulable } from "../types";
 import type { Platform, ScheduledPost, ChatMessage } from "../types";
 
-/**
- * Converts an ISO date string ("YYYY-MM-DD") to a human-readable label.
- *
- * Date parts are parsed manually rather than passing the raw string to `new Date()`
- * because the Date constructor treats "YYYY-MM-DD" as UTC midnight, which shifts
- * the displayed day by one in negative UTC-offset timezones.
- *
- * @param dateStr ISO date string, e.g. "2026-06-15"
- * @returns e.g. "Monday, June 15, 2026"
- */
-function formatDisplayDate(dateStr: string): string {
-  const [year, month, day] = dateStr.split("-").map(Number);
-  return new Date(year, month - 1, day).toLocaleDateString("en-US", {
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-    year: "numeric",
-  });
-}
+/** Order the platform picker is drawn in. Only the schedulable ones can be queued; the rest
+ * still generate copy so the modal is useful for drafting before an integration exists. */
+const PLATFORMS: Platform[] = ["linkedin", "facebook", "instagram", "tiktok", "x"];
 
 /**
- * Mock content generator — stand-in for the real LLM call that will be routed
- * through the Python/LangGraph service once the backend is integrated.
+ * Splits trailing hashtags off generated copy.
  *
- * Each platform returns copy that matches its tone conventions:
- * - Instagram: visual, emoji-heavy, link-in-bio CTA
- * - LinkedIn: formal, thought-leadership framing, no hashtags
- * - TikTok: Hook / Body / CTA / Sound script structure
- * - X: concise, direct, 1–2 hashtags only
- *
- * @param prompt   Raw text the user typed into the chat input.
- * @param platform The platform currently selected in the left panel.
- * @returns Structured draft with body text and hashtag array.
+ * The LLM service returns one blob of text with hashtags baked into it, but the calendar
+ * stores and styles them separately (and LinkedIn copy is meant to carry none). Only a
+ * trailing run of hashtag-only lines is taken, so a `#1` inside a sentence stays in the body.
  */
-function generateContent(
-  prompt: string,
-  platform: Platform,
-): { text: string; hashtags: string[] } {
-  const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
-  const templates: Record<Platform, { text: string; hashtags: string[] }> = {
-    instagram: {
-      text: `✨ ${cap(prompt)}.\n\nAt EcoHome Solutions, we believe sustainable living should be beautiful. Our Bamboo Collection brings nature into your everyday routine — crafted to last, designed to inspire. 🌿\n\nShop the full collection — link in bio.`,
-      hashtags: [
-        "#EcoHome",
-        "#BambooKitchen",
-        "#SustainableLiving",
-        "#HomeInspo",
-        "#ZeroWaste",
-      ],
-    },
-    linkedin: {
-      text: `${cap(prompt)}.\n\nAt EcoHome Solutions, we're committed to proving that sustainable manufacturing can meet — and exceed — conventional quality standards. Our Bamboo Kitchen Collection is the latest example of that commitment.\n\nWe'd love to hear your thoughts on sustainable homewares.`,
-      hashtags: [], // LinkedIn performs better without hashtag clutter
-    },
-    tiktok: {
-      text: `Hook: ${cap(prompt)} 🎋\nBody: Here's what most people don't know about sustainable kitchenware — bamboo is 3× stronger than steel by weight and grows back in months.\nCTA: Check out our Bamboo Collection — link in bio!\nSound: Upbeat indie acoustic`,
-      hashtags: [
-        "#EcoTok",
-        "#BambooLife",
-        "#SustainableKitchen",
-        "#KitchenTok",
-      ],
-    },
-    x: {
-      text: `${cap(prompt)}. 🌿\n\nEcoHome Bamboo Collection — sustainable, durable, beautiful. Shop now →`,
-      hashtags: ["#EcoHome", "#SustainableLiving"],
-    },
-  };
-  return templates[platform];
+function splitHashtags(text: string): { text: string; hashtags: string[] } {
+  const lines = text.trimEnd().split("\n");
+  const hashtags: string[] = [];
+
+  while (lines.length > 0) {
+    const line = lines[lines.length - 1].trim();
+    if (line === "") {
+      lines.pop();
+      continue;
+    }
+    const tokens = line.split(/\s+/);
+    if (tokens.every((t) => t.startsWith("#") && t.length > 1)) {
+      hashtags.unshift(...tokens);
+      lines.pop();
+      continue;
+    }
+    break;
+  }
+
+  return { text: lines.join("\n").trimEnd(), hashtags };
+}
+
+/** The Facebook Page ids picked in the Brand Profile — the same selection the chat page
+ * publishes to, so a post scheduled here lands on the Pages the user already chose. */
+function getSelectedPageIds(): number[] {
+  try {
+    const ids = JSON.parse(localStorage.getItem("starlight_meta_page_ids") || "[]");
+    return Array.isArray(ids) ? ids.map(Number).filter((n) => Number.isFinite(n)) : [];
+  } catch {
+    return [];
+  }
 }
 
 /** Props for the SchedulePostModal component. */
@@ -83,18 +58,23 @@ interface SchedulePostModalProps {
   existingPosts: ScheduledPost[];
   /** Called when the user dismisses the modal without scheduling. */
   onClose: () => void;
-  /** Called with the assembled ScheduledPost when the user confirms scheduling. */
-  onSchedule: (post: ScheduledPost) => void;
+  /** Called after the backend has accepted a new scheduled post. */
+  onScheduled: () => void;
+  /** Opens one of this day's existing posts in the detail view (which owns cancelling). */
+  onOpenPost: (post: ScheduledPost) => void;
 }
 
 export default function SchedulePostModal({
   day,
   existingPosts,
   onClose,
-  onSchedule,
+  onScheduled,
+  onOpenPost,
 }: SchedulePostModalProps) {
   const [time, setTime] = useState("09:00");
-  const [platform, setPlatform] = useState<Platform>("instagram");
+  const [platform, setPlatform] = useState<Platform>("linkedin");
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   // Chat message history; seeded with a contextual greeting on mount.
   const [messages, setMessages] = useState<ChatMessage[]>([
@@ -126,58 +106,135 @@ export default function SchedulePostModal({
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isThinking]);
 
+  const pageIds = platform === "facebook" ? getSelectedPageIds() : [];
+  const needsFacebookPage = platform === "facebook" && pageIds.length === 0;
+  const canSchedule =
+    !!scheduledContent && isSchedulable(platform) && !needsFacebookPage && !isSaving;
+
   /**
-   * Appends the user's message, triggers the mock AI delay, then appends the
-   * generated draft as an assistant message with attached `draftData`.
+   * Appends the user's message, calls the LLM service for a draft, then appends it as an
+   * assistant message with attached `draftData`.
    *
-   * The 1.3 s delay simulates LLM latency and shows the typing indicator.
-   * Replace `generateContent` with a real fetch call when the LLM service is ready.
+   * Prior turns go along as `history` so a follow-up ("shorter", "make it punchier") continues
+   * the thread rather than regenerating from scratch.
    */
   async function sendMessage() {
     if (!input.trim() || isThinking) return;
 
+    const prompt = input.trim();
     const userMsg: ChatMessage = {
       id: `u-${Date.now()}`,
       role: "user",
-      content: input.trim(),
+      content: prompt,
       timestamp: new Date(),
     };
+
+    // Built before the state update so it holds the turns *preceding* this one; the greeting
+    // is dropped because it's UI chrome, not part of the conversation the model should see.
+    const history = messages
+      .filter((m) => m.id !== "init")
+      .map((m) => ({ role: m.role, content: m.content }));
+
     setMessages((prev) => [...prev, userMsg]);
     setInput("");
     setIsThinking(true);
 
-    // Simulated LLM response delay.
-    await new Promise((r) => setTimeout(r, 1300));
+    try {
+      const res = await fetch("/api/text", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, platform, history }),
+      });
+      const data = await res.json();
 
-    const draft = generateContent(input.trim(), platform);
-    const aiMsg: ChatMessage = {
-      id: `a-${Date.now()}`,
-      role: "assistant",
-      content: draft.text,
-      timestamp: new Date(),
-      draftData: draft, // attaching draftData enables the "Use this content" button
-    };
-    setMessages((prev) => [...prev, aiMsg]);
-    setIsThinking(false);
+      if (!res.ok || data.error) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `a-${Date.now()}`,
+            role: "assistant",
+            content:
+              data.error ??
+              "The content service could not generate copy just now. Try again in a moment.",
+            timestamp: new Date(),
+          },
+        ]);
+        return;
+      }
+
+      const draft = splitHashtags(String(data.text ?? ""));
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `a-${Date.now()}`,
+          role: "assistant",
+          content: draft.text,
+          timestamp: new Date(),
+          draftData: draft, // attaching draftData enables the "Use this content" button
+        },
+      ]);
+    } catch {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `a-${Date.now()}`,
+          role: "assistant",
+          content: "Could not reach the content service.",
+          timestamp: new Date(),
+        },
+      ]);
+    } finally {
+      setIsThinking(false);
+    }
   }
 
   /**
-   * Assembles a ScheduledPost from the current form state and selected draft,
-   * then hands it to the parent ContentCalendar via `onSchedule`.
-   * Guard on `scheduledContent` ensures the button is only clickable when a
-   * draft has been explicitly selected by the user.
+   * Sends the selected draft to the scheduling API.
+   *
+   * The browser's timezone rides along so the backend resolves "09:00 on this day" to the same
+   * moment the user meant, rather than to 09:00 in whatever zone the server happens to run in.
    */
-  function handleSchedule() {
-    if (!scheduledContent) return;
-    onSchedule({
-      id: `sc-${Date.now()}`,
-      date: day,
-      time,
-      platform,
-      text: scheduledContent.text,
-      hashtags: scheduledContent.hashtags,
-      status: "scheduled",
-    });
+  async function handleSchedule() {
+    if (!scheduledContent || !isSchedulable(platform)) return;
+
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setSaveError("Log in before scheduling a post.");
+      return;
+    }
+
+    setIsSaving(true);
+    setSaveError(null);
+
+    try {
+      const res = await fetch("/api/schedule/posts", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          platform,
+          date: day,
+          time,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          message: scheduledContent.text,
+          hashtags: scheduledContent.hashtags,
+          page_ids: pageIds,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok || data.error) {
+        setSaveError(data.error ?? "Could not schedule the post.");
+        return;
+      }
+      onScheduled();
+    } catch {
+      setSaveError("Could not reach the backend.");
+    } finally {
+      setIsSaving(false);
+    }
   }
 
   return (
@@ -236,38 +293,38 @@ export default function SchedulePostModal({
                 />
               </div>
 
-              {/* Platform selector — 2×2 grid of toggle buttons */}
+              {/* Platform selector — 2-column grid of toggle buttons */}
               <div>
                 <label className="block text-xs font-semibold text-[#1B1A17] mb-2">
                   Platform
                 </label>
                 <div className="grid grid-cols-2 gap-2">
-                  {(["instagram", "linkedin", "tiktok", "x"] as Platform[]).map(
-                    (p) => (
-                      <button
-                        key={p}
-                        onClick={() => setPlatform(p)}
-                        className={`flex items-center gap-2 px-2.5 py-2 rounded-xl text-xs font-medium border transition-colors ${
-                          platform === p
-                            ? "border-[#FF4800] bg-[#FFF0EB] text-[#FF4800]" // active state
-                            : "border-[#E8E3DA] text-[#6B6561] hover:border-[#FF4800]/40 hover:bg-[#FFFAF8]"
-                        }`}
+                  {PLATFORMS.map((p) => (
+                    <button
+                      key={p}
+                      onClick={() => setPlatform(p)}
+                      className={`flex items-center gap-2 px-2.5 py-2 rounded-xl text-xs font-medium border transition-colors ${
+                        platform === p
+                          ? "border-[#FF4800] bg-[#FFF0EB] text-[#FF4800]" // active state
+                          : "border-[#E8E3DA] text-[#6B6561] hover:border-[#FF4800]/40 hover:bg-[#FFFAF8]"
+                      }`}
+                    >
+                      {/* Coloured platform badge (e.g. Instagram gradient) */}
+                      <span
+                        className={`w-5 h-5 rounded flex items-center justify-center text-[10px] font-bold text-white flex-shrink-0 ${PLATFORM_CONFIG[p].badge}`}
                       >
-                        {/* Coloured platform badge badge (e.g. Instagram gradient) */}
-                        <span
-                          className={`w-5 h-5 rounded flex items-center justify-center text-[10px] font-bold text-white flex-shrink-0 ${PLATFORM_CONFIG[p].badge}`}
-                        >
-                          {PLATFORM_CONFIG[p].abbr}
-                        </span>
-                        {/* Strip "(Twitter)" from "X (Twitter)" to keep labels short */}
-                        {PLATFORM_CONFIG[p].label.split(" ")[0]}
-                      </button>
-                    ),
-                  )}
+                        {PLATFORM_CONFIG[p].abbr}
+                      </span>
+                      {/* Strip "(Twitter)" from "X (Twitter)" to keep labels short */}
+                      {PLATFORM_CONFIG[p].label.split(" ")[0]}
+                    </button>
+                  ))}
                 </div>
               </div>
 
-              {/* Existing posts on this day — contextual read-only list */}
+              {/* Everything already queued for this day. Each row opens the post's own detail
+                  view, which is where the full copy and the cancel action live — this list is
+                  a compact index, not a second place to act on a post. */}
               {existingPosts.length > 0 && (
                 <div>
                   <p className="text-xs font-semibold text-[#1B1A17] mb-2">
@@ -278,9 +335,10 @@ export default function SchedulePostModal({
                   </p>
                   <div className="space-y-2">
                     {existingPosts.map((post) => (
-                      <div
+                      <button
                         key={post.id}
-                        className="bg-[#F8F5EE] rounded-xl p-3 border border-[#E8E3DA]"
+                        onClick={() => onOpenPost(post)}
+                        className="w-full text-left bg-[#F8F5EE] rounded-xl p-3 border border-[#E8E3DA] hover:border-[#FF4800]/40 hover:bg-[#FFFAF8] transition-colors"
                       >
                         <div className="flex items-center gap-2 mb-1.5">
                           <span
@@ -291,12 +349,13 @@ export default function SchedulePostModal({
                           <span className="text-xs text-[#6B6561] font-medium">
                             {post.time}
                           </span>
+                          <span className="text-xs text-[#C8C2BA] ml-auto">View →</span>
                         </div>
                         {/* Show only the first line of text to keep the card compact */}
                         <p className="text-xs text-[#9E9893] line-clamp-2 leading-relaxed">
                           {post.text.split("\n")[0]}
                         </p>
-                      </div>
+                      </button>
                     ))}
                   </div>
                 </div>
@@ -315,22 +374,40 @@ export default function SchedulePostModal({
               )}
             </div>
 
-            {/* Schedule button — disabled until a draft has been selected */}
+            {/* Schedule button — disabled until there's a draft on a platform we can publish to */}
             <div className="p-5 border-t border-[#E8E3DA] flex-shrink-0">
               <button
                 onClick={handleSchedule}
-                disabled={!scheduledContent}
+                disabled={!canSchedule}
                 className={`w-full py-2.5 rounded-xl text-sm font-semibold transition-colors ${
-                  scheduledContent
+                  canSchedule
                     ? "bg-[#FF4800] hover:bg-[#E03E00] text-white"
                     : "bg-[#F2EDE4] text-[#C8C2BA] cursor-not-allowed"
                 }`}
               >
-                Schedule Post
+                {isSaving ? "Scheduling…" : "Schedule Post"}
               </button>
-              {!scheduledContent && (
+
+              {/* One reason at a time, most specific first, so the hint always names the next
+                  thing to do rather than the first unmet condition alphabetically. */}
+              {!isSchedulable(platform) ? (
+                <p className="text-xs text-[#C8C2BA] text-center mt-2 leading-relaxed">
+                  {PLATFORM_CONFIG[platform].label.split(" ")[0]} isn&apos;t connected for
+                  publishing yet — you can still draft copy here.
+                </p>
+              ) : needsFacebookPage ? (
+                <p className="text-xs text-[#C8C2BA] text-center mt-2 leading-relaxed">
+                  Pick a Facebook Page in your Brand Profile first.
+                </p>
+              ) : !scheduledContent ? (
                 <p className="text-xs text-[#C8C2BA] text-center mt-2">
                   Generate content to continue
+                </p>
+              ) : null}
+
+              {saveError && (
+                <p className="text-xs text-red-600 text-center mt-2 leading-relaxed">
+                  {saveError}
                 </p>
               )}
             </div>

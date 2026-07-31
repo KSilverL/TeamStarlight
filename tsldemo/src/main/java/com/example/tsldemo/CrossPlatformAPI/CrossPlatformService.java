@@ -6,16 +6,9 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
-
-import java.time.LocalDateTime;
-import java.time.LocalTime;
-import java.time.ZoneId;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
-import java.util.stream.Stream;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -31,7 +24,6 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.scheduling.TaskScheduler;
 import org.springframework.stereotype.Service;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
@@ -59,6 +51,8 @@ import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaDataUserInfo;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaGranularScopes;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaIdentityRespDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaPermissionsRespDTO;
+import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaPostIdRespDTO;
+import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaPublishStateRespDTO;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaTokenDetails;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaUserInfoDTO;
 import com.example.tsldemo.DTOs.ResponseToFrontEnd.GlobalCredListRespDTO;
@@ -108,6 +102,20 @@ public class CrossPlatformService {
                 throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, reason);
             };
 
+    /** Graph's error bodies name the actual problem ("(#200) Requires pages_manage_posts",
+     * "Invalid parameter"), which the default handler would throw away. The scheduling paths
+     * need it kept: it ends up as the failure reason on the row and in the email telling the
+     * user why their post didn't go out, where "502 Bad Gateway" would be useless. */
+    private static final RestClient.ResponseSpec.ErrorHandler META_ERROR_HANDLER =
+            (request, response) -> {
+                String body = StreamUtils.copyToString(response.getBody(), StandardCharsets.UTF_8);
+                String reason = "Facebook " + response.getStatusCode() + " on " + request.getURI().getPath()
+                        + (body.isBlank() ? "" : " — " + body);
+
+                log.error("{}", reason);
+                throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, reason);
+            };
+
     @Autowired
     private CrossPlatformRepository crossPlatformRepository;
     
@@ -130,12 +138,8 @@ public class CrossPlatformService {
     @Value("${llm.service.base-url:http://localhost:8080}")
     private String llmServiceBaseUrl;
     
-    private final TaskScheduler taskScheduler;
-
-
-    public CrossPlatformService(RestClient restClient, TaskScheduler taskScheduler) {
+    public CrossPlatformService(RestClient restClient) {
         this.restClient = restClient;
-        this.taskScheduler = taskScheduler;
     }
 
     //////////////////////////////////////////////////////// GLOBAL METHODS ////////////////////////////////////////////////////////
@@ -643,18 +647,6 @@ public class CrossPlatformService {
         crossPlatformRepository.save(crossPlatformOAuth);
     }
 
-    
-    public void schedulePostToLinkedIn(int businessId, LinkedInPostReqDTO scheduledPost) {
-        Instant when = scheduledPost.scheduledTime()
-                .atZone(ZoneId.systemDefault())
-                .toInstant();
-
-        taskScheduler.schedule(() -> {
-            System.out.println("Scheduled LinkedIn post fired at " + Instant.now());
-            postToLinkedIn(businessId, scheduledPost);
-        }, when);
-    }
-    
     //////////////////////////////////////////////////////// META METHODS ////////////////////////////////////////////////////////
     /** {@code force} re-runs Facebook's consent screen even when a live token is already stored.
      * The Brand Profile passes it because the user clicking "Connect/Reconnect Facebook" has
@@ -925,51 +917,16 @@ public class CrossPlatformService {
         log.info("Meta post requested by business {} for pages {}",
                 requestDTO.getBusinessId(), Arrays.toString(requestDTO.getPageId()));
 
-        CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(requestDTO.getBusinessId(), PlatformEnum.META);
-        if (crossPlatformOAuth == null || crossPlatformOAuth.getAccessToken() == null) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                    "This business has not connected Facebook yet — connect it in your Brand Profile first.");
-        }
-
-        Long[] requestedPageIds = requestDTO.getPageId();
-        if (requestedPageIds == null || requestedPageIds.length == 0) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                    "No Facebook Page was selected — pick a Page in your Brand Profile first.");
-        }
-
-        MetaDataUserInfo[] pages = listPostablePages(crossPlatformOAuth);
-
-        // Graph answers "no Pages" with a 200 and an empty data array. Posting then died on an
-        // ArrayIndexOutOfBounds while looking up the Page token, which reached the browser as a
-        // bare 500 that said nothing about the actual problem — the same empty-Page-list state
-        // the Brand Profile already explains. Reuse that explanation here.
-        if (pages.length == 0) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                    explainNoPages(crossPlatformOAuth));
-        }
+        Map<Long, String> pageTokens = pageTokensFor(
+                requireMetaConnected(requestDTO.getBusinessId()), requestDTO.getPageId());
 
         List<String> postIds = new ArrayList<>();
 
-        for (Long pageId : requestedPageIds) {
-            // Publishing to a Page uses that Page's own token, not the user token, so a Page the
-            // current token no longer covers (revoked, or a stale id cached in the browser) has
-            // to be named — otherwise the user has no way to tell which selection went bad.
-            String pageAccessToken = Arrays.stream(pages)
-                    .filter(page -> Objects.equals(page.pageId(), pageId))
-                    .map(MetaDataUserInfo::pageAccessToken)
-                    .findFirst()
-                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                            "Facebook Page " + pageId + " is not one this connection can post to. "
-                            + "Pages available on the current connection: "
-                            + Arrays.stream(pages)
-                                    .map(p -> p.pageName() + " (" + p.pageId() + ")")
-                                    .collect(Collectors.joining(", "))
-                            + ". Reload the Page list in your Brand Profile and pick one of these."));
-
+        for (Map.Entry<Long, String> page : pageTokens.entrySet()) {
             // Body (Form) [No MetaPostReqDTO]
             MultiValueMap<String, Object> form = new LinkedMultiValueMap<>();
             form.add("message", requestDTO.getMessage());
-            form.add("access_token", pageAccessToken);
+            form.add("access_token", page.getValue());
 
             String url = "https://graph.facebook.com/v25.0/{page_id}/feed";
 
@@ -997,13 +954,234 @@ public class CrossPlatformService {
 
             }
             postIds.add(restClient.post()
-                    .uri(url, pageId)
+                    .uri(url, page.getKey())
                     .contentType(MediaType.MULTIPART_FORM_DATA)
                     .body(form)
                     .retrieve()
                     .body(String.class));
         }
         return postIds;
+    }
+
+    /** The Meta connection for this business, or a 400 naming the step the user has to do. */
+    private CrossPlatformOAuth requireMetaConnected(Long businessId) {
+        CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository
+                .findByBusinessIdAndPlatform(businessId, PlatformEnum.META);
+        if (crossPlatformOAuth == null || crossPlatformOAuth.getAccessToken() == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "This business has not connected Facebook yet — connect it in your Brand Profile first.");
+        }
+        return crossPlatformOAuth;
+    }
+
+    /**
+     * Resolves each requested Page to the Page token that can act as it, preserving the order
+     * the ids came in — scheduled posts are stored index-aligned against that order, so a later
+     * cancel or reschedule can pair each Graph post id back to the Page that holds it.
+     */
+    private Map<Long, String> pageTokensFor(CrossPlatformOAuth crossPlatformOAuth, Long[] requestedPageIds) {
+        if (requestedPageIds == null || requestedPageIds.length == 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "No Facebook Page was selected — pick a Page in your Brand Profile first.");
+        }
+
+        MetaDataUserInfo[] pages = listPostablePages(crossPlatformOAuth);
+
+        // Graph answers "no Pages" with a 200 and an empty data array. Posting then died on an
+        // ArrayIndexOutOfBounds while looking up the Page token, which reached the browser as a
+        // bare 500 that said nothing about the actual problem — the same empty-Page-list state
+        // the Brand Profile already explains. Reuse that explanation here.
+        if (pages.length == 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    explainNoPages(crossPlatformOAuth));
+        }
+
+        Map<Long, String> pageTokens = new LinkedHashMap<>();
+        for (Long pageId : requestedPageIds) {
+            // Publishing to a Page uses that Page's own token, not the user token, so a Page the
+            // current token no longer covers (revoked, or a stale id cached in the browser) has
+            // to be named — otherwise the user has no way to tell which selection went bad.
+            pageTokens.put(pageId, Arrays.stream(pages)
+                    .filter(page -> Objects.equals(page.pageId(), pageId))
+                    .map(MetaDataUserInfo::pageAccessToken)
+                    .findFirst()
+                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                            "Facebook Page " + pageId + " is not one this connection can post to. "
+                            + "Pages available on the current connection: "
+                            + Arrays.stream(pages)
+                                    .map(p -> p.pageName() + " (" + p.pageId() + ")")
+                                    .collect(Collectors.joining(", "))
+                            + ". Reload the Page list in your Brand Profile and pick one of these.")));
+        }
+        return pageTokens;
+    }
+
+    //////////////////////////////////////////////////////// META SCHEDULING ////////////////////////////////////////////////////////
+
+    /**
+     * Hands the schedule to Facebook rather than holding it ourselves.
+     *
+     * <p>An unpublished post with a {@code scheduled_publish_time} is Graph's own scheduling
+     * primitive: Facebook stores it and publishes it at that moment whether or not this service
+     * is running. That is strictly better than a server-side timer for the one platform that
+     * offers it — there is no window in which our downtime loses the post — so LinkedIn is the
+     * only platform left that actually needs the sweeper to publish it.
+     *
+     * <p>Callers must check the 10-minute/6-month lead-time bounds first; Graph rejects anything
+     * outside them, and {@code ScheduledPostService} falls back to the sweeper in that case.
+     *
+     * @return one Graph post id per Page, in the same order as {@code pageIds}
+     */
+    public List<String> scheduleToMeta(Long businessId, Long[] pageIds, String message, Instant publishAt) {
+        Map<Long, String> pageTokens = pageTokensFor(requireMetaConnected(businessId), pageIds);
+        List<String> postIds = new ArrayList<>();
+
+        for (Map.Entry<Long, String> page : pageTokens.entrySet()) {
+            MultiValueMap<String, Object> form = new LinkedMultiValueMap<>();
+            form.add("message", message);
+            form.add("published", "false");
+            form.add("scheduled_publish_time", String.valueOf(publishAt.getEpochSecond()));
+            form.add("access_token", page.getValue());
+
+            MetaPostIdRespDTO created = restClient.post()
+                    .uri("https://graph.facebook.com/v25.0/{page_id}/feed", page.getKey())
+                    .contentType(MediaType.MULTIPART_FORM_DATA)
+                    .body(form)
+                    .retrieve()
+                    .onStatus(HttpStatusCode::isError, META_ERROR_HANDLER)
+                    .body(MetaPostIdRespDTO.class);
+
+            if (created == null || created.id() == null) {
+                throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,
+                        "Facebook accepted the scheduled post for Page " + page.getKey()
+                        + " but returned no post id, so it could not be tracked. Check the Page's "
+                        + "scheduled posts in Meta Business Suite before trying again.");
+            }
+            postIds.add(created.id());
+        }
+
+        log.info("Scheduled {} Facebook post(s) for business {} at {}", postIds.size(), businessId, publishAt);
+        return postIds;
+    }
+
+    /** Publishes text to each Page immediately. Used by the sweeper for the posts Graph would
+     * not take a native schedule for (under its 10-minute lead time). */
+    public List<String> publishTextToMeta(Long businessId, Long[] pageIds, String message) {
+        Map<Long, String> pageTokens = pageTokensFor(requireMetaConnected(businessId), pageIds);
+        List<String> postIds = new ArrayList<>();
+
+        for (Map.Entry<Long, String> page : pageTokens.entrySet()) {
+            MultiValueMap<String, Object> form = new LinkedMultiValueMap<>();
+            form.add("message", message);
+            form.add("access_token", page.getValue());
+
+            MetaPostIdRespDTO created = restClient.post()
+                    .uri("https://graph.facebook.com/v25.0/{page_id}/feed", page.getKey())
+                    .contentType(MediaType.MULTIPART_FORM_DATA)
+                    .body(form)
+                    .retrieve()
+                    .onStatus(HttpStatusCode::isError, META_ERROR_HANDLER)
+                    .body(MetaPostIdRespDTO.class);
+
+            postIds.add(created == null || created.id() == null ? "" : created.id());
+        }
+        return postIds;
+    }
+
+    /** Deletes posts Facebook is holding for a future time, so cancelling in the calendar
+     * actually stops the post rather than only hiding it from our own table. */
+    public void cancelScheduledMetaPosts(Long businessId, Long[] pageIds, String[] postIds) {
+        if (postIds == null || postIds.length == 0) {
+            return;
+        }
+        List<String> tokens = new ArrayList<>(
+                pageTokensFor(requireMetaConnected(businessId), pageIds).values());
+
+        for (int i = 0; i < postIds.length; i++) {
+            restClient.delete()
+                    .uri("https://graph.facebook.com/v25.0/{postId}", postIds[i])
+                    .header("Authorization", "Bearer " + tokenAt(tokens, i))
+                    .retrieve()
+                    .onStatus(HttpStatusCode::isError, META_ERROR_HANDLER)
+                    .toBodilessEntity();
+        }
+        log.info("Deleted {} scheduled Facebook post(s) for business {}", postIds.length, businessId);
+    }
+
+    /** Moves a Facebook-held schedule to a new time. */
+    public void rescheduleMetaPosts(Long businessId, Long[] pageIds, String[] postIds, Instant publishAt) {
+        editScheduledMetaPosts(businessId, pageIds, postIds,
+                "scheduled_publish_time", String.valueOf(publishAt.getEpochSecond()));
+    }
+
+    /** Rewrites the copy of a Facebook-held schedule. */
+    public void updateScheduledMetaPosts(Long businessId, Long[] pageIds, String[] postIds, String message) {
+        editScheduledMetaPosts(businessId, pageIds, postIds, "message", message);
+    }
+
+    private void editScheduledMetaPosts(Long businessId, Long[] pageIds, String[] postIds,
+                                        String field, String value) {
+        if (postIds == null || postIds.length == 0) {
+            return;
+        }
+        List<String> tokens = new ArrayList<>(
+                pageTokensFor(requireMetaConnected(businessId), pageIds).values());
+
+        for (int i = 0; i < postIds.length; i++) {
+            MultiValueMap<String, Object> form = new LinkedMultiValueMap<>();
+            form.add(field, value);
+            form.add("access_token", tokenAt(tokens, i));
+
+            restClient.post()
+                    .uri("https://graph.facebook.com/v25.0/{postId}", postIds[i])
+                    .contentType(MediaType.MULTIPART_FORM_DATA)
+                    .body(form)
+                    .retrieve()
+                    .onStatus(HttpStatusCode::isError, META_ERROR_HANDLER)
+                    .toBodilessEntity();
+        }
+    }
+
+    /**
+     * Confirms posts Facebook was holding actually went live.
+     *
+     * @return null when every post is published, otherwise a description of what is not — which
+     *         becomes the failure reason on the row and in the user's email
+     */
+    public String verifyMetaPostsPublished(Long businessId, Long[] pageIds, String[] postIds) {
+        if (postIds == null || postIds.length == 0) {
+            return "Facebook never returned a post id for this schedule, so it cannot be confirmed "
+                    + "as published. Check the Page's scheduled posts in Meta Business Suite.";
+        }
+        List<String> tokens = new ArrayList<>(
+                pageTokensFor(requireMetaConnected(businessId), pageIds).values());
+
+        List<String> problems = new ArrayList<>();
+        for (int i = 0; i < postIds.length; i++) {
+            try {
+                MetaPublishStateRespDTO state = restClient.get()
+                        .uri("https://graph.facebook.com/v25.0/{postId}?fields=is_published", postIds[i])
+                        .header("Authorization", "Bearer " + tokenAt(tokens, i))
+                        .retrieve()
+                        .onStatus(HttpStatusCode::isError, META_ERROR_HANDLER)
+                        .body(MetaPublishStateRespDTO.class);
+
+                if (state == null || !Boolean.TRUE.equals(state.isPublished())) {
+                    problems.add(postIds[i] + " is still unpublished");
+                }
+            } catch (Exception e) {
+                problems.add(postIds[i] + " could not be checked (" + e.getMessage() + ")");
+            }
+        }
+
+        return problems.isEmpty() ? null
+                : "Facebook did not confirm this post went live: " + String.join("; ", problems) + ".";
+    }
+
+    /** Post ids are stored in the same order as their Pages, so index i is Page i's token. The
+     * fallback only matters if a stored row predates that guarantee or lost a Page. */
+    private static String tokenAt(List<String> tokens, int index) {
+        return index < tokens.size() ? tokens.get(index) : tokens.get(0);
     }
 
 }

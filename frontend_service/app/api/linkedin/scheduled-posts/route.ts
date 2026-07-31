@@ -1,5 +1,13 @@
 import { NextRequest } from "next/server";
 
+// Legacy: superseded by POST /api/schedule/posts, which no browser code bypasses any more.
+//
+// It still works — Java's /linkedin/schedule-post now writes the same persisted row as every
+// other scheduled post — but it accepts no timezone, so its wall-clock time is resolved in the
+// server's configured zone rather than the user's, and it returns only a status rather than an
+// id you can later list, edit or cancel. Kept for anything still pointed at it; prefer
+// /api/schedule/posts for new callers.
+
 const JAVA_SERVICE_URL = process.env.BACKEND_URL ?? "http://localhost:8081";
 
 export async function POST(request: NextRequest) {
