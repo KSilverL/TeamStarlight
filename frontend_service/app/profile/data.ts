@@ -1,5 +1,5 @@
 // Mock data & PLATFORM_CONFIG
-import type { Platform, PostStatus } from "./types";
+import type { Platform } from "./types";
 
 export const PLATFORM_CONFIG: Record<
   Platform,
@@ -36,77 +36,6 @@ export const PLATFORM_CONFIG: Record<
     dot: "bg-[#1B1A17]",
   },
 };
-
-export const MOCK_POSTS = [
-  {
-    id: "p1",
-    platform: "Instagram",
-    platformColor: "bg-gradient-to-r from-purple-600 to-pink-600",
-    platformBadge: "bg-pink-600",
-    abbr: "IG",
-    date: "Jun 9, 2026",
-    status: "pending" as PostStatus,
-    text: "🌿 Meet your kitchen's new best friend — the Bamboo Kitchen Collection.\n\nCrafted from 100% organic bamboo, each piece is naturally antimicrobial, carbon-negative in production, and built to last a decade. Because sustainable living shouldn't mean settling for less. 🏡",
-    hashtags: [
-      "#EcoHome",
-      "#BambooKitchen",
-      "#SustainableLiving",
-      "#ZeroWaste",
-      "#GreenHome",
-    ],
-  },
-  {
-    id: "p2",
-    platform: "LinkedIn",
-    platformColor: "bg-blue-700",
-    platformBadge: "bg-blue-600",
-    abbr: "in",
-    date: "Jun 9, 2026",
-    status: "pending" as PostStatus,
-    text: "The sustainable homewares market is projected to reach $150B by 2030 — and EcoHome Solutions is proud to be part of that shift.\n\nToday we're launching the Bamboo Kitchen Collection: premium products that prove sustainable materials can exceed conventional standards.",
-    hashtags: [],
-  },
-  {
-    id: "p3",
-    platform: "TikTok",
-    platformColor: "bg-[#1B1A17]",
-    platformBadge: "bg-[#1B1A17]",
-    abbr: "TK",
-    date: "Jun 8, 2026",
-    status: "pending" as PostStatus,
-    text: "Hook: POV — you just replaced every plastic utensil in your kitchen 🎋\nBody: Bamboo is 3× stronger than steel by weight, grows back in months, and looks stunning on any countertop.\nCTA: Link in bio to shop the Bamboo Kitchen Collection.\nSound: Upbeat acoustic indie track",
-    hashtags: ["#BambooLife", "#SustainableKitchen", "#EcoTok", "#GreenLiving"],
-  },
-  {
-    id: "p4",
-    platform: "X (Twitter)",
-    platformColor: "bg-[#1B1A17]",
-    platformBadge: "bg-[#1B1A17]",
-    abbr: "X",
-    date: "Jun 8, 2026",
-    status: "pending" as PostStatus,
-    text: "Your kitchen deserves better than plastic. 🌿\n\nThe EcoHome Bamboo Kitchen Collection — antimicrobial, carbon-negative, built to last. Shop now →",
-    hashtags: ["#EcoHome", "#SustainableLiving"],
-  },
-  {
-    id: "p5",
-    platform: "Instagram",
-    platformColor: "bg-gradient-to-r from-purple-600 to-pink-600",
-    platformBadge: "bg-pink-600",
-    abbr: "IG",
-    date: "Jun 7, 2026",
-    status: "pending" as PostStatus,
-    text: "Small swaps, big impact. ♻️\n\nSwitch to bamboo and reduce your kitchen's plastic footprint by up to 80%. Our new collection makes it easy — and beautiful.",
-    hashtags: [
-      "#ZeroWaste",
-      "#PlasticFree",
-      "#EcoHome",
-      "#BambooKitchen",
-      "#ConsciousLiving",
-      "#GreenHome",
-    ],
-  },
-];
 
 export const STATS = {
   postsCreated: 47,

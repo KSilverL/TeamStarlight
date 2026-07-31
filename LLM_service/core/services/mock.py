@@ -32,6 +32,7 @@ from agent_framework._types import ResponseStream
 
 from ...skills import parse_char_limit
 from ..config import get_settings
+from ..intent_schema import RequestClassification
 from ..plan_schema import PlanClarification, PlanItemSpec, PostingPlanSpec
 from ..skill_schema import SkillCandidate, SkillRule, UserSkillDoc
 from ..trend_schema import Trend, select_current_trends
@@ -266,6 +267,63 @@ _GOAL_VERBS = (
     "drive|increase|boost|promote|grow|launch|sell|raise|build|get|reach|convert"
     "|announce|educate|inspire|generate|attract|engage|highlight|showcase|celebrate"
 )
+# Phrases that mark a request as a multi-date CAMPAIGN rather than one post. Deliberately
+# narrow: the real prompt is told to prefer single_post when unsure, and the mock has to make
+# the same call or tests would encode behaviour production doesn't have.
+_PLAN_TRIGGERS = (
+    "campaign", "posting plan", "content plan", "content calendar", "posting schedule",
+    "plan out", "plan my", "plan me", "plan a", "schedule posts", "series of posts",
+    "posts for next", "posts over", "posts across", "content for next",
+)
+
+
+def _parse_window(text: str, today: str) -> tuple[str, str]:
+    """Resolve the relative windows the mock understands into absolute dates.
+
+    Covers what the tests and the demo path actually say — "next month", "the next 3 weeks",
+    an explicit ISO pair — and returns ("", "") for anything else, which is the same "user
+    named no period" answer the real model gives. Never invents a window."""
+    try:
+        base = date.fromisoformat(today)
+    except ValueError:
+        return "", ""
+
+    # An explicit pair wins: nothing to infer when the user gave real dates.
+    explicit = re.findall(r"\d{4}-\d{2}-\d{2}", text)
+    if len(explicit) >= 2:
+        return explicit[0], explicit[1]
+
+    if "next month" in text:
+        first = (base.replace(day=1) + timedelta(days=32)).replace(day=1)
+        last = (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+        return first.isoformat(), last.isoformat()
+
+    if "this month" in text:
+        last = (base.replace(day=1) + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+        return base.isoformat(), last.isoformat()
+
+    m = re.search(r"next (\d+) (day|week|month)s?", text)
+    if m:
+        days = {"day": 1, "week": 7, "month": 30}[m.group(2)] * int(m.group(1))
+        return base.isoformat(), (base + timedelta(days=days)).isoformat()
+
+    if "next week" in text:
+        return base.isoformat(), (base + timedelta(days=7)).isoformat()
+
+    return "", ""
+
+
+def _extract_goal(message: str) -> str:
+    """The campaign goal, when the sentence states one. Mirrors `_free_extract`'s "to <verb> …"
+    rule, plus the "for our <thing>" shape a campaign request tends to use."""
+    low = message.lower()
+    m = re.search(rf"\bto ({_GOAL_VERBS})\b(.+?)(?:[.;\n]|$)", low)
+    if m:
+        return f"{m.group(1)}{m.group(2)}".strip()
+    m = re.search(r"\bfor (?:our|my|the) (.+?)(?:[.;\n]|$)", low)
+    if m:
+        return m.group(1).strip()
+    return ""
 
 
 def _parse_platforms(text: str) -> list[str]:
@@ -533,6 +591,43 @@ class MockLLM(LLMService):
         # caller's fallback so mock/offline runs still surface a tidy sidebar title.
         words = (topic or user_intent or "New session").split()
         return " ".join(words[:6]).strip(" ,.;:—-") or "New session"
+
+    async def classify_request(
+        self,
+        *,
+        message: str,
+        today: str,
+        platforms: List[str],
+        known: Optional[dict] = None,
+        history: Optional[List[dict]] = None,
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        text = (message or "").lower()
+        settled = {k: v for k, v in (known or {}).items() if v}
+
+        # A campaign is asked for in a fairly narrow vocabulary; anything else is one post.
+        # Matches the real prompt's tie-break: when unsure, prefer the cheap immediate path.
+        is_plan = any(trigger in text for trigger in _PLAN_TRIGGERS)
+
+        # Anything already settled means a campaign conversation is under way, so a short
+        # follow-up ("to launch our subscription") can't read as a fresh one-off request.
+        # CampaignConversation enforces this too; keeping it here means a direct caller of
+        # classify_request gets the same answer.
+        if any(settled.get(field) for field in ("goal", "start_date", "end_date")):
+            is_plan = True
+
+        if not is_plan:
+            return RequestClassification(intent="single_post").model_dump()
+
+        start, end = _parse_window(text, today)
+        return RequestClassification(
+            intent="posting_plan",
+            goal=_extract_goal(message) or settled.get("goal", ""),
+            start_date=start or settled.get("start_date", ""),
+            end_date=end or settled.get("end_date", ""),
+            cadence_hint=settled.get("cadence_hint", ""),
+            tone_hint=settled.get("tone_hint", ""),
+        ).model_dump()
 
     async def clarify_campaign(
         self,

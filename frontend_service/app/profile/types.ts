@@ -1,8 +1,5 @@
 /** Identifies which sidebar section is currently active in the profile page. */
-export type Section = "approval" | "stats" | "brand" | "calendar";
-
-/** Lifecycle state of a post sitting in the approval queue. */
-export type PostStatus = "pending" | "approved" | "rejected";
+export type Section = "stats" | "brand" | "calendar";
 
 /** Supported social media platforms across the system. */
 export type Platform = "instagram" | "facebook" | "linkedin" | "tiktok" | "x";

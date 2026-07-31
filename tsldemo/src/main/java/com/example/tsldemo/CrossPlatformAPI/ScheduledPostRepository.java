@@ -1,8 +1,11 @@
 package com.example.tsldemo.CrossPlatformAPI;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
+
+import com.example.tsldemo.ENUMS.PlatformEnum;
 
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
@@ -51,4 +54,32 @@ public interface ScheduledPostRepository extends JpaRepository<ScheduledPost, Lo
 
     /** Rows stuck mid-publish because the app died between the claim and the outcome. */
     List<ScheduledPost> findByStatusAndUpdatedAtBefore(ScheduledPostStatus status, Instant before);
+
+    /**
+     * Has this plan slot already produced a live post for this platform?
+     *
+     * <p>Guards the approval handoff against double-scheduling — approving twice, or a retried
+     * request, must not put the same copy on the feed twice. Cancelled and failed rows are
+     * excluded by the caller's status list, so deliberately cancelling a post and re-running
+     * the handoff still works.
+     */
+    boolean existsByBusinessIdAndSourcePlanIdAndSourceItemIdAndPlatformAndStatusIn(
+            Long businessId, String sourcePlanId, String sourceItemId,
+            PlatformEnum platform, Collection<ScheduledPostStatus> statuses);
+
+    /**
+     * Has this plan slot ever produced a post for this platform, whatever became of it?
+     *
+     * <p>What the automatic sweep asks, and deliberately blunter than the check above. A
+     * cancelled post is a decision the user made on the calendar; a sweep that only skipped
+     * <em>live</em> posts would read that empty slot as work outstanding and put the post
+     * straight back, every couple of minutes, until they gave up. The explicit handoff keeps
+     * the narrower check, so re-scheduling a cancelled slot on purpose still works.
+     */
+    boolean existsByBusinessIdAndSourcePlanIdAndSourceItemIdAndPlatform(
+            Long businessId, String sourcePlanId, String sourceItemId, PlatformEnum platform);
+
+    /** Every post a plan slot produced, for the link-back on the plan view. */
+    List<ScheduledPost> findByBusinessIdAndSourcePlanIdOrderByScheduledAtAsc(
+            Long businessId, String sourcePlanId);
 }

@@ -33,6 +33,7 @@ from agent_framework._types import ResponseStream
 from pydantic import TypeAdapter, ValidationError
 
 from ..config import Settings
+from ..intent_schema import RequestClassification
 from ..plan_schema import PlanClarification, PostingPlanSpec
 from ..skill_schema import SkillCandidate, SkillRule
 from ..video_schema import StoryboardSpec, TemplateSlideSpec, VideoPromptSpec
@@ -349,6 +350,70 @@ class AzureLLM(LLMService):
             model=self._settings.preference_summary_model,
         )
         return raw.strip()
+
+    async def classify_request(
+        self,
+        *,
+        message: str,
+        today: str,
+        platforms: List[str],
+        known: Optional[dict] = None,
+        history: Optional[List[dict]] = None,
+    ) -> dict:
+        schema = json.dumps(RequestClassification.model_json_schema())
+        settled = {k: v for k, v in (known or {}).items() if v}
+        system = (
+            "You are the front desk of a social-media newsroom. Decide what the user is "
+            "asking for and extract the details in one pass.\n\n"
+            "intent is 'posting_plan' when they want content SCHEDULED over a period — a "
+            "campaign, a content calendar, 'posts for next month', 'a plan for the product "
+            "launch', anything spanning multiple dates. It is 'single_post' when they want "
+            "something written now: one post, one caption, one video. When the message is "
+            "ambiguous, prefer 'single_post' — writing one post is cheap and immediate, "
+            "whereas a wrongly-started campaign wastes the user's time reviewing a schedule "
+            "they never asked for.\n\n"
+            f"TODAY IS {today}. Resolve any relative period against it and return absolute "
+            "dates: 'next month' is that whole calendar month; 'the next 3 weeks' starts "
+            "today; 'Q4' is that quarter. If they named no period at all, leave start_date "
+            "and end_date as empty strings — never invent a window.\n\n"
+            "Leave any field the user has not spoken to as an empty string. Never ask about "
+            "or infer platforms; they are already chosen. Return ONLY valid JSON (no markdown "
+            "fences, no prose) matching this schema exactly:\n"
+            f"{schema}"
+        )
+        if settled:
+            # Two jobs. Without the carry-through, a turn that only answers "what's the goal?"
+            # comes back with the window blanked and the conversation asks for dates it already
+            # had. Without the intent pin, that same short answer reads as a one-off request in
+            # isolation and the campaign is abandoned mid-conversation.
+            system += (
+                "\n\nA campaign conversation is already under way, and these fields are "
+                f"settled: {json.dumps(settled)}. Carry them through unchanged unless this "
+                "message contradicts them, and keep intent as 'posting_plan' — this message is "
+                "an answer within that conversation, not a new request."
+            )
+
+        user = f"Platforms (already chosen): {', '.join(platforms) or 'none given'}\n\n{message}"
+        messages = [{"role": "system", "content": system},
+                    *(history or []),
+                    {"role": "user", "content": user}]
+
+        last_error: Exception = ValueError("classify_request: no attempts made")
+        for _ in range(_PLAN_CAMPAIGN_MAX_ATTEMPTS):
+            raw = await self._complete(messages)
+            try:
+                data = json.loads(_strip_fences(raw))
+                return RequestClassification(**data).model_dump()
+            except (json.JSONDecodeError, ValidationError) as exc:
+                last_error = exc
+                messages = messages + [
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content": (
+                        f"Your previous JSON was invalid: {exc}. Return corrected JSON "
+                        "only, matching the schema exactly."
+                    )},
+                ]
+        raise last_error
 
     async def clarify_campaign(
         self,

@@ -1,7 +1,8 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
+import DashboardSidebar from "../components/DashboardSidebar";
 
 type Platform = "x" | "instagram" | "tiktok" | "linkedin";
 type ContentType = "text" | "video" | "brand";
@@ -46,6 +47,33 @@ const CONTENT_TYPES: { id: ContentType; label: string }[] = [
   { id: "brand", label: "Brand Animation" },
 ];
 
+/** One post a plan slot put on the content calendar. The slice of the calendar's own record
+ * that the plan view needs: which platform, when it publishes, and where it got to. */
+interface ScheduledSlotPost {
+  id: string;
+  platform: string;
+  scheduled_at: string;
+  status: string;
+}
+
+/** How each calendar status reads on a plan slot. The plan view's question is "is this post
+ * going to go out?", so the wording is about the post's future, not its database row. */
+const DELIVERY_STATE: Record<string, { verb: string; className: string; icon: string }> = {
+  scheduled: { verb: "publishes", className: "text-green-700", icon: "✓" },
+  publishing: { verb: "publishing now", className: "text-green-700", icon: "↗" },
+  published: { verb: "published", className: "text-green-700", icon: "✓" },
+  failed: { verb: "failed to publish", className: "text-red-600", icon: "✕" },
+  cancelled: { verb: "cancelled", className: "text-[#9E9893] line-through", icon: "–" },
+};
+
+/** How often to re-read a plan while its campaign is being drafted. */
+const POLL_INTERVAL_MS = 5000;
+
+/** Polls to keep running after a confirm even with nothing yet `generating`. Slots are started
+ * one at a time with a pause between them, so the first can take a few seconds to appear —
+ * this covers that gap, and is bounded so a campaign that fails to start can't poll forever. */
+const CONFIRM_GRACE_TICKS = 6;
+
 const STATUS_BADGE: Record<string, string> = {
   planned: "bg-[#F2EDE4] text-[#6B6561]",
   generating: "bg-amber-100 text-amber-700",
@@ -64,10 +92,14 @@ export default function PlansPage() {
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  function authHeaders(): Record<string, string> {
+  // Stable across renders so children can safely depend on it. Without useCallback this is a
+  // new function every render, and any child effect listing it as a dependency re-runs every
+  // render — for a child that fetches, that is a request loop. It reads the token when called,
+  // so there is nothing for the empty dependency list to make stale.
+  const authHeaders = useCallback((): Record<string, string> => {
     const token = localStorage.getItem("starlight_token");
     return token ? { Authorization: `Bearer ${token}` } : {};
-  }
+  }, []);
 
   async function loadPlans() {
     setLoadingPlans(true);
@@ -119,23 +151,25 @@ export default function PlansPage() {
     setSelectedPlan(plan);
   }
 
-  function handlePlanUpdated(plan: Plan) {
+  // Stable for the same reason as authHeaders above: PlanDetail polls through this while a
+  // campaign drafts, and a new identity each render would reset its timer before it ever fired.
+  const handlePlanUpdated = useCallback((plan: Plan) => {
     setSelectedPlan(plan);
     setPlans((prev) => prev.map((p) => (p.plan_id === plan.plan_id ? plan : p)));
-  }
+  }, []);
 
   return (
     <div className="flex h-screen bg-[#F8F5EE] text-[#1B1A17] overflow-hidden">
-      {/* Sidebar: plan list */}
-      <aside className="w-80 flex-shrink-0 border-r border-[#E8E3DA] flex flex-col bg-white">
+      {/* The dashboard rail, so reaching plans from the profile doesn't strand the user on a
+          page with no way back to the calendar or the brand profile. */}
+      <DashboardSidebar active="plans" />
+
+      {/* Plan list. Slightly narrower than it was, to pay for the rail beside it — and it no
+          longer repeats the Starlight header, which the rail now carries. */}
+      <aside className="w-72 flex-shrink-0 border-r border-[#E8E3DA] flex flex-col bg-white">
         <div className="p-5 border-b border-[#E8E3DA] flex-shrink-0">
-          <Link
-            href="/"
-            className="flex items-center gap-2 font-bold text-lg text-[#1B1A17] hover:text-[#FF4800] transition-colors"
-          >
-            ✦ Starlight
-          </Link>
-          <p className="text-xs text-[#9E9893] mt-0.5">Posting Plans</p>
+          <h1 className="font-semibold text-[#1B1A17]">Posting Plans</h1>
+          <p className="text-xs text-[#9E9893] mt-0.5">Campaign schedules</p>
         </div>
 
         <div className="p-4">
@@ -422,6 +456,63 @@ interface PlanDetailProps {
 
 function PlanDetail({ plan, authHeaders, onUpdated, onError }: PlanDetailProps) {
   const [confirming, setConfirming] = useState(false);
+  // Polls remaining in the post-confirm grace window (see the effect below).
+  const [graceTicks, setGraceTicks] = useState(0);
+  // What each slot actually put on the content calendar. Kept here rather than per-card so it
+  // costs one request per plan instead of one per slot, and so any card that schedules
+  // something refreshes the whole plan's view of the truth.
+  const [scheduledByItem, setScheduledByItem] = useState<Record<string, ScheduledSlotPost[]>>({});
+
+  const planId = plan.plan_id;
+  const planActive = plan.status === "active";
+
+  const loadScheduled = useCallback(async () => {
+    if (!planActive) return;
+    try {
+      const res = await fetch(`/api/plans/${planId}/scheduled`, { headers: authHeaders() });
+      const data = await res.json();
+      if (!res.ok || data.error) return;  // a failed read must not blank out the plan itself
+      setScheduledByItem(data.items ?? {});
+    } catch {
+      // Same: leave whatever we already know rather than claiming nothing is scheduled.
+    }
+  }, [planId, planActive, authHeaders]);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetches first; the state lands in the promise callback, not synchronously
+    loadScheduled();
+  }, [loadScheduled]);
+
+  const reloadPlan = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/plans/${planId}`, { headers: authHeaders() });
+      const data = await res.json();
+      if (res.ok && !data.error) onUpdated(data as Plan);
+    } catch {
+      // A dropped poll is not worth reporting — the next one picks the change up.
+    }
+  }, [planId, authHeaders, onUpdated]);
+
+  // Confirming starts every slot drafting in the background, so the statuses on screen go
+  // stale the moment it returns. Poll while there is visibly work in flight, plus a short
+  // grace window after a confirm to cover the seconds before the first slot flips to
+  // `generating` — without that the page looks like nothing happened.
+  const isDrafting = planActive && plan.items.some((i) => i.status === "generating");
+  // "Ready" means the copy exists and is yours to look at — drafted, reviewed, or already
+  // scheduled. Skipped slots count too: they are settled, just not by writing anything.
+  const draftedCount = plan.items.filter(
+    (i) => i.status !== "planned" && i.status !== "generating"
+  ).length;
+
+  useEffect(() => {
+    if (!isDrafting && graceTicks === 0) return;
+
+    const timer = setTimeout(() => {
+      setGraceTicks((n) => Math.max(0, n - 1));
+      reloadPlan();
+    }, POLL_INTERVAL_MS);
+    return () => clearTimeout(timer);
+  }, [isDrafting, graceTicks, reloadPlan]);
 
   async function handleConfirm() {
     onError(null);
@@ -436,7 +527,10 @@ function PlanDetail({ plan, authHeaders, onUpdated, onError }: PlanDetailProps) 
         onError(data.error ?? "Failed to confirm plan.");
         return;
       }
+      // The response still shows every slot as `planned` — drafting starts after it returns.
+      // The grace window is what turns that into a live view.
       onUpdated(data as Plan);
+      setGraceTicks(CONFIRM_GRACE_TICKS);
     } catch {
       onError("Could not reach the backend.");
     } finally {
@@ -467,19 +561,35 @@ function PlanDetail({ plan, authHeaders, onUpdated, onError }: PlanDetailProps) 
       )}
 
       {plan.status === "draft" && (
-        <button
-          onClick={handleConfirm}
-          disabled={confirming}
-          className="mb-5 bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors"
-        >
-          {confirming ? "Confirming…" : "Confirm Plan — start auto-drafting"}
-        </button>
+        <>
+          <button
+            onClick={handleConfirm}
+            disabled={confirming}
+            className="mb-2 bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+          >
+            {confirming ? "Confirming…" : `Confirm Plan — write all ${plan.items.length} posts`}
+          </button>
+          <p className="mb-5 text-xs text-[#9E9893] leading-relaxed">
+            Every slot gets drafted now, so you can review the whole campaign at once. Nothing
+            publishes until you approve it.
+          </p>
+        </>
       )}
       {plan.status === "active" && (
-        <p className="mb-5 text-xs text-green-700 bg-green-50 border border-green-200 rounded-lg px-3 py-2 inline-block">
-          ✓ Active — items will auto-draft on their scheduled day. You&apos;ll review each one before
-          it&apos;s approved or posted.
-        </p>
+        <div className="mb-5">
+          {isDrafting ? (
+            <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 inline-flex items-center gap-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-[#FF4800] animate-pulse flex-shrink-0" />
+              Writing your campaign — {draftedCount} of {plan.items.length} posts ready. You can
+              review each one as it lands.
+            </p>
+          ) : (
+            <p className="text-xs text-green-700 bg-green-50 border border-green-200 rounded-lg px-3 py-2 inline-block">
+              ✓ Active — approve a post to queue it for its planned date. Nothing publishes until
+              you do.
+            </p>
+          )}
+        </div>
       )}
 
       <h2 className="text-sm font-semibold text-[#6B6561] mb-3">Schedule</h2>
@@ -490,7 +600,9 @@ function PlanDetail({ plan, authHeaders, onUpdated, onError }: PlanDetailProps) 
             planId={plan.plan_id}
             item={item}
             editable={plan.status === "draft"}
-            planActive={plan.status === "active"}
+            planActive={planActive}
+            scheduledPosts={scheduledByItem[item.item_id] ?? []}
+            onScheduled={loadScheduled}
             authHeaders={authHeaders}
             onUpdated={onUpdated}
             onError={onError}
@@ -508,12 +620,24 @@ interface PlanItemCardProps {
   item: PlanItem;
   editable: boolean;
   planActive: boolean;
+  scheduledPosts: ScheduledSlotPost[];
+  onScheduled: () => void;
   authHeaders: () => Record<string, string>;
   onUpdated: (plan: Plan) => void;
   onError: (msg: string | null) => void;
 }
 
-function PlanItemCard({ planId, item, editable, planActive, authHeaders, onUpdated, onError }: PlanItemCardProps) {
+function PlanItemCard({
+  planId,
+  item,
+  editable,
+  planActive,
+  scheduledPosts,
+  onScheduled,
+  authHeaders,
+  onUpdated,
+  onError,
+}: PlanItemCardProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [plannedDate, setPlannedDate] = useState(item.planned_date);
   const [topic, setTopic] = useState(item.topic);
@@ -677,6 +801,8 @@ function PlanItemCard({ planId, item, editable, planActive, authHeaders, onUpdat
           itemId={item.item_id}
           existingTaskId={item.task_id}
           itemStatus={item.status}
+          scheduledPosts={scheduledPosts}
+          onScheduled={onScheduled}
           authHeaders={authHeaders}
           onError={onError}
         />
@@ -692,15 +818,56 @@ interface ItemDraftPreviewProps {
   itemId: string;
   existingTaskId: string | null;
   itemStatus: string;
+  scheduledPosts: ScheduledSlotPost[];
+  onScheduled: () => void;
   authHeaders: () => Record<string, string>;
   onError: (msg: string | null) => void;
 }
 
-function ItemDraftPreview({ planId, itemId, existingTaskId, itemStatus, authHeaders, onError }: ItemDraftPreviewProps) {
+/** The Facebook Page ids picked in the Brand Profile. Java falls back to every Page on the
+ * connection when this is empty, so an unset selection still schedules. */
+function getSelectedPageIds(): number[] {
+  try {
+    const ids = JSON.parse(localStorage.getItem("starlight_meta_page_ids") || "[]");
+    return Array.isArray(ids) ? ids.map(Number).filter((n) => Number.isFinite(n)) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Why the handoff passed over a platform — the part of its answer that isn't already visible
+ * as a row on the calendar ("Instagram has no publishing integration yet").
+ *
+ * `reason_code` is what decides whether anything can be done about it. Only `time_passed` is
+ * recoverable, and only it gets the reschedule controls; matching the English sentence instead
+ * would break the first time someone improved the wording. */
+type SkipReason = { platform: string; reason: string; reason_code?: string };
+
+/** What the schedule call should do about a slot whose planned time has gone. */
+type RescheduleChoice =
+  | { auto_reschedule: true }              // let the planner pick the next slot in the window
+  | { scheduled_at: string };              // the user named a moment
+
+function ItemDraftPreview({
+  planId,
+  itemId,
+  existingTaskId,
+  itemStatus,
+  scheduledPosts,
+  onScheduled,
+  authHeaders,
+  onError,
+}: ItemDraftPreviewProps) {
   const [status, setStatus] = useState<"idle" | "starting" | "generating" | "ready" | "approved" | "rejected">("idle");
   const [statusLabel, setStatusLabel] = useState("");
-  const [draftText, setDraftText] = useState<string | null>(null);
+  // Keyed by platform: a slot can target several, and each gets its own draft and verdict.
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [taskId, setTaskId] = useState<string | null>(existingTaskId);
+  const [skipped, setSkipped] = useState<SkipReason[]>([]);
+  const [isReviewing, setIsReviewing] = useState(false);
+  const [isScheduling, setIsScheduling] = useState(false);
+
+  const draftEntries = Object.entries(drafts);
 
   // Auto-connect on mount if this item already has a task (e.g. the cron executed
   // it in the background, or you generated it earlier and reloaded the page) — the
@@ -771,7 +938,10 @@ function ItemDraftPreview({ planId, itemId, existingTaskId, itemStatus, authHead
       }
 
       if (type === "result" && evtStatus === "draft_ready") {
-        setDraftText(event.draft as string);
+        // Record which platform this draft is for — approving has to send a verdict for every
+        // one of them, or the task stays half-reviewed and can never be scheduled.
+        const platform = (event.platform as string) || "linkedin";
+        setDrafts((prev) => ({ ...prev, [platform]: event.draft as string }));
         setStatus((prev) => (prev === "approved" ? "approved" : "ready"));
       }
 
@@ -786,17 +956,77 @@ function ItemDraftPreview({ planId, itemId, existingTaskId, itemStatus, authHead
   }
 
   async function handleDecision(decision: "approve" | "reject") {
-    if (!taskId) return;
-    const platform = "linkedin"; // adjust if an item can target multiple platforms per draft
+    if (!taskId || draftEntries.length === 0) return;
+
+    // One verdict per drafted platform. Sending only one leaves the others pending, which keeps
+    // the task in awaiting_review — the slot then looks approved here but can never be scheduled.
+    const verdicts = Object.fromEntries(
+      draftEntries.map(([platform]) => [platform, { decision }])
+    );
+
+    setIsReviewing(true);
     try {
-      await fetch(`/api/tasks/${taskId}/review`, {
+      const res = await fetch(`/api/tasks/${taskId}/review`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ verdicts: { [platform]: { decision } } }),
+        body: JSON.stringify({ verdicts }),
       });
+      if (!res.ok) {
+        onError("Could not submit the review decision.");
+        return;
+      }
       setStatus(decision === "approve" ? "approved" : "rejected");
     } catch {
       onError("Could not submit the review decision.");
+      return;
+    } finally {
+      setIsReviewing(false);
+    }
+
+    // Approving and scheduling are two steps and are reported as two steps — the button says
+    // which one is in flight, so a slow handoff doesn't look like a stuck approval.
+    if (decision === "approve") {
+      await scheduleApprovedItem();
+    }
+  }
+
+  /**
+   * Queues the approved copy to publish at the slot's planned date and time.
+   *
+   * Fires straight after the approve so the user sees the outcome immediately, and can be run
+   * again by hand from the panel below. It is no longer the only way a slot gets scheduled —
+   * the backend sweeps for approved-but-unscheduled slots every couple of minutes — so a
+   * failure here is a delay, not a loss, and says so.
+   */
+  async function scheduleApprovedItem(reschedule?: RescheduleChoice) {
+    setIsScheduling(true);
+    try {
+      const res = await fetch(`/api/plans/${planId}/items/${itemId}/schedule`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ page_ids: getSelectedPageIds(), ...reschedule }),
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok || data.error) {
+        onError(
+          `${data.error ?? "The post could not be scheduled just now."} ` +
+            "It will be picked up automatically within a few minutes."
+        );
+        return;
+      }
+      // A 200 can still mean nothing was queued (e.g. every platform unsupported). Rather than
+      // trust the response as the record, keep only its skip reasons and re-read what actually
+      // landed on the calendar — that way the panel shows the same thing on a fresh page load.
+      setSkipped(data.skipped ?? []);
+      onScheduled();
+    } catch {
+      onError(
+        "The scheduling request could not be sent. It will be picked up automatically " +
+          "within a few minutes."
+      );
+    } finally {
+      setIsScheduling(false);
     }
   }
 
@@ -813,36 +1043,273 @@ function ItemDraftPreview({ planId, itemId, existingTaskId, itemStatus, authHead
 
   return (
     <div className="mt-3 pt-3 border-t border-[#E8E3DA]">
-      {(status === "starting" || (status === "generating" && !draftText)) && (
+      {(status === "starting" || (status === "generating" && draftEntries.length === 0)) && (
         <div className="flex items-center gap-2 text-xs text-[#9E9893] italic">
           <span className="w-1.5 h-1.5 rounded-full bg-[#FF4800] animate-pulse flex-shrink-0" />
           {statusLabel || "Loading draft…"}
         </div>
       )}
 
-      {draftText && (
+      {draftEntries.length > 0 && (
         <div className="bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg p-3">
-          <p className="text-sm text-[#1B1A17] whitespace-pre-wrap leading-relaxed mb-2">{draftText}</p>
+          {draftEntries.map(([platform, text]) => (
+            <div key={platform} className="mb-2 last:mb-2">
+              {/* Only label the platform when there's more than one to tell apart. */}
+              {draftEntries.length > 1 && (
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-[#9E9893] mb-1">
+                  {platform}
+                </p>
+              )}
+              <p className="text-sm text-[#1B1A17] whitespace-pre-wrap leading-relaxed">{text}</p>
+            </div>
+          ))}
+
           {status === "ready" && (
             <div className="flex gap-2">
+              {/* Labelled for what it does: approving also queues the post to publish at the
+                  slot's planned time, which is a bigger commitment than "approve" alone. */}
               <button
                 onClick={() => handleDecision("approve")}
-                className="flex-1 bg-green-600 hover:bg-green-500 text-white text-xs font-medium py-1.5 rounded-lg transition-colors"
+                disabled={isReviewing || isScheduling}
+                className="flex-1 bg-green-600 hover:bg-green-500 disabled:bg-green-300 text-white text-xs font-medium py-1.5 rounded-lg transition-colors"
               >
-                Approve
+                {isReviewing ? "Approving…" : isScheduling ? "Scheduling…" : "Approve & Schedule"}
               </button>
               <button
                 onClick={() => handleDecision("reject")}
+                disabled={isReviewing || isScheduling}
                 className="flex-1 bg-[#F2EDE4] hover:bg-[#E8E3DA] text-[#1B1A17] text-xs font-medium py-1.5 rounded-lg transition-colors border border-[#E8E3DA]"
               >
                 Reject
               </button>
             </div>
           )}
-          {status === "approved" && <p className="text-xs text-green-700 font-medium">✓ Approved</p>}
+
           {status === "rejected" && <p className="text-xs text-[#9E9893] font-medium">Rejected</p>}
+        </div>
+      )}
+
+      {/* Outside the draft panel on purpose. The draft text comes from the task's SSE replay,
+          which is gone once the LLM service restarts — an approved slot would then render an
+          empty card with no hint of whether it was ever scheduled. Where it's going to publish
+          is the part that must survive, so it reads from the calendar instead. */}
+      {status === "approved" && (
+        <SlotDelivery
+          posts={scheduledPosts}
+          skipped={skipped}
+          isScheduling={isScheduling}
+          onSchedule={scheduleApprovedItem}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Slot Delivery — what an approved slot actually put on the calendar ────────
+
+interface SlotDeliveryProps {
+  posts: ScheduledSlotPost[];
+  skipped: SkipReason[];
+  isScheduling: boolean;
+  onSchedule: (reschedule?: RescheduleChoice) => void;
+}
+
+/**
+ * Answers one question for an approved slot: is this going to be posted, and when?
+ *
+ * Approval alone used to be the whole story here — a slot read "✓ Approved" whether its copy
+ * was queued to publish or had gone nowhere at all. The two states look nothing alike now:
+ * scheduled slots name their platform and publish time, and an unscheduled one says so and
+ * offers the button that fixes it.
+ */
+function SlotDelivery({ posts, skipped, isScheduling, onSchedule }: SlotDeliveryProps) {
+  // A slot whose window has gone is the one skip the user can actually fix, so it gets its own
+  // controls rather than sitting in the muted list with the reasons nobody can act on.
+  const missed = skipped.filter((s) => s.reason_code === "time_passed");
+  const other = skipped.filter((s) => s.reason_code !== "time_passed");
+
+  if (isScheduling) {
+    return (
+      <div className="mt-2 flex items-center gap-2 text-xs text-[#9E9893] italic">
+        <span className="w-1.5 h-1.5 rounded-full bg-[#FF4800] animate-pulse flex-shrink-0" />
+        Adding to your content calendar…
+      </div>
+    );
+  }
+
+  if (missed.length > 0) {
+    return (
+      <div className="mt-2 space-y-1.5">
+        {posts.map((post) => (
+          <ScheduledLine key={post.id} post={post} />
+        ))}
+        <MissedSlot missed={missed} onSchedule={onSchedule} />
+        {other.map((s) => (
+          <p key={s.platform} className="text-xs text-[#9E9893] leading-relaxed">
+            {platformLabel(s.platform)}: {s.reason}
+          </p>
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-2 space-y-1.5">
+      {posts.length > 0 ? (
+        <>
+          {posts.map((post) => (
+            <ScheduledLine key={post.id} post={post} />
+          ))}
+          <Link
+            href="/profile?section=calendar"
+            className="inline-block text-xs text-[#FF4800] hover:underline"
+          >
+            View in content calendar →
+          </Link>
+        </>
+      ) : (
+        <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+          <p className="text-xs text-amber-800 font-medium">Approved — not on the calendar yet</p>
+          <p className="text-[11px] text-amber-700 mt-0.5 leading-relaxed">
+            This will be picked up automatically within a few minutes, or you can add it now.
+          </p>
+          <button
+            onClick={() => onSchedule()}
+            className="mt-1.5 text-xs font-medium text-white bg-amber-600 hover:bg-amber-500 px-2.5 py-1 rounded-lg transition-colors"
+          >
+            Schedule now
+          </button>
+        </div>
+      )}
+
+      {/* A platform we can't publish to is the ordinary case, not a failure — stated plainly
+          so "only LinkedIn was scheduled" never reads as something having gone wrong. */}
+      {skipped.map((s) => (
+        <p key={s.platform} className="text-xs text-[#9E9893] leading-relaxed">
+          {platformLabel(s.platform)}: {s.reason}
+        </p>
+      ))}
+    </div>
+  );
+}
+
+/** One post on the calendar: which platform, where it got to, and when it goes out. */
+function ScheduledLine({ post }: { post: ScheduledSlotPost }) {
+  const state = DELIVERY_STATE[post.status] ?? {
+    verb: post.status,
+    className: "text-[#6B6561]",
+    icon: "•",
+  };
+  return (
+    <p className={`text-xs font-medium ${state.className}`}>
+      {state.icon} {platformLabel(post.platform)} {state.verb} {formatSlot(post.scheduled_at)}
+    </p>
+  );
+}
+
+/**
+ * A slot whose posting window has already gone, and the two ways out of it.
+ *
+ * Approving a draft after its slot has passed used to be a dead end: the post was dropped with
+ * "that time has already passed" and the only thing the UI offered was the button that had
+ * just failed. The copy is fine — it is the clock that moved — so the choice is only ever
+ * *when*, and both answers live here: let the planner take the next occurrence of the slot's
+ * own window, or name a time.
+ */
+function MissedSlot({
+  missed,
+  onSchedule,
+}: {
+  missed: SkipReason[];
+  onSchedule: (reschedule?: RescheduleChoice) => void;
+}) {
+  const [customTime, setCustomTime] = useState("");
+  const [showPicker, setShowPicker] = useState(false);
+
+  return (
+    <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+      <p className="text-xs text-amber-800 font-medium">
+        {missed.length === 1
+          ? `${platformLabel(missed[0].platform)}: that posting time has passed`
+          : "Those posting times have passed"}
+      </p>
+      <p className="text-[11px] text-amber-700 mt-0.5 leading-relaxed">
+        The post is written and approved — it just needs a new time.
+      </p>
+
+      <div className="flex flex-wrap items-center gap-2 mt-1.5">
+        {/* The default action, because it keeps the window the plan chose and only moves the
+            day — a morning post stays a morning post. */}
+        <button
+          onClick={() => onSchedule({ auto_reschedule: true })}
+          className="text-xs font-medium text-white bg-amber-600 hover:bg-amber-500 px-2.5 py-1 rounded-lg transition-colors"
+        >
+          Post at the next best time
+        </button>
+        {!showPicker && (
+          <button
+            onClick={() => setShowPicker(true)}
+            className="text-xs font-medium text-amber-800 hover:underline"
+          >
+            or pick a time
+          </button>
+        )}
+      </div>
+
+      {showPicker && (
+        <div className="flex flex-wrap items-center gap-2 mt-2">
+          <input
+            type="datetime-local"
+            value={customTime}
+            min={minSchedulableTime()}
+            onChange={(e) => setCustomTime(e.target.value)}
+            className="bg-white border border-amber-200 rounded-lg px-2 py-1 text-xs text-[#1B1A17]"
+          />
+          <button
+            onClick={() => onSchedule({ scheduled_at: customTime })}
+            disabled={!customTime}
+            className="text-xs font-medium text-white bg-amber-600 hover:bg-amber-500 disabled:bg-amber-300 px-2.5 py-1 rounded-lg transition-colors"
+          >
+            Schedule
+          </button>
         </div>
       )}
     </div>
   );
+}
+
+/**
+ * The earliest time the picker will accept, as a `datetime-local` value.
+ *
+ * Matches the backend's own 15-minute lead, so the browser rules out a time the server would
+ * only reject after a round trip. Formatted from local components — `toISOString` would give
+ * UTC and offer the user a time in the wrong timezone.
+ */
+function minSchedulableTime(): string {
+  const soonest = new Date(Date.now() + 15 * 60 * 1000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return (
+    `${soonest.getFullYear()}-${pad(soonest.getMonth() + 1)}-${pad(soonest.getDate())}` +
+    `T${pad(soonest.getHours())}:${pad(soonest.getMinutes())}`
+  );
+}
+
+/** Platform ids are lowercase throughout the API; capitalise for prose. */
+function platformLabel(platform: string): string {
+  return platform.charAt(0).toUpperCase() + platform.slice(1);
+}
+
+/** Renders an ISO instant in the reader's own locale — the stored slot time is authoritative,
+ * this is only how it reads back. */
+function formatSlot(scheduledAt: string): string {
+  const when = new Date(scheduledAt);
+  return Number.isNaN(when.getTime())
+    ? scheduledAt
+    : when.toLocaleString(undefined, {
+        weekday: "short",
+        day: "numeric",
+        month: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
 }

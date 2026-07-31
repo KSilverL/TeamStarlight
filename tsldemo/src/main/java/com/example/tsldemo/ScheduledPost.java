@@ -86,6 +86,16 @@ public class ScheduledPost {
     @Column(columnDefinition = "TEXT")
     private String lastError;
 
+    /** The posting-plan slot this came from, when it was scheduled by the plan handoff rather
+     * than created by hand. Null for anything scheduled directly from the calendar or chat.
+     *
+     * <p>Carries two jobs: it makes re-running the handoff idempotent (a slot that already has
+     * a live post for a platform is skipped rather than duplicated), and it lets a plan show
+     * which posts its slots actually produced. */
+    private String sourcePlanId;
+
+    private String sourceItemId;
+
     private int attempts;
 
     private Instant createdAt;

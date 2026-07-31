@@ -176,11 +176,70 @@ interface RoundControlPrompt {
   timeout: number | null;
 }
 
+/**
+ * Today's date in the *browser's* timezone, as YYYY-MM-DD.
+ *
+ * Built from local components rather than `toISOString().slice(0, 10)`, which yields the UTC
+ * date — for a user west of Greenwich that is tomorrow's date all evening, and "next month"
+ * asked on the 31st would resolve a whole month wrong.
+ */
+function localToday(): string {
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
+
+// ── Posting plans in chat ─────────────────────────────────────────────────────
+
+/** One dated slot on a campaign schedule. Strategy, never copy — the posts themselves are
+ * written when the plan is confirmed. */
+interface PlanItem {
+  item_id: string;
+  planned_date: string;
+  time_of_day?: string | null;
+  platforms: string[];
+  topic: string;
+  angle?: string | null;
+  rationale?: string | null;
+  status: string;
+}
+
+interface Plan {
+  plan_id: string;
+  goal: string;
+  target_platforms: string[];
+  start_date: string;
+  end_date: string;
+  status: "draft" | "active" | string;
+  strategy_summary?: string;
+  recommended_cadence?: string;
+  items: PlanItem[];
+}
+
+/**
+ * Where a campaign request has got to, across turns.
+ *
+ * `POST /intake/classify` is stateless — it holds no session — so the accumulated `known` IS
+ * the conversation, and passing it back is what tells the service the campaign conversation is
+ * still open. A ref rather than state for the same reason `sessionIdRef` is: `handleSend`
+ * reads and writes it within one turn, and a re-render in between would race it.
+ */
+type CampaignPhase =
+  | "gathering"    // still filling in the goal / date window
+  | "clarifying";  // asked the planner's follow-up questions, waiting on the reply
+
+interface CampaignState {
+  phase: CampaignPhase;
+  known: Record<string, string>;
+  followupsAsked: number;
+  questions: string[];
+}
+
 interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
-  variant?: "status" | "draft" | "text-preview" | "html-preview" | "roundtable";
+  variant?: "status" | "draft" | "text-preview" | "html-preview" | "roundtable" | "plan-preview";
   platform?: Platform;
   draft?: DraftContent;
   html?: string;
@@ -207,6 +266,9 @@ interface Message {
   roundtableConverged?: boolean;
   roundtableStrategy?: string;
   roundControlWaiting?: RoundControlPrompt | null;
+  // The draft campaign schedule (variant === "plan-preview"). Grows in place: refining
+  // replaces it, confirming flips its status, so the card is always the plan's current truth.
+  plan?: Plan;
   // Set on voice turns (native speech-to-speech) once the clip is fully assembled —
   // an object URL for a WAV blob built client-side from the raw PCM16 the session
   // streamed, so the turn's audio can be replayed/downloaded from its bubble.
@@ -516,6 +578,179 @@ export default function ChatPage() {
     playNextRoundtableAudio();
   }
 
+  /**
+   * The JWT, for the routes that need one.
+   *
+   * The chat's own workflow calls go straight to the LLM service unauthenticated, but every
+   * plan route runs through Java, which derives `business_id` from this token — without it a
+   * plan is created against no brand, so the brand-voice profile silently never applies.
+   */
+  function authHeaders(): Record<string, string> {
+    const token = localStorage.getItem("starlight_token");
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  }
+
+  // ── Posting-plan path ───────────────────────────────────────────────────────
+
+  /**
+   * Handles one turn of a campaign request, and reports whether it took it.
+   *
+   * Returns false for an ordinary "write me a post" turn, which then flows on to `genWorkflow`
+   * exactly as it always did — the plan path is a fork in front of the existing behaviour, not
+   * a replacement for it.
+   */
+  async function handleCampaignTurn(text: string): Promise<boolean> {
+    // Mid-clarify: this turn is the answer to the planner's questions, not a new request.
+    if (campaignRef.current?.phase === "clarifying") {
+      await buildPlan(campaignRef.current.known, campaignRef.current.questions, text);
+      return true;
+    }
+
+    let result: Record<string, unknown>;
+    try {
+      const res = await fetch("/api/intake/classify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: text,
+          // The browser's own local date — genuinely the user's timezone, which is what makes
+          // "next month" resolvable. A server-side guess is a month out at a boundary.
+          today: localToday(),
+          target_platforms: selectedPlatforms,
+          known: campaignRef.current?.known,
+          followups_asked: campaignRef.current?.followupsAsked ?? 0,
+        }),
+      });
+      result = await res.json();
+      if (!res.ok || result.error) return false;  // fall back to the ordinary post path
+    } catch {
+      return false;  // classifying is an optimisation, never a reason to refuse the message
+    }
+
+    if (result.intent !== "posting_plan") {
+      campaignRef.current = null;
+      return false;
+    }
+
+    const campaign = (result.campaign ?? {}) as Record<string, string>;
+
+    // Still missing the goal or the window — ask, and keep what we have for the next turn.
+    if (!result.complete) {
+      campaignRef.current = {
+        phase: "gathering",
+        known: campaign,
+        followupsAsked: (result.followups_asked as number) ?? 0,
+        questions: [],
+      };
+      const question = (result.assistant_message as string) ?? "Tell me a bit more.";
+      pushMessage({ role: "assistant", content: question });
+      if (sessionIdRef.current) persistMessage(sessionIdRef.current, "assistant", question);
+      return true;
+    }
+
+    await startClarify(campaign);
+    return true;
+  }
+
+  /**
+   * The pre-generation step: propose a cadence and ask what would tailor the schedule.
+   *
+   * Worth a turn because these answers shape every slot, and they are far cheaper to give now
+   * than to fix by refining a plan that was built without them. If the planner has nothing to
+   * ask, this falls straight through to building the plan.
+   */
+  async function startClarify(campaign: Record<string, string>) {
+    pushMessage({ role: "assistant", content: "Working out the shape of this campaign…", variant: "status" });
+
+    let data: Record<string, unknown> = {};
+    try {
+      const res = await fetch("/api/plans/clarify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify(campaign),
+      });
+      data = await res.json();
+      if (!res.ok || data.error) data = {};  // a failed clarify is skippable, not fatal
+    } catch {
+      data = {};
+    }
+
+    const questions = Array.isArray(data.follow_up_questions)
+      ? (data.follow_up_questions as string[])
+      : [];
+
+    if (questions.length === 0) {
+      await buildPlan(campaign, [], "");
+      return;
+    }
+
+    campaignRef.current = {
+      phase: "clarifying",
+      known: campaign,
+      followupsAsked: 0,
+      questions,
+    };
+
+    const cadence = (data.recommended_cadence as string) ?? "";
+    const message = [
+      cadence ? `I'd suggest ${cadence}.` : "",
+      "Before I build it:",
+      ...questions.map((q) => `• ${q}`),
+      "",
+      "Answer what you can — or just say \"go ahead\" and I'll use my best judgement.",
+    ].filter(Boolean).join("\n");
+
+    pushMessage({ role: "assistant", content: message });
+    if (sessionIdRef.current) persistMessage(sessionIdRef.current, "assistant", message);
+  }
+
+  /** Generates the schedule and shows it as a card. */
+  async function buildPlan(
+    campaign: Record<string, string>,
+    questions: string[],
+    answerText: string
+  ) {
+    campaignRef.current = null;
+    pushMessage({ role: "assistant", content: "Designing your campaign schedule…", variant: "status" });
+
+    // The planner renders `answers` as Q/A lines for its prompt, and a free-text reply can't be
+    // reliably split across the questions it answers — so the whole block is sent as one pair.
+    // It reads correctly in the prompt, which is all the planner needs.
+    const answers =
+      questions.length > 0 && answerText.trim()
+        ? { [questions.join(" / ")]: answerText.trim() }
+        : undefined;
+
+    try {
+      const res = await fetch("/api/plans", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ ...campaign, ...(answers ? { answers } : {}) }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        pushMessage({
+          role: "assistant",
+          content: data.error ?? "I couldn't build that schedule. Try giving me the goal and dates again.",
+        });
+        return;
+      }
+      pushMessage({
+        role: "assistant",
+        content: "Here's the campaign I'd run — review it, ask for changes, or confirm to write the posts:",
+        variant: "plan-preview",
+        plan: data as Plan,
+      });
+    } catch {
+      pushMessage({ role: "assistant", content: "Could not reach the planning service." });
+    }
+  }
+
+  /** Swaps a plan card's plan in place, so refining and confirming update the same card. */
+  function updatePlanMessage(messageId: string, plan: Plan) {
+    setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, plan } : m)));
+  }
+
   /** Fire-and-forget: persist a message to the backend. Non-fatal if it fails. */
   async function persistMessage(sessionId: string, role: "user" | "assistant", content: string) {
     const token = localStorage.getItem("starlight_token");
@@ -533,6 +768,10 @@ export default function ChatPage() {
       console.log("Persistance failure. Request not saved to session.")
     }
   }
+  // Where a campaign request has got to. Null means no campaign conversation is open, which is
+  // also what tells the classifier to judge the next turn on its own merits.
+  const campaignRef = useRef<CampaignState | null>(null);
+
   const [pastSessions, setPastSessions] = useState<SessionSummary[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
@@ -1202,15 +1441,17 @@ export default function ChatPage() {
       persistMessage(sessionIdRef.current, "user", trimmed);
     }
 
-    // Single workflow call — the MAF pipeline generates text drafts, brand
-    // animations, and video specs in one pass. genWorkflow() gates which output
-    // cards are shown based on the current contentTypes selection.
-    const jobs: Promise<void>[] = [];
-    jobs.push(genWorkflow(trimmed));
-
     setIsLoading(true);
     try {
-      await Promise.allSettled(jobs);
+      // Is this a campaign rather than a post? Asked first, because the answer decides which
+      // of two entirely different pipelines runs. A turn that isn't one — or a classifier that
+      // is unreachable — falls straight through to the workflow path below, unchanged.
+      if (await handleCampaignTurn(trimmed)) return;
+
+      // Single workflow call — the MAF pipeline generates text drafts, brand
+      // animations, and video specs in one pass. genWorkflow() gates which output
+      // cards are shown based on the current contentTypes selection.
+      await genWorkflow(trimmed);
     } finally {
       setIsLoading(false);
     }
@@ -1444,6 +1685,20 @@ export default function ChatPage() {
                   formatTime={formatTime}
                   autoPlayAudio={autoPlayRoundtableAudio}
                   onToggleAutoPlayAudio={toggleAutoPlayRoundtableAudio}
+                />
+              );
+            }
+
+            if (msg.variant === "plan-preview" && msg.plan) {
+              return (
+                <PlanCard
+                  key={msg.id}
+                  message={msg}
+                  plan={msg.plan}
+                  authHeaders={authHeaders}
+                  onPlanChanged={(plan) => updatePlanMessage(msg.id, plan)}
+                  onNotice={(text) => pushMessage({ role: "assistant", content: text })}
+                  formatTime={formatTime}
                 />
               );
             }
@@ -2591,6 +2846,204 @@ function StoryboardPreview({ storyboard }: { storyboard: VideoStoryboard }) {
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+// ── Posting Plan Card ─────────────────────────────────────────────────────────
+
+interface PlanCardProps {
+  message: Message;
+  plan: Plan;
+  authHeaders: () => Record<string, string>;
+  onPlanChanged: (plan: Plan) => void;
+  onNotice: (text: string) => void;
+  formatTime: (d: Date) => string;
+}
+
+/**
+ * The campaign schedule, in chat.
+ *
+ * Shows what would go out and when — strategy, never copy, because the posts themselves are
+ * not written until the plan is confirmed. Two actions carry the whole loop: **refine**
+ * regenerates the schedule from free-text feedback, and **confirm** activates it and starts
+ * writing every post.
+ *
+ * Per-slot editing lives on the full plans page rather than here. Chat is the right place to
+ * say "more Instagram, push harder in the final week" and see the schedule change; it is a
+ * poor place to retype one slot's topic, and the plans page already does that well.
+ */
+function PlanCard({
+  message,
+  plan,
+  authHeaders,
+  onPlanChanged,
+  onNotice,
+  formatTime,
+}: PlanCardProps) {
+  const [feedback, setFeedback] = useState("");
+  const [busy, setBusy] = useState<"refining" | "confirming" | null>(null);
+
+  const isDraft = plan.status === "draft";
+
+  async function handleRefine() {
+    const text = feedback.trim();
+    if (!text || busy) return;
+
+    setBusy("refining");
+    try {
+      const res = await fetch(`/api/plans/${plan.plan_id}/refine`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ feedback: text }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        onNotice(data.error ?? "I couldn't revise that plan.");
+        return;
+      }
+      // Same plan_id, so the card updates in place rather than stacking a second schedule
+      // below the first — the user is iterating on one campaign, not collecting drafts.
+      onPlanChanged(data as Plan);
+      setFeedback("");
+    } catch {
+      onNotice("Could not reach the planning service.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleConfirm() {
+    if (busy) return;
+
+    setBusy("confirming");
+    try {
+      const res = await fetch(`/api/plans/${plan.plan_id}/confirm`, {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        onNotice(data.error ?? "I couldn't confirm that plan.");
+        return;
+      }
+      onPlanChanged(data as Plan);
+      onNotice(
+        `Confirmed — I'm writing all ${plan.items.length} posts now. They'll appear in your ` +
+        `review queue as they're ready, and nothing publishes until you approve it.`
+      );
+    } catch {
+      onNotice("Could not reach the planning service.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="w-full max-w-lg">
+      <p className="text-sm text-[#6B6561] mb-2">{message.content}</p>
+
+      <div className="bg-white border border-[#E8E3DA] rounded-2xl overflow-hidden shadow-sm">
+        <div className="px-4 py-3 bg-[#1B1A17] text-white">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm font-semibold truncate">{plan.goal}</p>
+            <span
+              className={`text-[10px] px-2 py-0.5 rounded-full font-medium flex-shrink-0 ${
+                isDraft ? "bg-white/15 text-white" : "bg-green-500 text-white"
+              }`}
+            >
+              {isDraft ? "draft" : plan.status}
+            </span>
+          </div>
+          <p className="text-[11px] text-white/60 mt-0.5">
+            {plan.start_date} → {plan.end_date} · {plan.items.length} posts
+          </p>
+        </div>
+
+        {plan.strategy_summary && (
+          <p className="px-4 py-2.5 text-xs text-[#6B6561] leading-relaxed border-b border-[#E8E3DA] bg-[#FFF9F5]">
+            {plan.strategy_summary}
+          </p>
+        )}
+
+        {/* Capped height: a six-week campaign is 20+ slots, and a card that long buries the
+            actions the user needs at the bottom of it. */}
+        <div className="max-h-72 overflow-y-auto divide-y divide-[#F2EDE4]">
+          {plan.items.map((item) => (
+            <div key={item.item_id} className="px-4 py-2.5">
+              <div className="flex items-center gap-2 flex-wrap mb-0.5">
+                <span className="text-xs font-semibold text-[#1B1A17]">{item.planned_date}</span>
+                {item.time_of_day && (
+                  <span className="text-[10px] text-[#9E9893]">{item.time_of_day}</span>
+                )}
+                {item.platforms.map((p) => (
+                  <span
+                    key={p}
+                    className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-[#F2EDE4] text-[#6B6561]"
+                  >
+                    {p}
+                  </span>
+                ))}
+              </div>
+              <p className="text-sm text-[#1B1A17]">{item.topic}</p>
+              {item.rationale && (
+                <p className="text-[11px] text-[#9E9893] mt-0.5 leading-relaxed">{item.rationale}</p>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {isDraft ? (
+          <div className="p-3 border-t border-[#E8E3DA] bg-[#F8F5EE] space-y-2">
+            <div className="flex gap-2">
+              <input
+                value={feedback}
+                onChange={(e) => setFeedback(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    handleRefine();
+                  }
+                }}
+                placeholder="Ask for changes — e.g. more Instagram, fewer promos"
+                disabled={busy !== null}
+                className="flex-1 min-w-0 bg-white border border-[#E8E3DA] rounded-lg px-3 py-1.5 text-xs placeholder:text-[#C8C2BA] disabled:opacity-50"
+              />
+              <button
+                onClick={handleRefine}
+                disabled={busy !== null || !feedback.trim()}
+                className="text-xs font-medium text-[#FF4800] hover:underline disabled:opacity-40 disabled:no-underline flex-shrink-0 px-1"
+              >
+                {busy === "refining" ? "Revising…" : "Revise"}
+              </button>
+            </div>
+
+            <button
+              onClick={handleConfirm}
+              disabled={busy !== null}
+              className="w-full bg-green-600 hover:bg-green-500 disabled:bg-green-300 text-white text-xs font-medium py-2 rounded-lg transition-colors"
+            >
+              {busy === "confirming"
+                ? "Confirming…"
+                : `Confirm — write all ${plan.items.length} posts`}
+            </button>
+            <p className="text-[11px] text-[#9E9893] text-center leading-relaxed">
+              Every post is drafted for you to review. Nothing publishes until you approve it.
+            </p>
+          </div>
+        ) : (
+          <div className="p-3 border-t border-[#E8E3DA] bg-[#F8F5EE] text-center">
+            <p className="text-xs text-green-700 font-medium mb-1">
+              ✓ Confirmed — writing {plan.items.length} posts
+            </p>
+            <Link href="/plans" className="text-xs text-[#FF4800] hover:underline">
+              Track them in Posting Plans →
+            </Link>
+          </div>
+        )}
+      </div>
+
+      <p className="text-[10px] text-[#C8C2BA] mt-1">{formatTime(message.timestamp)}</p>
     </div>
   );
 }

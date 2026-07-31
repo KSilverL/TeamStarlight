@@ -97,6 +97,16 @@ public class ScheduledPostService {
     //////////////////////////////////////////////////////// CRUD ////////////////////////////////////////////////////////
 
     public ScheduledPost create(long businessId, ScheduledPostReqDTO request) {
+        return create(businessId, request, null, null);
+    }
+
+    /**
+     * @param sourcePlanId the posting-plan slot this came from, or null when the post was
+     *                     created directly. Recorded so the plan handoff can tell an already
+     *                     scheduled slot from a new one.
+     */
+    public ScheduledPost create(long businessId, ScheduledPostReqDTO request,
+                                String sourcePlanId, String sourceItemId) {
         PlatformEnum platform = parsePlatform(request.platform());
         String message = requireMessage(request.message());
         ZoneId zone = parseZone(request.timezone());
@@ -121,6 +131,8 @@ public class ScheduledPostService {
         post.setPageIds(pageIds);
         post.setStatus(ScheduledPostStatus.SCHEDULED);
         post.setAttempts(0);
+        post.setSourcePlanId(sourcePlanId);
+        post.setSourceItemId(sourceItemId);
         post.setCreatedAt(Instant.now());
         post.setUpdatedAt(Instant.now());
 

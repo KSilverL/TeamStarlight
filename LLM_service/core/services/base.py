@@ -168,6 +168,36 @@ class LLMService(ABC):
         ...
 
     @abstractmethod
+    async def classify_request(
+        self,
+        *,
+        message: str,
+        today: str,
+        platforms: List[str],
+        known: Optional[dict] = None,
+        history: Optional[List[dict]] = None,
+    ) -> dict:
+        """Decide whether this chat turn is asking for ONE post or a whole CAMPAIGN, and
+        extract the campaign fields in the same pass — as a JSON-friendly dict matching
+        core.intent_schema.RequestClassification.
+
+        One call rather than two because the fields that distinguish the two intents (a goal,
+        a date range, a pace) are exactly the ones the campaign path needs next; classifying
+        and then re-reading the same sentence to extract them would be a wasted round trip.
+
+        `today` is the caller's date (YYYY-MM-DD) in the *user's* timezone, and is REQUIRED
+        for relative windows: "next month" is only resolvable against a known today, and this
+        service has no clock of its own. Implementations must resolve any relative period into
+        absolute `start_date` / `end_date` and leave them "" when the user named no period.
+
+        `known` carries what earlier turns already settled (the caller accumulates it and
+        passes it back — the conversation is stateless here), so a turn answering "what's the
+        goal?" doesn't lose the window a previous turn established. `platforms` are supplied by
+        the caller and never asked about, matching intake's existing rule.
+        """
+        ...
+
+    @abstractmethod
     async def clarify_campaign(
         self,
         *,
