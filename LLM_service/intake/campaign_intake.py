@@ -62,10 +62,15 @@ class CampaignConversation:
         business_id: Optional[str] = None,
         user_id: Optional[str] = None,
     ) -> dict:
-        """Returns {intent, complete, campaign, question, assistant_message, followups_asked}.
+        """Returns {intent, complete, campaign, question, assistant_message, followups_asked,
+        publish_at}.
 
         On `intent == "single_post"` it returns immediately with no campaign — the caller takes
-        the ordinary `POST /tasks` path and this engine never sees the conversation again.
+        the ordinary `POST /tasks` path and this engine never sees the conversation again. That
+        return carries `publish_at`, the one thing the single-post path needs from this call
+        beyond the verdict itself: the moment the user asked the post to go out at, if they
+        named one. It is a proposal for the caller's schedule controls, not an instruction —
+        nothing is queued until the user confirms it.
         """
         raw = await factory.get_llm().classify_request(
             message=message, today=today, platforms=platforms,
@@ -96,6 +101,7 @@ class CampaignConversation:
                 "question": None,
                 "assistant_message": None,
                 "followups_asked": followups_asked,
+                "publish_at": classification.publish_at,
             }
 
         settled = self._merge(known or {}, classification)
@@ -117,6 +123,10 @@ class CampaignConversation:
                 "question": _QUESTIONS[field],
                 "assistant_message": _QUESTIONS[field],
                 "followups_asked": followups_asked + 1,
+                # Always present, always blank on this path: a campaign is a window and a
+                # cadence, not one moment. Kept in the shape so the caller can read one key
+                # unconditionally rather than branching on intent to know if it exists.
+                "publish_at": "",
             }
 
         brief = CampaignBrief(
@@ -146,6 +156,7 @@ class CampaignConversation:
                 f"{', '.join(brief.target_platforms)}."
             ),
             "followups_asked": followups_asked,
+            "publish_at": "",
         }
 
     #: Every field the partial campaign carries. Fixed so an in-progress campaign always has

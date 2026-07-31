@@ -313,6 +313,85 @@ def _parse_window(text: str, today: str) -> tuple[str, str]:
     return "", ""
 
 
+#: The hour a named day defaults to when the user gives a day but no clock time ("post it on
+#: Friday"). Mirrors the instruction in the real prompt so mock and Azure agree. Nothing
+#: publishes off this — it pre-fills a control the user still has to confirm.
+_DEFAULT_PUBLISH_HOUR = 9
+
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
+def _parse_clock(text: str) -> Optional[tuple[int, int]]:
+    """The (hour, minute) in "at 10", "at 10:30pm", "@ 9am" — or None if no time is stated.
+
+    Anchored on "at"/"@" so a bare number elsewhere in the sentence ("our 5 best tips") can't
+    be mistaken for a publish time."""
+    m = re.search(r"\b(?:at|@)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", text)
+    if not m:
+        return None
+
+    hour = int(m.group(1))
+    minute = int(m.group(2) or 0)
+    meridiem = m.group(3)
+
+    if meridiem == "pm" and hour != 12:
+        hour += 12
+    elif meridiem == "am" and hour == 12:
+        hour = 0
+
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute
+
+
+def _parse_publish_day(text: str, base: date) -> Optional[date]:
+    """The day named in the sentence, resolved against `base`. None when no day is stated."""
+    explicit = re.search(r"\d{4}-\d{2}-\d{2}", text)
+    if explicit:
+        try:
+            return date.fromisoformat(explicit.group(0))
+        except ValueError:
+            return None
+
+    if "tomorrow" in text:
+        return base + timedelta(days=1)
+    if "today" in text or "tonight" in text:
+        return base
+
+    for offset, name in enumerate(_WEEKDAYS):
+        if name not in text:
+            continue
+        # The next one strictly ahead: "post it on Friday" said on a Friday means next Friday,
+        # not one already most of the way through.
+        ahead = (offset - base.weekday()) % 7
+        return base + timedelta(days=ahead or 7)
+
+    return None
+
+
+def _parse_publish_at(text: str, today: str) -> str:
+    """When a one-off post should go out, as "YYYY-MM-DDTHH:MM", or "" if no time was named.
+
+    The deterministic counterpart to the real prompt's publish_at rule, covering the shapes the
+    tests and the demo path actually use. Returns "" rather than guessing whenever the sentence
+    names neither a day nor a time — the same "user said nothing about timing" answer the real
+    model gives, and the answer that leaves the draft card on Post Now."""
+    try:
+        base = date.fromisoformat(today)
+    except ValueError:
+        return ""
+
+    day = _parse_publish_day(text, base)
+    clock = _parse_clock(text)
+    if day is None and clock is None:
+        return ""
+
+    hour, minute = clock or (_DEFAULT_PUBLISH_HOUR, 0)
+    return datetime.combine(day or base, datetime.min.time()).replace(
+        hour=hour, minute=minute
+    ).strftime("%Y-%m-%dT%H:%M")
+
+
 def _extract_goal(message: str) -> str:
     """The campaign goal, when the sentence states one. Mirrors `_free_extract`'s "to <verb> …"
     rule, plus the "for our <thing>" shape a campaign request tends to use."""
@@ -617,7 +696,13 @@ class MockLLM(LLMService):
             is_plan = True
 
         if not is_plan:
-            return RequestClassification(intent="single_post").model_dump()
+            # The one place publish_at is meaningful: a single post the user wants held until a
+            # stated moment. A campaign's timing is its window plus a cadence, so the plan
+            # branch below leaves it blank.
+            return RequestClassification(
+                intent="single_post",
+                publish_at=_parse_publish_at(text, today),
+            ).model_dump()
 
         start, end = _parse_window(text, today)
         return RequestClassification(

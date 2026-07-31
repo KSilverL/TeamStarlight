@@ -4,7 +4,7 @@ const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:8081";
 
 // Regenerates a DRAFT plan in place from free-text feedback — same plan_id, still a draft.
 //
-// This is the satisfaction loop: "more Instagram, fewer promos, push harder in the final week"
+// This is the satisfaction loop: "more Facebook, fewer promos, push harder in the final week"
 // rewrites the whole schedule. For a single-slot tweak the caller should PATCH the item instead
 // of regenerating everything.
 export async function POST(

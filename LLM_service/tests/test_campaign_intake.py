@@ -98,6 +98,60 @@ async def test_campaign_requests_route_to_the_planner(conversation, message):
     assert result["intent"] == "posting_plan"
 
 
+# ── publish_at: when a one-off post should go out ────────────────────────────
+#
+# The chat could always write a post and always schedule one, but never in the same breath:
+# "post this on Friday at 10" produced a draft with empty date/time controls, because the
+# classifier had nowhere to put the time it had just read. TODAY is a Friday, which makes the
+# weekday cases below meaningfully different from "tomorrow".
+
+def test_publish_at_normalises_to_minute_precision():
+    assert RequestClassification(publish_at="2026-08-07T10:00:00").publish_at == "2026-08-07T10:00"
+    assert RequestClassification(publish_at="").publish_at == ""
+
+
+def test_publish_at_rejects_junk_and_zoned_times():
+    with pytest.raises(ValidationError):
+        RequestClassification(publish_at="friday morning")
+    # A zone here would be this service inventing the one fact it is documented not to know.
+    with pytest.raises(ValidationError):
+        RequestClassification(publish_at="2026-08-07T10:00:00+01:00")
+
+
+@pytest.mark.parametrize("message, expected", [
+    ("Write a LinkedIn post about the launch and post it tomorrow at 10am", "2026-08-01T10:00"),
+    ("Draft a post and schedule it for tomorrow at 14:30", "2026-08-01T14:30"),
+    ("Write a post about the roastery and send it out on Monday at 9am", "2026-08-03T09:00"),
+    # Today IS Friday, so "on Friday" means the next one — not one already most of the way gone.
+    ("Post this on Friday at 8am", "2026-08-07T08:00"),
+    ("Write a caption and post it today at 5pm", "2026-07-31T17:00"),
+    # A day with no clock time takes the documented 09:00 default.
+    ("Write a post about the espresso blend and publish it tomorrow", "2026-08-01T09:00"),
+])
+async def test_a_named_time_is_carried_back_for_a_single_post(conversation, message, expected):
+    result = await _turn(conversation, message)
+
+    assert result["intent"] == "single_post"
+    assert result["publish_at"] == expected
+
+
+async def test_no_stated_time_leaves_publish_at_blank(conversation):
+    # Blank is what leaves the draft card on "Post Now". Guessing a time would put a post on
+    # the calendar the user never asked to defer.
+    result = await _turn(conversation, "Write me a LinkedIn post about our new espresso blend")
+
+    assert result["publish_at"] == ""
+
+
+async def test_a_campaign_never_carries_a_single_publish_moment(conversation):
+    # A campaign's timing is its window plus a cadence. One moment would be meaningless, and
+    # the key is still present so the caller can read it without branching on intent.
+    result = await _turn(conversation, "Plan my posts for next month")
+
+    assert result["intent"] == "posting_plan"
+    assert result["publish_at"] == ""
+
+
 # ── Date resolution (the whole reason `today` is a parameter) ─────────────────
 
 async def test_next_month_resolves_to_that_calendar_month(conversation):

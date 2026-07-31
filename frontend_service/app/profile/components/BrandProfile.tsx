@@ -388,7 +388,7 @@ export default function BrandProfile() {
           )}
         </div>
         <p className="text-xs text-[#9E9893] mb-4">
-          Connect a Meta Developer app so approved Instagram drafts can publish to a Facebook
+          Connect a Meta Developer app so approved Facebook drafts can publish to a Facebook
           Page. Text, images, and videos are supported.
         </p>
 

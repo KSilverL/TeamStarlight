@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "Starlight — AI Social Media Content",
-  description: "AI-powered multi-agent social media content generation for X, Instagram, TikTok, and LinkedIn",
+  description: "AI-powered multi-agent social media content generation for X, Facebook, TikTok, and LinkedIn",
 };
 
 export default function RootLayout({

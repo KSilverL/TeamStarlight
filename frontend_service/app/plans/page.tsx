@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
 import DashboardSidebar from "../components/DashboardSidebar";
 
-type Platform = "x" | "instagram" | "tiktok" | "linkedin";
+type Platform = "x" | "facebook" | "tiktok" | "linkedin";
 type ContentType = "text" | "video" | "brand";
 
 interface PlanItem {
@@ -35,7 +35,7 @@ interface Plan {
 
 const PLATFORMS: { id: Platform; label: string; abbr: string; badgeClass: string }[] = [
   { id: "x", label: "X (Twitter)", abbr: "X", badgeClass: "bg-[#1B1A17] text-white" },
-  { id: "instagram", label: "Instagram", abbr: "IG", badgeClass: "bg-pink-600 text-white" },
+  { id: "facebook", label: "Facebook", abbr: "f", badgeClass: "bg-[#1877F2] text-white" },
   { id: "tiktok", label: "TikTok", abbr: "TK", badgeClass: "bg-[#1B1A17] text-white" },
   { id: "linkedin", label: "LinkedIn", abbr: "in", badgeClass: "bg-blue-600 text-white" },
 ];
@@ -836,7 +836,7 @@ function getSelectedPageIds(): number[] {
 }
 
 /** Why the handoff passed over a platform — the part of its answer that isn't already visible
- * as a row on the calendar ("Instagram has no publishing integration yet").
+ * as a row on the calendar ("TikTok has no publishing integration yet").
  *
  * `reason_code` is what decides whether anything can be done about it. Only `time_passed` is
  * recoverable, and only it gets the reschedule controls; matching the English sentence instead

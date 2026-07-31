@@ -4,7 +4,7 @@ import { useState, useRef, useEffect } from "react";
 import Link from "next/link";
 import { useRealtimeVoice, type VoiceBriefPartial } from "./useRealtimeVoice";
 
-type Platform = "x" | "instagram" | "tiktok" | "linkedin";
+type Platform = "x" | "facebook" | "tiktok" | "linkedin";
 
 interface SessionSummary {
   id: string;
@@ -252,6 +252,10 @@ interface Message {
   // the real publish is the native video post (video + this copy as caption), so the draft
   // card hides its own text/image post buttons and points the user to the video card below.
   videoAlsoRequested?: boolean;
+  // "YYYY-MM-DDTHH:MM" when the request that produced this draft named a time to publish at
+  // ("post this on Friday at 10"). The draft card opens on Schedule with it filled in instead
+  // of on Post Now. Absent whenever the user named no time, which is the common case.
+  publishAt?: string;
   videoStoryboard?: VideoStoryboard;
   // User-attached reference images (base64 data URLs) for image-to-video generation
   // (Higgsfield backend). Threaded from the compose box onto the storyboard message so
@@ -290,11 +294,11 @@ const PLATFORMS: {
     headerClass: "bg-[#1B1A17] text-white",
   },
   {
-    id: "instagram",
-    label: "Instagram",
-    abbr: "IG",
-    badgeClass: "bg-pink-600 text-white",
-    headerClass: "bg-gradient-to-r from-purple-600 to-pink-600 text-white",
+    id: "facebook",
+    label: "Facebook",
+    abbr: "f",
+    badgeClass: "bg-[#1877F2] text-white",
+    headerClass: "bg-[#1877F2] text-white",
   },
   {
     id: "tiktok",
@@ -330,7 +334,17 @@ const INITIAL_MESSAGES: Message[] = [
 
 const platformMap = Object.fromEntries(PLATFORMS.map((p) => [p.id, p]));
 
-// The Facebook Page id(s) the user picked in their Brand Profile. Instagram-labelled drafts
+// Sessions stored before the Facebook pivot still carry "instagram" in target_platforms.
+// Those drafts always published to a Facebook Page, so read them back under the name the
+// platform goes by now rather than showing a platform the app no longer offers.
+const LEGACY_PLATFORM_IDS: Record<string, Platform> = { instagram: "facebook" };
+
+/** Display label for a stored platform id; unknown ids fall through as-is. */
+function platformLabel(id: string): string {
+  return platformMap[LEGACY_PLATFORM_IDS[id] ?? id]?.label ?? id;
+}
+
+// The Facebook Page id(s) the user picked in their Brand Profile. Facebook drafts
 // publish to these Pages via /api/meta/post; an empty list means Facebook isn't set up yet.
 function getSelectedPageIds(): number[] {
   try {
@@ -339,6 +353,18 @@ function getSelectedPageIds(): number[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Splits the classifier's "YYYY-MM-DDTHH:MM" into the [date, time] pair the two inputs take.
+ *
+ * Anything else — an absent value, or a shape the LLM service should never produce but might —
+ * comes back as ["", ""], which leaves the draft card on Post Now. That is the right fallback:
+ * a half-parsed moment on a scheduling control is worse than no moment at all.
+ */
+function splitPublishAt(publishAt?: string): [string, string] {
+  const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/.exec(publishAt ?? "");
+  return match ? [match[1], match[2]] : ["", ""];
 }
 
 // Human-readable labels for each MAF executor shown as live status messages.
@@ -511,7 +537,7 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>(INITIAL_MESSAGES);
   const [input, setInput] = useState("");
   const [selectedPlatforms, setSelectedPlatforms] = useState<Platform[]>([
-    "instagram",
+    "facebook",
     "linkedin",
   ]);
   const [contentTypes, setContentTypes] = useState<ContentType[]>(["text"]);
@@ -606,6 +632,11 @@ export default function ChatPage() {
       return true;
     }
 
+    // Cleared up front so a time from an earlier turn can never attach itself to this one —
+    // including when classifying fails below and the turn falls through to the ordinary post
+    // path with no verdict at all.
+    requestedPublishAtRef.current = "";
+
     let result: Record<string, unknown>;
     try {
       const res = await fetch("/api/intake/classify", {
@@ -629,6 +660,12 @@ export default function ChatPage() {
 
     if (result.intent !== "posting_plan") {
       campaignRef.current = null;
+      // The one thing the single-post path wants from this call besides the verdict: the time
+      // the user asked the post to go out at, if they named one. Carried to the draft card,
+      // which opens on Schedule with it filled in — the user still confirms it, so a
+      // misheard "Friday" costs a correction rather than a post on the wrong day.
+      requestedPublishAtRef.current =
+        typeof result.publish_at === "string" ? result.publish_at : "";
       return false;
     }
 
@@ -771,6 +808,17 @@ export default function ChatPage() {
   // Where a campaign request has got to. Null means no campaign conversation is open, which is
   // also what tells the classifier to judge the next turn on its own merits.
   const campaignRef = useRef<CampaignState | null>(null);
+
+  /**
+   * The publish moment the classifier read out of the last one-off request, or "" if the user
+   * named none.
+   *
+   * A ref rather than state because nothing renders from it directly: it is set while routing
+   * the turn and read once, several seconds later, when the workflow's draft finally lands —
+   * and re-rendering the whole chat in between would buy nothing. One request is in flight at
+   * a time, so there is no interleaving to guard against.
+   */
+  const requestedPublishAtRef = useRef<string>("");
 
   const [pastSessions, setPastSessions] = useState<SessionSummary[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -1229,6 +1277,9 @@ export default function ChatPage() {
             // (caption = this copy) from the storyboard card below — so hide this card's own
             // text/image post buttons to avoid a competing second post.
             videoAlsoRequested: contentTypes.includes("video"),
+            // Set only when this turn's request actually named a time; the card falls back to
+            // Post Now otherwise.
+            publishAt: requestedPublishAtRef.current || undefined,
           });
           if (sessionIdRef.current) {
             persistMessage(sessionIdRef.current, "assistant", event.draft as string);
@@ -1512,7 +1563,7 @@ export default function ChatPage() {
                       </p>
                       {s.targetPlatforms && s.targetPlatforms.length > 0 && (
                         <p className="text-[10px] text-[#9E9893] mt-0.5 truncate">
-                          {s.targetPlatforms.join(", ")}
+                          {s.targetPlatforms.map(platformLabel).join(", ")}
                         </p>
                       )}
                     </button>
@@ -1969,9 +2020,6 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
   const [postError, setPostError] = useState<string | null>(null);
   // Reference images carried from the compose box; the user can drop any before rendering.
   const [refs, setRefs] = useState<string[]>(message.referenceImages ?? []);
-  // instagram posting
-  const [igPostStatus, setIgPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
-  const [igPostError, setIgPostError] = useState<string | null>(null);
 
   async function handlePostVideoToLinkedIn() {
     if (!jobId || !caption.trim()) return;
@@ -2004,31 +2052,8 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
       setPostError("Could not reach the backend.");
     }
   }
-  
-  async function handlePostVideoToInstagram() {
-    if (!jobId) return;
-    setIgPostStatus("posting");
-    setIgPostError(null);
-    try {
-      const res = await fetch("/api/instagram/post-video", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jobId, caption: caption ?? "" }),
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        setIgPostStatus("error");
-        setIgPostError(data.error ?? "Failed to post video to Instagram.");
-        return;
-      }
-      setIgPostStatus("posted");
-    } catch (err) {
-      setIgPostStatus("error");
-      setIgPostError("Could not reach the backend.");
-    }
-  }
 
-  // Instagram-labelled storyboards publish the rendered MP4 to the connected Facebook Page.
+  // Facebook storyboards publish the rendered MP4 to the connected Facebook Page.
   // The proxy fetches the video bytes from the LLM service by jobId, so we only pass the id.
   async function handlePostVideoToFacebook() {
     if (!jobId || !caption.trim()) return;
@@ -2231,33 +2256,9 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
             )}
           </div>
         )}
-		
-		{renderState === "done" && downloadUrl && (
-		  <div className="px-4 pb-4 pt-1 border-t border-[#E8E3DA] space-y-2">
-		    {igPostStatus === "posted" ? (
-		      <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
-		        ✓ Posted to Instagram
-		      </div>
-		    ) : (
-				<button
-				  type="button"
-				  onClick={handlePostVideoToInstagram}
-				  // disabled={igPostStatus === "posting"}
-				  className="w-full bg-gradient-to-r from-purple-600 to-pink-600 hover:opacity-90 disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-				>
-				  {igPostStatus === "posting" ? "Uploading & posting…" : "Post Video to Instagram"}
-				</button>
-		    )}
 
-		    {igPostStatus === "error" && igPostError && (
-		      <p className="text-xs text-red-600 text-center">{igPostError}</p>
-		    )}
-		  </div>
-		)}
-
-
-        {/* Instagram-labelled storyboards publish to the connected Facebook Page. */}
-        {renderState === "done" && message.platform === "instagram" && (
+        {/* Facebook storyboards publish to the connected Facebook Page. */}
+        {renderState === "done" && message.platform === "facebook" && (
           <div className="px-4 pb-4 pt-1 border-t border-[#E8E3DA] space-y-2">
             {postStatus === "posted" ? (
               <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
@@ -2870,7 +2871,7 @@ interface PlanCardProps {
  * writing every post.
  *
  * Per-slot editing lives on the full plans page rather than here. Chat is the right place to
- * say "more Instagram, push harder in the final week" and see the schedule change; it is a
+ * say "more Facebook, push harder in the final week" and see the schedule change; it is a
  * poor place to retype one slot's topic, and the plans page already does that well.
  */
 function PlanCard({
@@ -3005,7 +3006,7 @@ function PlanCard({
                     handleRefine();
                   }
                 }}
-                placeholder="Ask for changes — e.g. more Instagram, fewer promos"
+                placeholder="Ask for changes — e.g. more Facebook, fewer promos"
                 disabled={busy !== null}
                 className="flex-1 min-w-0 bg-white border border-[#E8E3DA] rounded-lg px-3 py-1.5 text-xs placeholder:text-[#C8C2BA] disabled:opacity-50"
               />
@@ -3143,8 +3144,16 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
   const draft = message.draft!;
   const approval = message.approval;
 
-  // "now" = post immediately, "schedule" = pick a date/time first
-  const [postMode, setPostMode] = useState<"now" | "schedule">("now");
+  // The moment the agent read out of the request, split into the two controls below. Absent or
+  // malformed leaves both blank, which is indistinguishable from a draft nobody timed.
+  const [agentDate, agentTime] = splitPublishAt(message.publishAt);
+
+  // "now" = post immediately, "schedule" = pick a date/time first. Opens on "schedule" when the
+  // user already said when they wanted this out — asking them to click Schedule and retype a
+  // time they just gave in the prompt is the whole gap this closes.
+  const [postMode, setPostMode] = useState<"now" | "schedule">(
+    agentDate ? "schedule" : "now"
+  );
   const [postStatus, setPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
   const [postError, setPostError] = useState<string | null>(null);
   // Image posting is tracked separately from the text post so the two buttons don't clobber
@@ -3191,9 +3200,11 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
     }
   }
 
-  // Scheduling fields — native date/time inputs give a built-in calendar UI
-  const [scheduleDate, setScheduleDate] = useState(""); // "2026-07-18"
-  const [scheduleTime, setScheduleTime] = useState(""); // "10:00"
+  // Scheduling fields — native date/time inputs give a built-in calendar UI. Seeded from the
+  // agent's reading of the request when there was one, and freely editable either way: this is
+  // a filled-in form, not a decision already taken.
+  const [scheduleDate, setScheduleDate] = useState(agentDate); // "2026-07-18"
+  const [scheduleTime, setScheduleTime] = useState(agentTime); // "10:00"
   const [scheduleStatus, setScheduleStatus] = useState<"idle" | "scheduling" | "scheduled" | "error">("idle");
   const [scheduleError, setScheduleError] = useState<string | null>(null);
 
@@ -3241,11 +3252,35 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
     }
   }
 
-  async function handleSchedulePost() {
+  /**
+   * Queues this draft for later instead of publishing it now.
+   *
+   * Goes through the shared scheduling API so the draft lands in the same persisted queue the
+   * content calendar reads — one place to see, edit and cancel it, and a schedule that survives
+   * a backend restart. The browser's timezone rides along so "10:00" means 10:00 where the user
+   * is, not in whatever zone the server runs in.
+   *
+   * @param platform the card's own platform; a card is only ever one of them, which is why the
+   *                 date/time state below can be shared between the two branches
+   * @param pageIds  Facebook Pages to publish to. Empty for LinkedIn, which has no equivalent —
+   *                 the backend ignores the field for it.
+   */
+  async function schedulePost(platform: "linkedin" | "facebook", pageIds: number[] = []) {
+    const label = platform === "facebook" ? "Facebook" : "LinkedIn";
     const token = localStorage.getItem("starlight_token");
     if (!token) {
       setScheduleStatus("error");
-      setScheduleError("Log in, then connect LinkedIn from your Brand Profile before scheduling.");
+      setScheduleError(
+        `Log in, then connect ${label} from your Brand Profile before scheduling.`
+      );
+      return;
+    }
+    // Checked here as well as on the immediate-post path: a scheduled Facebook post needs a
+    // Page just as much, and finding that out when it comes due days later would be far worse
+    // than finding out now.
+    if (platform === "facebook" && pageIds.length === 0) {
+      setScheduleStatus("error");
+      setScheduleError("Connect Facebook and pick a Page in your Brand Profile first.");
       return;
     }
     if (!scheduleDate || !scheduleTime) {
@@ -3257,10 +3292,6 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
     setScheduleError(null);
 
     try {
-      // Goes through the shared scheduling API so this draft lands in the same persisted queue
-      // the content calendar reads — one place to see, edit and cancel it, and a schedule that
-      // survives a backend restart. The browser's timezone rides along so "10:00" means 10:00
-      // where the user is, not in whatever zone the server runs in.
       const res = await fetch("/api/schedule/posts", {
         method: "POST",
         headers: {
@@ -3268,11 +3299,12 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
           Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
-          platform: "linkedin",
+          platform,
           message: fullText(),
           date: scheduleDate,
           time: scheduleTime,
           timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          page_ids: pageIds,
         }),
       });
       const data = await res.json();
@@ -3288,7 +3320,7 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
     }
   }
   
-  // Instagram-labelled drafts publish to a connected Facebook Page (see the Brand Profile
+  // Facebook drafts publish to a connected Facebook Page (see the Brand Profile
   // "Facebook Page" card). These reuse the same status states as the LinkedIn handlers — a
   // given card is only ever one platform, so they never run against each other.
   async function handlePostTextToFacebook() {
@@ -3492,6 +3524,14 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
                   </button>
                 ) : (
                   <div className="space-y-2">
+                    {/* Say where the pre-filled time came from. Without this the controls just
+                        arrive populated, and a user who didn't notice would publish on a day
+                        they never confirmed. */}
+                    {agentDate && (
+                      <p className="text-xs text-[#6B6561] bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-2.5 py-1.5 leading-relaxed">
+                        Timed from your request — adjust it here if that&apos;s not what you meant.
+                      </p>
+                    )}
                     <div className="flex gap-2">
                       <input
                         type="date"
@@ -3507,7 +3547,7 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
                       />
                     </div>
                     <button
-                      onClick={handleSchedulePost}
+                      onClick={() => schedulePost("linkedin")}
                       disabled={scheduleStatus === "scheduling"}
                       className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
                     >
@@ -3559,24 +3599,91 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
           </div>
         )}
 
-        {/* Instagram-labelled drafts publish to the connected Facebook Page (Brand Profile). */}
-        {approval === "approved" && message.platform === "instagram" && (
-          <div className="px-4 pb-4">
+        {/* Facebook drafts publish to the connected Facebook Page (Brand Profile). */}
+        {approval === "approved" && message.platform === "facebook" && (
+          <div className="px-4 pb-4 space-y-3">
             {postStatus === "posted" ? (
               <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
                 ✓ Posted to Facebook
               </div>
+            ) : scheduleStatus === "scheduled" ? (
+              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+                ✓ Scheduled for {scheduleDate} at {scheduleTime}
+              </div>
             ) : (
-              <button
-                onClick={handlePostTextToFacebook}
-                disabled={postStatus === "posting"}
-                className="w-full bg-[#1877F2] hover:bg-[#166FE0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-              >
-                {postStatus === "posting" ? "Posting…" : "Post to Facebook"}
-              </button>
-            )}
-            {postStatus === "error" && postError && (
-              <p className="text-xs text-red-600 mt-2 text-center">{postError}</p>
+              <>
+                {/* Same now/schedule choice LinkedIn drafts get. Facebook holds the schedule
+                    itself once the time is far enough out, so a scheduled post here survives
+                    this service being down at publish time. */}
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setPostMode("now")}
+                    className={`flex-1 text-sm font-medium py-1.5 rounded-lg transition-colors ${
+                      postMode === "now"
+                        ? "bg-[#1877F2] text-white"
+                        : "bg-[#F2EDE4] text-[#6B6561] border border-[#E8E3DA]"
+                    }`}
+                  >
+                    Post Now
+                  </button>
+                  <button
+                    onClick={() => setPostMode("schedule")}
+                    className={`flex-1 text-sm font-medium py-1.5 rounded-lg transition-colors ${
+                      postMode === "schedule"
+                        ? "bg-[#1877F2] text-white"
+                        : "bg-[#F2EDE4] text-[#6B6561] border border-[#E8E3DA]"
+                    }`}
+                  >
+                    Schedule
+                  </button>
+                </div>
+
+                {postMode === "now" ? (
+                  <button
+                    onClick={handlePostTextToFacebook}
+                    disabled={postStatus === "posting"}
+                    className="w-full bg-[#1877F2] hover:bg-[#166FE0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                  >
+                    {postStatus === "posting" ? "Posting…" : "Post to Facebook"}
+                  </button>
+                ) : (
+                  <div className="space-y-2">
+                    {agentDate && (
+                      <p className="text-xs text-[#6B6561] bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-2.5 py-1.5 leading-relaxed">
+                        Timed from your request — adjust it here if that&apos;s not what you meant.
+                      </p>
+                    )}
+                    <div className="flex gap-2">
+                      <input
+                        type="date"
+                        value={scheduleDate}
+                        onChange={(e) => setScheduleDate(e.target.value)}
+                        className="flex-1 bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-1.5 text-sm text-[#1B1A17] focus:outline-none focus:border-[#1877F2]"
+                      />
+                      <input
+                        type="time"
+                        value={scheduleTime}
+                        onChange={(e) => setScheduleTime(e.target.value)}
+                        className="flex-1 bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-1.5 text-sm text-[#1B1A17] focus:outline-none focus:border-[#1877F2]"
+                      />
+                    </div>
+                    <button
+                      onClick={() => schedulePost("facebook", getSelectedPageIds())}
+                      disabled={scheduleStatus === "scheduling"}
+                      className="w-full bg-[#1877F2] hover:bg-[#166FE0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                    >
+                      {scheduleStatus === "scheduling" ? "Scheduling…" : "Schedule Post"}
+                    </button>
+                  </div>
+                )}
+
+                {postStatus === "error" && postError && (
+                  <p className="text-xs text-red-600 text-center">{postError}</p>
+                )}
+                {scheduleStatus === "error" && scheduleError && (
+                  <p className="text-xs text-red-600 text-center">{scheduleError}</p>
+                )}
+              </>
             )}
 
             {/* Optional: attach an image and publish it with this caption as a photo post. */}

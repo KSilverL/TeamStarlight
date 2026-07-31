@@ -3,12 +3,14 @@
 import { useState, useRef, useEffect } from "react";
 import { PLATFORM_CONFIG } from "../data";
 import { formatDisplayDate } from "../format";
+import { getSelectedMetaPages } from "../metaPages";
+import { describeTimeProblem } from "../scheduling";
 import { isSchedulable } from "../types";
 import type { Platform, ScheduledPost, ChatMessage } from "../types";
 
 /** Order the platform picker is drawn in. Only the schedulable ones can be queued; the rest
  * still generate copy so the modal is useful for drafting before an integration exists. */
-const PLATFORMS: Platform[] = ["linkedin", "facebook", "instagram", "tiktok", "x"];
+const PLATFORMS: Platform[] = ["linkedin", "facebook", "tiktok", "x"];
 
 /**
  * Splits trailing hashtags off generated copy.
@@ -37,17 +39,6 @@ function splitHashtags(text: string): { text: string; hashtags: string[] } {
   }
 
   return { text: lines.join("\n").trimEnd(), hashtags };
-}
-
-/** The Facebook Page ids picked in the Brand Profile — the same selection the chat page
- * publishes to, so a post scheduled here lands on the Pages the user already chose. */
-function getSelectedPageIds(): number[] {
-  try {
-    const ids = JSON.parse(localStorage.getItem("starlight_meta_page_ids") || "[]");
-    return Array.isArray(ids) ? ids.map(Number).filter((n) => Number.isFinite(n)) : [];
-  } catch {
-    return [];
-  }
 }
 
 /** Props for the SchedulePostModal component. */
@@ -106,10 +97,24 @@ export default function SchedulePostModal({
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isThinking]);
 
-  const pageIds = platform === "facebook" ? getSelectedPageIds() : [];
+  // The Pages picked in the Brand Profile — the same selection the chat page publishes to, so
+  // a post scheduled here lands where the user already said Facebook posts should go. Named
+  // rather than counted below, because "2 Pages" is not something anyone can check.
+  const facebookPages = platform === "facebook" ? getSelectedMetaPages() : [];
+  const pageIds = facebookPages.map((page) => page.id);
   const needsFacebookPage = platform === "facebook" && pageIds.length === 0;
+
+  // A new post is never handed to Facebook when it's under Graph's 10-minute lead time — the
+  // backend keeps it on the sweeper instead — so the only time rule that applies at creation
+  // is that it hasn't already passed.
+  const timeProblem = describeTimeProblem(day, time);
+
   const canSchedule =
-    !!scheduledContent && isSchedulable(platform) && !needsFacebookPage && !isSaving;
+    !!scheduledContent &&
+    isSchedulable(platform) &&
+    !needsFacebookPage &&
+    !timeProblem &&
+    !isSaving;
 
   /**
    * Appends the user's message, calls the LLM service for a draft, then appends it as an
@@ -195,7 +200,7 @@ export default function SchedulePostModal({
    * moment the user meant, rather than to 09:00 in whatever zone the server happens to run in.
    */
   async function handleSchedule() {
-    if (!scheduledContent || !isSchedulable(platform)) return;
+    if (!scheduledContent || !isSchedulable(platform) || timeProblem) return;
 
     const token = localStorage.getItem("starlight_token");
     if (!token) {
@@ -289,8 +294,17 @@ export default function SchedulePostModal({
                   type="time"
                   value={time}
                   onChange={(e) => setTime(e.target.value)}
-                  className="w-full border border-[#E8E3DA] rounded-xl px-3 py-2.5 text-sm text-[#1B1A17] focus:outline-none focus:border-[#FF4800] bg-white transition-colors"
+                  className={`w-full border rounded-xl px-3 py-2.5 text-sm text-[#1B1A17] focus:outline-none bg-white transition-colors ${
+                    timeProblem
+                      ? "border-red-300 focus:border-red-500"
+                      : "border-[#E8E3DA] focus:border-[#FF4800]"
+                  }`}
                 />
+                {/* Called out under the input rather than only on the disabled button: the time
+                    is what's wrong, so the message belongs next to the control that fixes it. */}
+                {timeProblem && (
+                  <p className="text-xs text-red-600 mt-1.5 leading-relaxed">{timeProblem}</p>
+                )}
               </div>
 
               {/* Platform selector — 2-column grid of toggle buttons */}
@@ -309,7 +323,7 @@ export default function SchedulePostModal({
                           : "border-[#E8E3DA] text-[#6B6561] hover:border-[#FF4800]/40 hover:bg-[#FFFAF8]"
                       }`}
                     >
-                      {/* Coloured platform badge (e.g. Instagram gradient) */}
+                      {/* Coloured platform badge (e.g. Facebook blue) */}
                       <span
                         className={`w-5 h-5 rounded flex items-center justify-center text-[10px] font-bold text-white flex-shrink-0 ${PLATFORM_CONFIG[p].badge}`}
                       >
@@ -322,13 +336,42 @@ export default function SchedulePostModal({
                 </div>
               </div>
 
+              {/* Which Pages this actually lands on. The selection lives in the Brand Profile and
+                  used to be applied invisibly — a Facebook post went out to whatever was in
+                  localStorage with nothing on screen to say so. Show it here, where it's still
+                  cheap to go and change it. */}
+              {platform === "facebook" && (
+                <div>
+                  <p className="text-xs font-semibold text-[#1B1A17] mb-2">Posting to</p>
+                  {facebookPages.length > 0 ? (
+                    <ul className="space-y-1.5">
+                      {facebookPages.map((page) => (
+                        <li
+                          key={page.id}
+                          className="flex items-center gap-2 text-xs text-[#6B6561] bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-2.5 py-1.5"
+                        >
+                          <span className="w-1.5 h-1.5 rounded-full bg-[#1877F2] flex-shrink-0" />
+                          <span className="truncate">{page.name}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="text-xs text-[#9E9893] leading-relaxed bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-2.5 py-2">
+                      No Page selected yet. Pick one under Brand Profile → Facebook.
+                    </p>
+                  )}
+                </div>
+              )}
+
               {/* Everything already queued for this day. Each row opens the post's own detail
                   view, which is where the full copy and the cancel action live — this list is
                   a compact index, not a second place to act on a post. */}
               {existingPosts.length > 0 && (
                 <div>
+                  {/* "On this day" rather than "Already scheduled" — the calendar also passes
+                      down posts that failed, and calling those scheduled would be a lie. */}
                   <p className="text-xs font-semibold text-[#1B1A17] mb-2">
-                    Already Scheduled{" "}
+                    On this day{" "}
                     <span className="text-[#9E9893] font-normal">
                       ({existingPosts.length})
                     </span>
@@ -398,6 +441,12 @@ export default function SchedulePostModal({
               ) : needsFacebookPage ? (
                 <p className="text-xs text-[#C8C2BA] text-center mt-2 leading-relaxed">
                   Pick a Facebook Page in your Brand Profile first.
+                </p>
+              ) : timeProblem ? (
+                // Terse here on purpose — the full explanation is already under the time input.
+                // The left panel scrolls, so the button still needs to say why it's dead.
+                <p className="text-xs text-[#C8C2BA] text-center mt-2">
+                  Fix the post time to continue
                 </p>
               ) : !scheduledContent ? (
                 <p className="text-xs text-[#C8C2BA] text-center mt-2">

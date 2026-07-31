@@ -22,7 +22,7 @@ Lives in `core/` like `trend_schema.py` / `video_schema.py` so `core/services/*`
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
@@ -40,6 +40,23 @@ def _iso_or_blank(raw: str) -> str:
     if not raw:
         return ""
     return date.fromisoformat(raw).isoformat()
+
+
+def _local_datetime_or_blank(raw: str) -> str:
+    """Same contract as `_iso_or_blank`, one field wider: a wall-clock moment to the minute.
+
+    Normalised to "YYYY-MM-DDTHH:MM" because that is what the scheduling API takes, and
+    deliberately *naive* — no offset, no "Z". The zone a wall-clock time belongs to is the
+    user's, which this service does not know (see the module docstring); attaching one here
+    would be inventing the very fact the caller is responsible for supplying."""
+    if not raw:
+        return ""
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is not None:
+        raise ValueError(
+            f"publish_at must be a local wall-clock time with no timezone, got {raw!r}"
+        )
+    return parsed.strftime("%Y-%m-%dT%H:%M")
 
 
 class RequestClassification(BaseModel):
@@ -63,10 +80,27 @@ class RequestClassification(BaseModel):
     cadence_hint: str = ""
     tone_hint: str = ""
 
+    #: When a *one-off* post should publish, as a local wall-clock moment resolved against the
+    #: caller's `today`. Blank means the user named no time, which is the common case.
+    #:
+    #: Only meaningful for `single_post`. A campaign's timing is its window plus the planner's
+    #: cadence, so this stays blank on `posting_plan` — one moment is not a schedule.
+    #:
+    #: Nothing publishes off the back of this. It pre-fills the draft card's schedule controls,
+    #: which the user still has to confirm; the field is a proposal, not an instruction.
+    publish_at: str = Field(
+        default="", description="YYYY-MM-DDTHH:MM local time, or '' if no time was given"
+    )
+
     @field_validator("start_date", "end_date")
     @classmethod
     def _check_dates(cls, raw: str) -> str:
         return _iso_or_blank(raw)
+
+    @field_validator("publish_at")
+    @classmethod
+    def _check_publish_at(cls, raw: str) -> str:
+        return _local_datetime_or_blank(raw)
 
 
 class CampaignBrief(BaseModel):

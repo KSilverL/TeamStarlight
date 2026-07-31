@@ -2,7 +2,7 @@
 export type Section = "stats" | "brand" | "calendar";
 
 /** Supported social media platforms across the system. */
-export type Platform = "instagram" | "facebook" | "linkedin" | "tiktok" | "x";
+export type Platform = "facebook" | "linkedin" | "tiktok" | "x";
 
 /**
  * The platforms a post can actually be scheduled to.

@@ -5,6 +5,7 @@ import { PLATFORM_CONFIG } from "../data";
 import type { Platform, ScheduledPost, ScheduledPostStatus } from "../types";
 import SchedulePostModal from "./SchedulePostModal";
 import ScheduledPostDetail from "./ScheduledPostDetail";
+import type { ScheduledPostPatch } from "./ScheduledPostDetail";
 
 const MONTH_NAMES = [
   "January",
@@ -169,16 +170,19 @@ export default function ContentCalendar() {
   // Group posts by date string so each day cell can look up its posts in O(1).
   // `??=` initialises the array on first encounter then pushes to it.
   //
-  // Only posts still waiting to go out are shown. Published, failed and cancelled rows stay in
-  // the backend as an audit record but would otherwise accumulate in the grid until the month
-  // was mostly history — the calendar is for what's coming, not what happened. A failed post
-  // still emails the business, so dropping it from here doesn't lose the notification.
+  // Pending and failed posts are shown; published and cancelled rows stay in the backend as an
+  // audit record but would otherwise accumulate in the grid until the month was mostly history
+  // — the calendar is for what's coming, not what happened. Failures are the exception: the
+  // business is emailed about them, but a post that silently disappeared from the day it was
+  // meant to go out is exactly the state that looks like the schedule losing work.
   const postsByDate = posts
-    .filter((post) => post.status === "scheduled")
+    .filter((post) => post.status === "scheduled" || post.status === "failed")
     .reduce<Record<string, ScheduledPost[]>>((acc, post) => {
       (acc[post.date] ??= []).push(post);
       return acc;
     }, {});
+
+  const hasFailures = posts.some((post) => post.status === "failed");
 
   // Build today's ISO string for the highlight ring — compared against each cell's dateStr.
   const todayStr = isoDate(today.getFullYear(), today.getMonth(), today.getDate());
@@ -238,6 +242,46 @@ export default function ContentCalendar() {
       // Thrown rather than set on the calendar's own error banner so the detail modal can show
       // it in place — the modal stays open, and the user sees why next to the post it refers to.
       throw new Error(data.error ?? "Could not cancel that post.");
+    }
+
+    setSelectedPost(null);
+    await loadMonth();
+  }
+
+  /**
+   * Applies an edit and refreshes the month.
+   *
+   * Refetched rather than merged locally for the same reason as a cancel, and one more: an
+   * edited date moves the post to another cell — or out of the visible month entirely — and
+   * only the server knows the wall-clock time the new instant resolves back to in the post's
+   * own timezone.
+   */
+  async function updatePost(postId: string, patch: ScheduledPostPatch) {
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      throw new Error("Log in again before editing a post.");
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(`/api/schedule/posts/${postId}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(patch),
+      });
+    } catch {
+      throw new Error("Could not reach the backend.");
+    }
+
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      // Thrown so the detail modal keeps the user's edits on screen next to the reason it was
+      // refused — a Facebook post whose new time Graph won't take is a fixable mistake, and
+      // closing the modal would throw away the copy they just rewrote along with it.
+      throw new Error(data.error ?? "Could not save those changes.");
     }
 
     setSelectedPost(null);
@@ -363,21 +407,41 @@ export default function ContentCalendar() {
 
               {/* Scheduled posts, most imminent first — each opens its own detail view. */}
               <div className="flex-1 flex flex-col gap-0.5 mt-1 min-h-0 w-full">
-                {dayPosts.slice(0, CHIPS_PER_CELL).map((post) => (
-                  <button
-                    key={post.id}
-                    onClick={() => setSelectedPost(post)}
-                    title={`${post.time} · ${PLATFORM_CONFIG[post.platform].label} — click to view`}
-                    className="flex items-center gap-1 px-1 py-0.5 rounded-md bg-[#F8F5EE] hover:bg-[#FFE4D9] border border-transparent hover:border-[#FFCBB8] transition-colors w-full overflow-hidden"
-                  >
-                    <span
-                      className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${PLATFORM_CONFIG[post.platform].dot}`}
-                    />
-                    <span className="text-[10px] font-medium text-[#6B6561] truncate">
-                      {post.time}
-                    </span>
-                  </button>
-                ))}
+                {dayPosts.slice(0, CHIPS_PER_CELL).map((post) => {
+                  // A failure is drawn in red rather than its platform colour: the point of the
+                  // chip is no longer "a LinkedIn post goes out here", it's "something that was
+                  // meant to go out here didn't", and the detail view carries the reason.
+                  const failed = post.status === "failed";
+                  return (
+                    <button
+                      key={post.id}
+                      onClick={() => setSelectedPost(post)}
+                      title={
+                        failed
+                          ? `${post.time} · ${PLATFORM_CONFIG[post.platform].label} — did not publish, click for the reason`
+                          : `${post.time} · ${PLATFORM_CONFIG[post.platform].label} — click to view`
+                      }
+                      className={`flex items-center gap-1 px-1 py-0.5 rounded-md border transition-colors w-full overflow-hidden ${
+                        failed
+                          ? "bg-red-50 border-red-200 hover:bg-red-100"
+                          : "bg-[#F8F5EE] border-transparent hover:bg-[#FFE4D9] hover:border-[#FFCBB8]"
+                      }`}
+                    >
+                      <span
+                        className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                          failed ? "bg-red-500" : PLATFORM_CONFIG[post.platform].dot
+                        }`}
+                      />
+                      <span
+                        className={`text-[10px] font-medium truncate ${
+                          failed ? "text-red-700" : "text-[#6B6561]"
+                        }`}
+                      >
+                        {post.time}
+                      </span>
+                    </button>
+                  );
+                })}
 
                 {/* The day modal lists the rest in full, each row clickable through to detail. */}
                 {overflow > 0 && (
@@ -395,8 +459,9 @@ export default function ContentCalendar() {
       </div>
 
       {/* ── Legend ────────────────────────────────────────────────────────── */}
-      {/* Only upcoming posts are drawn, so the legend is platforms alone — there are no
-          published/failed states on the grid to explain. */}
+      {/* Published and cancelled posts are never drawn, so the legend is the two platforms plus
+          the one other state that reaches the grid — and that entry only appears when there is
+          actually a failure to explain. */}
       <div className="flex-shrink-0 flex items-center gap-4 pt-3 mt-1 border-t border-[#E8E3DA] flex-wrap">
         <span className="text-xs text-[#9E9893] font-medium">Upcoming posts:</span>
         {LEGEND_PLATFORMS.map((p) => (
@@ -410,6 +475,12 @@ export default function ContentCalendar() {
             {PLATFORM_CONFIG[p].label}
           </span>
         ))}
+        {hasFailures && (
+          <span className="flex items-center gap-1.5 text-xs text-red-700">
+            <span className="w-2 h-2 rounded-full bg-red-500" />
+            Didn&apos;t publish
+          </span>
+        )}
         <span className="text-xs text-[#C8C2BA] ml-auto">
           Click a date to schedule · click a post to view it
         </span>
@@ -445,6 +516,7 @@ export default function ContentCalendar() {
           post={selectedPost}
           onClose={() => setSelectedPost(null)}
           onCancel={cancelPost}
+          onUpdate={updatePost}
         />
       )}
     </div>

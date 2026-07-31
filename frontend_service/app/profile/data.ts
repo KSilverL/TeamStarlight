@@ -5,12 +5,6 @@ export const PLATFORM_CONFIG: Record<
   Platform,
   { label: string; abbr: string; badge: string; dot: string }
 > = {
-  instagram: {
-    label: "Instagram",
-    abbr: "IG",
-    badge: "bg-gradient-to-r from-purple-600 to-pink-600",
-    dot: "bg-pink-500",
-  },
   facebook: {
     label: "Facebook",
     abbr: "f",
@@ -43,7 +37,7 @@ export const STATS = {
   engagementRate: 4.2,
   approvalRate: 89,
   avgTimeToApprove: "14 min",
-  topPlatform: "Instagram",
+  topPlatform: "Facebook",
   weeklyData: [
     { day: "Mon", posts: 3, impressions: 12400 },
     { day: "Tue", posts: 7, impressions: 18900 },
@@ -54,7 +48,7 @@ export const STATS = {
     { day: "Sun", posts: 6, impressions: 8200 },
   ],
   platformBreakdown: [
-    { platform: "Instagram", posts: 18, color: "bg-pink-500" },
+    { platform: "Facebook", posts: 18, color: "bg-[#1877F2]" },
     { platform: "LinkedIn", posts: 12, color: "bg-blue-500" },
     { platform: "TikTok", posts: 9, color: "bg-zinc-600" },
     { platform: "X (Twitter)", posts: 8, color: "bg-[#FF4800]" },
