@@ -4,13 +4,14 @@ import { useState, useRef, useEffect } from "react";
 import Link from "next/link";
 import { useRealtimeVoice, type VoiceBriefPartial } from "./useRealtimeVoice";
 
-type Platform = "x" | "instagram" | "tiktok" | "linkedin";
+type Platform = "x" | "facebook" | "tiktok" | "linkedin";
 
 interface SessionSummary {
   id: string;
   createdAt: string;
   status: string;
   targetPlatforms: string[] | null;
+  title?: string | null;
 }
 
 interface DBMessage {
@@ -152,6 +153,9 @@ interface RoundtableTurn {
   role: string;
   text: string;
   roundIndex: number;
+  // Set once the (asynchronous, background-synthesized) agent_utterance_audio event
+  // for this same turn arrives — a data: URL, playable directly in an <audio> tag.
+  audioUrl?: string;
 }
 
 // The discussion feed interleaves completed turns with the moderator's mic handoffs
@@ -172,11 +176,70 @@ interface RoundControlPrompt {
   timeout: number | null;
 }
 
+/**
+ * Today's date in the *browser's* timezone, as YYYY-MM-DD.
+ *
+ * Built from local components rather than `toISOString().slice(0, 10)`, which yields the UTC
+ * date — for a user west of Greenwich that is tomorrow's date all evening, and "next month"
+ * asked on the 31st would resolve a whole month wrong.
+ */
+function localToday(): string {
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
+
+// ── Posting plans in chat ─────────────────────────────────────────────────────
+
+/** One dated slot on a campaign schedule. Strategy, never copy — the posts themselves are
+ * written when the plan is confirmed. */
+interface PlanItem {
+  item_id: string;
+  planned_date: string;
+  time_of_day?: string | null;
+  platforms: string[];
+  topic: string;
+  angle?: string | null;
+  rationale?: string | null;
+  status: string;
+}
+
+interface Plan {
+  plan_id: string;
+  goal: string;
+  target_platforms: string[];
+  start_date: string;
+  end_date: string;
+  status: "draft" | "active" | string;
+  strategy_summary?: string;
+  recommended_cadence?: string;
+  items: PlanItem[];
+}
+
+/**
+ * Where a campaign request has got to, across turns.
+ *
+ * `POST /intake/classify` is stateless — it holds no session — so the accumulated `known` IS
+ * the conversation, and passing it back is what tells the service the campaign conversation is
+ * still open. A ref rather than state for the same reason `sessionIdRef` is: `handleSend`
+ * reads and writes it within one turn, and a re-render in between would race it.
+ */
+type CampaignPhase =
+  | "gathering"    // still filling in the goal / date window
+  | "clarifying";  // asked the planner's follow-up questions, waiting on the reply
+
+interface CampaignState {
+  phase: CampaignPhase;
+  known: Record<string, string>;
+  followupsAsked: number;
+  questions: string[];
+}
+
 interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
-  variant?: "status" | "draft" | "text-preview" | "html-preview" | "roundtable";
+  variant?: "status" | "draft" | "text-preview" | "html-preview" | "roundtable" | "plan-preview";
   platform?: Platform;
   draft?: DraftContent;
   html?: string;
@@ -185,6 +248,14 @@ interface Message {
   // Workflow-specific fields — set when the message originates from the MAF pipeline.
   workflowTaskId?: string;
   needsHumanIntervention?: boolean;
+  // Set on a text draft (variant "text-preview") when the same task also asked for a video:
+  // the real publish is the native video post (video + this copy as caption), so the draft
+  // card hides its own text/image post buttons and points the user to the video card below.
+  videoAlsoRequested?: boolean;
+  // "YYYY-MM-DDTHH:MM" when the request that produced this draft named a time to publish at
+  // ("post this on Friday at 10"). The draft card opens on Schedule with it filled in instead
+  // of on Post Now. Absent whenever the user named no time, which is the common case.
+  publishAt?: string;
   videoStoryboard?: VideoStoryboard;
   // User-attached reference images (base64 data URLs) for image-to-video generation
   // (Higgsfield backend). Threaded from the compose box onto the storyboard message so
@@ -199,6 +270,9 @@ interface Message {
   roundtableConverged?: boolean;
   roundtableStrategy?: string;
   roundControlWaiting?: RoundControlPrompt | null;
+  // The draft campaign schedule (variant === "plan-preview"). Grows in place: refining
+  // replaces it, confirming flips its status, so the card is always the plan's current truth.
+  plan?: Plan;
   // Set on voice turns (native speech-to-speech) once the clip is fully assembled —
   // an object URL for a WAV blob built client-side from the raw PCM16 the session
   // streamed, so the turn's audio can be replayed/downloaded from its bubble.
@@ -220,11 +294,11 @@ const PLATFORMS: {
     headerClass: "bg-[#1B1A17] text-white",
   },
   {
-    id: "instagram",
-    label: "Instagram",
-    abbr: "IG",
-    badgeClass: "bg-pink-600 text-white",
-    headerClass: "bg-gradient-to-r from-purple-600 to-pink-600 text-white",
+    id: "facebook",
+    label: "Facebook",
+    abbr: "f",
+    badgeClass: "bg-[#1877F2] text-white",
+    headerClass: "bg-[#1877F2] text-white",
   },
   {
     id: "tiktok",
@@ -259,6 +333,39 @@ const INITIAL_MESSAGES: Message[] = [
 ];
 
 const platformMap = Object.fromEntries(PLATFORMS.map((p) => [p.id, p]));
+
+// Sessions stored before the Facebook pivot still carry "instagram" in target_platforms.
+// Those drafts always published to a Facebook Page, so read them back under the name the
+// platform goes by now rather than showing a platform the app no longer offers.
+const LEGACY_PLATFORM_IDS: Record<string, Platform> = { instagram: "facebook" };
+
+/** Display label for a stored platform id; unknown ids fall through as-is. */
+function platformLabel(id: string): string {
+  return platformMap[LEGACY_PLATFORM_IDS[id] ?? id]?.label ?? id;
+}
+
+// The Facebook Page id(s) the user picked in their Brand Profile. Facebook drafts
+// publish to these Pages via /api/meta/post; an empty list means Facebook isn't set up yet.
+function getSelectedPageIds(): number[] {
+  try {
+    const ids = JSON.parse(localStorage.getItem("starlight_meta_page_ids") || "[]");
+    return Array.isArray(ids) ? ids.map(Number).filter((n) => Number.isFinite(n)) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Splits the classifier's "YYYY-MM-DDTHH:MM" into the [date, time] pair the two inputs take.
+ *
+ * Anything else — an absent value, or a shape the LLM service should never produce but might —
+ * comes back as ["", ""], which leaves the draft card on Post Now. That is the right fallback:
+ * a half-parsed moment on a scheduling control is worse than no moment at all.
+ */
+function splitPublishAt(publishAt?: string): [string, string] {
+  const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/.exec(publishAt ?? "");
+  return match ? [match[1], match[2]] : ["", ""];
+}
 
 // Human-readable labels for each MAF executor shown as live status messages.
 const NODE_LABELS: Record<string, string> = {
@@ -430,7 +537,7 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>(INITIAL_MESSAGES);
   const [input, setInput] = useState("");
   const [selectedPlatforms, setSelectedPlatforms] = useState<Platform[]>([
-    "instagram",
+    "facebook",
     "linkedin",
   ]);
   const [contentTypes, setContentTypes] = useState<ContentType[]>(["text"]);
@@ -462,6 +569,225 @@ export default function ChatPage() {
   // round_control events for the same table update the SAME card instead of spawning new ones.
   const roundtableMsgIdRef = useRef<Map<string, string>>(new Map());
 
+  // Roundtable auto-play: when on, each persona's TTS clip plays automatically as it
+  // arrives (agent_utterance_audio always lands after that persona's text turn, since
+  // synthesis is fire-and-forget in the background — so "auto-play" is inherently
+  // "after they've spoken"). Off by default, matching today's click-to-play behaviour.
+  // A ref mirrors the state so the SSE handler (a stable closure set up once per
+  // workflow run) always reads the live value instead of the one captured at connect time.
+  const [autoPlayRoundtableAudio, setAutoPlayRoundtableAudio] = useState(false);
+  const autoPlayRoundtableAudioRef = useRef(false);
+  function toggleAutoPlayRoundtableAudio() {
+    autoPlayRoundtableAudioRef.current = !autoPlayRoundtableAudioRef.current;
+    setAutoPlayRoundtableAudio(autoPlayRoundtableAudioRef.current);
+  }
+  // One shared sequential queue across every table on the page, so two persona clips
+  // (possibly from different concurrent tables) never overlap into a garble.
+  const roundtableAudioQueueRef = useRef<string[]>([]);
+  const roundtableAudioPlayingRef = useRef(false);
+  function playNextRoundtableAudio() {
+    if (roundtableAudioPlayingRef.current) return;
+    const next = roundtableAudioQueueRef.current.shift();
+    if (!next) return;
+    roundtableAudioPlayingRef.current = true;
+    const audio = new Audio(next);
+    const advance = () => {
+      roundtableAudioPlayingRef.current = false;
+      playNextRoundtableAudio();
+    };
+    audio.addEventListener("ended", advance);
+    audio.addEventListener("error", advance);
+    audio.play().catch(advance);
+  }
+  function enqueueRoundtableAudio(url: string) {
+    roundtableAudioQueueRef.current.push(url);
+    playNextRoundtableAudio();
+  }
+
+  /**
+   * The JWT, for the routes that need one.
+   *
+   * The chat's own workflow calls go straight to the LLM service unauthenticated, but every
+   * plan route runs through Java, which derives `business_id` from this token — without it a
+   * plan is created against no brand, so the brand-voice profile silently never applies.
+   */
+  function authHeaders(): Record<string, string> {
+    const token = localStorage.getItem("starlight_token");
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  }
+
+  // ── Posting-plan path ───────────────────────────────────────────────────────
+
+  /**
+   * Handles one turn of a campaign request, and reports whether it took it.
+   *
+   * Returns false for an ordinary "write me a post" turn, which then flows on to `genWorkflow`
+   * exactly as it always did — the plan path is a fork in front of the existing behaviour, not
+   * a replacement for it.
+   */
+  async function handleCampaignTurn(text: string): Promise<boolean> {
+    // Mid-clarify: this turn is the answer to the planner's questions, not a new request.
+    if (campaignRef.current?.phase === "clarifying") {
+      await buildPlan(campaignRef.current.known, campaignRef.current.questions, text);
+      return true;
+    }
+
+    // Cleared up front so a time from an earlier turn can never attach itself to this one —
+    // including when classifying fails below and the turn falls through to the ordinary post
+    // path with no verdict at all.
+    requestedPublishAtRef.current = "";
+
+    let result: Record<string, unknown>;
+    try {
+      const res = await fetch("/api/intake/classify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: text,
+          // The browser's own local date — genuinely the user's timezone, which is what makes
+          // "next month" resolvable. A server-side guess is a month out at a boundary.
+          today: localToday(),
+          target_platforms: selectedPlatforms,
+          known: campaignRef.current?.known,
+          followups_asked: campaignRef.current?.followupsAsked ?? 0,
+        }),
+      });
+      result = await res.json();
+      if (!res.ok || result.error) return false;  // fall back to the ordinary post path
+    } catch {
+      return false;  // classifying is an optimisation, never a reason to refuse the message
+    }
+
+    if (result.intent !== "posting_plan") {
+      campaignRef.current = null;
+      // The one thing the single-post path wants from this call besides the verdict: the time
+      // the user asked the post to go out at, if they named one. Carried to the draft card,
+      // which opens on Schedule with it filled in — the user still confirms it, so a
+      // misheard "Friday" costs a correction rather than a post on the wrong day.
+      requestedPublishAtRef.current =
+        typeof result.publish_at === "string" ? result.publish_at : "";
+      return false;
+    }
+
+    const campaign = (result.campaign ?? {}) as Record<string, string>;
+
+    // Still missing the goal or the window — ask, and keep what we have for the next turn.
+    if (!result.complete) {
+      campaignRef.current = {
+        phase: "gathering",
+        known: campaign,
+        followupsAsked: (result.followups_asked as number) ?? 0,
+        questions: [],
+      };
+      const question = (result.assistant_message as string) ?? "Tell me a bit more.";
+      pushMessage({ role: "assistant", content: question });
+      if (sessionIdRef.current) persistMessage(sessionIdRef.current, "assistant", question);
+      return true;
+    }
+
+    await startClarify(campaign);
+    return true;
+  }
+
+  /**
+   * The pre-generation step: propose a cadence and ask what would tailor the schedule.
+   *
+   * Worth a turn because these answers shape every slot, and they are far cheaper to give now
+   * than to fix by refining a plan that was built without them. If the planner has nothing to
+   * ask, this falls straight through to building the plan.
+   */
+  async function startClarify(campaign: Record<string, string>) {
+    pushMessage({ role: "assistant", content: "Working out the shape of this campaign…", variant: "status" });
+
+    let data: Record<string, unknown> = {};
+    try {
+      const res = await fetch("/api/plans/clarify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify(campaign),
+      });
+      data = await res.json();
+      if (!res.ok || data.error) data = {};  // a failed clarify is skippable, not fatal
+    } catch {
+      data = {};
+    }
+
+    const questions = Array.isArray(data.follow_up_questions)
+      ? (data.follow_up_questions as string[])
+      : [];
+
+    if (questions.length === 0) {
+      await buildPlan(campaign, [], "");
+      return;
+    }
+
+    campaignRef.current = {
+      phase: "clarifying",
+      known: campaign,
+      followupsAsked: 0,
+      questions,
+    };
+
+    const cadence = (data.recommended_cadence as string) ?? "";
+    const message = [
+      cadence ? `I'd suggest ${cadence}.` : "",
+      "Before I build it:",
+      ...questions.map((q) => `• ${q}`),
+      "",
+      "Answer what you can — or just say \"go ahead\" and I'll use my best judgement.",
+    ].filter(Boolean).join("\n");
+
+    pushMessage({ role: "assistant", content: message });
+    if (sessionIdRef.current) persistMessage(sessionIdRef.current, "assistant", message);
+  }
+
+  /** Generates the schedule and shows it as a card. */
+  async function buildPlan(
+    campaign: Record<string, string>,
+    questions: string[],
+    answerText: string
+  ) {
+    campaignRef.current = null;
+    pushMessage({ role: "assistant", content: "Designing your campaign schedule…", variant: "status" });
+
+    // The planner renders `answers` as Q/A lines for its prompt, and a free-text reply can't be
+    // reliably split across the questions it answers — so the whole block is sent as one pair.
+    // It reads correctly in the prompt, which is all the planner needs.
+    const answers =
+      questions.length > 0 && answerText.trim()
+        ? { [questions.join(" / ")]: answerText.trim() }
+        : undefined;
+
+    try {
+      const res = await fetch("/api/plans", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ ...campaign, ...(answers ? { answers } : {}) }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        pushMessage({
+          role: "assistant",
+          content: data.error ?? "I couldn't build that schedule. Try giving me the goal and dates again.",
+        });
+        return;
+      }
+      pushMessage({
+        role: "assistant",
+        content: "Here's the campaign I'd run — review it, ask for changes, or confirm to write the posts:",
+        variant: "plan-preview",
+        plan: data as Plan,
+      });
+    } catch {
+      pushMessage({ role: "assistant", content: "Could not reach the planning service." });
+    }
+  }
+
+  /** Swaps a plan card's plan in place, so refining and confirming update the same card. */
+  function updatePlanMessage(messageId: string, plan: Plan) {
+    setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, plan } : m)));
+  }
+
   /** Fire-and-forget: persist a message to the backend. Non-fatal if it fails. */
   async function persistMessage(sessionId: string, role: "user" | "assistant", content: string) {
     const token = localStorage.getItem("starlight_token");
@@ -479,9 +805,28 @@ export default function ChatPage() {
       console.log("Persistance failure. Request not saved to session.")
     }
   }
+  // Where a campaign request has got to. Null means no campaign conversation is open, which is
+  // also what tells the classifier to judge the next turn on its own merits.
+  const campaignRef = useRef<CampaignState | null>(null);
+
+  /**
+   * The publish moment the classifier read out of the last one-off request, or "" if the user
+   * named none.
+   *
+   * A ref rather than state because nothing renders from it directly: it is set while routing
+   * the turn and read once, several seconds later, when the workflow's draft finally lands —
+   * and re-rendering the whole chat in between would buy nothing. One request is in flight at
+   * a time, so there is no interleaving to guard against.
+   */
+  const requestedPublishAtRef = useRef<string>("");
+
   const [pastSessions, setPastSessions] = useState<SessionSummary[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
+  const [sessionTitle, setSessionTitle] = useState<string | null>(null);
+  // Guards against later prompts in the same session overwriting the name —
+  // the session is named once, from the first task's title.
+  const sessionTitleRef = useRef<string | null>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -506,6 +851,9 @@ export default function ChatPage() {
   async function loadSession(session: SessionSummary) {
     if (loadingSessionId) return;
     setLoadingSessionId(session.id);
+	sessionTitleRef.current = session.title ?? null;
+	setSessionTitle(session.title ?? null);
+	
     try {
       const token = localStorage.getItem("starlight_token");
       const res = await fetch(`/api/sessions/${session.id}/messages`, {
@@ -542,6 +890,15 @@ export default function ChatPage() {
     } finally {
       setLoadingSessionId(null);
     }
+  }
+  
+  function applySessionTitle(title: string) {
+    if (sessionTitleRef.current) return; // already named this session
+    sessionTitleRef.current = title;
+    setSessionTitle(title);
+    setPastSessions((prev) =>
+      prev.map((s) => (s.id === sessionIdRef.current ? { ...s, title } : s))
+    );
   }
 
   function formatDate(isoString: string) {
@@ -700,6 +1057,20 @@ export default function ChatPage() {
     }));
   }
 
+  /** agent_utterance_audio: the background TTS clip for an already-shown turn arrived —
+   *  find it by (speaker, roundIndex) and attach the clip; the turn itself doesn't move. */
+  function attachRoundtableTurnAudio(
+    taskId: string, tableId: string, speaker: string, roundIndex: number, audioUrl: string
+  ) {
+    upsertRoundtable(taskId, tableId, (m) => ({
+      roundtableFeed: (m.roundtableFeed ?? []).map((item) =>
+        item.kind === "turn" && item.turn.speaker === speaker && item.turn.roundIndex === roundIndex
+          ? { ...item, turn: { ...item.turn, audioUrl } }
+          : item
+      ),
+    }));
+  }
+
   function finalizeRoundtable(tableId: string, strategy: Record<string, unknown> | undefined) {
     const existingId = roundtableMsgIdRef.current.get(tableId);
     if (!existingId) return;
@@ -765,6 +1136,9 @@ export default function ChatPage() {
         return;
       }
       taskId = data.task_id as string;
+	  if (data.title) {
+	    applySessionTitle(data.title as string);
+	  }
     } catch {
       pushMessage({ role: "assistant", content: "Could not reach the workflow backend." });
       return;
@@ -847,6 +1221,25 @@ export default function ChatPage() {
         });
       }
 
+      // agent_utterance_audio: the TTS clip for a turn already shown — arrives later,
+      // synthesized in the background so it never held up the text discussion.
+      if (type === "agent_utterance_audio") {
+        const audioB64 = event.audio_b64 as string | undefined;
+        if (audioB64) {
+          const dataUrl = `data:audio/mpeg;base64,${audioB64}`;
+          attachRoundtableTurnAudio(
+            taskId,
+            event.table_id as string,
+            event.speaker as string,
+            event.round_index as number,
+            dataUrl
+          );
+          if (autoPlayRoundtableAudioRef.current) {
+            enqueueRoundtableAudio(dataUrl);
+          }
+        }
+      }
+
       // discussion_consensus: the table converged on a strategy before drafting starts.
       if (type === "result" && status === "discussion_consensus") {
         finalizeRoundtable(event.table_id as string, event.strategy as Record<string, unknown> | undefined);
@@ -880,6 +1273,13 @@ export default function ChatPage() {
             workflowTaskId: taskId,
             needsHumanIntervention: (event.needs_human_intervention as boolean) ?? false,
             approval: "pending",
+            // When a video was also requested, the single publish is the native video post
+            // (caption = this copy) from the storyboard card below — so hide this card's own
+            // text/image post buttons to avoid a competing second post.
+            videoAlsoRequested: contentTypes.includes("video"),
+            // Set only when this turn's request actually named a time; the card falls back to
+            // Post Now otherwise.
+            publishAt: requestedPublishAtRef.current || undefined,
           });
           if (sessionIdRef.current) {
             persistMessage(sessionIdRef.current, "assistant", event.draft as string);
@@ -925,6 +1325,9 @@ export default function ChatPage() {
             workflowTaskId: taskId,
             approval: "approved",
             referenceImages: pendingRefsRef.current.length ? pendingRefsRef.current : undefined,
+            // Carry the approved copy so the video card prefills its caption with it — a text+video
+            // task then publishes as one native video post with the generated copy as the caption.
+            draft: contentTypes.includes("text") ? { text: event.draft as string } : undefined,
           });
         }
       }
@@ -1089,15 +1492,17 @@ export default function ChatPage() {
       persistMessage(sessionIdRef.current, "user", trimmed);
     }
 
-    // Single workflow call — the MAF pipeline generates text drafts, brand
-    // animations, and video specs in one pass. genWorkflow() gates which output
-    // cards are shown based on the current contentTypes selection.
-    const jobs: Promise<void>[] = [];
-    jobs.push(genWorkflow(trimmed));
-
     setIsLoading(true);
     try {
-      await Promise.allSettled(jobs);
+      // Is this a campaign rather than a post? Asked first, because the answer decides which
+      // of two entirely different pipelines runs. A turn that isn't one — or a classifier that
+      // is unreachable — falls straight through to the workflow path below, unchanged.
+      if (await handleCampaignTurn(trimmed)) return;
+
+      // Single workflow call — the MAF pipeline generates text drafts, brand
+      // animations, and video specs in one pass. genWorkflow() gates which output
+      // cards are shown based on the current contentTypes selection.
+      await genWorkflow(trimmed);
     } finally {
       setIsLoading(false);
     }
@@ -1154,11 +1559,11 @@ export default function ChatPage() {
                       } disabled:opacity-50`}
                     >
                       <p className="font-medium text-xs truncate">
-                        {isLoading ? "Loading…" : formatDate(s.createdAt)}
+                        {isLoading ? "Loading…" : (s.title ?? formatDate(s.createdAt))}
                       </p>
                       {s.targetPlatforms && s.targetPlatforms.length > 0 && (
                         <p className="text-[10px] text-[#9E9893] mt-0.5 truncate">
-                          {s.targetPlatforms.join(", ")}
+                          {s.targetPlatforms.map(platformLabel).join(", ")}
                         </p>
                       )}
                     </button>
@@ -1285,14 +1690,15 @@ export default function ChatPage() {
               </svg>
             </button>
             <div>
-              <h1 className="font-semibold text-sm text-[#1B1A17]">
-                {activeSessionId ? `Session ${activeSessionId}` : "New Session"}
-              </h1>
+			  <h1 className="font-semibold text-sm text-[#1B1A17]">
+			    {sessionTitle ?? (activeSessionId ? `Session ${activeSessionId}` : "New Session")}
+			  </h1>
               <p className="text-xs text-[#9E9893] mt-0.5">
                 {selectedPlatforms.length} platform
                 {selectedPlatforms.length !== 1 ? "s" : ""} ·{" "}
                 {contentTypes.length ? contentTypes.join(", ") : "no"} content
               </p>
+			  
             </div>
           </div>
           <div className="flex items-center gap-1.5">
@@ -1323,7 +1729,29 @@ export default function ChatPage() {
             }
 
             if (msg.variant === "roundtable") {
-              return <RoundtableStage key={msg.id} message={msg} formatTime={formatTime} />;
+              return (
+                <RoundtableStage
+                  key={msg.id}
+                  message={msg}
+                  formatTime={formatTime}
+                  autoPlayAudio={autoPlayRoundtableAudio}
+                  onToggleAutoPlayAudio={toggleAutoPlayRoundtableAudio}
+                />
+              );
+            }
+
+            if (msg.variant === "plan-preview" && msg.plan) {
+              return (
+                <PlanCard
+                  key={msg.id}
+                  message={msg}
+                  plan={msg.plan}
+                  authHeaders={authHeaders}
+                  onPlanChanged={(plan) => updatePlanMessage(msg.id, plan)}
+                  onNotice={(text) => pushMessage({ role: "assistant", content: text })}
+                  formatTime={formatTime}
+                />
+              );
             }
 
             if (msg.variant === "html-preview" && msg.html) {
@@ -1584,14 +2012,14 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
-  const [caption, setCaption] = useState("");
+  // Prefill the caption with the approved post copy when a text+video task threaded it on
+  // (message.draft); a video-only task has none, so it starts empty for the user to write.
+  const [caption, setCaption] = useState(() => message.draft?.text ?? "");
+  const [videoTitle, setVideoTitle] = useState("");
   const [postStatus, setPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
   const [postError, setPostError] = useState<string | null>(null);
   // Reference images carried from the compose box; the user can drop any before rendering.
   const [refs, setRefs] = useState<string[]>(message.referenceImages ?? []);
-  // instagram posting
-  const [igPostStatus, setIgPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
-  const [igPostError, setIgPostError] = useState<string | null>(null);
 
   async function handlePostVideoToLinkedIn() {
     if (!jobId || !caption.trim()) return;
@@ -1624,27 +2052,53 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
       setPostError("Could not reach the backend.");
     }
   }
-  
-  async function handlePostVideoToInstagram() {
-    if (!jobId) return;
-    setIgPostStatus("posting");
-    setIgPostError(null);
+
+  // Facebook storyboards publish the rendered MP4 to the connected Facebook Page.
+  // The proxy fetches the video bytes from the LLM service by jobId, so we only pass the id.
+  async function handlePostVideoToFacebook() {
+    if (!jobId || !caption.trim()) return;
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setPostStatus("error");
+      setPostError("Log in, then connect Facebook from your Brand Profile before posting.");
+      return;
+    }
+    const pageIds = getSelectedPageIds();
+    if (pageIds.length === 0) {
+      setPostStatus("error");
+      setPostError("Connect Facebook and pick a Page in your Brand Profile first.");
+      return;
+    }
+    setPostStatus("posting");
+    setPostError(null);
     try {
-      const res = await fetch("/api/instagram/post-video", {
+      const res = await fetch("/api/meta/post-video", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jobId, caption: caption ?? "" }),
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          // Graph captions a Page video from `description` on the /{page-id}/videos edge —
+          // `message` is the /feed and /photos field and is silently dropped there. Send the
+          // caption as both so the one Java endpoint can serve whichever edge the mime picks.
+          jobId,
+          message: caption.trim(),
+          title: videoTitle.trim(),
+          description: caption.trim(),
+          pageIds,
+        }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
-        setIgPostStatus("error");
-        setIgPostError(data.error ?? "Failed to post video to Instagram.");
+        setPostStatus("error");
+        setPostError(data.error ?? "Failed to post video to Facebook.");
         return;
       }
-      setIgPostStatus("posted");
-    } catch (err) {
-      setIgPostStatus("error");
-      setIgPostError("Could not reach the backend.");
+      setPostStatus("posted");
+    } catch {
+      setPostStatus("error");
+      setPostError("Could not reach the backend.");
     }
   }
 
@@ -1802,30 +2256,46 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
             )}
           </div>
         )}
-		
-		{renderState === "done" && downloadUrl && (
-		  <div className="px-4 pb-4 pt-1 border-t border-[#E8E3DA] space-y-2">
-		    {igPostStatus === "posted" ? (
-		      <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
-		        ✓ Posted to Instagram
-		      </div>
-		    ) : (
-				<button
-				  type="button"
-				  onClick={handlePostVideoToInstagram}
-				  // disabled={igPostStatus === "posting"}
-				  className="w-full bg-gradient-to-r from-purple-600 to-pink-600 hover:opacity-90 disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-				>
-				  {igPostStatus === "posting" ? "Uploading & posting…" : "Post Video to Instagram"}
-				</button>
-		    )}
 
-		    {igPostStatus === "error" && igPostError && (
-		      <p className="text-xs text-red-600 text-center">{igPostError}</p>
-		    )}
-		  </div>
-		)}
-
+        {/* Facebook storyboards publish to the connected Facebook Page. */}
+        {renderState === "done" && message.platform === "facebook" && (
+          <div className="px-4 pb-4 pt-1 border-t border-[#E8E3DA] space-y-2">
+            {postStatus === "posted" ? (
+              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+                ✓ Posted to Facebook
+              </div>
+            ) : (
+              <>
+                <input
+                  type="text"
+                  value={videoTitle}
+                  onChange={(e) => setVideoTitle(e.target.value)}
+                  placeholder="Video title (optional)"
+                  disabled={postStatus === "posting"}
+                  className="w-full bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-2 text-xs text-[#1B1A17] placeholder:text-[#9E9893] focus:outline-none focus:border-[#FF4800] disabled:opacity-60"
+                />
+                <textarea
+                  value={caption}
+                  onChange={(e) => setCaption(e.target.value)}
+                  placeholder="Write a caption for this video…"
+                  rows={2}
+                  disabled={postStatus === "posting"}
+                  className="w-full bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-2 text-xs text-[#1B1A17] placeholder:text-[#9E9893] resize-none focus:outline-none focus:border-[#FF4800] disabled:opacity-60"
+                />
+                <button
+                  onClick={handlePostVideoToFacebook}
+                  disabled={postStatus === "posting" || !caption.trim()}
+                  className="w-full bg-[#1877F2] hover:bg-[#166FE0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                >
+                  {postStatus === "posting" ? "Uploading & posting…" : "Post Video to Facebook"}
+                </button>
+              </>
+            )}
+            {postStatus === "error" && postError && (
+              <p className="text-xs text-red-600 text-center">{postError}</p>
+            )}
+          </div>
+        )}
 
         <p className="text-xs text-[#9E9893] px-4 pb-3">
           {formatTime(message.timestamp)}
@@ -1840,6 +2310,8 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
 interface RoundtableStageProps {
   message: Message;
   formatTime: (d: Date) => string;
+  autoPlayAudio: boolean;
+  onToggleAutoPlayAudio: () => void;
 }
 
 // The always-present AI seats; trend_scout joins only when it actually appears in the
@@ -1957,7 +2429,9 @@ const CLAMP_3: React.CSSProperties = {
  * keeps the full transcript, moderator announcements included; below it live the step-mode
  * round controls (manual mode) and the always-available raise-hand seat.
  */
-function RoundtableStage({ message, formatTime }: RoundtableStageProps) {
+function RoundtableStage({
+  message, formatTime, autoPlayAudio, onToggleAutoPlayAudio,
+}: RoundtableStageProps) {
   const [handRaised, setHandRaised] = useState(false);
   const [sayText, setSayText] = useState("");
   const [speakText, setSpeakText] = useState("");
@@ -2156,9 +2630,28 @@ function RoundtableStage({ message, formatTime }: RoundtableStageProps) {
               <span className="text-[10px] font-semibold uppercase tracking-wider text-[#9E9893]">
                 Minutes
               </span>
-              <span className="text-[10px] text-[#BDB6AE]">
-                {turnCount} {turnCount === 1 ? "turn" : "turns"}
-              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={onToggleAutoPlayAudio}
+                  title={
+                    autoPlayAudio
+                      ? "Auto-play voice: on — each persona's clip plays as it arrives"
+                      : "Auto-play voice: off — click a clip's play button to hear it"
+                  }
+                  className={`flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded-full border transition-colors ${
+                    autoPlayAudio
+                      ? "bg-[#1B1A17] text-white border-[#1B1A17]"
+                      : "bg-white text-[#9E9893] border-[#E8E3DA] hover:text-[#1B1A17]"
+                  }`}
+                >
+                  <span aria-hidden>{autoPlayAudio ? "\u{1F50A}" : "\u{1F507}"}</span>
+                  Auto-play
+                </button>
+                <span className="text-[10px] text-[#BDB6AE]">
+                  {turnCount} {turnCount === 1 ? "turn" : "turns"}
+                </span>
+              </div>
             </div>
             <div className="flex-1 overflow-y-auto p-3 space-y-2">
               {feed.length === 0 && (
@@ -2197,6 +2690,9 @@ function RoundtableStage({ message, formatTime }: RoundtableStageProps) {
                     <p className="text-xs text-[#1B1A17] whitespace-pre-wrap leading-relaxed">
                       {item.turn.text}
                     </p>
+                    {item.turn.audioUrl && (
+                      <audio controls src={item.turn.audioUrl} className="mt-1 h-7 w-full" />
+                    )}
                   </div>
                 );
               })}
@@ -2355,6 +2851,204 @@ function StoryboardPreview({ storyboard }: { storyboard: VideoStoryboard }) {
   );
 }
 
+// ── Posting Plan Card ─────────────────────────────────────────────────────────
+
+interface PlanCardProps {
+  message: Message;
+  plan: Plan;
+  authHeaders: () => Record<string, string>;
+  onPlanChanged: (plan: Plan) => void;
+  onNotice: (text: string) => void;
+  formatTime: (d: Date) => string;
+}
+
+/**
+ * The campaign schedule, in chat.
+ *
+ * Shows what would go out and when — strategy, never copy, because the posts themselves are
+ * not written until the plan is confirmed. Two actions carry the whole loop: **refine**
+ * regenerates the schedule from free-text feedback, and **confirm** activates it and starts
+ * writing every post.
+ *
+ * Per-slot editing lives on the full plans page rather than here. Chat is the right place to
+ * say "more Facebook, push harder in the final week" and see the schedule change; it is a
+ * poor place to retype one slot's topic, and the plans page already does that well.
+ */
+function PlanCard({
+  message,
+  plan,
+  authHeaders,
+  onPlanChanged,
+  onNotice,
+  formatTime,
+}: PlanCardProps) {
+  const [feedback, setFeedback] = useState("");
+  const [busy, setBusy] = useState<"refining" | "confirming" | null>(null);
+
+  const isDraft = plan.status === "draft";
+
+  async function handleRefine() {
+    const text = feedback.trim();
+    if (!text || busy) return;
+
+    setBusy("refining");
+    try {
+      const res = await fetch(`/api/plans/${plan.plan_id}/refine`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ feedback: text }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        onNotice(data.error ?? "I couldn't revise that plan.");
+        return;
+      }
+      // Same plan_id, so the card updates in place rather than stacking a second schedule
+      // below the first — the user is iterating on one campaign, not collecting drafts.
+      onPlanChanged(data as Plan);
+      setFeedback("");
+    } catch {
+      onNotice("Could not reach the planning service.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleConfirm() {
+    if (busy) return;
+
+    setBusy("confirming");
+    try {
+      const res = await fetch(`/api/plans/${plan.plan_id}/confirm`, {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        onNotice(data.error ?? "I couldn't confirm that plan.");
+        return;
+      }
+      onPlanChanged(data as Plan);
+      onNotice(
+        `Confirmed — I'm writing all ${plan.items.length} posts now. They'll appear in your ` +
+        `review queue as they're ready, and nothing publishes until you approve it.`
+      );
+    } catch {
+      onNotice("Could not reach the planning service.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="w-full max-w-lg">
+      <p className="text-sm text-[#6B6561] mb-2">{message.content}</p>
+
+      <div className="bg-white border border-[#E8E3DA] rounded-2xl overflow-hidden shadow-sm">
+        <div className="px-4 py-3 bg-[#1B1A17] text-white">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm font-semibold truncate">{plan.goal}</p>
+            <span
+              className={`text-[10px] px-2 py-0.5 rounded-full font-medium flex-shrink-0 ${
+                isDraft ? "bg-white/15 text-white" : "bg-green-500 text-white"
+              }`}
+            >
+              {isDraft ? "draft" : plan.status}
+            </span>
+          </div>
+          <p className="text-[11px] text-white/60 mt-0.5">
+            {plan.start_date} → {plan.end_date} · {plan.items.length} posts
+          </p>
+        </div>
+
+        {plan.strategy_summary && (
+          <p className="px-4 py-2.5 text-xs text-[#6B6561] leading-relaxed border-b border-[#E8E3DA] bg-[#FFF9F5]">
+            {plan.strategy_summary}
+          </p>
+        )}
+
+        {/* Capped height: a six-week campaign is 20+ slots, and a card that long buries the
+            actions the user needs at the bottom of it. */}
+        <div className="max-h-72 overflow-y-auto divide-y divide-[#F2EDE4]">
+          {plan.items.map((item) => (
+            <div key={item.item_id} className="px-4 py-2.5">
+              <div className="flex items-center gap-2 flex-wrap mb-0.5">
+                <span className="text-xs font-semibold text-[#1B1A17]">{item.planned_date}</span>
+                {item.time_of_day && (
+                  <span className="text-[10px] text-[#9E9893]">{item.time_of_day}</span>
+                )}
+                {item.platforms.map((p) => (
+                  <span
+                    key={p}
+                    className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-[#F2EDE4] text-[#6B6561]"
+                  >
+                    {p}
+                  </span>
+                ))}
+              </div>
+              <p className="text-sm text-[#1B1A17]">{item.topic}</p>
+              {item.rationale && (
+                <p className="text-[11px] text-[#9E9893] mt-0.5 leading-relaxed">{item.rationale}</p>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {isDraft ? (
+          <div className="p-3 border-t border-[#E8E3DA] bg-[#F8F5EE] space-y-2">
+            <div className="flex gap-2">
+              <input
+                value={feedback}
+                onChange={(e) => setFeedback(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    handleRefine();
+                  }
+                }}
+                placeholder="Ask for changes — e.g. more Facebook, fewer promos"
+                disabled={busy !== null}
+                className="flex-1 min-w-0 bg-white border border-[#E8E3DA] rounded-lg px-3 py-1.5 text-xs placeholder:text-[#C8C2BA] disabled:opacity-50"
+              />
+              <button
+                onClick={handleRefine}
+                disabled={busy !== null || !feedback.trim()}
+                className="text-xs font-medium text-[#FF4800] hover:underline disabled:opacity-40 disabled:no-underline flex-shrink-0 px-1"
+              >
+                {busy === "refining" ? "Revising…" : "Revise"}
+              </button>
+            </div>
+
+            <button
+              onClick={handleConfirm}
+              disabled={busy !== null}
+              className="w-full bg-green-600 hover:bg-green-500 disabled:bg-green-300 text-white text-xs font-medium py-2 rounded-lg transition-colors"
+            >
+              {busy === "confirming"
+                ? "Confirming…"
+                : `Confirm — write all ${plan.items.length} posts`}
+            </button>
+            <p className="text-[11px] text-[#9E9893] text-center leading-relaxed">
+              Every post is drafted for you to review. Nothing publishes until you approve it.
+            </p>
+          </div>
+        ) : (
+          <div className="p-3 border-t border-[#E8E3DA] bg-[#F8F5EE] text-center">
+            <p className="text-xs text-green-700 font-medium mb-1">
+              ✓ Confirmed — writing {plan.items.length} posts
+            </p>
+            <Link href="/plans" className="text-xs text-[#FF4800] hover:underline">
+              Track them in Posting Plans →
+            </Link>
+          </div>
+        )}
+      </div>
+
+      <p className="text-[10px] text-[#C8C2BA] mt-1">{formatTime(message.timestamp)}</p>
+    </div>
+  );
+}
+
 // ── Brand Animation Card ──────────────────────────────────────────────────────
 
 interface BrandAnimationCardProps {
@@ -2450,8 +3144,16 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
   const draft = message.draft!;
   const approval = message.approval;
 
-  // "now" = post immediately, "schedule" = pick a date/time first
-  const [postMode, setPostMode] = useState<"now" | "schedule">("now");
+  // The moment the agent read out of the request, split into the two controls below. Absent or
+  // malformed leaves both blank, which is indistinguishable from a draft nobody timed.
+  const [agentDate, agentTime] = splitPublishAt(message.publishAt);
+
+  // "now" = post immediately, "schedule" = pick a date/time first. Opens on "schedule" when the
+  // user already said when they wanted this out — asking them to click Schedule and retype a
+  // time they just gave in the prompt is the whole gap this closes.
+  const [postMode, setPostMode] = useState<"now" | "schedule">(
+    agentDate ? "schedule" : "now"
+  );
   const [postStatus, setPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
   const [postError, setPostError] = useState<string | null>(null);
   // Image posting is tracked separately from the text post so the two buttons don't clobber
@@ -2498,9 +3200,11 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
     }
   }
 
-  // Scheduling fields — native date/time inputs give a built-in calendar UI
-  const [scheduleDate, setScheduleDate] = useState(""); // "2026-07-18"
-  const [scheduleTime, setScheduleTime] = useState(""); // "10:00"
+  // Scheduling fields — native date/time inputs give a built-in calendar UI. Seeded from the
+  // agent's reading of the request when there was one, and freely editable either way: this is
+  // a filled-in form, not a decision already taken.
+  const [scheduleDate, setScheduleDate] = useState(agentDate); // "2026-07-18"
+  const [scheduleTime, setScheduleTime] = useState(agentTime); // "10:00"
   const [scheduleStatus, setScheduleStatus] = useState<"idle" | "scheduling" | "scheduled" | "error">("idle");
   const [scheduleError, setScheduleError] = useState<string | null>(null);
 
@@ -2548,11 +3252,35 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
     }
   }
 
-  async function handleSchedulePost() {
+  /**
+   * Queues this draft for later instead of publishing it now.
+   *
+   * Goes through the shared scheduling API so the draft lands in the same persisted queue the
+   * content calendar reads — one place to see, edit and cancel it, and a schedule that survives
+   * a backend restart. The browser's timezone rides along so "10:00" means 10:00 where the user
+   * is, not in whatever zone the server runs in.
+   *
+   * @param platform the card's own platform; a card is only ever one of them, which is why the
+   *                 date/time state below can be shared between the two branches
+   * @param pageIds  Facebook Pages to publish to. Empty for LinkedIn, which has no equivalent —
+   *                 the backend ignores the field for it.
+   */
+  async function schedulePost(platform: "linkedin" | "facebook", pageIds: number[] = []) {
+    const label = platform === "facebook" ? "Facebook" : "LinkedIn";
     const token = localStorage.getItem("starlight_token");
     if (!token) {
       setScheduleStatus("error");
-      setScheduleError("Log in, then connect LinkedIn from your Brand Profile before scheduling.");
+      setScheduleError(
+        `Log in, then connect ${label} from your Brand Profile before scheduling.`
+      );
+      return;
+    }
+    // Checked here as well as on the immediate-post path: a scheduled Facebook post needs a
+    // Page just as much, and finding that out when it comes due days later would be far worse
+    // than finding out now.
+    if (platform === "facebook" && pageIds.length === 0) {
+      setScheduleStatus("error");
+      setScheduleError("Connect Facebook and pick a Page in your Brand Profile first.");
       return;
     }
     if (!scheduleDate || !scheduleTime) {
@@ -2563,16 +3291,21 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
     setScheduleStatus("scheduling");
     setScheduleError(null);
 
-    const scheduled_time = `${scheduleDate}T${scheduleTime}:00`;
-
     try {
-      const res = await fetch("/api/linkedin/scheduled-posts", {   // ← changed here
+      const res = await fetch("/api/schedule/posts", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ message: fullText(), scheduled_time }),
+        body: JSON.stringify({
+          platform,
+          message: fullText(),
+          date: scheduleDate,
+          time: scheduleTime,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          page_ids: pageIds,
+        }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
@@ -2587,6 +3320,85 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
     }
   }
   
+  // Facebook drafts publish to a connected Facebook Page (see the Brand Profile
+  // "Facebook Page" card). These reuse the same status states as the LinkedIn handlers — a
+  // given card is only ever one platform, so they never run against each other.
+  async function handlePostTextToFacebook() {
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setPostStatus("error");
+      setPostError("Log in, then connect Facebook from your Brand Profile before posting.");
+      return;
+    }
+    const pageIds = getSelectedPageIds();
+    if (pageIds.length === 0) {
+      setPostStatus("error");
+      setPostError("Connect Facebook and pick a Page in your Brand Profile first.");
+      return;
+    }
+    setPostStatus("posting");
+    setPostError(null);
+    try {
+      const form = new FormData();
+      form.append("message", captionText);
+      for (const id of pageIds) form.append("pageId", String(id));
+      const res = await fetch("/api/meta/post", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setPostStatus("error");
+        setPostError(data.error ?? "Failed to post to Facebook.");
+        return;
+      }
+      setPostStatus("posted");
+    } catch {
+      setPostStatus("error");
+      setPostError("Could not reach the backend.");
+    }
+  }
+
+  async function handlePostImageToFacebook() {
+    if (!imageFile) return;
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setImagePostStatus("error");
+      setImagePostError("Log in, then connect Facebook from your Brand Profile before posting.");
+      return;
+    }
+    const pageIds = getSelectedPageIds();
+    if (pageIds.length === 0) {
+      setImagePostStatus("error");
+      setImagePostError("Connect Facebook and pick a Page in your Brand Profile first.");
+      return;
+    }
+    setImagePostStatus("posting");
+    setImagePostError(null);
+    try {
+      const form = new FormData();
+      form.append("image", imageFile);
+      form.append("message", captionText);
+      for (const id of pageIds) form.append("pageId", String(id));
+      const res = await fetch("/api/meta/post", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setImagePostStatus("error");
+        setImagePostError(data.error ?? "Failed to post image to Facebook.");
+        return;
+      }
+      setImagePostStatus("posted");
+    } catch {
+      setImagePostStatus("error");
+      setImagePostError("Could not reach the backend.");
+    }
+  }
+
   return (
     <div className="w-full max-w-lg">
       <p className="text-sm text-[#6B6561] mb-2">{message.content}</p>
@@ -2654,8 +3466,19 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
           </div>
         )}
 
+        {/* A text+video task publishes as a single native video post (caption = this copy) from
+            the storyboard card below, so this card offers no competing text/image post — just a note. */}
+        {approval === "approved" && message.platform === "linkedin" && message.videoAlsoRequested && (
+          <div className="px-4 pb-4">
+            <div className="rounded-lg bg-[#F8F5EE] border border-[#E8E3DA] px-3 py-2 text-xs text-[#6B6561]">
+              This copy will be published as the caption of your video post below — render and
+              post it there to publish once.
+            </div>
+          </div>
+        )}
+
         {/* Post / Schedule (LinkedIn only, once approved) */}
-        {approval === "approved" && message.platform === "linkedin" && (
+        {approval === "approved" && message.platform === "linkedin" && !message.videoAlsoRequested && (
           <div className="px-4 pb-4 space-y-3">
             {postStatus === "posted" ? (
               <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
@@ -2701,6 +3524,14 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
                   </button>
                 ) : (
                   <div className="space-y-2">
+                    {/* Say where the pre-filled time came from. Without this the controls just
+                        arrive populated, and a user who didn't notice would publish on a day
+                        they never confirmed. */}
+                    {agentDate && (
+                      <p className="text-xs text-[#6B6561] bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-2.5 py-1.5 leading-relaxed">
+                        Timed from your request — adjust it here if that&apos;s not what you meant.
+                      </p>
+                    )}
                     <div className="flex gap-2">
                       <input
                         type="date"
@@ -2716,7 +3547,7 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
                       />
                     </div>
                     <button
-                      onClick={handleSchedulePost}
+                      onClick={() => schedulePost("linkedin")}
                       disabled={scheduleStatus === "scheduling"}
                       className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
                     >
@@ -2758,6 +3589,127 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
                     className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
                   >
                     {imagePostStatus === "posting" ? "Uploading & posting…" : "Post Image to LinkedIn"}
+                  </button>
+                </div>
+              )}
+              {imagePostStatus === "error" && imagePostError && (
+                <p className="text-xs text-red-600 mt-2 text-center">{imagePostError}</p>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Facebook drafts publish to the connected Facebook Page (Brand Profile). */}
+        {approval === "approved" && message.platform === "facebook" && (
+          <div className="px-4 pb-4 space-y-3">
+            {postStatus === "posted" ? (
+              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+                ✓ Posted to Facebook
+              </div>
+            ) : scheduleStatus === "scheduled" ? (
+              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+                ✓ Scheduled for {scheduleDate} at {scheduleTime}
+              </div>
+            ) : (
+              <>
+                {/* Same now/schedule choice LinkedIn drafts get. Facebook holds the schedule
+                    itself once the time is far enough out, so a scheduled post here survives
+                    this service being down at publish time. */}
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setPostMode("now")}
+                    className={`flex-1 text-sm font-medium py-1.5 rounded-lg transition-colors ${
+                      postMode === "now"
+                        ? "bg-[#1877F2] text-white"
+                        : "bg-[#F2EDE4] text-[#6B6561] border border-[#E8E3DA]"
+                    }`}
+                  >
+                    Post Now
+                  </button>
+                  <button
+                    onClick={() => setPostMode("schedule")}
+                    className={`flex-1 text-sm font-medium py-1.5 rounded-lg transition-colors ${
+                      postMode === "schedule"
+                        ? "bg-[#1877F2] text-white"
+                        : "bg-[#F2EDE4] text-[#6B6561] border border-[#E8E3DA]"
+                    }`}
+                  >
+                    Schedule
+                  </button>
+                </div>
+
+                {postMode === "now" ? (
+                  <button
+                    onClick={handlePostTextToFacebook}
+                    disabled={postStatus === "posting"}
+                    className="w-full bg-[#1877F2] hover:bg-[#166FE0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                  >
+                    {postStatus === "posting" ? "Posting…" : "Post to Facebook"}
+                  </button>
+                ) : (
+                  <div className="space-y-2">
+                    {agentDate && (
+                      <p className="text-xs text-[#6B6561] bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-2.5 py-1.5 leading-relaxed">
+                        Timed from your request — adjust it here if that&apos;s not what you meant.
+                      </p>
+                    )}
+                    <div className="flex gap-2">
+                      <input
+                        type="date"
+                        value={scheduleDate}
+                        onChange={(e) => setScheduleDate(e.target.value)}
+                        className="flex-1 bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-1.5 text-sm text-[#1B1A17] focus:outline-none focus:border-[#1877F2]"
+                      />
+                      <input
+                        type="time"
+                        value={scheduleTime}
+                        onChange={(e) => setScheduleTime(e.target.value)}
+                        className="flex-1 bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-1.5 text-sm text-[#1B1A17] focus:outline-none focus:border-[#1877F2]"
+                      />
+                    </div>
+                    <button
+                      onClick={() => schedulePost("facebook", getSelectedPageIds())}
+                      disabled={scheduleStatus === "scheduling"}
+                      className="w-full bg-[#1877F2] hover:bg-[#166FE0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                    >
+                      {scheduleStatus === "scheduling" ? "Scheduling…" : "Schedule Post"}
+                    </button>
+                  </div>
+                )}
+
+                {postStatus === "error" && postError && (
+                  <p className="text-xs text-red-600 text-center">{postError}</p>
+                )}
+                {scheduleStatus === "error" && scheduleError && (
+                  <p className="text-xs text-red-600 text-center">{scheduleError}</p>
+                )}
+              </>
+            )}
+
+            {/* Optional: attach an image and publish it with this caption as a photo post. */}
+            <div className="mt-3 pt-3 border-t border-[#E8E3DA]">
+              {imagePostStatus === "posted" ? (
+                <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+                  ✓ Image posted to Facebook
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => {
+                      setImageFile(e.target.files?.[0] ?? null);
+                      setImagePostStatus("idle");
+                      setImagePostError(null);
+                    }}
+                    className="block w-full text-xs text-[#6B6561] file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border file:border-[#E8E3DA] file:bg-[#F2EDE4] file:text-[#1B1A17] file:text-xs file:font-medium hover:file:bg-[#E8E3DA]"
+                  />
+                  <button
+                    onClick={handlePostImageToFacebook}
+                    disabled={!imageFile || imagePostStatus === "posting"}
+                    className="w-full bg-[#1877F2] hover:bg-[#166FE0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                  >
+                    {imagePostStatus === "posting" ? "Uploading & posting…" : "Post Image to Facebook"}
                   </button>
                 </div>
               )}

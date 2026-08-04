@@ -76,6 +76,7 @@ and approved, not posted.
 - [Plan status values](#plan-status-values) · [Item status values](#item-status-values) · [content_types](#content_types)
 
 **Endpoints (Backend → LLM Service)**
+- [0. Classify — one post, or a campaign?](#0-classify--one-post-or-a-campaign)
 - [1. Clarify — ask before generating](#1-clarify--ask-before-generating)
 - [2. Create a plan](#2-create-a-plan)
 - [3. Refine a draft](#3-refine-a-draft)
@@ -87,7 +88,9 @@ and approved, not posted.
 - [9. Execute one slot](#9-execute-one-slot)
 
 **Integration**
-- [The daily scheduler you must build](#the-daily-scheduler-you-must-build)
+- [The daily scheduler (implemented in the Java backend)](#the-daily-scheduler-implemented-in-the-java-backend)
+- [Approval → scheduling handoff (Java backend)](#approval--scheduling-handoff-java-backend)
+- [Reading back what a plan scheduled (Java backend)](#reading-back-what-a-plan-scheduled-java-backend)
 - [Error codes](#error-codes)
 - [End-to-end sequence](#end-to-end-sequence)
 
@@ -182,6 +185,81 @@ PATCH.
 ---
 
 ## Endpoints (Backend → LLM Service)
+
+### 0. Classify — one post, or a campaign?
+
+**Description**
+The chat's front door. Decides whether a chat turn is asking for one post now or a campaign
+across a date range, and extracts the campaign fields in the same pass. Without it the chat has
+no fork at all — every message becomes a single post, so *"plan my LinkedIn posts for next
+month"* produces one post **about** planning LinkedIn posts.
+
+**Stateless.** Multi-turn works by the caller passing `known` and `followups_asked` back from
+the previous response; the accumulated campaign *is* the conversation state. Passing `known` is
+also what declares the campaign conversation still open — a short answer like *"to launch our
+subscription"* reads like a one-off request in isolation, so while `known` carries anything the
+intent stays `posting_plan`. Drop `known` to end the conversation.
+
+**Endpoint** `POST /intake/classify`
+
+**Body Parameters**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `message` | string | **Yes** | The user's turn, verbatim |
+| `today` | string | **Yes** | `YYYY-MM-DD` — the caller's date **in the user's timezone** |
+| `target_platforms` | string[] | No | Backend-chosen; never asked about |
+| `known` | object | No | The `campaign` from the previous response |
+| `history` | object[] | No | Prior `{role, content}` turns |
+| `followups_asked` | int | No | From the previous response; at the cap (2) the gaps get filled rather than asked about |
+| `business_id` / `user_id` | string | No | Ride onto the finished brief |
+
+> **`today` is required and this is the point of it.** The service has no clock — `/plans/due`
+> takes the date as an argument for the same reason. "Next month" is only resolvable against a
+> known today, and on 31 July a server-clock guess in the wrong timezone is a whole month out.
+
+**Example Request**
+
+```http
+POST /intake/classify HTTP/1.1
+Content-Type: application/json
+
+{
+  "message": "Plan my LinkedIn posts for next month",
+  "today": "2026-07-31",
+  "target_platforms": ["linkedin"]
+}
+```
+
+**Example Successful Response** — `200 OK` (campaign, still gathering)
+
+```json
+{
+  "intent": "posting_plan",
+  "complete": false,
+  "campaign": {
+    "goal": "", "start_date": "2026-08-01", "end_date": "2026-08-31",
+    "cadence_hint": "", "tone_hint": ""
+  },
+  "question": "What should this campaign achieve?",
+  "assistant_message": "What should this campaign achieve?",
+  "followups_asked": 1
+}
+```
+
+Once `complete` is true, `campaign` is the full `POST /plans` body (blank optionals omitted) and
+the caller carries on to [clarify](#1-clarify--ask-before-generating) and
+[create](#2-create-a-plan). An `intent` of `"single_post"` comes back `complete` with
+`campaign: null` — the caller takes the ordinary `POST /tasks` path and this endpoint is out of
+the picture.
+
+**Example Unsuccessful Response** — `400 Bad Request`
+
+```json
+{ "error": "missing or malformed required field: today (YYYY-MM-DD)" }
+```
+
+---
 
 ### 1. Clarify — ask before generating
 
@@ -440,6 +518,16 @@ The full plan document (same shape as [Create](#2-create-a-plan)).
 **Description** Move a plan `draft` → `active`. Only active plans' items appear in
 [`/plans/due`](#8-due--the-daily-jobs-query).
 
+> **Confirming through the Java backend also writes the campaign.** `POST /plans/{id}/confirm`
+> on the backend activates the plan and then starts drafting **every** `planned` slot, so the
+> user can review the whole campaign at once instead of a slot a day. It returns as soon as the
+> plan is active — the items in that response still read `planned` and move to `generating` over
+> the following seconds, so a caller that wants to show progress must re-read the plan. Calling
+> this endpoint on the LLM service directly still only flips the status.
+>
+> The trade: copy is written against the confirm day's trends snapshot, not each slot's own
+> publish day. The approval gate is unchanged — every slot still stops for a human.
+
 **Endpoint** `POST /plans/{plan_id}/confirm`
 
 **Example Request**
@@ -602,41 +690,156 @@ Content-Type: application/json
 
 ---
 
-## The daily scheduler you must build
+## The daily scheduler (implemented in the Java backend)
 
-**This service has no scheduler and never fires on its own.** Stand up **one recurring job**
-(Spring `@Scheduled(cron=…)`, Quartz, a k8s `CronJob`, or an Azure Container Apps Job) that fires
-**once a day** in the user's timezone and runs:
+**This service has no scheduler and never fires on its own** — the clock lives in the caller.
+The Java backend supplies it: `PlanScheduler` runs `@Scheduled` once a day and drives the loop
+below. What follows describes both the contract and how the backend actually satisfies it.
+
+> **This job is now a backstop, not the main path.** `PlanCampaignDrafter` writes every slot when
+> the plan is confirmed, so in the ordinary case the daily run finds nothing to do. It still
+> matters for the cases that miss that path — a restart part-way through drafting, slots added or
+> un-skipped by a PATCH after confirm, plans confirmed before campaign-time drafting existed, and
+> slots whose first draft attempt failed.
 
 ```text
-today = LocalDate.now(userZone)                     # YOUR clock — the service never reads its own
-for each active brand/user you manage:
-    due = GET /plans/due?date={today}&business_id={brandId}
+horizon = LocalDate.now(appZone) + generationLeadDays    # YOUR clock — the service never reads its own
+for each business:
+    due = GET /plans/due?date={horizon}&business_id={brandId}
     for item in due.items:
-        if item.overdue: log/alert — a slot slipped (cron missed a day, or the plan was confirmed late)
+        if item.planned_date < today: log — a slot slipped past its publish date
         result = POST /plans/{item.plan_id}/items/{item.item_id}/execute
         # result.task.task_id is now an ordinary run heading to the human gate
-        notify the user: "Today's post for '{item.item.topic}' is drafting — review it: <link to task_id>"
+        email the user: "your slot for {planned_date} is drafting — review it"
 ```
 
-Then the user drives the spawned `task_id` through the **normal task flow** (SSE events →
+The user then drives the spawned `task_id` through the **normal task flow** (SSE events →
 `POST /tasks/{id}/review`). Practical rules:
 
+- **Draft ahead of the slot, not on it.** The horizon is `today + lead` (default 1 day,
+  `PLANS_GENERATION_LEAD_DAYS`), not `today`. Drafting a 07:30 slot at 18:00 on its own day is
+  already past the window, and the copy still has to clear the human gate before it can be
+  scheduled — so an evening run drafts *tomorrow's* slots. The trade-off is that copy rides the
+  trends snapshot of the day it was generated, not the day it publishes.
 - **Idempotency is handled for you.** `execute` 409s on a non-`planned` item, and the spawned
   `task_id` (`{plan_id}--{item_id}`) 409s if it already exists. If your cron runs twice or you
   retry after a blip, the second call is safely rejected — treat a `409` on `execute` as "already
   started", not an error to surface.
 - **Missed days self-heal.** `due` returns every `planned` item with `planned_date <= date`
   (flagged `overdue: true`), so a cron that didn't run yesterday picks up yesterday's slots today.
-  No catch-up mechanism needed.
-- **Pass the date explicitly, every time.** `today` must be *your* date in *your* user's timezone.
+  No catch-up mechanism needed. Note `overdue` is computed against the date you *sent*, so with a
+  lead in play it means "should have been drafted earlier" — compare `planned_date` against the
+  real today to find slots that missed their publish date.
+- **Pass the date explicitly, every time.** It must be *your* date in *your* user's timezone.
   Never assume the service's wall clock.
-- **`time_of_day` scheduling is yours.** Each item carries a `time_of_day` hint (e.g. `"morning"`,
-  `"18:00"`) — *advice* for when to publish; the service does nothing with it. Draft at 06:00 and
-  remind at 09:00 if you want — that's your cron's job.
-- **No auto-publishing anywhere.** Executing an item produces a draft that waits at the human gate.
-  Pushing approved copy to the platforms is a separate integration you build on the approved
-  `outputs`.
+- **`time_of_day` is advice, and the caller resolves it.** Items carry a free-text hint
+  (`"morning"`, `"18:00"`); this service does nothing with it. The backend's
+  `PostingWindowResolver` turns it into a concrete `HH:mm`, preferring an explicit time, then the
+  platform's own window from `skills/posting_plan.md`, then a generic one, then the platform
+  default.
+- **Publishing is still a separate step, but it is now built.** Executing an item produces a draft
+  that waits at the human gate; nothing auto-publishes. Approving it leads to
+  `POST /plans/{planId}/items/{itemId}/schedule` on the **Java backend** (not this service), which
+  reads the approved `outputs` and writes a scheduled post per platform. See below.
+- **Approval anywhere is enough.** The backend's `PlanHandoffSweeper` runs every couple of
+  minutes, finds active-plan slots that are approved but have no post on the calendar, and
+  schedules them. So a slot approved from the chat view — or one whose browser-side schedule call
+  never landed — still reaches the calendar. The explicit endpoint below is the fast path that
+  gives the reviewer immediate feedback, not the only route.
+
+---
+
+## Approval → scheduling handoff (Java backend)
+
+`POST /plans/{planId}/items/{itemId}/schedule` — takes the approved copy for a slot and queues it
+to publish at that slot's date and resolved time. JWT-scoped like every other backend plan route.
+
+Called **immediately after a successful approve**, because this service keeps task outputs in an
+in-memory registry — they do not survive a restart, so there is no "collect it later" option.
+
+**Request body** — all optional:
+
+| Field | Type | Description |
+|---|---|---|
+| `page_ids` | number[] | Facebook Pages to publish to. Omitted → every Page on the business's Meta connection, since the browser's own selection lives in localStorage where a server-side caller can't reach it. |
+| `scheduled_at` | string | A local datetime (`2026-08-05T09:00`) to publish at instead of the slot's own time. Must be ≥15 minutes ahead. |
+| `auto_reschedule` | bool | For a slot whose time has passed: take the next occurrence of that slot's own posting window. |
+
+**Rescheduling a slot whose time has passed.** A plan drafted Monday and approved Thursday has
+Tuesday's slots behind it, and a morning slot approved that afternoon has missed its window.
+Neither is a failure of the copy — only of the clock — so there are two ways forward:
+`auto_reschedule` keeps the window the plan chose and moves only the day (a morning post stays a
+morning post), or `scheduled_at` names a moment outright.
+
+**Neither is the default.** Without one, a passed slot comes back in `skipped` with
+`reason_code: "time_passed"` and nothing moves — a post appearing on a different day than the
+plan shows is worse than one that visibly didn't go out, because nobody goes looking for it.
+
+Every `skipped` entry carries a `reason_code` alongside its prose: `time_passed` (the only one
+a caller can act on), `no_integration`, `no_text`, `no_pages`, `already_scheduled`, `rejected`,
+`error`. Branch on the code, never on the message.
+
+**Response** — `200 OK`, with a per-platform breakdown. A 200 does **not** mean everything was
+scheduled; read the body:
+
+```json
+{
+  "plan_id": "plan-7f3a1b2c",
+  "item_id": "item-2",
+  "scheduled": [
+    { "platform": "linkedin", "scheduled_post_id": "84", "scheduled_at": "2026-07-21T07:00:00Z" }
+  ],
+  "skipped": [
+    { "platform": "instagram", "reason_code": "no_integration",
+      "reason": "instagram has no publishing integration yet — the copy is drafted but has to be posted manually." }
+  ]
+}
+```
+
+Partial success is the normal case: a slot can target platforms with no publishing path, and a
+slot approved after its window has passed can no longer be scheduled. Neither costs the caller the
+platforms that did work.
+
+**Conflicts** — `409` with `{ "error": … }`:
+
+| Cause | Message |
+|---|---|
+| Slot never drafted | "This slot hasn't been drafted yet" |
+| Still generating | "…still being generated (status: running)" |
+| Not yet approved, or only some platforms approved | "…still waiting on a review decision" |
+| Draft generation failed | "…failed, so there is nothing to schedule" |
+
+Re-running is safe: each scheduled post records the plan and item it came from, and a slot that
+already has a live post for a platform is skipped rather than duplicated. Cancelling a post and
+re-running this endpoint does schedule it again — but the automatic sweep will **not**, because
+it treats a post in any state, cancelled included, as already handled. Cancelling on the calendar
+is a decision, not a gap to fill.
+
+---
+
+## Reading back what a plan scheduled (Java backend)
+
+`GET /plans/{planId}/scheduled` — the posts a plan's slots put on the content calendar, keyed by
+item id. JWT-scoped like every other backend plan route.
+
+The plan document says only that a slot reached `done`, which is "the copy was approved" and not
+"something will be published". This is how a caller tells those apart, and how the plans UI
+distinguishes a scheduled slot from one whose handoff never happened.
+
+```json
+{
+  "plan_id": "plan-7f3a1b2c",
+  "items": {
+    "item-2": [
+      { "id": "84", "platform": "linkedin", "scheduled_at": "2026-07-21T07:00:00Z",
+        "status": "scheduled", "...": "…" }
+    ]
+  }
+}
+```
+
+Values are full calendar records (the same shape `GET /schedule/posts` returns). Items with
+nothing scheduled are simply absent.
 
 ---
 
@@ -658,15 +861,20 @@ All 4xx bodies are `{ "error": "message" }` (except `422`, which uses FastAPI's 
 A typical authoring-then-scheduling integration:
 
 ```
+0.  POST /intake/classify        → is this a campaign at all? (chat only; a form knows already)
+      intent=single_post  → POST /tasks, the ordinary one-post path — done here
+      intent=posting_plan, complete=false → ask `question`, repeat with `known` + followups_asked
 1.  POST /plans/clarify         → show recommended_cadence + follow_up_questions to the user
 2.  (collect the user's answers)
 3.  POST /plans (+ answers)      → draft plan
 4.  user reviews the draft:
       not happy?  → POST /plans/{id}/refine (feedback / answers) → back to 4
       tweak one slot? → PATCH /plans/{id}/items/{iid} → back to 4
-5.  POST /plans/{id}/confirm     → active
---- then, once per day, your cron: ---
-6.  GET /plans/due?date=<today>  → due items
-7.  for each: POST /plans/{id}/items/{iid}/execute → notify the user with task_id
-8.  user reviews via the normal task flow (SSE + POST /tasks/{id}/review) → item lands `done`
+5.  POST /plans/{id}/confirm     → active, AND every slot starts drafting
+6.  user reviews each draft via the normal task flow (SSE + POST /tasks/{id}/review) → `done`
+7.  the approved copy is scheduled — by the browser's own POST …/schedule call, or failing
+    that by the backend's handoff sweep — and appears on the content calendar
+--- and, as a backstop, once per day: ---
+8.  GET /plans/due?date=<today+lead>  → any slot still undrafted as its date approaches
+9.  for each: POST /plans/{id}/items/{iid}/execute → back into step 6
 ```

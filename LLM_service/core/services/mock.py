@@ -32,6 +32,7 @@ from agent_framework._types import ResponseStream
 
 from ...skills import parse_char_limit
 from ..config import get_settings
+from ..intent_schema import RequestClassification
 from ..plan_schema import PlanClarification, PlanItemSpec, PostingPlanSpec
 from ..skill_schema import SkillCandidate, SkillRule, UserSkillDoc
 from ..trend_schema import Trend, select_current_trends
@@ -47,6 +48,7 @@ from .base import (
     SafetyResult,
     SafetyService,
     StoreService,
+    SynthesizedSpeech,
     VideoGenerationService,
     VoiceoverService,
     VoiceService,
@@ -265,6 +267,142 @@ _GOAL_VERBS = (
     "drive|increase|boost|promote|grow|launch|sell|raise|build|get|reach|convert"
     "|announce|educate|inspire|generate|attract|engage|highlight|showcase|celebrate"
 )
+# Phrases that mark a request as a multi-date CAMPAIGN rather than one post. Deliberately
+# narrow: the real prompt is told to prefer single_post when unsure, and the mock has to make
+# the same call or tests would encode behaviour production doesn't have.
+_PLAN_TRIGGERS = (
+    "campaign", "posting plan", "content plan", "content calendar", "posting schedule",
+    "plan out", "plan my", "plan me", "plan a", "schedule posts", "series of posts",
+    "posts for next", "posts over", "posts across", "content for next",
+)
+
+
+def _parse_window(text: str, today: str) -> tuple[str, str]:
+    """Resolve the relative windows the mock understands into absolute dates.
+
+    Covers what the tests and the demo path actually say — "next month", "the next 3 weeks",
+    an explicit ISO pair — and returns ("", "") for anything else, which is the same "user
+    named no period" answer the real model gives. Never invents a window."""
+    try:
+        base = date.fromisoformat(today)
+    except ValueError:
+        return "", ""
+
+    # An explicit pair wins: nothing to infer when the user gave real dates.
+    explicit = re.findall(r"\d{4}-\d{2}-\d{2}", text)
+    if len(explicit) >= 2:
+        return explicit[0], explicit[1]
+
+    if "next month" in text:
+        first = (base.replace(day=1) + timedelta(days=32)).replace(day=1)
+        last = (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+        return first.isoformat(), last.isoformat()
+
+    if "this month" in text:
+        last = (base.replace(day=1) + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+        return base.isoformat(), last.isoformat()
+
+    m = re.search(r"next (\d+) (day|week|month)s?", text)
+    if m:
+        days = {"day": 1, "week": 7, "month": 30}[m.group(2)] * int(m.group(1))
+        return base.isoformat(), (base + timedelta(days=days)).isoformat()
+
+    if "next week" in text:
+        return base.isoformat(), (base + timedelta(days=7)).isoformat()
+
+    return "", ""
+
+
+#: The hour a named day defaults to when the user gives a day but no clock time ("post it on
+#: Friday"). Mirrors the instruction in the real prompt so mock and Azure agree. Nothing
+#: publishes off this — it pre-fills a control the user still has to confirm.
+_DEFAULT_PUBLISH_HOUR = 9
+
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
+def _parse_clock(text: str) -> Optional[tuple[int, int]]:
+    """The (hour, minute) in "at 10", "at 10:30pm", "@ 9am" — or None if no time is stated.
+
+    Anchored on "at"/"@" so a bare number elsewhere in the sentence ("our 5 best tips") can't
+    be mistaken for a publish time."""
+    m = re.search(r"\b(?:at|@)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", text)
+    if not m:
+        return None
+
+    hour = int(m.group(1))
+    minute = int(m.group(2) or 0)
+    meridiem = m.group(3)
+
+    if meridiem == "pm" and hour != 12:
+        hour += 12
+    elif meridiem == "am" and hour == 12:
+        hour = 0
+
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute
+
+
+def _parse_publish_day(text: str, base: date) -> Optional[date]:
+    """The day named in the sentence, resolved against `base`. None when no day is stated."""
+    explicit = re.search(r"\d{4}-\d{2}-\d{2}", text)
+    if explicit:
+        try:
+            return date.fromisoformat(explicit.group(0))
+        except ValueError:
+            return None
+
+    if "tomorrow" in text:
+        return base + timedelta(days=1)
+    if "today" in text or "tonight" in text:
+        return base
+
+    for offset, name in enumerate(_WEEKDAYS):
+        if name not in text:
+            continue
+        # The next one strictly ahead: "post it on Friday" said on a Friday means next Friday,
+        # not one already most of the way through.
+        ahead = (offset - base.weekday()) % 7
+        return base + timedelta(days=ahead or 7)
+
+    return None
+
+
+def _parse_publish_at(text: str, today: str) -> str:
+    """When a one-off post should go out, as "YYYY-MM-DDTHH:MM", or "" if no time was named.
+
+    The deterministic counterpart to the real prompt's publish_at rule, covering the shapes the
+    tests and the demo path actually use. Returns "" rather than guessing whenever the sentence
+    names neither a day nor a time — the same "user said nothing about timing" answer the real
+    model gives, and the answer that leaves the draft card on Post Now."""
+    try:
+        base = date.fromisoformat(today)
+    except ValueError:
+        return ""
+
+    day = _parse_publish_day(text, base)
+    clock = _parse_clock(text)
+    if day is None and clock is None:
+        return ""
+
+    hour, minute = clock or (_DEFAULT_PUBLISH_HOUR, 0)
+    return datetime.combine(day or base, datetime.min.time()).replace(
+        hour=hour, minute=minute
+    ).strftime("%Y-%m-%dT%H:%M")
+
+
+def _extract_goal(message: str) -> str:
+    """The campaign goal, when the sentence states one. Mirrors `_free_extract`'s "to <verb> …"
+    rule, plus the "for our <thing>" shape a campaign request tends to use."""
+    low = message.lower()
+    m = re.search(rf"\bto ({_GOAL_VERBS})\b(.+?)(?:[.;\n]|$)", low)
+    if m:
+        return f"{m.group(1)}{m.group(2)}".strip()
+    m = re.search(r"\bfor (?:our|my|the) (.+?)(?:[.;\n]|$)", low)
+    if m:
+        return m.group(1).strip()
+    return ""
 
 
 def _parse_platforms(text: str) -> list[str]:
@@ -412,13 +550,22 @@ def _mock_scene_component(*, broken: bool) -> str:
     )
 
 
-def _mock_storyboard(topic: str, draft: str, tone_hint: Optional[str], platform: str) -> dict:
-    """A deterministic 4-slide StoryboardSpec-shaped dict — one of each core slide
+def _mock_storyboard(
+    topic: str, draft: str, tone_hint: Optional[str], platform: str, direction: str = "",
+) -> dict:
+    """A deterministic 4-slide StoryboardSpec-shaped dict — one of each Phase 1 slide
     type, in a typical order (hook -> collage -> counter_stat -> outro), so
-    contract-parity / shape tests have something stable to assert on."""
+    contract-parity / shape tests have something stable to assert on. When `direction`
+    (the roundtable's agreed video direction) is given, it is echoed into the hook slide's
+    narration so tests can assert the direction reached the generator; empty `direction`
+    leaves the deterministic baseline output unchanged."""
     primary, secondary, accent = _MEDIA_PALETTE
     brand = _brand_name(topic)
     tagline = (tone_hint or "Crafted with intent").strip()[:48] or "Crafted with intent"
+    hook_narration = (
+        f"Introducing {brand}. Direction: {direction.strip()}"
+        if direction and direction.strip() else f"Introducing {brand}."
+    )
     return StoryboardSpec(
         brandName=brand,
         primaryColor=primary,
@@ -426,15 +573,24 @@ def _mock_storyboard(topic: str, draft: str, tone_hint: Optional[str], platform:
         accentColor=accent,
         platform=platform,
         slides=[
-            {"type": "hook", "headline": tagline, "imageQuery": topic, "shape": "circle"},
-            {"type": "collage", "headline": "Why It Matters", "imageQueries": [topic, "team", "product"]},
+            {"type": "hook", "headline": tagline, "imageQuery": topic, "shape": "circle",
+             "narration": hook_narration},
+            {"type": "collage", "headline": "Why It Matters", "imageQueries": [topic, "team", "product"],
+             "narration": f"Here's why {topic} matters for you."},
             {"type": "counter_stat", "sectionLabel": "By The Numbers", "stats": [
                 {"value": "100%", "label": "On brand", "icon": "★"},
                 {"value": "3", "label": "Platforms", "icon": "◆"},
                 {"value": "24/7", "label": "Always on", "icon": "●"},
-            ]},
-            {"type": "outro", "brandName": brand, "ctaLabel": "Learn More", "contact": "@brand · brand.com"},
+            ], "narration": "The numbers speak for themselves."},
+            {"type": "outro", "brandName": brand, "ctaLabel": "Learn More", "contact": "@brand · brand.com",
+             "narration": f"Learn more about {brand} today."},
         ],
+        audio={
+            "musicMood": "inspiring",
+            "musicGenre": "corporate",
+            "musicEnergy": "medium",
+            "narrationVoice": "warm",
+        },
     ).model_dump()
 
 
@@ -516,6 +672,49 @@ class MockLLM(LLMService):
         # session_title event fires) instead of no-op'ing on a short topic.
         words = (topic or user_intent or "New session").split()
         return " ".join(w.capitalize() for w in words[:6]).strip(" ,.;:—-") or "New session"
+
+    async def classify_request(
+        self,
+        *,
+        message: str,
+        today: str,
+        platforms: List[str],
+        known: Optional[dict] = None,
+        history: Optional[List[dict]] = None,
+    ) -> dict:
+        await asyncio.sleep(_MOCK_LATENCY)
+        text = (message or "").lower()
+        settled = {k: v for k, v in (known or {}).items() if v}
+
+        # A campaign is asked for in a fairly narrow vocabulary; anything else is one post.
+        # Matches the real prompt's tie-break: when unsure, prefer the cheap immediate path.
+        is_plan = any(trigger in text for trigger in _PLAN_TRIGGERS)
+
+        # Anything already settled means a campaign conversation is under way, so a short
+        # follow-up ("to launch our subscription") can't read as a fresh one-off request.
+        # CampaignConversation enforces this too; keeping it here means a direct caller of
+        # classify_request gets the same answer.
+        if any(settled.get(field) for field in ("goal", "start_date", "end_date")):
+            is_plan = True
+
+        if not is_plan:
+            # The one place publish_at is meaningful: a single post the user wants held until a
+            # stated moment. A campaign's timing is its window plus a cadence, so the plan
+            # branch below leaves it blank.
+            return RequestClassification(
+                intent="single_post",
+                publish_at=_parse_publish_at(text, today),
+            ).model_dump()
+
+        start, end = _parse_window(text, today)
+        return RequestClassification(
+            intent="posting_plan",
+            goal=_extract_goal(message) or settled.get("goal", ""),
+            start_date=start or settled.get("start_date", ""),
+            end_date=end or settled.get("end_date", ""),
+            cadence_hint=settled.get("cadence_hint", ""),
+            tone_hint=settled.get("tone_hint", ""),
+        ).model_dump()
 
     async def clarify_campaign(
         self,
@@ -719,10 +918,11 @@ class MockLLM(LLMService):
         tone_hint: Optional[str],
         platform: str,
         skill: str = "",
+        direction: str = "",
         history: Optional[List[dict]] = None,
     ) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
-        return _mock_storyboard(topic, draft, tone_hint, platform)
+        return _mock_storyboard(topic, draft, tone_hint, platform, direction)
 
     async def generate_video_prompt(
         self,
@@ -1457,11 +1657,11 @@ class MockVoiceover(VoiceoverService):
     the file — works end to end without real credentials. Reuses `_silent_mp3`
     (already built for MockMusicGeneration; same ffprobe-decodability requirement)."""
 
-    async def synthesize(self, *, text: str, voice: str) -> bytes:
+    async def synthesize(self, *, text: str, voice: str) -> SynthesizedSpeech:
         await asyncio.sleep(_MOCK_LATENCY)
         words = len(text.split())
         duration_seconds = max(1.0, (words / _MOCK_SPEAKING_RATE_WPM) * 60)
-        return _silent_mp3(duration_seconds)
+        return SynthesizedSpeech(audio=_silent_mp3(duration_seconds), duration_seconds=duration_seconds)
 
 
 # Minimal but structurally-valid MP4 container (ftyp + mdat), used as the offline

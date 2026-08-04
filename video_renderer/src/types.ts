@@ -220,9 +220,16 @@ export interface RenderableStoryboard {
   // Job-relative path (e.g. "music.mp3"), resolved by workflow/video/music.py.
   // Absent/undefined when generation failed or was skipped — render stays silent.
   musicLocalPath?: string;
-  // Job-relative path (e.g. "voiceover.mp3"), resolved by workflow/video/voiceover.py.
-  // Absent/undefined when no narration was requested or synthesis failed.
+  // Job-relative path (e.g. "voiceover.mp3") for a SINGLE whole-video narration track
+  // (the fallback path). Absent when per-slide narration drove the render, or when none
+  // was requested / synthesis failed.
   voiceoverLocalPath?: string;
+  // Per-slide narration paths (e.g. "voiceover/0.mp3"), index-aligned to `slides` — one
+  // clip per slide that carried a narration line (null for a slide with none / a failed
+  // synth). KEEP IN SYNC with LLM_service/core/video_schema.py RenderableStoryboard.
+  // When present, each plays inside its own slide sequence (slide-synced); absent →
+  // fall back to voiceoverLocalPath.
+  voiceoverSlidePaths?: (string | null)[];
   // Index signature so this satisfies Remotion's `Record<string, unknown>` props
   // constraint (CalculateMetadataFunction / Composition generics require it).
   [key: string]: unknown;

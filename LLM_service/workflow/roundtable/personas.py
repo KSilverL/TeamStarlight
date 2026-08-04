@@ -45,9 +45,11 @@ BRAND_VOICE = "brand_voice"
 USER_ADVOCATE = "user_advocate"
 AUDIENCE_ADVOCATE = "audience_advocate"
 TREND_SCOUT = "trend_scout"
+VIDEO_DIRECTOR = "video_director"
 
 # The always-on four seats. `trend_scout` is appended inside build_personas only when
-# TREND_SCOUT_ENABLED — with the toggle off the roster (and every existing test) is unchanged.
+# TREND_SCOUT_ENABLED, and `video_director` only when the brief requests "video" — with both
+# toggles off the roster (and every existing test) is unchanged.
 ROSTER: List[str] = [PLATFORM_EDITOR, BRAND_VOICE, USER_ADVOCATE, AUDIENCE_ADVOCATE]
 
 _DELIVERABLE_LABELS = {
@@ -96,6 +98,20 @@ def render_deliverable_scope(content_types: List[str]) -> str:
     return "\n".join(lines)
 
 
+# One Azure Neural TTS voice per seat, for the optional spoken readback of the discussion
+# (runner.py synthesizes each turn's line in this voice once it completes). Same "one
+# model, many roles" economy as the text personas above — just via VoiceoverService's
+# `voice` parameter instead of a system prompt. Used as a fallback for any unmapped
+# speaker (e.g. the "user" seat, which is never synthesized).
+DEFAULT_VOICE = "en-US-JennyNeural"
+PERSONA_VOICES: Dict[str, str] = {
+    PLATFORM_EDITOR: "en-US-GuyNeural",
+    BRAND_VOICE: "en-US-DavisNeural",
+    USER_ADVOCATE: "en-US-JennyNeural",
+    AUDIENCE_ADVOCATE: "en-US-AriaNeural",
+    TREND_SCOUT: "en-US-SaraNeural",
+}
+
 # Appended VERBATIM to every seat's instructions so each turn reads like a real person speaking
 # at a fast roundtable, not an essay: ONE point, a sentence or two, reacting to what was just
 # said. This is the primary lever for keeping turns short — keep it the same for all seats so the
@@ -137,6 +153,11 @@ PERSONA_DESCRIPTIONS: Dict[str, str] = {
     TREND_SCOUT: (
         "Cultural-trend radar: pitches one genuine fusion angle between a current trend and "
         "the topic — or says plainly that none fits; call on them for timeliness angles."
+    ),
+    VIDEO_DIRECTOR: (
+        "Short-form video director: shapes the storyboard — the opening hook beat, visual "
+        "tone, pacing, slide arc, and closing on-screen CTA; call on them for how the idea "
+        "should move as a video, not read as a caption."
     ),
 }
 
@@ -282,11 +303,32 @@ def build_personas(
             "discussion; name only the one trend you are pitching.\n\n"
             f"{trend_block or '(no current trends available — skip the trend angle)'}"
         ),
+        VIDEO_DIRECTOR: (
+            f"You are the video director — the seat that turns this post into a short-form "
+            f"{platform} video that stops the scroll in its first second.\n"
+            "Your mission: shape a tight storyboard — an opening hook beat, a clear visual arc "
+            "of a few beats, and a closing on-screen call to action — carrying the SAME message "
+            "as the post copy, never a different one.\n"
+            "Your lens: does each idea translate into a concrete motion beat a viewer would "
+            "watch — an opening hook shot, a stat or proof beat, a visual payoff — rather than "
+            "the caption read aloud over a static background?\n"
+            "Be concrete about the VISUAL: name the opening beat, the visual tone (energetic / "
+            "calm / bold), the pacing, and what the final frame says. Give exactly ONE "
+            "storyboard idea per turn, not a full shot list — build the arc across rounds.\n"
+            "Push back the moment the video would just be the caption on a plain background, or "
+            "when a beat has nothing to actually show — say what to put on screen instead.\n"
+            "Stay in your lane: the platform editor owns caption format and the brand-voice "
+            "guardian owns brand rules — you own how the story MOVES as a video."
+        ),
     }
 
     roster = list(ROSTER)
     if settings.trend_scout_enabled:
         roster.append(TREND_SCOUT)
+    # The video director joins only when the brief asks for a video — the seat exists to give
+    # the storyboard real deliberation inside the one shared session (no second table).
+    if "video" in (brief.content_types or []):
+        roster.append(VIDEO_DIRECTOR)
 
     personas: List[Persona] = []
     for name in roster:

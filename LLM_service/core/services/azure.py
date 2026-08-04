@@ -33,6 +33,7 @@ from agent_framework._types import ResponseStream
 from pydantic import TypeAdapter, ValidationError
 
 from ..config import Settings
+from ..intent_schema import RequestClassification
 from ..plan_schema import PlanClarification, PostingPlanSpec
 from ..skill_schema import SkillCandidate, SkillRule
 from ..video_schema import StoryboardSpec, TemplateSlideSpec, VideoPromptSpec
@@ -43,6 +44,7 @@ from .base import (
     RealtimeVoiceSession,
     SafetyResult,
     SafetyService,
+    SynthesizedSpeech,
     VoiceoverService,
     VoiceService,
 )
@@ -179,6 +181,7 @@ class AzureLLM(LLMService):
         self, messages: List[dict], *, model: Optional[str] = None,
         temperature: Optional[float] = None, max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None, verbosity: Optional[str] = None,
+        max_retries: Optional[int] = None,
     ) -> str:
         """Single seam through which all chat traffic flows (overridable in tests).
         `model` overrides the deployment for one call (e.g. the cheap summary tier);
@@ -192,8 +195,15 @@ class AzureLLM(LLMService):
         set, `temperature` is DROPPED even if the caller passed one — a reasoning
         deployment rejects (or ignores) a custom temperature, which is exactly why
         AzureChatClient (the roundtable path) never sends one; callers that opt
-        into reasoning_effort are asserting this is a reasoning-tier call."""
+        into reasoning_effort are asserting this is a reasoning-tier call.
+        `max_retries` overrides the client's SDK-level retry count for THIS call
+        only (`with_options` copies the client but keeps the same underlying httpx
+        connection pool, so this is not a per-call connection leak). The codegen
+        path passes 0 — see Settings.codegen_max_retries for why retrying a
+        300s-timeout reasoning call is actively harmful."""
         client = self._ensure_client()
+        if max_retries is not None:
+            client = client.with_options(max_retries=max_retries)
         kwargs: dict = {
             "model": model or self._settings.azure_chat_deployment,
             "messages": messages,
@@ -340,6 +350,77 @@ class AzureLLM(LLMService):
             model=self._settings.preference_summary_model,
         )
         return raw.strip()
+
+    async def classify_request(
+        self,
+        *,
+        message: str,
+        today: str,
+        platforms: List[str],
+        known: Optional[dict] = None,
+        history: Optional[List[dict]] = None,
+    ) -> dict:
+        schema = json.dumps(RequestClassification.model_json_schema())
+        settled = {k: v for k, v in (known or {}).items() if v}
+        system = (
+            "You are the front desk of a social-media newsroom. Decide what the user is "
+            "asking for and extract the details in one pass.\n\n"
+            "intent is 'posting_plan' when they want content SCHEDULED over a period — a "
+            "campaign, a content calendar, 'posts for next month', 'a plan for the product "
+            "launch', anything spanning multiple dates. It is 'single_post' when they want "
+            "something written now: one post, one caption, one video. When the message is "
+            "ambiguous, prefer 'single_post' — writing one post is cheap and immediate, "
+            "whereas a wrongly-started campaign wastes the user's time reviewing a schedule "
+            "they never asked for.\n\n"
+            f"TODAY IS {today}. Resolve any relative period against it and return absolute "
+            "dates: 'next month' is that whole calendar month; 'the next 3 weeks' starts "
+            "today; 'Q4' is that quarter. If they named no period at all, leave start_date "
+            "and end_date as empty strings — never invent a window.\n\n"
+            "publish_at is for a SINGLE post the user wants held until a stated moment — "
+            "'post this on Friday at 10', 'schedule it for tomorrow morning', 'send it out "
+            "on the 12th at 9am'. Resolve it against TODAY the same way, to the minute, as "
+            "'YYYY-MM-DDTHH:MM' in the user's own local time — no timezone offset, no 'Z'. "
+            "A named day with no clock time takes 09:00. Leave it blank when they want the "
+            "post now, when they named no time at all, or whenever intent is 'posting_plan' "
+            "— a campaign is a window and a cadence, not one moment.\n\n"
+            "Leave any field the user has not spoken to as an empty string. Never ask about "
+            "or infer platforms; they are already chosen. Return ONLY valid JSON (no markdown "
+            "fences, no prose) matching this schema exactly:\n"
+            f"{schema}"
+        )
+        if settled:
+            # Two jobs. Without the carry-through, a turn that only answers "what's the goal?"
+            # comes back with the window blanked and the conversation asks for dates it already
+            # had. Without the intent pin, that same short answer reads as a one-off request in
+            # isolation and the campaign is abandoned mid-conversation.
+            system += (
+                "\n\nA campaign conversation is already under way, and these fields are "
+                f"settled: {json.dumps(settled)}. Carry them through unchanged unless this "
+                "message contradicts them, and keep intent as 'posting_plan' — this message is "
+                "an answer within that conversation, not a new request."
+            )
+
+        user = f"Platforms (already chosen): {', '.join(platforms) or 'none given'}\n\n{message}"
+        messages = [{"role": "system", "content": system},
+                    *(history or []),
+                    {"role": "user", "content": user}]
+
+        last_error: Exception = ValueError("classify_request: no attempts made")
+        for _ in range(_PLAN_CAMPAIGN_MAX_ATTEMPTS):
+            raw = await self._complete(messages)
+            try:
+                data = json.loads(_strip_fences(raw))
+                return RequestClassification(**data).model_dump()
+            except (json.JSONDecodeError, ValidationError) as exc:
+                last_error = exc
+                messages = messages + [
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content": (
+                        f"Your previous JSON was invalid: {exc}. Return corrected JSON "
+                        "only, matching the schema exactly."
+                    )},
+                ]
+        raise last_error
 
     async def clarify_campaign(
         self,
@@ -589,6 +670,7 @@ class AzureLLM(LLMService):
         tone_hint: Optional[str],
         platform: str,
         skill: str = "",
+        direction: str = "",
         history: Optional[List[dict]] = None,
     ) -> dict:
         schema = json.dumps(StoryboardSpec.model_json_schema())
@@ -602,11 +684,18 @@ class AzureLLM(LLMService):
             "Return ONLY valid JSON (no markdown fences, no prose) matching the schema "
             f"exactly:\n{schema}" + style_guide
         )
+        # The roundtable's agreed video direction (when present) is the primary creative brief —
+        # the caption is supporting context, not the whole basis.
+        direction_block = (
+            f"\nAgreed video direction (from the content roundtable — follow this):\n{direction}"
+            if direction and direction.strip() else ""
+        )
         user = (
             f"Brand topic: {topic}\n"
             f"Approved post copy:\n{draft}\n"
             f"Tone: {tone_hint or 'brand voice'}\n"
             f"Target platform: {platform}"
+            f"{direction_block}"
         )
         messages = [{"role": "system", "content": system}, *(history or []),
                     {"role": "user", "content": user}]
@@ -716,6 +805,8 @@ class AzureLLM(LLMService):
         raw = await self._complete(
             [{"role": "system", "content": system}, {"role": "user", "content": user_content}],
             model=self._settings.codegen_model,
+            max_tokens=self._settings.codegen_review_max_tokens,
+            max_retries=self._settings.codegen_max_retries,
         )
         data = json.loads(_strip_fences(raw))
         fixes = data.get("fixes")
@@ -748,6 +839,7 @@ class AzureLLM(LLMService):
                 model=self._settings.codegen_model,
                 reasoning_effort=self._settings.codegen_plan_reasoning_effort,
                 temperature=0.8, max_tokens=self._settings.codegen_plan_max_tokens,
+                max_retries=self._settings.codegen_max_retries,
             )
             return raw.strip()
         except Exception:
@@ -849,6 +941,7 @@ class AzureLLM(LLMService):
             reasoning_effort=self._settings.codegen_reasoning_effort,
             temperature=0.3 if attempt == 1 else 0.5,
             max_tokens=self._settings.codegen_max_tokens,
+            max_retries=self._settings.codegen_max_retries,
         )
         return _strip_fences(raw)
 
@@ -858,7 +951,14 @@ class AzureLLM(LLMService):
         """One-shot degradation for an exhausted `generated` slide (workflow/video/
         fallback.py): re-express the brief + data as the best-fitting FIXED slide.
         Returns the raw parsed dict; the caller validates against the template-only
-        union and degrades any invalid answer to a hook card, so no retry loop here."""
+        union and degrades any invalid answer to a hook card, so no retry loop here.
+
+        The heaviest prompt in the pipeline (the full ~23KB TemplateSlideSpec schema)
+        for the cheapest task (pick a `type`, copy the data into its fields), and it
+        runs on a slide that has ALREADY spent the whole codegen budget — so it is
+        explicitly steered away from reasoning and capped. Both were previously
+        unset, which on a reasoning deployment made this an unbounded call sitting
+        directly in the render's critical path."""
         schema = json.dumps(TypeAdapter(TemplateSlideSpec).json_schema())
         system = (
             "A bespoke video scene could not be generated. Re-express its creative "
@@ -880,7 +980,10 @@ class AzureLLM(LLMService):
         raw = await self._complete(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
             model=self._settings.codegen_model,
+            reasoning_effort=self._settings.codegen_convert_reasoning_effort,
             temperature=0.2,
+            max_tokens=self._settings.codegen_convert_max_tokens,
+            max_retries=self._settings.codegen_max_retries,
         )
         return json.loads(_strip_fences(raw))
 
@@ -1443,8 +1546,15 @@ class AzureSpeechVoiceover(VoiceoverService):
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
+    # Constant bitrate of the requested output format below (48 kbit/s), used to
+    # derive the clip duration from the byte length without ffprobe or a decode:
+    # for CBR MP3, seconds ≈ bytes * 8 / bitrate. Dragon HD voices synthesize
+    # through this same endpoint — only the SSML `<voice name>` differs.
+    _OUTPUT_FORMAT = "audio-24khz-48kbitrate-mono-mp3"
+    _OUTPUT_BITRATE_BPS = 48000
+
     def _synthesis_url(self) -> str:
-        region = self._settings.azure_speech_region
+        region = self._settings.roundtable_tts_region
         return f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
 
     @staticmethod
@@ -1458,18 +1568,20 @@ class AzureSpeechVoiceover(VoiceoverService):
             "</speak>"
         )
 
-    async def synthesize(self, *, text: str, voice: str) -> bytes:
+    async def synthesize(self, *, text: str, voice: str) -> SynthesizedSpeech:
         import httpx  # lazy import, matches the rest of core/services/*
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 self._synthesis_url(),
                 headers={
-                    "Ocp-Apim-Subscription-Key": self._settings.azure_speech_key,
+                    "Ocp-Apim-Subscription-Key": self._settings.roundtable_tts_key,
                     "Content-Type": "application/ssml+xml",
-                    "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+                    "X-Microsoft-OutputFormat": self._OUTPUT_FORMAT,
                 },
                 content=self._ssml(text, voice).encode("utf-8"),
             )
             resp.raise_for_status()
-            return resp.content
+            audio = resp.content
+            duration_seconds = (len(audio) * 8) / self._OUTPUT_BITRATE_BPS
+            return SynthesizedSpeech(audio=audio, duration_seconds=duration_seconds)

@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 
+// Matches every other proxy route in the app. This previously hardcoded the Docker service
+// name, so the route only resolved inside compose and 500'd in local dev.
+const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:8081";
+
 export async function POST(
   req: NextRequest,
   context: {
@@ -15,7 +19,7 @@ export async function POST(
     const token = req.headers.get("authorization");
 
     const response = await fetch(
-      `http://backend:8081/plans/${planId}/items/${itemId}/execute`,
+      `${BACKEND_URL}/plans/${planId}/items/${itemId}/execute`,
       {
         method: "POST",
         headers: {

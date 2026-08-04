@@ -41,6 +41,7 @@ __all__ = [
     "ImageSearchService",
     "BackgroundRemovalService",
     "MusicGenerationService",
+    "SynthesizedSpeech",
     "VoiceoverService",
     "VideoGenerationService",
     "empty_profile",
@@ -164,6 +165,36 @@ class LLMService(ABC):
         runs on the cheap summary tier and is called concurrently (never awaited) at task start,
         so the caller always applies a deterministic topic-derived fallback and clamps the length
         — an empty or oversized return degrades gracefully and never blocks a run."""
+        ...
+
+    @abstractmethod
+    async def classify_request(
+        self,
+        *,
+        message: str,
+        today: str,
+        platforms: List[str],
+        known: Optional[dict] = None,
+        history: Optional[List[dict]] = None,
+    ) -> dict:
+        """Decide whether this chat turn is asking for ONE post or a whole CAMPAIGN, and
+        extract the campaign fields in the same pass — as a JSON-friendly dict matching
+        core.intent_schema.RequestClassification.
+
+        One call rather than two because the fields that distinguish the two intents (a goal,
+        a date range, a pace) are exactly the ones the campaign path needs next; classifying
+        and then re-reading the same sentence to extract them would be a wasted round trip.
+
+        `today` is the caller's date (YYYY-MM-DD) in the *user's* timezone, and is REQUIRED
+        for relative windows: "next month" is only resolvable against a known today, and this
+        service has no clock of its own. Implementations must resolve any relative period into
+        absolute `start_date` / `end_date` and leave them "" when the user named no period.
+
+        `known` carries what earlier turns already settled (the caller accumulates it and
+        passes it back — the conversation is stateless here), so a turn answering "what's the
+        goal?" doesn't lose the window a previous turn established. `platforms` are supplied by
+        the caller and never asked about, matching intake's existing rule.
+        """
         ...
 
     @abstractmethod
@@ -308,6 +339,7 @@ class LLMService(ABC):
         tone_hint: Optional[str],
         platform: str,
         skill: str = "",
+        direction: str = "",
         history: Optional[List[dict]] = None,
     ) -> dict:
         """Generate a dynamic, composable storyboard for a short-form brand video as a
@@ -318,9 +350,12 @@ class LLMService(ABC):
         external to this service. `platform` lets the prompt reason about length/format
         context, but the final aspect ratio is derived deterministically downstream
         (core.video_schema.aspect_for_platform), never trusted from the LLM. `skill` is
-        the static spec (skills/brand_video_storyboard.md). `history` (optional) is the
-        prior {role, content} conversation the caller assembled, folded in as context
-        for a follow-up; None/empty = single-turn."""
+        the static spec (skills/brand_video_storyboard.md). `direction` (optional) is the
+        roundtable's agreed creative direction for the video (visual tone, pacing, key beats,
+        on-screen CTA) — folded into the prompt so the storyboard reflects the discussion, not
+        just the caption; '' means none. `history` (optional) is the prior {role, content}
+        conversation the caller assembled, folded in as context for a follow-up; None/empty =
+        single-turn."""
         ...
 
     @abstractmethod
@@ -803,7 +838,7 @@ class BackgroundRemovalService(ABC):
         ...
 
 
-# ── Background music (Soundraw) ───────────────────────────────────────────────
+# ── Background music ───────────────────────────────────────────────
 
 class MusicGenerationService(ABC):
     """Background music generation, sized to a render's exact duration."""
@@ -818,6 +853,19 @@ class MusicGenerationService(ABC):
 
 # ── Voiceover (Azure Speech text-to-speech) ────────────────────────────────────
 
+@dataclass(frozen=True)
+class SynthesizedSpeech:
+    """One synthesized narration clip: the `audio` bytes (mp3) plus the clip's
+    `duration_seconds`. The duration is returned by the service (not measured
+    downstream) because only the impl knows its output format — the Azure impl
+    computes it from the CBR bitrate, the mock from its word-count estimate. The
+    per-slide voiceover pipeline (workflow/video/voiceover.py) uses it to stretch
+    each slide so its narration is never clipped."""
+
+    audio: bytes
+    duration_seconds: float
+
+
 class VoiceoverService(ABC):
     """Narration text-to-speech for an optional voiceover track
     — distinct from VoiceService above, which bridges SPOKEN
@@ -827,10 +875,11 @@ class VoiceoverService(ABC):
     a reason to abort the render."""
 
     @abstractmethod
-    async def synthesize(self, *, text: str, voice: str) -> bytes:
-        """Return audio bytes (mp3) speaking `text` in `voice` (a provider-specific
-        voice id, e.g. an Azure Neural voice name). Raises on a hard failure (rate
-        limit, bad voice id, network) — callers fall back to no narration."""
+    async def synthesize(self, *, text: str, voice: str) -> SynthesizedSpeech:
+        """Return a `SynthesizedSpeech` (mp3 `audio` + `duration_seconds`) speaking
+        `text` in `voice` (a provider-specific voice id, e.g. an Azure Neural voice
+        name). Raises on a hard failure (rate limit, bad voice id, network) —
+        callers fall back to no narration."""
         ...
 
 

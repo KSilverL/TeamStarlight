@@ -13,9 +13,10 @@ the video subsystem — kept out of api.py itself (which stays a thin transport 
 from __future__ import annotations
 
 import asyncio
+import math
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from ...core.config import Settings, get_settings
 from ...core.services import factory
@@ -24,7 +25,16 @@ from .assets import resolve_storyboard_assets
 from .codegen import cleanup_job_generated, sweep_stale_generated
 from .music import resolve_storyboard_music
 from .render import RenderError, render_storyboard
-from .voiceover import resolve_storyboard_voiceover
+from .voiceover import (
+    resolve_narration_voice,
+    resolve_slide_voiceovers,
+    resolve_storyboard_voiceover,
+)
+
+# Extra frames left after a slide's narration finishes before the slide cuts, so speech
+# never butts right against the transition (also absorbs the small slack in the CBR
+# duration estimate). 12 frames ≈ 0.4s at 30fps.
+_NARRATION_TAIL_PAD_FRAMES = 12
 
 
 # Strong references to detached render tasks. asyncio only holds tasks weakly, so a
@@ -40,7 +50,7 @@ def _job_dir(settings: Settings, job_id: str) -> Path:
 async def _run_job(
     job_id: str, storyboard: StoryboardSpec, settings: Settings,
     *, narration_text: Optional[str] = None, narration_voice: Optional[str] = None,
-    reference_images: Optional[list[bytes]] = None,
+    narration_enabled: bool = True, reference_images: Optional[list[bytes]] = None,
 ) -> None:
     store = factory.get_store()
     job_dir = _job_dir(settings, job_id)
@@ -67,19 +77,58 @@ async def _run_job(
     sweep_stale_generated(settings)
     try:
         renderable = await resolve_storyboard_assets(storyboard, job_dir=job_dir, settings=settings)
-        # Match the transition-adjusted length the renderer actually produces
-        # (metadata.ts), so music/voiceover don't run past the final frame.
+        # Agent-selected audio: the storyboard LLM authors music mood/genre/energy on
+        # `storyboard.audio`, and a per-slide `narration` line on each slide (None on a
+        # legacy storyboard → fallback music constants / no narration).
+        audio = storyboard.audio
+
+        # ── Narration (on by default) ─────────────────────────────────────────────
+        # Precedence: caller override text (whole-video) > per-slide agent narration
+        # (slide-synced) > whole-video agent script (audio.narrationScript fallback).
+        # narration_enabled=False suppresses narration outright. Per-slide narration
+        # stretches each slide to fit its line, so it MUST run before music sizing below.
+        if narration_enabled:
+            effective_voice = narration_voice or resolve_narration_voice(
+                audio.narrationVoice if audio else None, settings,
+            )
+            per_slide = [s.narration for s in storyboard.slides]
+            if narration_text:
+                renderable.voiceoverLocalPath = await resolve_storyboard_voiceover(
+                    job_dir=job_dir, text=narration_text, voice=effective_voice, settings=settings,
+                )
+            elif any(n and n.strip() for n in per_slide):
+                clips = await resolve_slide_voiceovers(
+                    job_dir=job_dir, narrations=per_slide, voice=effective_voice, settings=settings,
+                )
+                paths: List[Optional[str]] = []
+                for slide, clip in zip(renderable.slides, clips):
+                    if clip is None:
+                        paths.append(None)
+                        continue
+                    path, duration_seconds = clip
+                    needed = math.ceil(duration_seconds * renderable.fps) + _NARRATION_TAIL_PAD_FRAMES
+                    slide.durationFrames = max(slide.durationFrames, needed)
+                    paths.append(path)
+                renderable.voiceoverSlidePaths = paths
+            elif audio and audio.narrationScript:
+                renderable.voiceoverLocalPath = await resolve_storyboard_voiceover(
+                    job_dir=job_dir, text=audio.narrationScript, voice=effective_voice, settings=settings,
+                )
+
+        # ── Music, sized to the (possibly stretched) final length ─────────────────
+        # renderable_total_frames mirrors metadata.ts's transition-adjusted total, so
+        # the music track doesn't run past the final frame.
         total_frames = renderable_total_frames(
             [s.durationFrames for s in renderable.slides], renderable.transition,
         )
         total_seconds = total_frames / renderable.fps
-        renderable.musicLocalPath = await resolve_storyboard_music(
-            job_dir=job_dir, duration_seconds=total_seconds,
+        music_kwargs = (
+            {"mood": audio.musicMood, "genre": audio.musicGenre, "energy": audio.musicEnergy}
+            if audio else {}
         )
-        if narration_text:
-            renderable.voiceoverLocalPath = await resolve_storyboard_voiceover(
-                job_dir=job_dir, text=narration_text, voice=narration_voice, settings=settings,
-            )
+        renderable.musicLocalPath = await resolve_storyboard_music(
+            job_dir=job_dir, duration_seconds=total_seconds, **music_kwargs,
+        )
         output_path = await render_storyboard(renderable, job_dir=job_dir, settings=settings)
         await store.update_video_job(job_id=job_id, status="done", output_path=str(output_path), error=None)
     except RenderError as exc:
@@ -97,7 +146,7 @@ async def _run_job(
 async def start_render_job(
     *, task_id: str, platform: str, storyboard: StoryboardSpec,
     narration_text: Optional[str] = None, narration_voice: Optional[str] = None,
-    reference_images: Optional[list[bytes]] = None,
+    narration_enabled: bool = True, reference_images: Optional[list[bytes]] = None,
 ) -> dict:
     """Create a `pending` video job row and kick off the render in the background.
     Returns the freshly created job document (id, task_id, platform, status=pending, ...).
@@ -105,7 +154,12 @@ async def start_render_job(
     voiceover track; omitted/None means no narration. It is never auto-generated
     from the approved draft — the caller supplies it. `reference_images` (optional) are
     the user's attached images, passed to the Higgsfield backend as image-to-video
-    references; ignored by the Remotion (local/lambda) backends."""
+    references; ignored by the Remotion (local/lambda) backends.
+    Narration is on by default: the storyboard LLM authors a script + voice persona on
+    `storyboard.audio`, which is used unless `narration_text`/`narration_voice` override
+    it, or `narration_enabled=False` suppresses narration entirely. `reference_images`
+    (optional) are the user's attached images, passed to the Higgsfield backend as
+    image-to-video references; ignored by the Remotion (local/lambda) backends."""
     store = factory.get_store()
     settings = get_settings()
     job_id = f"vid-{uuid.uuid4().hex[:12]}"
@@ -116,7 +170,7 @@ async def start_render_job(
         _run_job(
             job_id, storyboard, settings,
             narration_text=narration_text, narration_voice=narration_voice,
-            reference_images=reference_images,
+            narration_enabled=narration_enabled, reference_images=reference_images,
         )
     )
     _RUNNING_JOBS.add(job_task)
