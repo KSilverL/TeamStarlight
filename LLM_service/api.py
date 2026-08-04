@@ -65,6 +65,7 @@ from .intake.campaign_intake import CampaignConversation
 from .skills import load_skill
 from .workflow import Brief, HumanVerdict, build_workflow
 from .workflow.builder import WORKFLOW_NAME
+from .workflow.executors.compliance import BLOCKED_ALLOWED_DECISIONS
 from .workflow.learning import archive_conversation
 from .workflow.learning.archivist import _intake_user_turns
 from .workflow.messages import CONTENT_TYPES, DEFAULT_CONTENT_TYPES, CreativeStrategy
@@ -192,6 +193,35 @@ def _brief_from_inputs(inputs: dict) -> Brief:
     )
 
 
+def _compliance_payload(request) -> dict:
+    """The additive compliance fields for one pending gate (`HumanReviewRequest`).
+
+    **Empty dict unless the compliance screen actually blocked this draft** — that is what
+    keeps this purely additive: every payload that could be produced before this feature
+    existed is byte-identical, and the three keys appear only in the genuinely new
+    situation (a gate that re-opened because the approved copy is not publishable).
+
+    Clients get a machine-readable signal instead of having to match on `comment` prose:
+
+        blocked            true (present only when true — treat "absent" as false)
+        block_reason       the raw SafetyService reason, for your own UI copy / i18n
+        allowed_decisions  the verdicts that can actually resolve this gate; `approve`
+                           is absent because re-approving unchanged copy is screened
+                           and blocked again
+
+    Shared by the `/tasks/{id}` + `/review` snapshot `pending` entries and the SSE
+    `draft_ready` event, so the two can never disagree about a block.
+    """
+    reason = getattr(request, "compliance_block", None)
+    if not reason:
+        return {}
+    return {
+        "blocked": True,
+        "block_reason": reason,
+        "allowed_decisions": list(BLOCKED_ALLOWED_DECISIONS),
+    }
+
+
 def _roundtable_mode_from_inputs(inputs: dict) -> str:
     """Pop + validate the per-request step-mode switch. "auto" (the default) never prompts —
     today's hands-off flow; "manual" pauses every table at each round boundary for the user's
@@ -225,6 +255,7 @@ class _Task:
         self.subscribers: list[asyncio.Queue] = []   # live SSE queues
         self.pending: dict[str, dict] = {}           # request_id -> HumanReviewRequest data
         self.outputs: dict[str, dict] = {}           # platform -> FinalDraft dict
+        self.discarded: dict[str, dict] = {}         # platform -> the user's `discard` verdict
         self.proposed_rules: list[dict] = []         # brand rules written on confirm-learning (snapshot)
         self.conversation: list[dict] = []           # intake transcript threaded in at start
         self.roundtable_transcript: list[dict] = []   # discussion turns (roundtable mode) for learning
@@ -355,6 +386,7 @@ class WorkflowService:
                     "draft": data.draft,
                     "critic_comment": data.comment,
                     "needs_human_intervention": data.needs_human_intervention,
+                    **_compliance_payload(data),
                 }),
                 progress_event("human_gate", INTERRUPTED, platform=data.platform),
             ]
@@ -373,6 +405,15 @@ class WorkflowService:
                 "proposed_rules": [r.model_dump() for r in draft.proposed_rules],
             })]
         return []
+
+    def _record_discard(self, task: _Task, platform: str, reason: Optional[str]) -> None:
+        """Book a `discard` verdict + publish it, so the platform's terminal state is on both
+        surfaces a client may watch (the snapshot's `discarded`, and a `discarded` result
+        event alongside the `final` it will never get)."""
+        entry = {"platform": platform, "reason": reason or None}
+        task.discarded[platform] = entry
+        self._publish(task, result_event(
+            "human_gate", "discarded", platform=platform, payload={"reason": entry["reason"]}))
 
     def _record_output(self, task: _Task, draft) -> None:
         task.outputs[draft.platform] = draft.model_dump()
@@ -408,6 +449,7 @@ class WorkflowService:
                     "draft": d.draft,
                     "comment": d.comment,
                     "needs_human_intervention": d.needs_human_intervention,
+                    **_compliance_payload(d),
                 }
             elif ev.type == "output":
                 self._record_output(task, ev.data)
@@ -486,6 +528,11 @@ class WorkflowService:
             "outputs": list(task.outputs.values()),
             "proposed_rules": task.proposed_rules,
         }
+        if task.discarded:
+            # Only when something was actually discarded, so an ordinary run's snapshot is
+            # byte-identical to what it was before `discard` existed. A discarded platform
+            # produces no output, so this is the only place its absence is explained.
+            snap["discarded"] = list(task.discarded.values())
         if task.title is not None:
             snap["title"] = task.title  # short session title for the frontend's history sidebar
         if task.error is not None:
@@ -632,11 +679,18 @@ class WorkflowService:
                 verdict = verdicts.get(data["platform"])
                 if verdict is None:
                     continue  # leave un-addressed platforms pending
-                responses[req_id] = _verdict_from_payload(verdict, data["platform"])
+                platform = data["platform"]
+                responses[req_id] = _verdict_from_payload(verdict, platform)
                 # Record the AI draft the human reviewed + the verdict, so confirm-learning can
                 # distil brand rules (AI-vs-final diff) and trace a learned preference to the edit.
-                task.original_drafts[data["platform"]] = data["draft"]
-                task.last_verdicts.append({"platform": data["platform"], **verdict})
+                task.original_drafts[platform] = data["draft"]
+                task.last_verdicts.append({"platform": platform, **verdict})
+                if responses[req_id].decision == "discard":
+                    # The graph emits nothing for a discarded platform, so its absence from
+                    # `outputs` would otherwise be unexplained. Record it here (the only layer
+                    # that knows the verdict) and announce it, so a client can settle that
+                    # platform's card instead of waiting for a `final` that never comes.
+                    self._record_discard(task, platform, verdict.get("reason"))
             if not responses:
                 raise ApiError(400, "no verdict matched a pending platform")
             # Learning no longer runs automatically — it waits for POST /tasks/{id}/confirm-learning.
@@ -1519,8 +1573,9 @@ def _verdict_from_payload(payload: dict, platform: Optional[str] = None) -> Huma
     platform they belong to (verdicts are already keyed by platform at
     `POST /review`, so this is never asked of the client)."""
     decision = (payload.get("decision") or "").lower()
-    if decision not in ("approve", "approve_after_edit", "reject"):
-        raise ApiError(400, "decision must be approve, approve_after_edit, or reject")
+    if decision not in ("approve", "approve_after_edit", "reject", "discard"):
+        raise ApiError(
+            400, "decision must be approve, approve_after_edit, reject, or discard")
     if decision == "approve_after_edit" and not payload.get("edited_draft"):
         raise ApiError(400, "approve_after_edit requires 'edited_draft'")
     return HumanVerdict(

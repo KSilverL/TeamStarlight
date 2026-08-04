@@ -6,11 +6,10 @@ Separate from the main suite on purpose. These are NOT feature tests: each one p
 only by implication. Every test here answers one question: **if the implementation were
 wrong, would this actually go red?**
 
-Two of them are `xfail(strict=True)`. That is deliberate — they encode invariants the
-system does NOT satisfy today (the safety-gate gaps in
-`interview_prep/04_安全门重设计.md`). A strict xfail keeps the suite green while making
-the gap machine-checkable: the day someone closes the gap, the test XPASSes and the
-suite goes red, forcing the marker to be removed. That is the point.
+Two of them (§7) were `xfail(strict=True)` — deliberately encoding invariants the system
+did NOT satisfy, so the gap was machine-checkable rather than a TODO that rots. The
+`compliance_gate` executor closed both gaps; the tests XPASSed, the suite went red, and
+the markers came off. That whole cycle is the point of a strict xfail.
 
 Run them:
     pytest -m audit                       # only these
@@ -359,12 +358,16 @@ async def test_safety_block_exhausts_retries_and_produces_no_output(workflow):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# 7. The human gate must not be able to bypass Content Safety  (TWO KNOWN GAPS)
+# 7. The human gate must not be able to bypass Content Safety  (BOTH GAPS CLOSED)
 # ════════════════════════════════════════════════════════════════════════════════
+#
+# Both of these ran as `xfail(strict=True)` while the gaps were open. The
+# `compliance_gate` executor (workflow/executors/compliance.py) closed them: it screens
+# the bytes the human approved — the edit included — between the gate and the
+# media_producer, and bounces a blocked draft back to the gate instead of publishing it.
+# The markers came off the day they XPASSed, which is exactly what strict xfail is for.
 
-@pytest.mark.xfail(strict=True, reason=(
-    "AS-BUILT GAP A: once the circuit breaker is exhausted, a plain human `approve` lets "
-    "safety-blocked copy through to the media_producer. See interview_prep/04 §1.3."))
+
 async def test_human_cannot_approve_safety_blocked_content(workflow):
     result = await workflow.run(_brief(topic="unsafe cure", platforms=("twitter",)))
     rid = result.get_request_info_events()[0].request_id
@@ -376,9 +379,6 @@ async def test_human_cannot_approve_safety_blocked_content(workflow):
     )
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "AS-BUILT GAP B: `approve_after_edit` text goes straight to the media_producer; "
-    "SafetyService never sees the human's edit. See interview_prep/04 §1.3."))
 async def test_edited_draft_is_rechecked_by_safety(workflow, monkeypatch):
     checked: list[str] = []
     safety = factory.get_safety()

@@ -1,5 +1,5 @@
 """The workflow executors: dispatcher, strategist, creator, reviewer, human_gate,
-media_producer.
+compliance_gate, media_producer.
 
 Each is a thin MAF Executor that reads its input message, reaches its backend via
 core.services.factory (so it stays mock/prod-agnostic), and emits the next typed
@@ -10,6 +10,7 @@ Brand-voice rule distillation is not an in-graph executor: it runs at the servic
 layer after the user confirms learning (see api.py confirm_learning + workflow/learning/).
 """
 
+from .compliance import ComplianceGateExecutor
 from .creator import CreatorExecutor
 from .dispatcher import DispatcherExecutor
 from .human_gate import HumanGateExecutor
@@ -24,6 +25,7 @@ __all__ = [
     "CreatorExecutor",
     "ReviewerExecutor",
     "HumanGateExecutor",
+    "ComplianceGateExecutor",
     "MediaEntryExecutor",
     "MediaProducerExecutor",
 ]

@@ -40,6 +40,7 @@ NODE_PHASE: dict[str, str] = {
     "creator": "create",         # per-platform fan-out
     "reviewer": "review",
     "human_gate": "review",      # RequestPort human approval
+    "compliance_gate": "review",  # final content-safety screen on the approved bytes
     "archivist": "archive",
     "media_producer": "produce",  # animated card + video storyboard
 }
