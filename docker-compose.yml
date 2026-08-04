@@ -37,7 +37,7 @@ services:
       - GEOAPIFY_MAP_STYLE=${GEOAPIFY_MAP_STYLE}
 
       - USE_MOCK_MUSIC_GENERATION=true
-      - USE_MOCK_SAFETY=true
+      - USE_MOCK_SAFETY=false
 
       # Voice
       - USE_MOCK_VOICE=${USE_MOCK_VOICE}

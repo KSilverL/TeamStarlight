@@ -2,6 +2,11 @@
 .env
 .vscode
 .pytest_cache
+# pytest-cov / coverage.py output (coverage runs by default — see pytest.ini addopts)
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 **/__pycache__/
 *.pyc
 .idea/
@@ -19,3 +24,9 @@ LLM_service/.video_jobs/
 video_renderer/node_modules/
 video_renderer/out/
 video_renderer/.remotion/
+# Evaluation sweep outputs (raw run records + reports) — regenerate with
+# `python -m evaluation.run_eval`; never checked in.
+evaluation/results/
+# NB `evaluation/labels/` is deliberately NOT ignored. Those are real human
+# labels: they cannot be regenerated, they are small, and they are the anchor
+# every phase-2 claim is checked against. Do not add them here.

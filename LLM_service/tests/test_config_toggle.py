@@ -303,3 +303,86 @@ def test_resolved_video_renderer_dir_is_absolute_with_absolute_override(tmp_path
 def test_resolved_video_renderer_dir_is_absolute_by_default():
     from LLM_service.core.config import Settings
     assert Settings().resolved_video_renderer_dir.is_absolute()
+
+
+# ── Render-pipeline service getters (the credentialed asset vendors) ──────────
+# Same mock-vs-production boundary as the four core contracts above, for the
+# services that only ever run with a paid API key: Pexels, Remove.bg, Soundraw,
+# Azure Speech and Higgsfield. Selecting one without its key must raise a clear
+# RuntimeError, never silently fall back to mock (which would mean a "successful"
+# run that quietly produced mock assets).
+
+_ASSET_GETTERS = [
+    # (getter, toggle var, credential env, production class, the name in the error)
+    ("get_image_search", "USE_MOCK_IMAGE_SEARCH", {"PEXELS_API_KEY": "pex"},
+     "PexelsImageSearch", "Pexels"),
+    ("get_background_removal", "USE_MOCK_BACKGROUND_REMOVAL", {"REMOVEBG_API_KEY": "rmbg"},
+     "RemoveBgService", "Remove.bg"),
+    ("get_music_generation", "USE_MOCK_MUSIC_GENERATION", {"SOUNDRAW_API_KEY": "snd"},
+     "SoundrawMusic", "Soundraw"),
+    ("get_voiceover_generation", "USE_MOCK_VOICEOVER",
+     {"AZURE_SPEECH_KEY": "sp", "AZURE_SPEECH_REGION": "westeurope"},
+     "AzureSpeechVoiceover", "Azure Speech"),
+    ("get_video_generation", "USE_MOCK_VIDEO_GENERATION",
+     {"HIGGSFIELD_API_KEY": "hf", "HIGGSFIELD_API_SECRET": "hf-secret"},
+     "HiggsfieldVideoGeneration", "Higgsfield"),
+]
+
+
+@pytest.fixture
+def asset_env(monkeypatch):
+    """Clear every render-pipeline toggle + key, then let a test set what it needs."""
+    for getter, toggle, creds, _cls, _name in _ASSET_GETTERS:
+        monkeypatch.delenv(toggle, raising=False)
+        for key in creds:
+            monkeypatch.delenv(key, raising=False)
+    reset_settings()
+    reset_services()
+    yield monkeypatch
+    reset_settings()
+    reset_services()
+
+
+@pytest.mark.parametrize("getter, toggle, creds, cls, name", _ASSET_GETTERS)
+def test_asset_service_defaults_to_mock(asset_env, getter, toggle, creds, cls, name):
+    from LLM_service.core.services import factory
+
+    assert type(getattr(factory, getter)()).__name__.startswith("Mock")
+
+
+@pytest.mark.parametrize("getter, toggle, creds, cls, name", _ASSET_GETTERS)
+def test_asset_service_resolves_production_impl_with_credentials(
+        asset_env, getter, toggle, creds, cls, name):
+    from LLM_service.core.services import factory
+
+    asset_env.setenv(toggle, "false")
+    for key, value in creds.items():
+        asset_env.setenv(key, value)
+    reset_settings()
+    reset_services()
+    assert type(getattr(factory, getter)()).__name__ == cls
+
+
+@pytest.mark.parametrize("getter, toggle, creds, cls, name", _ASSET_GETTERS)
+def test_asset_service_without_credentials_raises(asset_env, getter, toggle, creds, cls, name):
+    from LLM_service.core.services import factory
+
+    asset_env.setenv(toggle, "false")  # production requested, no key set
+    reset_settings()
+    reset_services()
+    with pytest.raises(RuntimeError, match=name):
+        getattr(factory, getter)()
+
+
+def test_asset_services_follow_the_global_mock_switch(asset_env):
+    """USE_MOCK=false flips the asset vendors too — with their keys present."""
+    from LLM_service.core.services import factory
+
+    asset_env.setenv("USE_MOCK", "false")
+    for _getter, _toggle, creds, _cls, _name in _ASSET_GETTERS:
+        for key, value in creds.items():
+            asset_env.setenv(key, value)
+    reset_settings()
+    reset_services()
+    for getter, _toggle, _creds, cls, _name in _ASSET_GETTERS:
+        assert type(getattr(factory, getter)()).__name__ == cls

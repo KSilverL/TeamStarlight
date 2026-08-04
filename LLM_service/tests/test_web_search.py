@@ -10,6 +10,8 @@ Fully offline — AzureWebSearch/LiveImageSearch are exercised via the overridab
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from LLM_service.core import agent_tools
@@ -208,3 +210,137 @@ def test_research_tool_defs_are_valid_function_defs():
         assert tool["type"] == "function"
         assert tool["function"]["description"]
         assert tool["function"]["parameters"]["type"] == "object"
+
+
+# ── The credentialed layer: the Foundry SDK call + the raw page fetch ─────────
+# Everything above stubs `_run_agent`. These drive the seam ITSELF (and
+# fetch_url_text's httpx call), which only ran with a real Foundry project +
+# credentials — via a fake SDK module / the fake httpx transport in conftest.
+
+class _FakeResponses:
+    def __init__(self, holder):
+        self._holder = holder
+
+    def create(self, **kwargs):
+        self._holder["create_kwargs"] = kwargs
+        return type("_Resp", (), {"output_text": self._holder["output_text"]})()
+
+
+class _FakeProjectClient:
+    """AIProjectClient stand-in: records the endpoint/credential and hands back a
+    fake OpenAI-compatible client whose `responses.create` returns scripted text."""
+
+    def __init__(self, holder):
+        self._holder = holder
+
+    def __call__(self, *, endpoint, credential):
+        self._holder["endpoint"] = endpoint
+        self._holder["credential"] = credential
+        return self
+
+    def get_openai_client(self):
+        return type("_OAI", (), {"responses": _FakeResponses(self._holder)})()
+
+
+@pytest.fixture
+def fake_foundry(monkeypatch):
+    """Install fake azure.ai.projects / azure.identity for `_run_agent`'s lazy imports."""
+    from LLM_service.tests.conftest import install_fake_module
+
+    holder = {"output_text": "[]", "create_kwargs": None}
+    install_fake_module(monkeypatch, "azure.ai.projects",
+                        AIProjectClient=_FakeProjectClient(holder))
+    install_fake_module(monkeypatch, "azure.identity",
+                        DefaultAzureCredential=lambda: "default-credential")
+    return holder
+
+
+def _foundry_settings(**over):
+    from LLM_service.core.config import Settings
+
+    base = dict(foundry_project_endpoint="https://foundry.services.ai.azure.com/api/projects/p",
+                web_search_agent_name="web-research-01", review_search_agent_name="review-01")
+    base.update(over)
+    return Settings(**base)
+
+
+async def test_run_agent_drives_the_portal_agent_by_reference(fake_foundry):
+    fake_foundry["output_text"] = json.dumps([
+        {"title": "Cold brew is booming", "url": "https://news/1", "snippet": "up 30%"},
+    ])
+    svc = web_search.AzureWebSearch(_foundry_settings(web_search_agent_version="8"))
+
+    results = await svc.search_web(query="cold brew trends", count=3)
+
+    assert fake_foundry["endpoint"] == "https://foundry.services.ai.azure.com/api/projects/p"
+    assert fake_foundry["credential"] == "default-credential"
+    kwargs = fake_foundry["create_kwargs"]
+    # The agent is addressed by reference (same mechanism as the daily trend scan),
+    # never by inlining instructions or a model name.
+    assert kwargs["extra_body"] == {
+        "agent_reference": {"name": "web-research-01", "type": "agent_reference", "version": "8"},
+    }
+    assert kwargs["input"][0]["role"] == "user"
+    assert "cold brew trends" in kwargs["input"][0]["content"]
+    assert results == [{"title": "Cold brew is booming", "url": "https://news/1", "snippet": "up 30%"}]
+
+
+async def test_run_agent_omits_version_when_unpinned(fake_foundry):
+    await web_search.AzureWebSearch(_foundry_settings()).search_web(query="q")
+    assert "version" not in fake_foundry["create_kwargs"]["extra_body"]["agent_reference"]
+
+
+async def test_run_agent_uses_the_review_agent_for_reviews(fake_foundry):
+    fake_foundry["output_text"] = json.dumps([
+        {"quote": "Best flat white in town", "rating": 5, "source": "Google", "url": "https://g/1"},
+    ])
+    out = await web_search.AzureWebSearch(_foundry_settings()).search_reviews(subject="Acme Coffee")
+    assert fake_foundry["create_kwargs"]["extra_body"]["agent_reference"]["name"] == "review-01"
+    assert out[0]["quote"] == "Best flat white in town" and out[0]["rating"] == 5
+
+
+async def test_run_agent_strips_whitespace_and_survives_a_silent_agent(fake_foundry):
+    fake_foundry["output_text"] = None  # agent returned nothing at all
+    assert await web_search.AzureWebSearch(_foundry_settings()).search_web(query="q") == []
+
+
+async def test_live_image_search_goes_through_the_same_agent(fake_foundry):
+    fake_foundry["output_text"] = json.dumps([
+        {"url": "https://cdn/product.jpg", "source": "acme.com"},
+    ])
+    out = await web_search.LiveImageSearch(_foundry_settings()).search(query="acme cup", per_page=2)
+    assert fake_foundry["create_kwargs"]["extra_body"]["agent_reference"]["name"] == "web-research-01"
+    assert out == [{"url": "https://cdn/product.jpg", "photographer": "acme.com",
+                    "width": None, "height": None}]
+
+
+async def test_fetch_url_text_strips_markup_and_truncates(fake_httpx):
+    from LLM_service.tests.conftest import FakeResponse
+
+    page = ("<html><head><style>.a{color:red}</style><script>evil()</script></head>"
+            "<body><h1>Cold&nbsp;brew</h1><p>up  30%</p></body></html>")
+    fake_httpx.handler = lambda *_: FakeResponse(text=page)
+
+    text = await web_search.AzureWebSearch(_foundry_settings()).fetch_url_text(url="https://news/1")
+
+    assert "evil()" not in text and "color:red" not in text and "<" not in text
+    assert "Cold" in text and "brew" in text and "up 30%" in text
+    _, url, kwargs = fake_httpx.call()
+    assert url == "https://news/1"
+    assert fake_httpx.clients[0]["follow_redirects"] is True
+
+
+async def test_fetch_url_text_soft_fails_on_a_dead_page(fake_httpx):
+    """A fetch failure returns "" so the caller skips the enrichment — never aborts."""
+    from LLM_service.tests.conftest import FakeResponse
+
+    fake_httpx.handler = lambda *_: FakeResponse(status_code=503)
+    assert await web_search.AzureWebSearch(_foundry_settings()).fetch_url_text(url="https://x") == ""
+
+
+async def test_fetch_url_text_caps_the_body_at_20k(fake_httpx):
+    from LLM_service.tests.conftest import FakeResponse
+
+    fake_httpx.handler = lambda *_: FakeResponse(text="<p>" + ("word " * 20_000) + "</p>")
+    text = await web_search.AzureWebSearch(_foundry_settings()).fetch_url_text(url="https://x")
+    assert len(text) == 20_000

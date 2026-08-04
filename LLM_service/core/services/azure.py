@@ -1185,7 +1185,7 @@ class AzureChatClient(BaseChatClient):
 # ── Safety (Azure AI Content Safety) ──────────────────────────────────────────
 
 # Azure Content Safety severities are 0/2/4/6; flag at or above this.
-_SAFETY_SEVERITY_THRESHOLD = 2
+_SAFETY_SEVERITY_THRESHOLD = 4
 
 
 class AzureSafety(SafetyService):
