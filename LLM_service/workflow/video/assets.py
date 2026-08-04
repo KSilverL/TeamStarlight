@@ -243,10 +243,17 @@ async def resolve_storyboard_assets(
     # spend the full per-slide attempt budget — see CodegenBudget's docstring.
     # The configured total acts as a FLOOR, scaled up at 4 attempts per generated
     # slide: a storyboard with 3 bespoke slides must not starve slide 3 just
-    # because slides 1-2 used their retries.
+    # because slides 1-2 used their retries. The wall-clock deadline is scaled the
+    # same way and for the same reason — one shared clock across all the bespoke
+    # slides, since they're resolved sequentially (see the `generated` branch below).
+    # 0/negative CODEGEN_MAX_TOTAL_SECONDS -> no deadline, attempts only.
     n_generated = sum(1 for s in storyboard.slides if s.type == "generated")
+    max_seconds = settings.codegen_max_total_seconds
     codegen_budget = codegen.CodegenBudget(
-        max(settings.codegen_max_total_attempts, 4 * n_generated)
+        max(settings.codegen_max_total_attempts, 4 * n_generated),
+        max_seconds=(
+            max(max_seconds, 300.0 * n_generated) if max_seconds > 0 else None
+        ),
     )
 
     # Gather every (slide_index, query) pair across hook + collage slides so all

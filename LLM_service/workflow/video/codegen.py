@@ -49,11 +49,19 @@ Further design points:
     storyboard, not just per-slide — mirrors workflow/builder.py's `_should_retry`
     circuit breaker (bounded retry on the loop, never unbounded), scoped to the
     whole job so a storyboard with several struggling slides can't multiply
-    max_attempts-per-slide x N-slides worth of LLM calls + compiles + renders.
+    max_attempts-per-slide x N-slides worth of LLM calls + compiles + renders. It
+    ALSO carries a wall-clock deadline, because an attempt count bounds cost but
+    not duration once a reasoning-tier deployment is in play.
+  - No LLM call in the loop may raise into the caller: a timeout or 5xx degrades
+    the slide (spend an attempt, or fall back to a template) exactly like invalid
+    generated code does. An uncaught one used to fail the ENTIRE render job via
+    jobs.py's blanket handler — bypassing the budget and the fallback both.
   - Every attempt (typecheck failure, preview-render failure, visual-QA rejection,
     success, or budget exhaustion) is logged via the standard `logging` module with
-    structured `extra` fields (job_id, slide_index, attempt, ...) — this pipeline
-    is non-deterministic and iterative, so per-attempt observability matters.
+    structured `extra` fields (job_id, slide_index, attempt, and per-stage
+    `*_s` timings) — this pipeline is non-deterministic and iterative, so
+    per-attempt observability matters, and the timings are what make a
+    CODEGEN_REASONING_EFFORT change measurable rather than a guess.
 """
 
 from __future__ import annotations
@@ -81,18 +89,45 @@ _TYPECHECK_TIMEOUT_S = 60.0
 
 
 class CodegenBudget:
-    """Shared, cross-slide attempt budget for one render job's whole codegen pass.
+    """Shared, cross-slide budget for one render job's whole codegen pass.
     `take()` consumes one unit and returns True, or returns False once exhausted —
     callers stop retrying and fall back immediately, exactly like running out of
     per-slide `max_attempts`. Pass the SAME instance to every generate_scene() call
     for one storyboard (assets.py does this) so the budget is shared across slides,
-    not reset per slide."""
+    not reset per slide.
 
-    def __init__(self, total_attempts: int) -> None:
+    Two independent limits, either of which ends the pass:
+
+      * `total_attempts` — bounds COST (LLM calls + compiles + preview renders).
+      * `max_seconds` — bounds WALL CLOCK, because an attempt count says nothing
+        about how long an attempt takes. On a reasoning-tier deployment a single
+        attempt can run minutes, so a 12-attempt budget that looks cheap on paper
+        can hold a render job open far longer than any user will wait. None
+        disables the deadline (the pre-deadline behaviour).
+
+    The deadline is only checked between attempts, so the true bound is
+    `max_seconds` plus one in-flight attempt — this deliberately never interrupts
+    work already underway, which would waste an LLM call that has already been paid
+    for. Bounding the in-flight attempt itself is the HTTP client's job (its
+    per-request timeout), not this counter's."""
+
+    def __init__(self, total_attempts: int, *, max_seconds: Optional[float] = None) -> None:
         self.remaining = total_attempts
+        self.max_seconds = max_seconds
+        # monotonic, not time.time(): a deadline must not move if the system clock
+        # is adjusted mid-render (sweep_stale_generated below uses wall-clock time
+        # deliberately, because it compares against file mtimes).
+        self._deadline = None if max_seconds is None else time.monotonic() + max_seconds
+
+    @property
+    def expired(self) -> bool:
+        """True once the wall-clock deadline has passed (always False when no
+        deadline was set). Distinct from running out of attempts, so callers can
+        log which limit actually stopped them."""
+        return self._deadline is not None and time.monotonic() >= self._deadline
 
     def take(self) -> bool:
-        if self.remaining <= 0:
+        if self.remaining <= 0 or self.expired:
             return False
         self.remaining -= 1
         return True
@@ -428,7 +463,13 @@ async def generate_scene(
     caller (assets.py) falls back to a safe static template slide, so a bad
     generation never blocks the whole video. Every attempt is logged (see module
     docstring) with `job_id`/`slide_index`/`attempt` so a run is traceable after
-    the fact."""
+    the fact.
+
+    NO LLM call in this loop may raise into the caller: `plan_scene_design` is
+    guarded inside the service, and the generate/review calls are guarded here (a
+    failed generate burns the attempt, a failed review accepts the candidate). A
+    timeout or 5xx therefore degrades the slide, exactly like broken generated
+    code does — it never fails the render job."""
     llm = factory.get_llm()
     name = component_name(job_id, slide_index)
     duration = clamp_duration("generated", spec.durationFrames)
@@ -438,25 +479,63 @@ async def generate_scene(
 
     # Stage 1: one cheap visual-concept pass BEFORE any code,
     # reused across every attempt so repairs fix code without re-rolling the concept.
-    design_plan = await llm.plan_scene_design(description=spec.description, data=spec.data)
+    # Guarded here as well as inside AzureLLM so the no-raise contract above holds for
+    # ANY LLMService impl, and because an absent plan is already a supported state.
+    try:
+        design_plan = await llm.plan_scene_design(description=spec.description, data=spec.data)
+    except Exception as exc:
+        logger.info("scene design plan unavailable, generating without one",
+                    extra={**log_ctx, "error": f"{type(exc).__name__}: {exc}"[:500]})
+        design_plan = ""
 
     for attempt in range(1, max_attempts + 1):
         if budget is not None and not budget.take():
-            logger.info("codegen budget exhausted for this storyboard, falling back",
-                        extra={**log_ctx, "attempt": attempt})
+            logger.info(
+                "codegen %s for this storyboard, falling back",
+                "deadline reached" if budget.expired else "attempt budget exhausted",
+                extra={**log_ctx, "attempt": attempt,
+                       "limit": "deadline" if budget.expired else "attempts"},
+            )
             break
 
-        source = await llm.generate_scene_component(
-            description=spec.description, data=spec.data,
-            width=width, height=height, fps=fps, duration_frames=duration,
-            attempt=attempt, prior_error=prior_error, prior_source=prior_source,
-            design_plan=design_plan or None,
-        )
+        # Per-stage timings: this pipeline's wall clock is dominated by the LLM
+        # calls, but which stage and how much is a deployment/reasoning-effort
+        # question (see CODEGEN_REASONING_EFFORT) that can only be settled with real
+        # numbers. Logged on every outcome, so a slow render is diagnosable from the
+        # job's own logs rather than by re-running it with a stopwatch.
+        t_attempt = t_stage = time.monotonic()
+        try:
+            source = await llm.generate_scene_component(
+                description=spec.description, data=spec.data,
+                width=width, height=height, fps=fps, duration_frames=duration,
+                attempt=attempt, prior_error=prior_error, prior_source=prior_source,
+                design_plan=design_plan or None,
+            )
+        except Exception as exc:
+            # A transport-level failure (most often APITimeoutError on a long
+            # reasoning-tier call) is an attempt that produced NOTHING — not a bad
+            # component. Deliberately leaves prior_error/prior_source untouched so the
+            # next attempt re-runs this stage cleanly instead of prompting a repair
+            # against source that was never written. Uncaught, this used to escape
+            # the loop entirely and fail the whole render job via jobs.py's blanket
+            # handler, bypassing both the budget and the template fallback below —
+            # the exact opposite of this module's "one bad slide never blocks the
+            # video" contract.
+            logger.warning("codegen attempt failed to produce source",
+                           extra={**log_ctx, "attempt": attempt,
+                                  "error": f"{type(exc).__name__}: {exc}"[:500],
+                                  "generate_s": round(time.monotonic() - t_stage, 1)})
+            continue
+        generate_s = round(time.monotonic() - t_stage, 1)
         _write_component(settings, job_id, name, source)
 
+        t_stage = time.monotonic()
         ok, err = await _run_typecheck(settings, job_id=job_id)
+        typecheck_s = round(time.monotonic() - t_stage, 1)
         if not ok:
-            logger.info("codegen attempt failed typecheck", extra={**log_ctx, "attempt": attempt, "error": err[:500]})
+            logger.info("codegen attempt failed typecheck",
+                        extra={**log_ctx, "attempt": attempt, "error": err[:500],
+                               "generate_s": generate_s, "typecheck_s": typecheck_s})
             prior_error, prior_source = _with_repair_hint(err), source
             continue
 
@@ -466,20 +545,47 @@ async def generate_scene(
             primary_color=primary_color, secondary_color=secondary_color, accent_color=accent_color,
         )
         preview_frame = _generated_dir(settings, job_id) / f"{name}.preview.png"
+        t_stage = time.monotonic()
         ok, err = await _run_preview_render(
             settings, entry_path=entry, output_path=preview_frame, frame=duration // 2,
         )
+        preview_s = round(time.monotonic() - t_stage, 1)
         if not ok:
             logger.info("codegen attempt failed preview render",
-                        extra={**log_ctx, "attempt": attempt, "error": err[:500]})
+                        extra={**log_ctx, "attempt": attempt, "error": err[:500],
+                               "generate_s": generate_s, "typecheck_s": typecheck_s,
+                               "preview_s": preview_s})
             prior_error, prior_source = _with_repair_hint(err), source
             continue
 
-        review = await llm.review_scene_preview(
-            description=spec.description, image_bytes=preview_frame.read_bytes(), attempt=attempt,
-        )
+        t_stage = time.monotonic()
+
+        def _timings() -> dict:
+            return {
+                "generate_s": generate_s, "typecheck_s": typecheck_s, "preview_s": preview_s,
+                "review_s": round(time.monotonic() - t_stage, 1),
+                "attempt_s": round(time.monotonic() - t_attempt, 1),
+            }
+
+        try:
+            review = await llm.review_scene_preview(
+                description=spec.description, image_bytes=preview_frame.read_bytes(), attempt=attempt,
+            )
+        except Exception as exc:
+            # Fail OPEN, unlike the generate step above: this candidate already
+            # typechecked and preview-rendered, so the only thing missing is a
+            # taste judgement. Spending another attempt (or ultimately falling back
+            # to a template slide) because the reviewer was unreachable would throw
+            # away a component known to work. Matches map_qa.py, where every QA
+            # failure path returns the slide as-is.
+            logger.warning("codegen visual QA call failed, accepting the attempt on its own merits",
+                           extra={**log_ctx, "attempt": attempt, **_timings(),
+                                  "error": f"{type(exc).__name__}: {exc}"[:500]})
+            return RenderGeneratedSlide(componentName=name, data=spec.data, durationFrames=duration)
+
         if review.get("approved", True):
-            logger.info("codegen attempt succeeded", extra={**log_ctx, "attempt": attempt})
+            logger.info("codegen attempt succeeded",
+                        extra={**log_ctx, "attempt": attempt, **_timings()})
             return RenderGeneratedSlide(componentName=name, data=spec.data, durationFrames=duration)
 
         feedback = review.get("feedback") or "visual QA rejected this attempt with no further detail"
@@ -488,13 +594,16 @@ async def generate_scene(
         fixes = review.get("fixes") or []
         fix_block = ("\nApply these specific fixes:\n" + "\n".join(f"- {f}" for f in fixes)) if fixes else ""
         logger.info("codegen attempt rejected by visual QA",
-                    extra={**log_ctx, "attempt": attempt, "feedback": feedback, "fixes": fixes})
+                    extra={**log_ctx, "attempt": attempt, "feedback": feedback, "fixes": fixes,
+                           **_timings()})
         prior_error = (
             f"Visual QA feedback (the code compiled and rendered, but looked wrong): {feedback}{fix_block}"
         )
         prior_source = source
 
-    logger.warning("codegen exhausted its attempt budget, falling back to a static template slide", extra=log_ctx)
+    logger.warning("codegen gave up on this slide, falling back to a static template slide",
+                   extra={**log_ctx,
+                          "limit": "deadline" if budget is not None and budget.expired else "attempts"})
     # Remove this slide's leftovers so a later `generated` slide in the SAME job
     # doesn't inherit a broken sibling into its (job-scoped) typecheck — the
     # intra-job analogue of the cross-job isolation _write_job_tsconfig provides.

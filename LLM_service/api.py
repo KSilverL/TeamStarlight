@@ -61,6 +61,7 @@ from .core.events import (
 from .core.services import factory
 from .core.services.base import RealtimeVoiceSession
 from .intake import IntakeSession, PriorSessionContext, RealtimeVoiceIntake, build_intake
+from .intake.campaign_intake import CampaignConversation
 from .skills import load_skill
 from .workflow import Brief, HumanVerdict, build_workflow
 from .workflow.builder import WORKFLOW_NAME
@@ -907,6 +908,42 @@ class IntakeService:
     def __init__(self) -> None:
         self._sessions: dict[str, IntakeSession] = {}
         self._realtime_sessions: dict[str, RealtimeVoiceIntake] = {}
+        # Stateless, so it needs no per-session entry — see campaign_intake's module docstring.
+        self._campaign = CampaignConversation()
+
+    async def classify(
+        self, *, message: str, today: str, target_platforms: Optional[list] = None,
+        known: Optional[dict] = None, history: Optional[list] = None,
+        followups_asked: int = 0, business_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> dict:
+        """Route one chat turn: one post now, or a campaign across a date range?
+
+        The chat had no such fork — every message became a single post — so "plan my LinkedIn
+        posts for next month" produced one post *about* planning LinkedIn posts. A
+        `single_post` answer means the caller carries on to `POST /tasks` exactly as before;
+        `posting_plan` means it keeps turning this until `complete`, then takes the result to
+        `/plans/clarify` and `POST /plans`."""
+        if not (message or "").strip():
+            raise ApiError(400, "missing required field: message")
+
+        # The user's date, not ours: this service has no clock (see core/intent_schema.py),
+        # and a window resolved against the wrong day is off by a whole month at a boundary.
+        try:
+            date.fromisoformat(today)
+        except (TypeError, ValueError):
+            raise ApiError(400, "missing or malformed required field: today (YYYY-MM-DD)")
+
+        return await self._campaign.turn(
+            message=message,
+            today=today,
+            platforms=list(target_platforms or []),
+            known=known,
+            history=history,
+            followups_asked=followups_asked,
+            business_id=business_id,
+            user_id=user_id,
+        )
 
     def _require(self, session_id: str) -> IntakeSession:
         session = self._sessions.get(session_id)
@@ -1032,7 +1069,7 @@ class VideoService:
     async def start(
         self, task_id: str, platform: str, *,
         narration_text: Optional[str] = None, narration_voice: Optional[str] = None,
-        reference_images: Optional[list[str]] = None,
+        narration_enabled: bool = True, reference_images: Optional[list[str]] = None,
     ) -> dict:
         draft = self._workflow.get_final_draft(task_id, platform)
         if draft is None:
@@ -1043,6 +1080,7 @@ class VideoService:
         doc = await start_render_job(
             task_id=task_id, platform=platform, storyboard=StoryboardSpec(**storyboard),
             narration_text=narration_text, narration_voice=narration_voice,
+            narration_enabled=narration_enabled,
             reference_images=_decode_reference_images(reference_images),
         )
         return {"job_id": doc["id"], "status": doc["status"]}
@@ -1608,6 +1646,32 @@ class RoundtableRequest(BaseModel):
         "(round_control SSE event + POST /tasks/{id}/round-control); 'auto' (default) never prompts.")
 
 
+class ClassifyRequest(BaseModel):
+    """One chat turn, plus everything needed to judge it without holding any state here."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    message: str = Field(..., description="The user's turn, verbatim")
+    today: str = Field(
+        ..., description="The caller's date (YYYY-MM-DD) in the USER's timezone. Required: "
+        "relative windows like 'next month' are only resolvable against a known today, and "
+        "this service deliberately has no clock of its own.")
+    target_platforms: Optional[list[str]] = Field(
+        None, description="Platforms chosen by the backend. Never asked about, matching the "
+        "rule the rest of intake follows.")
+    known: Optional[dict] = Field(
+        None, description="What earlier turns already settled — pass back the `campaign` from "
+        "the previous response. This is what makes a multi-turn conversation work against a "
+        "stateless endpoint; without it, answering 'what's the goal?' loses the date window.")
+    history: Optional[list[dict]] = Field(
+        None, description="Prior {role, content} turns, for context")
+    followups_asked: int = Field(
+        0, description="Clarifiers asked so far — pass back from the previous response. At the "
+        "cap the conversation fills the gaps itself rather than interrogating further.")
+    business_id: Optional[str] = None
+    user_id: Optional[str] = None
+
+
 class IntakeStartRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
@@ -1670,12 +1734,17 @@ class GenerateHtmlRequest(BaseModel):
 class RenderVideoRequest(BaseModel):
     platform: str = Field(..., description="Which finished platform draft's storyboard to render")
     narration_text: Optional[str] = Field(
-        None, description="Optional voiceover script to synthesize and mix into the render "
-        "(TTS via Azure Speech, or a silent mock). Omit for no narration."
+        None, description="Override the agent-authored voiceover script. Omit to use the "
+        "narration the storyboard LLM wrote (narration is on by default); set "
+        "narration_enabled=false for a silent-narration render."
     )
     narration_voice: Optional[str] = Field(
-        None, description="Provider voice id (e.g. an Azure Neural voice name). "
-        "Omit to use VOICEOVER_DEFAULT_VOICE."
+        None, description="Override the voice as a provider voice id (e.g. an Azure Neural "
+        "voice name). Omit to use the voice persona the storyboard LLM picked."
+    )
+    narration_enabled: bool = Field(
+        True, description="Whether to render narration at all. True (default) uses the "
+        "agent's script (or narration_text override); false suppresses narration entirely."
     )
     reference_images: Optional[list[str]] = Field(
         None, description="1-3 user-attached reference images as base64 data URLs "
@@ -1921,6 +1990,7 @@ async def render_video(request: Request, task_id: str, body: RenderVideoRequest)
     return await _video(request).start(
         task_id, body.platform,
         narration_text=body.narration_text, narration_voice=body.narration_voice,
+        narration_enabled=body.narration_enabled,
         reference_images=body.reference_images,
     )
 
@@ -1935,6 +2005,22 @@ async def intake_start(request: Request, body: IntakeStartRequest) -> dict:
         target_platforms=body.target_platforms,
         prior_context=body.prior_context,
     )
+
+@intake_router.post("/classify", summary="One post now, or a campaign? (routes a chat turn)")
+async def intake_classify(request: Request, body: ClassifyRequest) -> dict:
+    """The chat's front door. Stateless: pass `known` and `followups_asked` back from the
+    previous response to continue a conversation."""
+    return await _intake(request).classify(
+        message=body.message,
+        today=body.today,
+        target_platforms=body.target_platforms,
+        known=body.known,
+        history=body.history,
+        followups_asked=body.followups_asked,
+        business_id=body.business_id,
+        user_id=body.user_id,
+    )
+
 
 @intake_router.post("/{session_id}/turn", summary="Send one user turn to an intake session")
 async def intake_turn(request: Request, session_id: str, body: IntakeTurnRequest) -> dict:

@@ -12,6 +12,9 @@ unavailable, e.g. in pure-mock test runs.
 
 from __future__ import annotations
 
+import json
+import random
+from pathlib import Path
 from typing import List, Optional
 
 from ..config import Settings
@@ -202,6 +205,54 @@ class GeoapifyStaticMap:
             )
             resp.raise_for_status()
             return resp.content
+
+
+class BundledMusicLibrary(MusicGenerationService):
+    """Background music from a local, pre-curated royalty-free library — the offline,
+    zero-cost, zero-key default (Soundraw's generation API is enterprise-gated).
+
+    Reads `<music_dir>/manifest.json` — a list of tracks each tagged with `mood`,
+    `genre`, and `energy` (the same vocab as video_schema's MusicMood/MusicGenre/
+    MusicEnergy) — and returns the bytes of the track that best matches the agent's
+    request, so the storyboard LLM's musicMood/genre/energy still drive the pick.
+    Sourcing + tagging the tracks is a one-time human step (see
+    LLM_service/assets/music/README.md).
+
+    `duration_seconds` is accepted for contract parity but not used: the render clips
+    the track to the video length (Remotion <Audio>), so a track just needs to be at
+    least as long as a typical short-form video (~40s+)."""
+
+    _MANIFEST = "manifest.json"
+    # Tag-match weights: mood dominates the feel, then genre, then energy. A track with
+    # a field absent (or non-matching) simply scores 0 for it.
+    _WEIGHTS = {"mood": 4, "genre": 2, "energy": 1}
+
+    def __init__(self, settings: Settings) -> None:
+        self._dir: Path = settings.resolved_music_library_dir
+        self._tracks: Optional[List[dict]] = None  # lazy-loaded, cached per instance
+
+    def _load(self) -> List[dict]:
+        if self._tracks is None:
+            data = json.loads((self._dir / self._MANIFEST).read_text(encoding="utf-8"))
+            self._tracks = list(data.get("tracks", []))
+        return self._tracks
+
+    def _score(self, track: dict, wanted: dict) -> int:
+        return sum(w for k, w in self._WEIGHTS.items() if track.get(k) and track.get(k) == wanted[k])
+
+    async def generate(self, *, mood: str, genre: str, duration_seconds: float, energy: str) -> bytes:
+        tracks = self._load()
+        if not tracks:
+            raise RuntimeError(f"music library at {self._dir} has no tracks (populate manifest.json)")
+        wanted = {"mood": mood, "genre": genre, "energy": energy}
+        scored = [(self._score(t, wanted), t) for t in tracks]
+        best = max(score for score, _ in scored)
+        # Among the best-matching tracks pick at random, so repeated renders of the same
+        # brief don't always get the identical track. A zero best score (nothing matched)
+        # still returns SOME track — wrong-mood music beats silence.
+        candidates = [t for score, t in scored if score == best]
+        chosen = random.choice(candidates)
+        return (self._dir / chosen["file"]).read_bytes()
 
 
 class SoundrawMusic(MusicGenerationService):

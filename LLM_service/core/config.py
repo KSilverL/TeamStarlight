@@ -18,6 +18,7 @@ The toggle set tracks the service contracts in core/services/base.py
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from functools import lru_cache
@@ -256,14 +257,27 @@ class Settings:
     # https://apidocs.geoapify.com/docs/maps/map-tiles/ for the preset names.
     geoapify_map_style: Optional[str] = None
 
-    # ── Soundraw (background music generation) ──────────────────────────────────
+    # ── Background music ────────────────────────────────────────────────────────
+    # Soundraw is a generative option but is enterprise-gated; the default real
+    # provider is a local, curated royalty-free library (media_assets.BundledMusicLibrary):
+    # zero key, zero cost, offline. `music_library_dir` overrides where its tracks +
+    # manifest.json live (default: LLM_service/assets/music/). The bundled library is
+    # used when USE_MOCK_MUSIC_GENERATION=false and the library has ≥1 tagged track;
+    # Soundraw is only reached if no library is populated.
+    music_library_dir: Optional[str] = None
     soundraw_api_key: Optional[str] = None
 
+    # ── Azure Speech (text-to-speech — roundtable persona readback + video narration) ──
+    roundtable_tts_key: Optional[str] = None
+    roundtable_tts_region: Optional[str] = None
+    # Default Neural voice when a caller doesn't specify one (POST /tasks/{id}/render-video).
     # ── Azure Speech (voiceover text-to-speech) ─────────────────────────────────
     azure_speech_key: Optional[str] = None
     azure_speech_region: Optional[str] = None
-    # Default Neural voice when a caller doesn't specify one (POST /tasks/{id}/render-video).
-    voiceover_default_voice: str = "en-US-JennyNeural"
+    # Default voice when a persona/caller doesn't specify one. An Azure Dragon HD voice
+    # (LM-based, far more natural than the older Neural voices) — same Speech endpoint;
+    # note HD voices may require the S0 tier and specific regions (see .env.example).
+    voiceover_default_voice: str = "en-US-Ava:DragonHDLatestNeural"
 
     # ── Higgsfield (premium generative AI video render backend) ─────────────────
     # Used only when video_render_backend == "higgsfield" (see below). Auth + upload +
@@ -333,6 +347,15 @@ class Settings:
     # storyboard with several struggling slides could otherwise spend
     # max_attempts-per-slide x N-slides worth of real cost.
     codegen_max_total_attempts: int = 9
+    # The wall-clock half of the same budget (codegen.CodegenBudget). An attempt
+    # count bounds COST but says nothing about DURATION: on a reasoning-tier
+    # deployment one attempt can run minutes, so a budget that looks cheap in
+    # attempts can still hold a render job open far past what anyone will wait for
+    # — and nothing else in the pipeline caps it (jobs.py runs the render detached,
+    # the client just polls). Like the attempt budget this is a FLOOR, scaled up per
+    # `generated` slide in assets.py. Checked between attempts only, so the real
+    # bound is this plus one in-flight attempt. 0/blank disables the deadline.
+    codegen_max_total_seconds: float = 900.0
     # Deployment for the scene-codegen LLM calls (generate_scene_component,
     # plan_scene_design, review_scene_preview, convert_generated_to_template).
     # None -> falls back to azure_chat_deployment, same pattern as
@@ -363,6 +386,32 @@ class Settings:
     # deep-reasoning task — mirrors the roundtable personas' "minimal" so the
     # budget goes to the visible bullets, not hidden reasoning tokens.
     codegen_plan_reasoning_effort: Optional[str] = "minimal"
+    # SDK-level retries for the codegen calls ONLY (every other call site keeps the
+    # client's max_retries=3). 0 by default because the openai SDK retries
+    # APITimeoutError: at the client's 300s timeout, a reasoning-tier codegen call
+    # that runs long costs 4 x 300s = 20 MINUTES before it finally raises. codegen.py
+    # already owns retrying at a much better altitude — its own loop re-prompts with
+    # the error and re-validates, and CodegenBudget bounds the total — so a
+    # transport-level retry here only multiplies wall clock. Raise it only if you see
+    # genuinely transient 429/5xx (which this also stops retrying).
+    codegen_max_retries: int = 0
+    # review_scene_preview's max_completion_tokens. The visible answer is a tiny JSON
+    # object, but this call sent NO cap at all, so on a reasoning deployment it was
+    # unbounded. Deliberately generous (not the ~512 the output needs): no
+    # reasoning_effort is steered here, so the cap must clear the hidden-reasoning
+    # floor by a wide margin or the response comes back EMPTY (see
+    # ROUNDTABLE_PERSONA_MAX_TOKENS). This is a runaway ceiling, not a tight budget.
+    codegen_review_max_tokens: int = 4096
+    # convert_generated_to_template's max_completion_tokens. Also previously
+    # uncapped — and it's the most expensive prompt in the pipeline, since it dumps
+    # the whole ~23KB TemplateSlideSpec JSON schema into the system message.
+    codegen_convert_max_tokens: int = 4096
+    # ...and it is schema-filling, not reasoning: the slide type is nearly determined
+    # by the brief, so "minimal" keeps the budget on the visible JSON. Setting this
+    # also DROPS the temperature=0.2 that call used to send (see AzureLLM._complete —
+    # a reasoning deployment should not get a custom temperature). Blank -> send no
+    # reasoning_effort, restoring the temperature.
+    codegen_convert_reasoning_effort: Optional[str] = "minimal"
     # Visual QA pass for `map` slides (workflow/video/map_qa.py): preview-still +
     # vision review per map slide, with a bounded zoom-out repair on rejection.
     # Cost per attempt ≈ one `remotion still` (5-20s) + one vision call, so
@@ -435,12 +484,34 @@ class Settings:
         return bool(self.soundraw_api_key)
 
     @property
+    def resolved_music_library_dir(self) -> Path:
+        """Absolute path to the bundled royalty-free music library. MUSIC_LIBRARY_DIR
+        overrides; otherwise defaults to LLM_service/assets/music/ (this file is
+        core/config.py, so parent.parent is LLM_service/)."""
+        if self.music_library_dir:
+            return Path(self.music_library_dir).resolve()
+        return Path(__file__).resolve().parent.parent / "assets" / "music"
+
+    @property
+    def has_music_library(self) -> bool:
+        """Whether a usable bundled music library is present: a manifest.json with at
+        least one tagged track. Parses defensively — a missing/malformed manifest reads
+        as 'no library' (the factory then falls back to Soundraw/mock), never an error."""
+        manifest = self.resolved_music_library_dir / "manifest.json"
+        if not manifest.is_file():
+            return False
+        try:
+            return bool(json.loads(manifest.read_text(encoding="utf-8")).get("tracks"))
+        except Exception:
+            return False
+
+    @property
     def has_web_search(self) -> bool:
         return bool(self.foundry_project_endpoint and self.web_search_agent_name)
 
     @property
-    def has_azure_speech(self) -> bool:
-        return bool(self.azure_speech_key and self.azure_speech_region)
+    def has_roundtable_tts(self) -> bool:
+        return bool(self.roundtable_tts_key and self.roundtable_tts_region)
 
     @property
     def has_higgsfield(self) -> bool:
@@ -559,10 +630,16 @@ def _load() -> Settings:
         removebg_api_key=os.getenv("REMOVEBG_API_KEY"),
         geoapify_api_key=os.getenv("GEOAPIFY_API_KEY"),
         geoapify_map_style=os.getenv("GEOAPIFY_MAP_STYLE") or None,
+        music_library_dir=os.getenv("MUSIC_LIBRARY_DIR"),
         soundraw_api_key=os.getenv("SOUNDRAW_API_KEY"),
+        # Shared Azure Speech credential — used by BOTH the roundtable persona TTS
+        # readback and workflow/video/voiceover.py's video narration.
+        roundtable_tts_key=os.getenv("ROUNDTABLE_TTS_KEY"),
+        roundtable_tts_region=os.getenv("ROUNDTABLE_TTS_REGION"),
         azure_speech_key=os.getenv("AZURE_SPEECH_KEY"),
         azure_speech_region=os.getenv("AZURE_SPEECH_REGION"),
-        voiceover_default_voice=os.getenv("VOICEOVER_DEFAULT_VOICE", "en-US-JennyNeural"),
+        voiceover_default_voice=os.getenv("VOICEOVER_DEFAULT_VOICE", "en-US-Ava:DragonHDLatestNeural"),
+
         higgsfield_api_key=os.getenv("HIGGSFIELD_API_KEY"),
         higgsfield_api_secret=os.getenv("HIGGSFIELD_API_SECRET"),
         higgsfield_text_model=os.getenv("HIGGSFIELD_TEXT_MODEL", ""),
@@ -581,12 +658,19 @@ def _load() -> Settings:
         remotion_lambda_site_name_prefix=os.getenv("REMOTION_LAMBDA_SITE_NAME_PREFIX", "storyboard-job"),
         remotion_lambda_output_bucket=os.getenv("REMOTION_LAMBDA_OUTPUT_BUCKET"),
         codegen_max_total_attempts=_env_int("CODEGEN_MAX_TOTAL_ATTEMPTS", 9),
+        codegen_max_total_seconds=_env_float("CODEGEN_MAX_TOTAL_SECONDS", 900.0),
         codegen_model=os.getenv("CODEGEN_MODEL"),
         codegen_reasoning_effort=(os.getenv("CODEGEN_REASONING_EFFORT") or "").strip() or None,
         codegen_max_tokens=_env_int("CODEGEN_MAX_TOKENS", 12000),
         codegen_plan_max_tokens=_env_int("CODEGEN_PLAN_MAX_TOKENS", 1536),
         codegen_plan_reasoning_effort=(
             os.getenv("CODEGEN_PLAN_REASONING_EFFORT", "minimal").strip() or None
+        ),
+        codegen_max_retries=_env_int("CODEGEN_MAX_RETRIES", 0),
+        codegen_review_max_tokens=_env_int("CODEGEN_REVIEW_MAX_TOKENS", 4096),
+        codegen_convert_max_tokens=_env_int("CODEGEN_CONVERT_MAX_TOKENS", 4096),
+        codegen_convert_reasoning_effort=(
+            os.getenv("CODEGEN_CONVERT_REASONING_EFFORT", "minimal").strip() or None
         ),
         map_qa_enabled=True if map_qa is None else map_qa,
         map_qa_max_attempts=_env_int("MAP_QA_MAX_ATTEMPTS", 2),

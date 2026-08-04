@@ -102,6 +102,7 @@ public class SessionController {
 		return msg;
 	}
 	
+	
 	@GetMapping("/api/sessions/{id}/messages") 
 	public List<Message> getMessages(@PathVariable String id) {
 		Session s = service.getSessionBy(id).get();
@@ -132,5 +133,9 @@ public class SessionController {
 		
 	}
 	
+	@DeleteMapping("api/session/{id}")
+	public Session deleteSession(@PathVariable String id) {
+		return service.deleteSession(id);
+	}
 	
 }

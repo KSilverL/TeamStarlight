@@ -16,20 +16,57 @@ Event mapping is per docs/roundtable_api_notes.md:
 from __future__ import annotations
 
 import asyncio
+import base64
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from ...core.events import (
+    agent_utterance_audio_event,
     agent_utterance_event,
     discussion_consensus_event,
     speaker_scheduled_event,
 )
+from ...core.services import factory
 from ..messages import Brief, CreativeStrategy
 from .builder import RoundtableBuild, build_roundtable
 from .context import build_persona_context
 from .manager import BeforeRound
 from .messages import DiscussionTurn, RoundtableConsensus
-from .personas import Persona
+from .personas import PERSONA_VOICES, Persona
+
+# Fire-and-forget TTS tasks (below) hold no other reference once spawned — keep them
+# here so the event loop doesn't garbage-collect one mid-flight (the standard asyncio
+# idiom for background tasks: https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task).
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _synthesize_turn_audio(
+    turn: DiscussionTurn, table_id: str, on_event: Callable[[dict], None],
+) -> None:
+    """Speak `turn`'s line in its persona's voice and emit it as a follow-up event once
+    ready — NEVER on the turn-completion path itself, so a slow/failed TTS call can
+    never delay the next persona from being scheduled. The user's own turns (no entry
+    in PERSONA_VOICES) are silently skipped — we don't read the human's words back to
+    them. Synthesis failures degrade to "no audio for this turn", matching
+    VoiceoverService's documented contract (never a reason to abort anything)."""
+    voice = PERSONA_VOICES.get(turn.speaker)
+    if voice is None:
+        return
+
+    async def _go() -> None:
+        try:
+            audio = await factory.get_voiceover_generation().synthesize(
+                text=turn.text, voice=voice)
+        except Exception:
+            return
+        on_event(agent_utterance_audio_event(
+            table_id=table_id, speaker=turn.speaker,
+            round_index=turn.round_index, audio_b64=base64.b64encode(audio).decode("ascii"),
+        ))
+
+    task = asyncio.create_task(_go())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 @dataclass
@@ -44,17 +81,31 @@ class RoundtableResult:
 def _task_prompt(brief: Brief, platform: str) -> str:
     intent = brief.user_intent or "raise awareness"
     types = brief.content_types or ["text"]
+    labels = {"brand": "an animated HTML brand card", "video": "a short brand video"}
+    media = [t for t in ("brand", "video") if t in types]
     # Case 4 (no "text" requested): the table discusses HOW TO DESIGN the requested media
     # (the HTML brand card / video), not post copy — the discussion's consensus becomes the
-    # media_producer's render brief. Otherwise it converges on the post content strategy.
+    # media_producer's render brief.
     if "text" not in types:
-        labels = {"brand": "an animated HTML brand card", "video": "a short brand video"}
-        wanted = " and ".join(labels[t] for t in ("brand", "video") if t in types) or "the brand media"
+        wanted = " and ".join(labels[t] for t in media) or "the brand media"
         return (
             f"Discuss and converge on how to design {wanted} for {platform} about "
             f"'{brief.topic}' that meets the brief — the angle, key message, visual tone, and "
             f"call to action. Goal: {intent}. (No written post copy is needed.)"
         )
+    # Text + media (ONE shared session): converge on the post AND the media's creative
+    # direction in the same discussion, so the caption and the media derived from it share a
+    # single narrative. The agreed media direction is threaded downstream (ApprovedDraft.strategy)
+    # to the media_producer, so the storyboard reflects the table, not just the final caption.
+    if media:
+        wanted = " and ".join(labels[t] for t in media)
+        return (
+            f"Discuss and converge on the best content strategy for {platform} about "
+            f"'{brief.topic}'. Converge on TWO things: (1) the post copy angle — the hook and "
+            f"the call to action; and (2) the creative direction for {wanted} derived from it — "
+            f"the key message, visual tone, pacing, and on-screen call to action. Goal: {intent}."
+        )
+    # Text only.
     return (
         f"Discuss and converge on the best content strategy for {platform} about "
         f"'{brief.topic}'. Goal: {intent}."
@@ -167,6 +218,9 @@ async def run_table(
                     table_id=platform, speaker=turn.speaker, role=turn.role,
                     text=turn.text, round_index=turn.round_index,
                 ))
+                # TTS readback: fires in the background and arrives as a separate,
+                # later event — never blocks this turn or the next one being scheduled.
+                _synthesize_turn_audio(turn, platform, on_event)
         elif etype == "output":
             consensus_text = getattr(data, "text", None) or (str(data) if data is not None else "")
 

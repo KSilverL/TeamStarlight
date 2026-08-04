@@ -21,6 +21,7 @@ from typing import Optional
 PROGRESS = "progress"               # "the task is now at executor X"
 RESULT = "result"                   # "executor X produced this content"
 AGENT_UTTERANCE = "agent_utterance" # "a roundtable participant just spoke"
+AGENT_UTTERANCE_AUDIO = "agent_utterance_audio"  # the TTS clip for an already-emitted turn
 SPEAKER_SCHEDULED = "speaker_scheduled"  # "the manager just handed the mic to a participant"
 DISCUSSION_CONSENSUS = "discussion_consensus"  # the table converged (a RESULT status)
 ROUND_CONTROL = "round_control"     # step mode: the table is asking the user what to do next
@@ -129,6 +130,34 @@ def agent_utterance_event(
         "role": role,
         "text": text,
         "round_index": round_index,
+    }
+
+
+def agent_utterance_audio_event(
+    *,
+    table_id: str,
+    speaker: str,
+    round_index: int,
+    audio_b64: str,
+) -> dict:
+    """The synthesized speech (base64 mp3) for a turn `agent_utterance_event` already
+    emitted. Fired separately and later — TTS synthesis runs in the background so it
+    never delays the live text discussion (mirrors how `speaker_scheduled_event` is
+    already a second, separately-timed event for the same turn, just on the other
+    side of it). The frontend matches it back to the right bubble via `speaker` +
+    `round_index`, the same pair `agent_utterance_event` carries."""
+    return {
+        "type": AGENT_UTTERANCE_AUDIO,
+        "node": speaker,
+        "phase": "discuss",
+        "platform": table_id,
+        "status": "done",
+        "ts": time.time(),
+        "table_id": table_id,
+        "speaker": speaker,
+        "agent_id": speaker,
+        "round_index": round_index,
+        "audio_b64": audio_b64,
     }
 
 
