@@ -19,7 +19,7 @@ import time
 import httpx
 import pytest
 
-from LLM_service.api import WorkflowService, create_app
+from LLM_service.api import WorkflowService, _verdict_from_payload, create_app
 from LLM_service.core.services import factory, mock, postgres
 from LLM_service.tests.conftest import run_app
 from LLM_service.workflow import HumanVerdict, build_workflow
@@ -57,6 +57,62 @@ async def test_draft_ready_result_streamed_per_platform():
     assert ready == {"linkedin", "instagram"}
 
 
+async def test_every_post_intake_stage_is_platform_tagged():
+    """Everything after intake runs per platform, so its progress says which one.
+
+    The graph really is per-platform from the dispatcher on — the strategist calls
+    `plan_strategy` once per platform with that platform's `skills/<platform>.md`,
+    the creator fans out, and the reviewer/gate/media_producer are per-platform —
+    so a subscriber can run one lane per platform. `_platforms_of` reads the tag
+    from the payload: a message's own `platform` when it has one, otherwise the
+    run's `target_platforms` (supplied by the backend at `POST /tasks` and carried
+    on every brief-level message). The envelope's `platform` is single-valued, so
+    a payload covering N platforms yields N events.
+
+    The subtlety it exists for: `executor_invoked` carries the single inbound
+    message, but `executor_completed` carries a **list** of the messages the
+    executor emitted. Reading `.platform` off that list yields None every time,
+    which used to close `reviewer/linkedin running` with an untagged
+    `reviewer done` — leaving that platform spinning forever in a subscribed UI.
+    """
+    svc = WorkflowService()
+    await svc.start(_START, task_id="t1")
+    await svc.review("t1", {p: {"decision": "approve"} for p in ("linkedin", "instagram")})
+
+    tagged = {}
+    for e in svc.buffered_events("t1"):
+        if e["type"] == "progress":
+            tagged.setdefault((e["node"], e["status"]), []).append(e["platform"])
+
+    both = {"linkedin", "instagram"}
+    for node in ("dispatcher", "strategist", "creator", "reviewer", "media_producer"):
+        assert set(tagged[(node, "running")]) == both, f"{node} running"
+        assert set(tagged[(node, "done")]) == both, f"{node} done"
+
+    # The gate is tagged on both the pause (from the HumanReviewRequest) and the
+    # resume (from the verdict, which `review()` stamps with its platform).
+    assert set(tagged[("human_gate", "interrupted")]) == both
+    assert set(tagged[("human_gate", "running")]) == both
+    # …the one exception: at the pause MAF reports the gate "completed" with an
+    # EMPTY payload (it yielded a request instead of emitting a message), so there
+    # is nothing to attribute. The tag is never invented, so that one stays None —
+    # the `interrupted` before it and the real `done` after it carry the platform.
+    assert set(tagged[("human_gate", "done")]) == both | {None}
+
+
+async def test_verdict_carries_the_platform_it_answers():
+    """`review()` stamps each verdict with its pending request's platform."""
+    svc = WorkflowService()
+    await svc.start(_START, task_id="t1")
+    pending = {p["request_id"]: p["platform"] for p in (await svc.get("t1"))["pending"]}
+    assert set(pending.values()) == {"linkedin", "instagram"}
+
+    verdict = _verdict_from_payload({"decision": "approve"}, "linkedin")
+    assert verdict.platform == "linkedin"
+    # Optional: a directly-constructed verdict (tests, CLI) stays valid.
+    assert HumanVerdict(decision="approve").platform is None
+
+
 async def test_events_follow_the_envelope():
     svc = WorkflowService()
     await svc.start(_START, task_id="t1")
@@ -91,15 +147,31 @@ async def test_session_title_set_immediately_then_upgraded_off_path():
     assert titles[0]["title"] == snap["title"] != fallback
 
 
-async def test_session_title_present_on_inline_run_without_extra_event():
-    """Inline runs (CLI/tests) get the deterministic title on the snapshot but spawn no concurrent
-    upgrade — so no stray task is left pending and no session_title event is emitted."""
+async def test_session_title_present_on_plain_inline_run_without_extra_event():
+    """A plain inline run (no background, no live listener — the test/programmatic path) gets the
+    deterministic title on the snapshot but spawns no concurrent upgrade: no stray task is left
+    pending and no session_title event is emitted."""
     svc = WorkflowService()
-    await svc.start(_START, task_id="t_inline")  # background defaults to False
+    await svc.start(_START, task_id="t_inline")  # background defaults to False, no event_listener
     snap = await svc.get("t_inline")
-    assert snap["title"] == "ethiopia harvest"
+    assert snap["title"] == "ethiopia harvest"       # the raw-topic fallback (uncased)
     assert svc._tasks["t_inline"].title_runner is None
     assert not [e for e in svc.buffered_events("t_inline") if e["type"] == "session_title"]
+
+
+async def test_session_title_upgraded_for_a_live_inline_listener():
+    """A live consumer — the CLI's `event_listener` (or the HTTP background path) — opts the
+    off-path title upgrade in even on an inline run. `_dispatch` settles the concurrent title task
+    before returning, so the polished title is on the snapshot and exactly one session_title event
+    reached the listener. This is what `main.py` surfaces live."""
+    seen: list[dict] = []
+    svc = WorkflowService()
+    await svc.start(_START, task_id="t_live", event_listener=seen.append)
+    assert svc._tasks["t_live"].title_runner is not None   # a live consumer triggered the upgrade
+    snap = await svc.get("t_live")
+    assert snap["title"] == "Ethiopia Harvest"             # mock name_session Title-Cases the topic
+    titles = [e for e in seen if e["type"] == "session_title"]
+    assert len(titles) == 1 and titles[0]["title"] == "Ethiopia Harvest"
 
 
 # ── B. Review resume → completion + final results ────────────────────────────

@@ -156,7 +156,11 @@ def _print_event(e: dict) -> None:
     `WorkflowService.start(event_listener=…)` so persona turns, progress, the gate draft and
     the final all stream as they happen (no end-of-run replay)."""
     etype = e.get("type")
-    if etype == "agent_utterance":
+    if etype == "session_title":
+        # The off-path title upgrade landed — the deterministic fallback (already on the snapshot)
+        # is now replaced by the polished LLM title. This is the frontend's history-sidebar label.
+        print(f"\n    🏷  session title → {e.get('title')!r}")
+    elif etype == "agent_utterance":
         who = e.get("speaker", "?")
         print(f"\n    💬 [{e.get('table_id')} · r{e.get('round_index')}] {who}:")
         for line in (e.get("text", "") or "").splitlines() or [""]:
@@ -206,6 +210,8 @@ async def _run_gate(svc, task_id: str, snapshot: dict) -> dict:
 
 def _show_finals(snapshot: dict) -> None:
     _section("FINAL — ready-to-publish posts + media")
+    if snapshot.get("title"):
+        print(f"  Session title (history sidebar): {snapshot['title']!r}")
     for out in snapshot["outputs"]:
         print(f"\n  ── {out['platform']} ({out.get('decision')}) ──")
         print(_draft_box(out.get("draft", "")))
@@ -502,6 +508,7 @@ def _cheat_sheet() -> None:
         ("No-brand path",        "Brand id = blank (steers on tone only, never reads the store)"),
         ("Text / voice intake",  "Brief step → choose 2 or 3 (vs 1 = manual)"),
         ("Learning + read-back", "Set Brand id + User id, then 'Learn this conversation?' = Y"),
+        ("Session title",        "Any content run: watch for '🏷 session title → …' (the off-path upgrade) + the 'Session title' line in FINAL"),
         ("Posting plan",         "Top menu → 2: clarify Qs first → generate (blank cadence = agent picks the pace) → refine on feedback → confirm → 'daily cron' a date → execute a slot"),
     ]
     for name, how in rows:

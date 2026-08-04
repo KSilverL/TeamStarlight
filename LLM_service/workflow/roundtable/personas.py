@@ -52,6 +52,52 @@ VIDEO_DIRECTOR = "video_director"
 # toggles off the roster (and every existing test) is unchanged.
 ROSTER: List[str] = [PLATFORM_EDITOR, BRAND_VOICE, USER_ADVOCATE, AUDIENCE_ADVOCATE]
 
+_DELIVERABLE_LABELS = {
+    "text": "written social post/caption copy",
+    "brand": "an animated HTML brand card",
+    "video": "a short brand video",
+}
+
+
+def render_deliverable_scope(content_types: List[str]) -> str:
+    """Render the user's requested output modalities as a hard constraint shared by every
+    roundtable seat. Platform skills describe what generally performs well, but they must not
+    tempt a persona into recommending an artifact the user did not request."""
+    requested_types = list(dict.fromkeys(content_types or ["text"]))
+    requested = ", ".join(
+        _DELIVERABLE_LABELS.get(content_type, content_type)
+        for content_type in requested_types
+    )
+    unrequested = ", ".join(
+        label
+        for content_type, label in _DELIVERABLE_LABELS.items()
+        if content_type not in requested_types
+    )
+
+    lines = [
+        "DELIVERABLE SCOPE — HARD CONSTRAINT:",
+        f"The user requested exactly: {requested}.",
+        "Discuss and optimize only the requested deliverables. Do not recommend, design, "
+        "storyboard, or assume an unrequested content format, even if the platform guide says "
+        "that format generally performs better.",
+    ]
+    if unrequested:
+        lines.append(f"Unrequested and out of scope: {unrequested}.")
+    if requested_types == ["text"]:
+        lines.append(
+            "This is a TEXT-ONLY task. Discuss written post/caption copy only. Do not propose "
+            "or assume a video, Reel, animation, image/photo, carousel/document, storyboard, "
+            "visual treatment, or any other media asset. Any platform-guide advice about "
+            "visuals or media does not apply to this run."
+        )
+    elif "text" not in requested_types:
+        lines.append(
+            "No written post copy was requested. Do not propose copy as an additional "
+            "deliverable; discuss only the requested media output."
+        )
+    return "\n".join(lines)
+
+
 # One Azure Neural TTS voice per seat, for the optional spoken readback of the discussion
 # (runner.py synthesizes each turn's line in this voice once it completes). Same "one
 # model, many roles" economy as the text personas above — just via VoiceoverService's
@@ -161,6 +207,7 @@ def build_personas(
     brand_block = render_brand_profile(brand_profile)
     user_block = render_user_skills(user_skills)
     trend_block = render_trends(trends or [])
+    deliverable_scope = render_deliverable_scope(brief.content_types)
 
     # Each seat's charter follows one structure — mission / lens / voice signature /
     # push-back mandate / lane discipline — so the seats differentiate through what they
@@ -285,7 +332,7 @@ def build_personas(
 
     personas: List[Persona] = []
     for name in roster:
-        text = instructions[name] + "\n\n" + DISCUSSION_STYLE
+        text = instructions[name] + "\n\n" + deliverable_scope + "\n\n" + DISCUSSION_STYLE
         description = PERSONA_DESCRIPTIONS[name]
         agent = Agent(make_client(name), instructions=text, name=name, description=description)
         personas.append(Persona(

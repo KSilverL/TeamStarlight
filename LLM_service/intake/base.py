@@ -42,7 +42,7 @@ def _render_prior_context(prior: PriorSessionContext) -> str:
     behaviour."""
     if prior is None or not prior.has_content():
         return ""
-    lines = ["", "## 前情提要 (continuing a prior conversation)",
+    lines = ["", "## continuing a prior conversation",
              "This is a follow-up to an earlier session. Treat its outcome as context and infer "
              "the new brief against it; only ask about what genuinely changed."]
     if prior.topic:

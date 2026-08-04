@@ -32,6 +32,11 @@ _FALSE = {"0", "false", "no", "off", "n", "f"}
 # (this file is core/config.py, so parent.parent is LLM_service/).
 _DEFAULT_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
+# Set this to suppress the automatic .env read in get_settings(). The test suite
+# sets it (at conftest import time, before anything can resolve settings) so a
+# developer's local .env can never leak into an offline, deterministic run.
+IGNORE_DOTENV_VAR = "LLM_SERVICE_IGNORE_DOTENV"
+
 
 def _parse_env_value(raw: str) -> str:
     """Parse one .env value. Quoted values ('...' / "...") are taken verbatim;
@@ -58,11 +63,11 @@ def load_dotenv(path: Union[str, Path, None] = None, *, override: bool = False) 
     """Load KEY=VALUE pairs from a .env file into ``os.environ``.
 
     Dependency-free (no python-dotenv needed). Real environment variables win by
-    default (``override=False``), so a value exported in the shell — or cleared by
-    the test harness — is never clobbered by the file. Call this once from an entry
-    point (main.py / api.py) *before* ``get_settings()``; it is deliberately not an
-    import side-effect, so importing this module in tests stays inert. Returns True
-    if a file was found and read."""
+    default (``override=False``), so a value exported in the shell — or set by a
+    caller — is never clobbered by the file. ``get_settings()`` calls this itself,
+    so consumers do not have to; entry points may still call it explicitly (to
+    report whether a file was found, say). It is not an import side-effect, so
+    importing this module stays inert. Returns True if a file was found and read."""
     env_path = Path(path) if path is not None else _DEFAULT_ENV_FILE
     if not env_path.is_file():
         return False
@@ -674,7 +679,28 @@ def _load() -> Settings:
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Return the cached Settings, loading from the environment on first call."""
+    """Return the cached Settings, loading from the environment on first call.
+
+    The `.env` file is read here, so **every** consumer sees the configured
+    settings — not just `api.py:serve()` and `main.py`, which used to be the only
+    callers of `load_dotenv()`. Anything else (a script, a notebook, the
+    evaluation harness) silently saw an empty configuration and every toggle fell
+    back to its default, which is a very quiet way to be wrong: "inherit the
+    project's configuration" ended up meaning "always mock".
+
+    Real environment variables still win (`override=False`), so an exported var
+    or a value set by a caller is never clobbered by the file. Setting
+    `LLM_SERVICE_IGNORE_DOTENV` suppresses the read entirely — the test suite does
+    this (see `tests/conftest.py`) so the offline/deterministic guarantee never
+    depends on whatever a developer happens to have in their local `.env`.
+
+    That flag must be set **before the first resolution**, not merely before a
+    `reset_settings()`: `load_dotenv` copies the file into `os.environ`, so once a
+    read has happened the values are in the process environment for good and
+    setting the flag later suppresses nothing. Hence conftest sets it at import.
+    """
+    if not _env_bool(IGNORE_DOTENV_VAR):
+        load_dotenv()
     return _load()
 
 
