@@ -1,9 +1,9 @@
 """
-Roundtable personas (§4). Each persona is an independent MAF `Agent` (NOT a "ChatAgent"
+Roundtable personas. Each persona is an independent MAF `Agent` (NOT a "ChatAgent"
 — that type does not exist in the installed framework; see docs/roundtable_api_notes.md),
 built over a per-persona chat client from `factory.get_chat_client`.
 
-The roster (3-4 AI seats per table + the user, who joins in Phase 3):
+The roster (3-4 AI seats per table + the user seat):
   - platform_editor   — native format/tone/length; injects `skills/<platform>.md`.
   - brand_voice       — guards the brand's must_do / must_avoid; injects the brand profile.
   - user_advocate     — speaks for this user's learned preferences; injects user_skills.
@@ -29,10 +29,15 @@ from agent_framework import Agent
 
 from ...core.config import get_settings
 from ...core.services import factory
-from ...core.skill_schema import UserSkillDoc
+from ...core.services.base import render_brand_profile  # re-exported (moved to core)
+from ...core.skill_schema import UserSkillDoc, render_user_skills  # re-exported (moved to core)
 from ...core.trend_schema import Trend, render_trends
 from ...skills import load_skill
 from ..messages import Brief
+
+# render_brand_profile / render_user_skills / render_trends now all live in core (shared
+# with the linear strategist + the plan layer, so a non-roundtable run reasons with the
+# same brand/user/trend context) and are re-exported here for existing importers.
 
 # Persona names double as their role label and as the manager's speaker keys.
 PLATFORM_EDITOR = "platform_editor"
@@ -40,16 +45,78 @@ BRAND_VOICE = "brand_voice"
 USER_ADVOCATE = "user_advocate"
 AUDIENCE_ADVOCATE = "audience_advocate"
 TREND_SCOUT = "trend_scout"
+VIDEO_DIRECTOR = "video_director"
 
 # The always-on four seats. `trend_scout` is appended inside build_personas only when
-# TREND_SCOUT_ENABLED — with the toggle off the roster (and every existing test) is unchanged.
+# TREND_SCOUT_ENABLED, and `video_director` only when the brief requests "video" — with both
+# toggles off the roster (and every existing test) is unchanged.
 ROSTER: List[str] = [PLATFORM_EDITOR, BRAND_VOICE, USER_ADVOCATE, AUDIENCE_ADVOCATE]
+
+_DELIVERABLE_LABELS = {
+    "text": "written social post/caption copy",
+    "brand": "an animated HTML brand card",
+    "video": "a short brand video",
+}
+
+
+def render_deliverable_scope(content_types: List[str]) -> str:
+    """Render the user's requested output modalities as a hard constraint shared by every
+    roundtable seat. Platform skills describe what generally performs well, but they must not
+    tempt a persona into recommending an artifact the user did not request."""
+    requested_types = list(dict.fromkeys(content_types or ["text"]))
+    requested = ", ".join(
+        _DELIVERABLE_LABELS.get(content_type, content_type)
+        for content_type in requested_types
+    )
+    unrequested = ", ".join(
+        label
+        for content_type, label in _DELIVERABLE_LABELS.items()
+        if content_type not in requested_types
+    )
+
+    lines = [
+        "DELIVERABLE SCOPE — HARD CONSTRAINT:",
+        f"The user requested exactly: {requested}.",
+        "Discuss and optimize only the requested deliverables. Do not recommend, design, "
+        "storyboard, or assume an unrequested content format, even if the platform guide says "
+        "that format generally performs better.",
+    ]
+    if unrequested:
+        lines.append(f"Unrequested and out of scope: {unrequested}.")
+    if requested_types == ["text"]:
+        lines.append(
+            "This is a TEXT-ONLY task. Discuss written post/caption copy only. Do not propose "
+            "or assume a video, Reel, animation, image/photo, carousel/document, storyboard, "
+            "visual treatment, or any other media asset. Any platform-guide advice about "
+            "visuals or media does not apply to this run."
+        )
+    elif "text" not in requested_types:
+        lines.append(
+            "No written post copy was requested. Do not propose copy as an additional "
+            "deliverable; discuss only the requested media output."
+        )
+    return "\n".join(lines)
+
+
+# One Azure Neural TTS voice per seat, for the optional spoken readback of the discussion
+# (runner.py synthesizes each turn's line in this voice once it completes). Same "one
+# model, many roles" economy as the text personas above — just via VoiceoverService's
+# `voice` parameter instead of a system prompt. Used as a fallback for any unmapped
+# speaker (e.g. the "user" seat, which is never synthesized).
+DEFAULT_VOICE = "en-US-JennyNeural"
+PERSONA_VOICES: Dict[str, str] = {
+    PLATFORM_EDITOR: "en-US-GuyNeural",
+    BRAND_VOICE: "en-US-DavisNeural",
+    USER_ADVOCATE: "en-US-JennyNeural",
+    AUDIENCE_ADVOCATE: "en-US-AriaNeural",
+    TREND_SCOUT: "en-US-SaraNeural",
+}
 
 # Appended VERBATIM to every seat's instructions so each turn reads like a real person speaking
 # at a fast roundtable, not an essay: ONE point, a sentence or two, reacting to what was just
-# said. This is the primary lever for "短句为主" — keep it the same for all seats so the manager
-# can run many short exchanges (and check for a raised hand) between turns instead of a few long
-# monologues. (A hard token backstop is the optional ROUNDTABLE_PERSONA_MAX_TOKENS knob.)
+# said. This is the primary lever for keeping turns short — keep it the same for all seats so the
+# manager can run many short exchanges (and check for a raised hand) between turns instead of a
+# few long monologues. (A hard token backstop is the optional ROUNDTABLE_PERSONA_MAX_TOKENS knob.)
 DISCUSSION_STYLE = (
     "Speak like you would at a real, fast-moving roundtable — not in an essay. Make ONE point "
     "per turn, in a sentence or two (a short, tight paragraph at the very most). React to what "
@@ -87,6 +154,11 @@ PERSONA_DESCRIPTIONS: Dict[str, str] = {
         "Cultural-trend radar: pitches one genuine fusion angle between a current trend and "
         "the topic — or says plainly that none fits; call on them for timeliness angles."
     ),
+    VIDEO_DIRECTOR: (
+        "Short-form video director: shapes the storyboard — the opening hook beat, visual "
+        "tone, pacing, slide arc, and closing on-screen CTA; call on them for how the idea "
+        "should move as a video, not read as a caption."
+    ),
 }
 
 
@@ -102,38 +174,6 @@ class Persona:
     instructions: str
     agent: object
     description: str = ""
-
-
-def render_brand_profile(profile: dict) -> str:
-    """Render the brand voice profile as a prompt block (empty string when cold-start)."""
-    must_do = profile.get("must_do") or []
-    must_avoid = profile.get("must_avoid") or []
-    examples = [e.get("text", "") for e in (profile.get("examples") or []) if e.get("text")]
-    parts: List[str] = []
-    if must_do:
-        parts.append("BRAND MUST DO:\n" + "\n".join(f"- {x}" for x in must_do))
-    if must_avoid:
-        parts.append("BRAND MUST AVOID:\n" + "\n".join(f"- {x}" for x in must_avoid))
-    if examples:
-        parts.append("BRAND EXAMPLES:\n" + "\n".join(f"- {x}" for x in examples))
-    return "\n\n".join(parts)
-
-
-# render_trends now lives in core/trend_schema.py (shared with the linear strategist and
-# the intake copilot — Phase 4); re-exported here so the seat's renderer stays importable.
-
-def render_user_skills(doc: Optional[UserSkillDoc]) -> str:
-    """Render this user's learned rules as a prompt block (empty when none)."""
-    if not doc or not doc.rules:
-        return ""
-    prefers = [r.text for r in doc.rules if r.kind == "positive"]
-    avoids = [r.text for r in doc.rules if r.kind == "negative"]
-    parts: List[str] = []
-    if prefers:
-        parts.append("USER PREFERS:\n" + "\n".join(f"- {t}" for t in prefers))
-    if avoids:
-        parts.append("USER AVOIDS:\n" + "\n".join(f"- {t}" for t in avoids))
-    return "\n\n".join(parts)
 
 
 def build_personas(
@@ -167,6 +207,7 @@ def build_personas(
     brand_block = render_brand_profile(brand_profile)
     user_block = render_user_skills(user_skills)
     trend_block = render_trends(trends or [])
+    deliverable_scope = render_deliverable_scope(brief.content_types)
 
     # Each seat's charter follows one structure — mission / lens / voice signature /
     # push-back mandate / lane discipline — so the seats differentiate through what they
@@ -262,15 +303,36 @@ def build_personas(
             "discussion; name only the one trend you are pitching.\n\n"
             f"{trend_block or '(no current trends available — skip the trend angle)'}"
         ),
+        VIDEO_DIRECTOR: (
+            f"You are the video director — the seat that turns this post into a short-form "
+            f"{platform} video that stops the scroll in its first second.\n"
+            "Your mission: shape a tight storyboard — an opening hook beat, a clear visual arc "
+            "of a few beats, and a closing on-screen call to action — carrying the SAME message "
+            "as the post copy, never a different one.\n"
+            "Your lens: does each idea translate into a concrete motion beat a viewer would "
+            "watch — an opening hook shot, a stat or proof beat, a visual payoff — rather than "
+            "the caption read aloud over a static background?\n"
+            "Be concrete about the VISUAL: name the opening beat, the visual tone (energetic / "
+            "calm / bold), the pacing, and what the final frame says. Give exactly ONE "
+            "storyboard idea per turn, not a full shot list — build the arc across rounds.\n"
+            "Push back the moment the video would just be the caption on a plain background, or "
+            "when a beat has nothing to actually show — say what to put on screen instead.\n"
+            "Stay in your lane: the platform editor owns caption format and the brand-voice "
+            "guardian owns brand rules — you own how the story MOVES as a video."
+        ),
     }
 
     roster = list(ROSTER)
     if settings.trend_scout_enabled:
         roster.append(TREND_SCOUT)
+    # The video director joins only when the brief asks for a video — the seat exists to give
+    # the storyboard real deliberation inside the one shared session (no second table).
+    if "video" in (brief.content_types or []):
+        roster.append(VIDEO_DIRECTOR)
 
     personas: List[Persona] = []
     for name in roster:
-        text = instructions[name] + "\n\n" + DISCUSSION_STYLE
+        text = instructions[name] + "\n\n" + deliverable_scope + "\n\n" + DISCUSSION_STYLE
         description = PERSONA_DESCRIPTIONS[name]
         agent = Agent(make_client(name), instructions=text, name=name, description=description)
         personas.append(Persona(

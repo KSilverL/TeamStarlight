@@ -1,5 +1,5 @@
 """
-Typed messages for the roundtable discussion stage (the §3 schema, aligned to the
+Typed messages for the roundtable discussion stage (aligned to the
 real signatures in docs/roundtable_api_notes.md).
 
 All models are serializable pydantic (same style as workflow/messages.py) so they can
@@ -36,8 +36,7 @@ class DiscussionTurn(BaseModel):
 
 
 class UserUtterance(BaseModel):
-    """A queued user interjection (Phase 3: the user raises a hand each round). Carried
-    here so the type exists for the consensus/transcript even before the queue is wired."""
+    """A queued user interjection (the user raises a hand and speaks into a table)."""
 
     task_id: str
     table_id: str
@@ -47,8 +46,8 @@ class UserUtterance(BaseModel):
 
 class RoundtableConsensus(BaseModel):
     """The product of one table. `strategy` reuses the existing `CreativeStrategy` (a
-    single-platform `strategies` dict here); Phase 6 merges N of these into one
-    `CreativeStrategy` for the creator's fan-out."""
+    single-platform `strategies` dict here); the service layer merges N of these into
+    one `CreativeStrategy` for the creator's fan-out."""
 
     platform: str
     strategy: CreativeStrategy

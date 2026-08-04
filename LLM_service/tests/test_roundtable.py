@@ -1,10 +1,10 @@
 """
-Phase 1 acceptance for the roundtable stage (docs/ROUNDTABLE_IMPLEMENTATION.md): a single
+Roundtable-stage acceptance (docs/ROUNDTABLE_IMPLEMENTATION.md): a single
 platform, pure text, no user, fully mocked + deterministic.
 
 Covers:
   - reproducibility: same brief + same mock skills/profile → identical transcript + consensus.
-  - read side (§6.5): brand_voice / user_advocate personas carry the injected profile / skills.
+  - read side: brand_voice / user_advocate personas carry the injected profile / skills.
   - drop-in shape: RoundtableConsensus.strategy has the SAME fields as the strategist's CreativeStrategy.
   - termination: the table always stops at MAX_ROUNDS.
 
@@ -53,6 +53,7 @@ from LLM_service.workflow.roundtable.personas import (
     ROSTER,
     TREND_SCOUT,
     USER_ADVOCATE,
+    VIDEO_DIRECTOR,
 )
 
 PLATFORM = "linkedin"
@@ -66,6 +67,7 @@ def _brief(**over) -> Brief:
         business_id=over.get("business_id", ROUNDTABLE_FIXTURE_BUSINESS_ID),
         user_id=over.get("user_id", ROUNDTABLE_FIXTURE_USER_ID),
         tone_hint="warm, authentic",
+        content_types=over.get("content_types", ["text"]),
     )
 
 
@@ -116,6 +118,44 @@ async def test_personas_carry_injected_profile_and_skills():
     assert "BRAND MUST DO" not in personas[AUDIENCE_ADVOCATE].instructions
 
 
+async def test_text_only_scope_is_a_hard_constraint_for_every_persona():
+    """Every seat receives the requested deliverable scope, so platform/media priors cannot
+    turn a text-only request into a video, Reel, carousel, image, or animation proposal."""
+    brief = _brief(content_types=["text"])
+    context = await build_persona_context(brief)
+    personas = build_personas(
+        PLATFORM, brief,
+        brand_profile=context.brand_profile, user_skills=context.user_skills,
+    )
+
+    for persona in personas:
+        instructions = persona.instructions
+        assert "DELIVERABLE SCOPE — HARD CONSTRAINT" in instructions
+        assert "The user requested exactly: written social post/caption copy." in instructions
+        assert "This is a TEXT-ONLY task." in instructions
+        assert "Do not propose or assume a video, Reel, animation, image/photo" in instructions
+        assert "platform-guide advice about visuals or media does not apply" in instructions
+
+
+async def test_mixed_deliverable_scope_allows_only_the_requested_formats():
+    """A mixed request names every allowed artifact and explicitly leaves the omitted one out."""
+    brief = _brief(content_types=["text", "video"])
+    context = await build_persona_context(brief)
+    personas = build_personas(
+        PLATFORM, brief,
+        brand_profile=context.brand_profile, user_skills=context.user_skills,
+    )
+
+    for persona in personas:
+        instructions = persona.instructions
+        assert (
+            "The user requested exactly: written social post/caption copy, a short brand video."
+            in instructions
+        )
+        assert "Unrequested and out of scope: an animated HTML brand card." in instructions
+        assert "This is a TEXT-ONLY task." not in instructions
+
+
 async def test_personas_are_differentiated(monkeypatch):
     """Each seat carries a distinct charter — pairwise-different instructions with the
     seat's own identity marker and an explicit lane boundary — and a non-empty,
@@ -159,7 +199,7 @@ async def test_personas_are_differentiated(monkeypatch):
 
 async def test_consensus_strategy_matches_strategist_creativestrategy_shape():
     """The consensus carries a real CreativeStrategy with the SAME fields the strategist emits,
-    so it is a drop-in for the creator (Phase 6)."""
+    so it is a drop-in for the creator."""
     brief = _brief()
     result = await run_table(PLATFORM, brief)
 
@@ -195,7 +235,7 @@ async def test_no_brand_no_user_runs_clean():
     assert result.consensus.strategy.strategies[PLATFORM]
 
 
-# ── Phase 3: the user "raise hand" seat ────────────────────────────────────────
+# ── The user "raise hand" seat ─────────────────────────────────────────────────
 
 async def test_user_utterance_becomes_a_turn():
     """A queued utterance makes the next turn the user's, with the text in the transcript."""
@@ -286,7 +326,7 @@ async def test_say_enqueues_to_store():
     assert await has_pending(factory.get_store(), task_id="t-say", table_id=PLATFORM) is True
 
 
-# ── Phase 3 refinement: raise hand → table waits for the user to actually speak ─
+# ── Raise hand → table waits for the user to actually speak ────────────────────
 
 async def test_raise_hand_makes_discussion_wait_for_user():
     """A raised hand reserves the next turn; the table BLOCKS there until the user sends, so
@@ -322,7 +362,7 @@ async def test_raise_hand_times_out_and_discussion_proceeds():
             assert "origin farm" not in t.text
 
 
-# ── Phase 5: one table per platform (concurrent fan-out) ───────────────────────
+# ── One table per platform (concurrent fan-out) ────────────────────────────────
 
 async def test_multi_platform():
     """A multi-platform brief fans out to one table per platform; the tables never cross-talk,
@@ -351,6 +391,44 @@ async def test_multi_platform():
         assert utterances and len(consensus) == 1
         rounds = [e["round_index"] for e in utterances]
         assert rounds == sorted(rounds)
+
+
+async def test_agent_utterance_audio_follows_each_persona_turn():
+    """Each persona turn gets a matching TTS readback event — fired in the background
+    (never inline on the turn-completion path, see runner._synthesize_turn_audio), so
+    tests must drain the tracked background tasks before asserting completeness. The
+    user's own turns (no PERSONA_VOICES entry) never get one — we don't read the
+    human's words back to them."""
+    import base64
+
+    from LLM_service.workflow.roundtable import runner as roundtable_runner
+    from LLM_service.workflow.roundtable.personas import PERSONA_VOICES
+
+    collected: list[dict] = []
+    await run_table(PLATFORM, _brief(), on_event=lambda ev: collected.append(ev))
+
+    # Fire-and-forget tasks may still be in flight the instant run_table returns —
+    # drain them (the same set _synthesize_turn_audio registers into) before asserting.
+    pending = list(roundtable_runner._background_tasks)
+    if pending:
+        await asyncio.gather(*pending)
+
+    utterances = [e for e in collected if e["type"] == "agent_utterance"]
+    audio_events = {
+        (e["speaker"], e["round_index"]): e
+        for e in collected if e["type"] == "agent_utterance_audio"
+    }
+    assert utterances  # sanity: the table actually produced turns
+
+    for turn in utterances:
+        key = (turn["speaker"], turn["round_index"])
+        if turn["speaker"] not in PERSONA_VOICES:
+            assert key not in audio_events  # e.g. a user turn — never synthesized
+            continue
+        audio = audio_events[key]
+        assert audio["table_id"] == turn["table_id"]
+        decoded = base64.b64decode(audio["audio_b64"])
+        assert len(decoded) > 0  # MockVoiceover's real (silent) mp3 bytes, not a placeholder
 
 
 async def test_multi_platform_streams_over_sse():
@@ -417,7 +495,7 @@ async def test_each_platform_drafts_from_its_own_strategy():
         "linkedin": "LEAD WITH A DATA HOOK",
         "instagram": "LEAD WITH A VISUAL STORY",
     })
-    # roundtable_entry starts at the creator with the per-platform strategy (Phase 6 shape).
+    # roundtable_entry starts at the creator with the per-platform strategy.
     result = await build_workflow(roundtable_entry=True).run(strategy)
 
     reqs = {e.data.platform: e.data for e in result.get_request_info_events()}
@@ -496,6 +574,40 @@ async def test_trend_scout_speaks_and_table_converges(monkeypatch):
     assert TREND_SCOUT in speakers
     assert speakers >= set(ROSTER)  # the original four still speak
     assert result.consensus.converged is True
+
+
+# ── Video director seat (joins only when "video" is requested) ────────────────
+
+async def test_video_director_joins_only_when_video_requested():
+    """The video_director seat is opt-in on the deliverable: it joins the one shared table
+    when the brief asks for a video, and the roster is otherwise unchanged (text-only or
+    brand-only never add it)."""
+    context = await build_persona_context(_brief())
+
+    def _roster(content_types):
+        brief = _brief().model_copy(update={"content_types": content_types})
+        return [p.name for p in build_personas(
+            PLATFORM, brief,
+            brand_profile=context.brand_profile, user_skills=context.user_skills,
+            trends=context.trends,
+        )]
+
+    assert _roster(["text"]) == ROSTER                       # text only → unchanged
+    assert _roster(["text", "brand"]) == ROSTER              # brand card doesn't add the seat
+    assert _roster(["text", "video"]) == ROSTER + [VIDEO_DIRECTOR]
+    assert _roster(["brand", "video"]) == ROSTER + [VIDEO_DIRECTOR]  # media-only + video too
+
+
+async def test_video_director_speaks_and_table_converges():
+    """With video requested the director takes real turns in the SAME session (one table),
+    the original four still speak, and the table still converges to a consensus."""
+    brief = _brief().model_copy(update={"content_types": ["text", "video"]})
+    result = await run_table(PLATFORM, brief)
+    speakers = {t.speaker for t in result.consensus.transcript}
+    assert VIDEO_DIRECTOR in speakers
+    assert speakers >= set(ROSTER)
+    assert result.consensus.converged is True
+    assert result.consensus.strategy.strategies[PLATFORM]  # one converged strategy string
     assert result.consensus.strategy.strategies[PLATFORM]
 
 
@@ -529,7 +641,7 @@ async def test_trend_scout_stale_snapshot_degrades_gracefully(monkeypatch):
 
 
 async def test_trend_scout_store_failure_degrades_to_no_trends(monkeypatch):
-    """A store that raises on get_trends must never fail the run (§3.5): the context
+    """A store that raises on get_trends must never fail the run: the context
     degrades to [] and the discussion still runs to consensus."""
     _enable_trend_scout(monkeypatch)
 
@@ -598,6 +710,93 @@ def _context_with_user():
     )
 
 
+def test_manager_reasoning_effort_reaches_only_the_moderator_client(monkeypatch):
+    """The ROUNDTABLE_MANAGER_REASONING_EFFORT knob lands on the moderator's chat client at
+    build time — and only there: persona seats keep their own (`minimal`) setting. The project
+    default is `low` (fast roundtable launch), so an unset env var still dials the moderator to
+    low; an explicit value overrides it."""
+    from LLM_service.core.services.base import empty_profile
+    from LLM_service.core.services.mock import MockChatClient
+    from LLM_service.workflow.roundtable import builder as rt_builder
+    from LLM_service.workflow.roundtable.context import PersonaContext
+
+    monkeypatch.setenv("USE_MOCK_LLM", "false")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com/openai/v1")
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "fake-key")
+
+    calls: dict = {}
+
+    def spy(**kwargs):
+        calls[kwargs["agent_name"]] = kwargs
+        return MockChatClient(agent_name=kwargs["agent_name"])
+
+    monkeypatch.setattr(rt_builder.factory, "get_chat_client", spy)
+    ctx = PersonaContext(brand_profile=empty_profile(None), user_skills=None)
+
+    monkeypatch.setenv("ROUNDTABLE_MANAGER_REASONING_EFFORT", "medium")  # explicit override
+    reset_settings()
+    rt_builder.build_roundtable(PLATFORM, _brief(), context=ctx)
+    assert calls["moderator"]["reasoning_effort"] == "medium"
+    assert calls[PLATFORM_EDITOR]["reasoning_effort"] == "minimal"  # persona knob untouched
+
+    monkeypatch.delenv("ROUNDTABLE_MANAGER_REASONING_EFFORT")
+    reset_settings()
+    calls.clear()
+    rt_builder.build_roundtable(PLATFORM, _brief(), context=ctx)
+    assert calls["moderator"]["reasoning_effort"] == "low"  # project default (fast launch)
+
+
+async def test_llm_manager_plan_uses_a_single_combined_call():
+    """Latency lever #1: the production manager's plan() makes ONE combined facts+plan LLM
+    call (not StandardMagenticManager's two), still populating the task_ledger the framework +
+    replan() expect and grounding chat_history for later ledger calls."""
+    from agent_framework import Message
+
+    mgr = _interactive_manager("rt_plan1")
+    calls: list = []
+
+    async def fake_complete(messages):
+        calls.append(messages)
+        return Message(
+            role="assistant",
+            contents=["GIVEN OR VERIFIED FACTS\n- launch is in spring\n"
+                      "===PLAN===\n- open with the native hook"],
+        )
+
+    mgr._complete = fake_complete
+    ctx = _context_with_user()
+    rendered = await mgr.plan(ctx)
+
+    assert len(calls) == 1                                    # ONE call, not two
+    assert mgr.task_ledger is not None                        # ledger populated (replan baseline)
+    assert "spring" in mgr.task_ledger.facts.text             # facts section split out
+    assert "native hook" in mgr.task_ledger.plan.text         # plan section split out
+    assert "spring" in rendered.text and "native hook" in rendered.text  # rendered full ledger
+    assert ctx.chat_history                                   # grounded for later ledger calls
+
+
+async def test_llm_manager_plan_degrades_when_marker_absent():
+    """If the model omits the split marker, plan() still makes exactly one call and puts the
+    whole response in BOTH ledger slots — real content, never an empty/None ledger."""
+    from agent_framework import Message
+
+    mgr = _interactive_manager("rt_plan2")
+    calls: list = []
+
+    async def fake_complete(messages):
+        calls.append(messages)
+        return Message(role="assistant", contents=["a fact sheet and a plan, but no marker"])
+
+    mgr._complete = fake_complete
+    ctx = _context_with_user()
+    await mgr.plan(ctx)
+
+    assert len(calls) == 1
+    assert mgr.task_ledger is not None
+    assert "no marker" in mgr.task_ledger.facts.text
+    assert "no marker" in mgr.task_ledger.plan.text
+
+
 async def test_llm_manager_hides_user_from_roster_and_never_selects_them():
     """Idle user (no raised hand / no queued message): the LLM moderator must not even SEE the
     user seat in the roster it picks from, and — even if the model hallucinated the name — the
@@ -646,7 +845,7 @@ async def test_llm_manager_yields_to_user_on_raised_hand():
     assert ledger.next_speaker.answer == USER_SEAT_NAME
 
 
-# ── Step mode (每轮 4 选 1): per-round user control ─────────────────────────────
+# ── Step mode: per-round user control ─────────────────────────────────────────
 # `roundtable_mode: "manual"` pauses each table at every round boundary for the user's
 # 4-way choice — next / speak / enough / auto — answered via POST /tasks/{id}/round-control.
 # Default stays "auto" (hands-off), so nothing here changes the existing contract.

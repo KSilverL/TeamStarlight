@@ -1,4 +1,4 @@
-"""Text intake (MIGRATION_PLAN §4.3) — the typed-chat entry.
+"""Text intake — the typed-chat entry.
 
 The transport is the identity: a typed turn is already user text, so this subclass
 adds nothing but `intake_mode`. All conversation logic lives in the shared

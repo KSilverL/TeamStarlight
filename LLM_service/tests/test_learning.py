@@ -1,5 +1,5 @@
 """
-Phase 7 — per-user learning from the roundtable interaction (§6.5 write side).
+Per-user learning from the roundtable interaction (the write side).
 
 The roundtable's richer signal (the user's interjections + their final verdict) is distilled
 into preferences and written back through the EXISTING per-user channel (consolidate_skills →
@@ -19,6 +19,7 @@ from LLM_service.core.services import factory
 from LLM_service.core.services.mock import ROUNDTABLE_FIXTURE_BUSINESS_ID
 from LLM_service.core.skill_schema import SkillRule
 from LLM_service.workflow import Brief, build_workflow
+from LLM_service.workflow.learning import archive_conversation
 from LLM_service.workflow.roundtable import build_persona_context, push_utterance
 
 _INTERJECTION = "always mention fair-trade sourcing"
@@ -121,6 +122,34 @@ async def test_safety_red_line_overrides_a_learned_skill():
     req = result.get_request_info_events()[0].data
     # Rejected on every attempt → circuit breaker → flagged for the human (red line wins).
     assert req.needs_human_intervention is True
+
+
+# ── One learning channel failing degrades to that channel only, never a 500 ───
+
+async def test_channel_failure_degrades_and_preserves_the_other(monkeypatch):
+    """A distiller that raises (a malformed real-LLM response, a store hiccup) must not
+    abort the whole confirm: the failing channel yields nothing, the other still lands."""
+    llm = factory.get_llm()
+
+    async def boom(**_kwargs):
+        raise ValueError("simulated malformed LLM response")
+
+    monkeypatch.setattr(llm, "distill_rules", boom)  # break the brand channel only
+
+    result = await archive_conversation(
+        brief=_brief("u_degrade"),
+        transcript=[{"role": "user", "text": _INTERJECTION}],
+        conversation=None,
+        outputs={"linkedin": {"draft": "final copy"}},
+        original_drafts={"linkedin": "ai copy"},
+        verdicts=[],
+        source_task_id="learn-degrade",
+    )
+
+    assert result["brand_rules"] == []                       # failing channel degraded
+    assert result["preference_summary"] is not None          # the other channel still learned
+    doc = await factory.get_store().get_user_skills(user_id="u_degrade")
+    assert doc is not None and doc.rules
 
 
 # ── Regression: LEARNING_ENABLED=false reads but never writes ─────────────────

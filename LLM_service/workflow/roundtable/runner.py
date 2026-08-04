@@ -1,12 +1,13 @@
 """
-Roundtable runner (§6 / §1 stage-chaining). `run_table` drives ONE table's Magentic workflow,
-collects the transcript from the event stream, and emits a `RoundtableConsensus` whose
-`.strategy` is the existing `CreativeStrategy` — the strategist drop-in. `run_tables` (Phase 5)
+Roundtable runner. `run_table` drives ONE table's Magentic workflow, collects the
+transcript from the event stream, and emits a `RoundtableConsensus` whose
+`.strategy` is the existing `CreativeStrategy` — the strategist drop-in. `run_tables`
 fans that out: one table per target platform, run concurrently, summarised into a
 `list[RoundtableConsensus]`.
 
-Event mapping is per the Phase 0 probe (docs/roundtable_api_notes.md):
-  - `group_chat` / GroupChatRequestSentEvent  → the round index of the upcoming turn.
+Event mapping is per docs/roundtable_api_notes.md:
+  - `group_chat` / GroupChatRequestSentEvent  → the round index + participant of the upcoming
+    turn; re-emitted to callers as a `speaker_scheduled` event (the moderator's announcement).
   - `executor_invoked` / AgentExecutorResponse → a persona's spoken text (executor_id +
     agent_response.text); this is the transcript source.
   - `output` / AgentResponseUpdate            → the manager's final consensus text.
@@ -15,16 +16,57 @@ Event mapping is per the Phase 0 probe (docs/roundtable_api_notes.md):
 from __future__ import annotations
 
 import asyncio
+import base64
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
-from ...core.events import agent_utterance_event, discussion_consensus_event
+from ...core.events import (
+    agent_utterance_audio_event,
+    agent_utterance_event,
+    discussion_consensus_event,
+    speaker_scheduled_event,
+)
+from ...core.services import factory
 from ..messages import Brief, CreativeStrategy
 from .builder import RoundtableBuild, build_roundtable
 from .context import build_persona_context
 from .manager import BeforeRound
 from .messages import DiscussionTurn, RoundtableConsensus
-from .personas import Persona
+from .personas import PERSONA_VOICES, Persona
+
+# Fire-and-forget TTS tasks (below) hold no other reference once spawned — keep them
+# here so the event loop doesn't garbage-collect one mid-flight (the standard asyncio
+# idiom for background tasks: https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task).
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _synthesize_turn_audio(
+    turn: DiscussionTurn, table_id: str, on_event: Callable[[dict], None],
+) -> None:
+    """Speak `turn`'s line in its persona's voice and emit it as a follow-up event once
+    ready — NEVER on the turn-completion path itself, so a slow/failed TTS call can
+    never delay the next persona from being scheduled. The user's own turns (no entry
+    in PERSONA_VOICES) are silently skipped — we don't read the human's words back to
+    them. Synthesis failures degrade to "no audio for this turn", matching
+    VoiceoverService's documented contract (never a reason to abort anything)."""
+    voice = PERSONA_VOICES.get(turn.speaker)
+    if voice is None:
+        return
+
+    async def _go() -> None:
+        try:
+            audio = await factory.get_voiceover_generation().synthesize(
+                text=turn.text, voice=voice)
+        except Exception:
+            return
+        on_event(agent_utterance_audio_event(
+            table_id=table_id, speaker=turn.speaker,
+            round_index=turn.round_index, audio_b64=base64.b64encode(audio).decode("ascii"),
+        ))
+
+    task = asyncio.create_task(_go())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 @dataclass
@@ -39,21 +81,41 @@ class RoundtableResult:
 def _task_prompt(brief: Brief, platform: str) -> str:
     intent = brief.user_intent or "raise awareness"
     types = brief.content_types or ["text"]
+    labels = {"brand": "an animated HTML brand card", "video": "a short brand video"}
+    media = [t for t in ("brand", "video") if t in types]
     # Case 4 (no "text" requested): the table discusses HOW TO DESIGN the requested media
     # (the HTML brand card / video), not post copy — the discussion's consensus becomes the
-    # media_producer's render brief. Otherwise it converges on the post content strategy.
+    # media_producer's render brief.
     if "text" not in types:
-        labels = {"brand": "an animated HTML brand card", "video": "a short brand video"}
-        wanted = " and ".join(labels[t] for t in ("brand", "video") if t in types) or "the brand media"
+        wanted = " and ".join(labels[t] for t in media) or "the brand media"
         return (
             f"Discuss and converge on how to design {wanted} for {platform} about "
             f"'{brief.topic}' that meets the brief — the angle, key message, visual tone, and "
             f"call to action. Goal: {intent}. (No written post copy is needed.)"
         )
+    # Text + media (ONE shared session): converge on the post AND the media's creative
+    # direction in the same discussion, so the caption and the media derived from it share a
+    # single narrative. The agreed media direction is threaded downstream (ApprovedDraft.strategy)
+    # to the media_producer, so the storyboard reflects the table, not just the final caption.
+    if media:
+        wanted = " and ".join(labels[t] for t in media)
+        return (
+            f"Discuss and converge on the best content strategy for {platform} about "
+            f"'{brief.topic}'. Converge on TWO things: (1) the post copy angle — the hook and "
+            f"the call to action; and (2) the creative direction for {wanted} derived from it — "
+            f"the key message, visual tone, pacing, and on-screen call to action. Goal: {intent}."
+        )
+    # Text only.
     return (
         f"Discuss and converge on the best content strategy for {platform} about "
         f"'{brief.topic}'. Goal: {intent}."
     )
+
+
+# The speaker name on the round-0 convening announcement (a `speaker_scheduled` event emitted
+# the moment a table starts, before the manager's plan phase). It is NOT a persona seat — it is
+# the moderator's own voice, and the frontend keys its moderator avatar on exactly this string.
+MODERATOR_SPEAKER = "moderator"
 
 
 # The Magentic orchestrator yields this sentinel (not a synthesized answer) when a table hits
@@ -89,8 +151,8 @@ async def run_table(
 ) -> RoundtableResult:
     """Run one platform's table to convergence and return its consensus. `build` can be
     injected (tests); otherwise the context is read from the store and the table is built.
-    Passing `task_id` seats the user (Phase 3): queued utterances for (task_id, platform)
-    become `user` turns when the manager yields the mic. `on_event` (Phase 4), if given, is
+    Passing `task_id` seats the user: queued utterances for (task_id, platform)
+    become `user` turns when the manager yields the mic. `on_event`, if given, is
     called with an `agent_utterance` event as each turn completes and a `discussion_consensus`
     event at convergence — the caller pipes these onto the existing SSE channel. `before_round`
     (the per-round user-interjection hook) is forwarded to the manager when this builds the table."""
@@ -107,6 +169,15 @@ async def run_table(
     consensus_text = ""
     current_round = 0
 
+    if on_event is not None:
+        # Convening announcement (round 0, the moderator): the LLM manager's plan phase and
+        # its first progress ledger run BEFORE any real mic handoff, so this is the client's
+        # only signal that the table exists during that window — without it the stream shows
+        # nothing between task start and the first speaker_scheduled.
+        on_event(speaker_scheduled_event(
+            table_id=platform, speaker=MODERATOR_SPEAKER, round_index=0,
+        ))
+
     async for ev in build.workflow.run(_task_prompt(brief, platform), stream=True):
         etype = getattr(ev, "type", None)
         data = getattr(ev, "data", None)
@@ -114,6 +185,16 @@ async def run_table(
 
         if etype == "group_chat" and dname == "GroupChatRequestSentEvent":
             current_round = getattr(data, "round_index", current_round)
+            # The manager just handed the mic over — announce who holds the floor NOW,
+            # so the UI can show the upcoming speaker before their turn completes.
+            scheduled = getattr(data, "participant_name", "")
+            if scheduled in persona_names and on_event is not None:
+                key = ("scheduled", scheduled, current_round)
+                if key not in seen:
+                    seen.add(key)
+                    on_event(speaker_scheduled_event(
+                        table_id=platform, speaker=scheduled, round_index=current_round,
+                    ))
         elif etype == "executor_invoked" and dname == "AgentExecutorResponse":
             speaker = getattr(data, "executor_id", "")
             if speaker not in persona_names:
@@ -132,11 +213,14 @@ async def run_table(
                 round_index=current_round,
             )
             transcript.append(turn)
-            if on_event is not None:  # stream this turn as it completes (Phase 4)
+            if on_event is not None:  # stream this turn as it completes
                 on_event(agent_utterance_event(
                     table_id=platform, speaker=turn.speaker, role=turn.role,
                     text=turn.text, round_index=turn.round_index,
                 ))
+                # TTS readback: fires in the background and arrives as a separate,
+                # later event — never blocks this turn or the next one being scheduled.
+                _synthesize_turn_audio(turn, platform, on_event)
         elif etype == "output":
             consensus_text = getattr(data, "text", None) or (str(data) if data is not None else "")
 
@@ -150,7 +234,7 @@ async def run_table(
         rounds_used=rounds_used,
         converged=converged,
     )
-    if on_event is not None:  # the table converged — emit the consensus result (Phase 4)
+    if on_event is not None:  # the table converged — emit the consensus result
         on_event(discussion_consensus_event(
             table_id=platform, strategy=strategy.strategies,
             rounds_used=rounds_used, converged=consensus.converged, turns=len(transcript),
@@ -174,7 +258,7 @@ async def run_tables(
     checkpoint, and user-utterance queue, so the discussions never cross-talk; every emitted
     event carries its `table_id`, so the shared SSE stream stays separable per table.
 
-    The brand/user context (the read side, §6.5) is read once and shared across tables — the
+    The brand/user context (the learning loop's read side) is read once and shared across tables — the
     only per-table difference is the platform style skill the platform_editor injects.
 
     Cost note: total LLM calls ≈ N_platforms × personas_per_table × rounds, so personas run on

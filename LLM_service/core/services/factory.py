@@ -18,15 +18,19 @@ from typing import Any, Callable, Dict, Optional
 from agent_framework import CheckpointStorage, InMemoryCheckpointStorage
 
 from ..config import get_settings
-from . import azure, media_assets, mock, postgres
+from . import azure, higgsfield, media_assets, mock, postgres, web_search
 from .base import (
     BackgroundRemovalService,
     ImageSearchService,
     LLMService,
     MusicGenerationService,
+    RealtimeVoiceService,
     SafetyService,
     StoreService,
+    VideoGenerationService,
+    VoiceoverService,
     VoiceService,
+    WebSearchService,
 )
 
 __all__ = [
@@ -34,10 +38,15 @@ __all__ = [
     "get_safety",
     "get_store",
     "get_voice",
+    "get_realtime_voice",
     "get_chat_client",
     "get_image_search",
+    "get_live_image_search",
     "get_background_removal",
     "get_music_generation",
+    "get_web_search",
+    "get_voiceover_generation",
+    "get_video_generation",
     "get_checkpoint_storage",
     "reset_services",
 ]
@@ -113,6 +122,20 @@ def get_voice() -> VoiceService:
     return _cached("voice", build)
 
 
+def get_realtime_voice() -> RealtimeVoiceService:
+    """Native speech-to-speech bridge (GPT-Realtime), used by WS /intake/{sid}/voice.
+    Distinct from get_voice()'s cascaded transcribe_turn contract, kept as a fallback
+    (still reachable over the cascaded REST intake path)."""
+    def build() -> RealtimeVoiceService:
+        s = get_settings()
+        if s.mock_voice():
+            return mock.MockRealtimeVoice()
+        _require(s.has_voice, "Azure Voice Live API (realtime)",
+                 "AZURE_VOICELIVE_ENDPOINT", "USE_MOCK_VOICE=true")
+        return azure.AzureRealtimeVoice(s)
+    return _cached("realtime_voice", build)
+
+
 def get_chat_client(
     *,
     agent_name: str,
@@ -176,15 +199,72 @@ def get_music_generation() -> MusicGenerationService:
         s = get_settings()
         if s.mock_music_generation():
             return mock.MockMusicGeneration()
-        _require(s.has_soundraw, "Soundraw", "SOUNDRAW_API_KEY", "USE_MOCK_MUSIC_GENERATION=true")
+        # Prefer the local royalty-free library (offline, no key) when it's populated;
+        # Soundraw is the generative fallback and is enterprise-gated.
+        if s.has_music_library:
+            return media_assets.BundledMusicLibrary(s)
+        _require(s.has_soundraw, "Background music",
+                 "a populated MUSIC_LIBRARY_DIR/manifest.json (see assets/music/README.md), "
+                 "or SOUNDRAW_API_KEY", "USE_MOCK_MUSIC_GENERATION=true")
         return media_assets.SoundrawMusic(s)
     return _cached("music_generation", build)
 
 
+def get_web_search() -> WebSearchService:
+    def build() -> WebSearchService:
+        s = get_settings()
+        if s.mock_web_search():
+            return mock.MockWebSearch()
+        _require(s.has_web_search, "Web search (Azure AI Foundry)",
+                 "FOUNDRY_PROJECT_ENDPOINT and WEB_SEARCH_AGENT_NAME", "USE_MOCK_WEB_SEARCH=true")
+        return web_search.AzureWebSearch(s)
+    return _cached("web_search", build)
+
+
+def get_live_image_search() -> ImageSearchService:
+    """Live web image search (real, current images) — a sibling of get_image_search()'s
+    Pexels stock search, for when the agent needs something more specific/timely
+    than brand-safe generic stock. Shares the same Foundry credentials as
+    get_web_search(); toggled by the same USE_MOCK_WEB_SEARCH flag."""
+    def build() -> ImageSearchService:
+        s = get_settings()
+        if s.mock_web_search():
+            return mock.MockLiveImageSearch()
+        _require(s.has_web_search, "Web search (Azure AI Foundry)",
+                 "FOUNDRY_PROJECT_ENDPOINT and WEB_SEARCH_AGENT_NAME", "USE_MOCK_WEB_SEARCH=true")
+        return web_search.LiveImageSearch(s)
+    return _cached("live_image_search", build)
+
+
+def get_voiceover_generation() -> VoiceoverService:
+    def build() -> VoiceoverService:
+        s = get_settings()
+        if s.mock_voiceover():
+            return mock.MockVoiceover()
+        _require(s.has_roundtable_tts, "Azure Speech",
+                 "ROUNDTABLE_TTS_KEY and ROUNDTABLE_TTS_REGION", "USE_MOCK_VOICEOVER=true")
+        return azure.AzureSpeechVoiceover(s)
+    return _cached("voiceover_generation", build)
+
+
+def get_video_generation() -> VideoGenerationService:
+    """Generative AI video (Higgsfield) — the premium render backend selected by
+    VIDEO_RENDER_BACKEND=higgsfield. Mock = a real, offline placeholder MP4;
+    production = the Higgsfield REST API (submit → poll → download)."""
+    def build() -> VideoGenerationService:
+        s = get_settings()
+        if s.mock_video_generation():
+            return mock.MockVideoGeneration()
+        _require(s.has_higgsfield, "Higgsfield",
+                 "HIGGSFIELD_API_KEY and HIGGSFIELD_API_SECRET", "USE_MOCK_VIDEO_GENERATION=true")
+        return higgsfield.HiggsfieldVideoGeneration(s)
+    return _cached("video_generation", build)
+
+
 def get_checkpoint_storage() -> CheckpointStorage:
     """The MAF CheckpointStorage that persists workflow supersteps so a RequestPort
-    pause survives a process restart (replaces the in-process MemorySaver). Mock =
-    in-memory; production = the Postgres `workflow_checkpoints` table (§8.2).
+    pause survives a process restart. Mock = in-memory; production = the Postgres
+    `workflow_checkpoints` table.
 
     Cached as one singleton per process so every task's workflow shares the same
     durable store; reset_services() drops it (tests get a clean store)."""

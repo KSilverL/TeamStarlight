@@ -1,5 +1,5 @@
 """
-Service-level learning, distilled from a completed conversation (§6.5 write side).
+Service-level learning, distilled from a completed conversation.
 
 `archive_conversation` is the single, confirmation-gated entry point (behind
 `POST /tasks/{id}/confirm-learning`). It feeds BOTH channels off the same conversation:

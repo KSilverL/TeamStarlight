@@ -1,5 +1,5 @@
 """
-The user seat (§1 decision 4 / Phase 3): the human is a real roundtable participant, not
+The user seat: the human is a real roundtable participant, not
 a special pause path. It is an ordinary MAF `Agent` backed by `UserSeatClient`, which — when
 the manager hands it the mic — dequeues the next utterance from the persisted queue
 (`queue.py`) and speaks it. So an enqueued "raise hand" becomes a genuine `user` turn in the

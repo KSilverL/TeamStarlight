@@ -4,9 +4,7 @@ PostgreSQL-backed persistence.
 `PostgresStore` is the StoreService — brand profiles (`brand_profiles`) plus the
 StoreService checkpoint KV. `PostgresCheckpointStorage` is the MAF CheckpointStorage
 that persists every workflow superstep to `workflow_checkpoints`, so a RequestPort
-pause survives a process restart (replacing the in-process MemorySaver). Both store
-whole documents in a JSONB `doc` column, so the same code shapes apply as the old
-Cosmos impl did.
+pause survives a process restart. Both store whole documents in a JSONB `doc` column.
 
 `asyncpg` is **lazy-imported inside `_pool()`** so this module imports cleanly in
 mock mode / tests where the driver (and a database) are absent. The `_read` / `_write`
@@ -80,7 +78,7 @@ def _video_jobs_ddl(table: str) -> str:
     # Same whole-document-in-JSONB shape as brand_profiles/user_skills; the job_id
     # is the primary key. task_id/platform/status are pulled out as plain columns
     # too (not just inside `doc`) so a future "list jobs for a task" query doesn't
-    # need a JSONB index — Phase 1 doesn't need that query, but the columns are free.
+    # need a JSONB index — nothing runs that query yet, but the columns are free.
     return (
         f"CREATE TABLE IF NOT EXISTS {table} ("
         f"id TEXT PRIMARY KEY, task_id TEXT, platform TEXT, status TEXT, "
@@ -95,6 +93,18 @@ def _trends_ddl(table: str) -> str:
         f"CREATE TABLE IF NOT EXISTS {table} ("
         f"id TEXT PRIMARY KEY, doc JSONB NOT NULL, "
         f"updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+    )
+
+
+def _posting_plans_ddl(table: str) -> str:
+    # One row per posting plan (core.plan_schema.PostingPlan), whole doc in JSONB.
+    # business_id/user_id/status are pulled out as plain columns (kept in sync on
+    # every upsert) so the daily "list active plans for this brand" query filters
+    # without a JSONB index — same rationale as video_jobs' promoted columns.
+    return (
+        f"CREATE TABLE IF NOT EXISTS {table} ("
+        f"id TEXT PRIMARY KEY, business_id TEXT, user_id TEXT, status TEXT, "
+        f"doc JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
     )
 
 
@@ -118,6 +128,7 @@ class PostgresStore(StoreService):
                 await conn.execute(_checkpoints_ddl(s.postgres_checkpoints_table))
                 await conn.execute(_video_jobs_ddl(s.postgres_video_jobs_table))
                 await conn.execute(_trends_ddl(s.postgres_trends_table))
+                await conn.execute(_posting_plans_ddl(s.postgres_posting_plans_table))
         return self._pool_obj
 
     async def _read(self, table: str, key: str) -> Optional[dict]:
@@ -233,10 +244,47 @@ class PostgresStore(StoreService):
             row = await conn.fetchrow(f"SELECT doc FROM {table} WHERE id = $1", job_id)
         return json.loads(row["doc"]) if row else None
 
+    async def upsert_posting_plan(self, *, plan: dict) -> None:
+        pool = await self._pool()
+        table = self._settings.postgres_posting_plans_table
+        async with pool.acquire() as conn:
+            await conn.execute(
+                f"INSERT INTO {table} (id, business_id, user_id, status, doc) "
+                f"VALUES ($1, $2, $3, $4, $5::jsonb) "
+                f"ON CONFLICT (id) DO UPDATE SET business_id = EXCLUDED.business_id, "
+                f"user_id = EXCLUDED.user_id, status = EXCLUDED.status, "
+                f"doc = EXCLUDED.doc, updated_at = now()",
+                plan["plan_id"], plan.get("business_id"), plan.get("user_id"),
+                plan.get("status", "draft"), json.dumps(plan),
+            )
+
+    async def get_posting_plan(self, *, plan_id: str) -> Optional[dict]:
+        return await self._read(self._settings.postgres_posting_plans_table, plan_id)
+
+    async def list_posting_plans(
+        self,
+        *,
+        business_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[dict]:
+        clauses, args = [], []
+        for column, value in (("business_id", business_id), ("user_id", user_id),
+                              ("status", status)):
+            if value is not None:
+                args.append(value)
+                clauses.append(f"{column} = ${len(args)}")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        pool = await self._pool()
+        table = self._settings.postgres_posting_plans_table
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(f"SELECT doc FROM {table}{where} ORDER BY updated_at", *args)
+        return [json.loads(row["doc"]) for row in rows]
+
 
 class PostgresCheckpointStorage(CheckpointStorage):
-    """MAF CheckpointStorage backed by the Postgres `workflow_checkpoints` table
-    (MIGRATION_PLAN §8.2). Each WorkflowCheckpoint is stored as its `to_dict()` in a
+    """MAF CheckpointStorage backed by the Postgres `workflow_checkpoints` table.
+    Each WorkflowCheckpoint is stored as its `to_dict()` in a
     JSONB column; `seq` (insertion order) drives list/get_latest, so we make no
     assumption about the checkpoint timestamp type."""
 

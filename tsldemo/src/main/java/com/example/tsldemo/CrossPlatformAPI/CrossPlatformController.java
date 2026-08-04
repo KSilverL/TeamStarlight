@@ -1,74 +1,260 @@
 package com.example.tsldemo.CrossPlatformAPI;
 
+import com.example.tsldemo.CrossPlatformOAuth;
 import com.example.tsldemo.DTOs.Request.CrossPlatPostReqDTO;
-import com.example.tsldemo.DTOs.Request.LinkedIn.LinkedInCredsReqDTO;
+import com.example.tsldemo.DTOs.Request.GlobalCrossPlatform.GlobalCredsReqDTO;
+import com.example.tsldemo.DTOs.ResponseToFrontEnd.GlobalCredListRespDTO;
+import com.example.tsldemo.DTOs.ResponseToFrontEnd.MetaPageInfo;
+import com.example.tsldemo.ENUMS.PlatformEnum;
+import com.example.tsldemo.DTOs.Request.LinkedInCredsReqDTO;
+import com.example.tsldemo.DTOs.Request.LinkedInPostReqDTO;
+import com.example.tsldemo.DTOs.Request.LinkedInVideoPostReqDTO;
+import com.example.tsldemo.DTOs.Request.ScheduledPostReqDTO;
+import com.example.tsldemo.ScheduledPost;
+import com.example.tsldemo.auth.JwtUtil;
 
 import jakarta.servlet.http.HttpServletResponse;
 
-import org.apache.tika.Tika;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
+import org.springframework.web.client.ResourceAccessException;
+import org.springframework.web.client.RestClientResponseException;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.Map;
 
 @RestController
 public class CrossPlatformController {
 
     private final CrossPlatformService crossPlatformService;
+    private final ScheduledPostService scheduledPostService;
+    private final JwtUtil jwtUtil;
 
-    public CrossPlatformController(CrossPlatformService crossPlatformService) {
+    public CrossPlatformController(CrossPlatformService crossPlatformService,
+                                   ScheduledPostService scheduledPostService,
+                                   JwtUtil jwtUtil) {
         this.crossPlatformService = crossPlatformService;
+        this.scheduledPostService = scheduledPostService;
+        this.jwtUtil = jwtUtil;
+    }
+
+    //////////////////////////////////////////////////////// GLOBAL METHODS ////////////////////////////////////////////////////////
+    @GetMapping("/global/getCompCreds")
+    public ResponseEntity<?> getGlobalCompCreds(@RequestParam(value = "businessId", required = false) Long businessId,
+                                            @RequestParam(value = "platforms", required = false) List<PlatformEnum> platforms) {
+        
+        List<GlobalCredListRespDTO> records = crossPlatformService.getGlobalCredentials(businessId, platforms);
+        return ResponseEntity.ok(records);
+    }
+
+    @PostMapping("/global/addCompCreds")
+    public ResponseEntity<?> addGlobalCompCreds(@RequestBody GlobalCredsReqDTO[] requestDTO) {
+        
+        crossPlatformService.saveGlobalCredentials(requestDTO);
+        return ResponseEntity.ok("Credentials Added Successfully.");
+    }
+
+    @PutMapping("/global/updateCompCreds")
+    public ResponseEntity<?> updateGlobalCompCreds(@RequestBody GlobalCredsReqDTO[] requestDTO) {
+        
+        crossPlatformService.updateGlobalCredentials(requestDTO);
+        return ResponseEntity.ok("Credentials Updated Successfully.");
+    }
+
+    @DeleteMapping("/global/deleteCompCreds")
+    public ResponseEntity<?> deleteGlobalCompCreds(@RequestParam(value = "businessId", required = false) Long businessId,
+                                            @RequestParam(value = "platforms", required = false) List<PlatformEnum> platforms) {
+        
+        crossPlatformService.deleteGlobalCredentials(businessId, platforms);
+        return ResponseEntity.ok("Credentials Deleted Successfully.");
+    }
+
+    /** All endpoints are scoped to the calling business, taken from the JWT — never from
+     * anything the client claims in the request body — so one business can't read or act on
+     * another's LinkedIn connection. */
+    private int requireBusinessId(String authHeader) {
+        int businessId = jwtUtil.extractBusinessId(authHeader);
+        if (businessId == -1) {
+            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Missing or invalid authorization token");
+        }
+        return businessId;
     }
 
     //////////////////////////////////////////////////////// LINKEDIN METHODS ////////////////////////////////////////////////////////
     @PostMapping("/linkedin/auth")
-    public void linkedInAuth(HttpServletResponse response, @RequestBody LinkedInCredsReqDTO requestDTO) throws IOException{
+    public void linkedInAuth(
+            HttpServletResponse response,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) throws IOException {
 
-        crossPlatformService.authCodeLinkedIn(requestDTO, response);
-
+        int businessId = requireBusinessId(authHeader);
+        crossPlatformService.authCodeLinkedIn(businessId, response);
     }
 
     @GetMapping("/linkedin/callback")
-    public ResponseEntity<?> linkedInCallback(@RequestParam(value = "code", required = false) String authCode,
-                                        @RequestParam(value = "state", required = false) String state) {
+    public void linkedInCallback(
+            HttpServletResponse response,
+            @RequestParam(value = "code", required = false) String authCode,
+            @RequestParam(value = "state", required = false) String state) throws IOException {
 
-        crossPlatformService.accessTokenLinkedIn(authCode, state);
-        
-        return ResponseEntity.ok("Access token retrieved and saved successfully.");
+        try {
+            crossPlatformService.accessTokenLinkedIn(authCode, state);
+            crossPlatformService.redirectToFrontend(response, true);
+        } catch (Exception e) {
+            crossPlatformService.redirectToFrontend(response, false);
+        }
     }
 
     @PostMapping("/linkedin/post")
-    public ResponseEntity<?> linkedInPost(@ModelAttribute CrossPlatPostReqDTO requestDTO) {
+    public ResponseEntity<?> linkedInPost(
+            @RequestBody LinkedInPostReqDTO requestDTO,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
 
-        String postId = crossPlatformService.postToLinkedIn(requestDTO);
+        int businessId = requireBusinessId(authHeader);
+        String postId = crossPlatformService.postToLinkedIn(businessId, requestDTO);
         return ResponseEntity.ok(Map.of("PostId", postId));
     }
 
-    @PostMapping("/linkedin/addCompCreds")
-    public ResponseEntity<?> linkedCompCreds(@RequestBody LinkedInCredsReqDTO requestDTO) {
-        
-        crossPlatformService.saveLinkedInCredentials(requestDTO);
-        return ResponseEntity.ok("LinkedIn company credentials added successfully.");
+    /** Posts a user-attached image. Sent as multipart/form-data (the raw image bytes plus a
+     * text commentary), unlike the JSON text/video endpoints — the browser uploads a real file
+     * here rather than referencing an already-rendered asset by id. */
+    @PostMapping("/linkedin/post-image")
+    public ResponseEntity<?> linkedInPostImage(
+            @RequestParam("message") String message,
+            @RequestParam("image") MultipartFile image,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+
+        int businessId = requireBusinessId(authHeader);
+        String postId = crossPlatformService.postImageToLinkedIn(businessId, message, image);
+        return ResponseEntity.ok(Map.of("PostId", postId));
     }
 
-    // @PostMapping("/MultipartFileTest")
-    // public ResponseEntity<?> testMultipartFile(@RequestBody MultipartFile media) {
-        
-    //     System.out.println("Detected Content Type: ");
-    //     Tika tika = new Tika();
+    @PostMapping("/linkedin/post-video")
+    public ResponseEntity<?> linkedInPostVideo(
+            @RequestBody LinkedInVideoPostReqDTO requestDTO,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
 
-    //     String mime = null;
-    //     try {
-    //         mime = tika.detect(media.getInputStream());
-    //     } catch (IOException e) {
-    //         // TODO Auto-generated catch block
-    //         e.printStackTrace();
-    //     }
+        int businessId = requireBusinessId(authHeader);
+        String postId = crossPlatformService.postVideoToLinkedIn(businessId, requestDTO);
+        return ResponseEntity.ok(Map.of("PostId", postId));
+    }
 
-    //     System.out.println(mime);
+    //////////////////////////////////////////////////////// META METHODS ////////////////////////////////////////////////////////
+
+    @PutMapping("/meta/addPageInfo")
+    public ResponseEntity<?> addMetaCompPageInfo(@RequestBody Long businessId) {
         
-    //     return ResponseEntity.ok("File uploaded successfully.");
-    // }
+        try {
+            CrossPlatformOAuth crossPlatformOAuth = crossPlatformService.saveMetaPagesInfo(businessId);
+            MetaPageInfo response = new MetaPageInfo();
+            response.setPageIds(crossPlatformOAuth.getPageIdArray());
+            response.setPageNames(crossPlatformOAuth.getPageNameArray());
+            return ResponseEntity.ok(response);
+        } catch (ResponseStatusException e) {
+            // Spring Boot 4 drops the exception's reason from the default error body, so letting
+            // this propagate would reach the browser as a bare "Bad Request". The reason IS the
+            // payload here — it names the Meta permission or consent step the user has to fix —
+            // so return it in a body the frontend can relay verbatim.
+            return ResponseEntity.status(e.getStatusCode())
+                    .body(Map.of("error", e.getReason() == null ? "Could not load Facebook Pages." : e.getReason()));
+        }
+    }
+
+    @PostMapping("/linkedin/addCompCreds")
+    public ResponseEntity<?> linkedCompCreds(
+            @RequestBody LinkedInCredsReqDTO requestDTO,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+
+        int businessId = requireBusinessId(authHeader);
+        crossPlatformService.saveLinkedInCredentials(businessId, requestDTO);
+        return ResponseEntity.ok("LinkedIn company credentials added successfully.");
+    }
+    
+    /**
+     * Schedules a LinkedIn text post.
+     *
+     * <p>Kept as an alias for the browser code that already calls it; the schedule itself now
+     * lives in the {@code scheduled_post} table and is published by the sweeper, so — unlike
+     * the in-memory timer this replaced — it survives a restart and can be listed, edited and
+     * cancelled through {@code /schedule/posts}. The row id is returned so callers can do that.
+     */
+    @PostMapping("/linkedin/schedule-post")
+    public ResponseEntity<?> linkedInSchedulePost(
+            @RequestBody LinkedInPostReqDTO requestDTO,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+
+        int businessId = requireBusinessId(authHeader);
+
+        ScheduledPost post = scheduledPostService.create(businessId, new ScheduledPostReqDTO(
+                "linkedin",
+                requestDTO.scheduledTime() == null ? null : requestDTO.scheduledTime().toString(),
+                null,
+                requestDTO.message(),
+                List.of(),
+                List.of()
+        ));
+
+        return ResponseEntity.ok(Map.of(
+                "status", "scheduled",
+                "id", String.valueOf(post.getId()),
+                "scheduled_at", post.getScheduledAt().toString()));
+    }
+
+    @PostMapping("/meta/auth")
+    public void metaAuth(HttpServletResponse response,
+                         @RequestBody Long businessId,
+                         @RequestParam(value = "force", defaultValue = "false") boolean force) throws IOException{
+        crossPlatformService.authCodeMeta(businessId, response, force);
+    }
+
+    @GetMapping("/meta/callback")
+    public void metaCallback(HttpServletResponse response,
+                             @RequestParam(value = "code", required = true) String authCode,
+                             @RequestParam(value = "state", required = true) String state) throws IOException {
+        try {
+            crossPlatformService.accessTokenMeta(authCode, state);
+            crossPlatformService.redirectToFrontend(response, "meta", true);
+        } catch (Exception e) {
+            crossPlatformService.redirectToFrontend(response, "meta", false);
+        }
+    }
+
+    /** Publishes immediately to the selected Page(s).
+     *
+     * <p>The business id comes from the JWT and overwrites whatever the multipart body carried.
+     * It used to be taken from the body outright, which meant anything that could reach this
+     * port could post as any business by changing one form field — the LinkedIn endpoints have
+     * always derived it from the token, and this now matches them. */
+    @PostMapping("/meta/post")
+    public ResponseEntity<?> metaPost(
+            @ModelAttribute CrossPlatPostReqDTO requestDTO,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) throws IOException {
+
+        requestDTO.setBusinessId((long) requireBusinessId(authHeader));
+        try {
+            List<String> postIdList = crossPlatformService.postToMeta(requestDTO);
+            return ResponseEntity.ok(Map.of("Meta Post ok: ", postIdList));
+        } catch (ResponseStatusException e) {
+            // Same reason as /meta/addPageInfo: Spring Boot 4 drops the reason from the default
+            // error body, and the reason IS the payload here — it names the connection or Page
+            // problem the user has to fix, so return it in a body the frontend can relay.
+            return ResponseEntity.status(e.getStatusCode())
+                    .body(Map.of("error", e.getReason() == null ? "Could not post to Facebook." : e.getReason()));
+        } catch (ResourceAccessException e) {
+            // The upload never got an answer — a read timeout on a slow video, or Graph dropping
+            // the connection. An unhandled throw would surface as a bare 500, which tells the
+            // user nothing about whether to retry or shrink the video.
+            return ResponseEntity.status(HttpStatus.GATEWAY_TIMEOUT)
+                    .body(Map.of("error", "Facebook did not respond while the video was uploading. "
+                            + "Large videos can exceed the upload window — try a shorter clip, or retry."));
+        } catch (RestClientResponseException e) {
+            // Graph rejected the post outright (bad page token, unsupported media, policy). Its
+            // JSON body names the actual reason, so pass it through rather than swallowing it.
+            return ResponseEntity.status(e.getStatusCode())
+                    .body(Map.of("error", "Facebook rejected the post: " + e.getResponseBodyAsString()));
+        }
+    }
 }

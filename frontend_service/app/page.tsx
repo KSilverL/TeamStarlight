@@ -3,7 +3,7 @@ import Link from "next/link";
 const FEATURES = [
   {
     title: "Multi-Platform",
-    desc: "Generate tailored content for X, Instagram, TikTok, and LinkedIn simultaneously in a single campaign.",
+    desc: "Generate tailored content for X, Facebook, TikTok, and LinkedIn simultaneously in a single campaign.",
     icon: (
       <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true">
         <rect x="1" y="1" width="8" height="8" rx="2" stroke="#FF4800" strokeWidth="1.6" />
@@ -73,7 +73,7 @@ export default function Home() {
 
         <p className="text-lg text-[#6B6561] max-w-xl mb-10 leading-relaxed">
           Starlight is an AI multi-agent system that generates, reviews, and refines
-          social media content tailored to your brand — across X, Instagram, TikTok,
+          social media content tailored to your brand — across X, Facebook, TikTok,
           and LinkedIn.
         </p>
 
@@ -97,7 +97,7 @@ export default function Home() {
 
         <div className="flex flex-wrap items-center justify-center gap-4 mt-12 text-sm text-[#9E9893]">
           <span>Supports</span>
-          {["X (Twitter)", "Instagram", "TikTok", "LinkedIn"].map((p) => (
+          {["X (Twitter)", "Facebook", "TikTok", "LinkedIn"].map((p) => (
             <span key={p} className="text-[#6B6561] font-medium">
               {p}
             </span>

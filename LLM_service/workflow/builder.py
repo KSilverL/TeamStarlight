@@ -1,6 +1,6 @@
 """Assemble the "virtual newsroom" MAF workflow.
 
-Graph (MIGRATION_PLAN §5.1):
+Graph:
 
     dispatcher ──▶ strategist ──▶ creator ──▶ reviewer
                                 ▲            │  switch-case edge (the circuit breaker):
@@ -21,7 +21,7 @@ The circuit breaker is expressed purely as the condition on the reviewer's
 outgoing switch-case edge — no executor reads retry state across a service
 boundary. The human gate is a RequestPort: it pauses the run via request_info and
 resumes from a HumanVerdict. A CheckpointStorage is attached so the pause persists
-and a restarted process can resume (replaces the old in-process MemorySaver).
+and a restarted process can resume.
 """
 
 from __future__ import annotations
@@ -71,12 +71,12 @@ def build_workflow(
     lets callers (api.py, tests) inspect / persist the pause state; defaults to an
     in-memory store.
 
-    `roundtable_entry` (Phase 6) swaps the front of the graph: when True the roundtable
-    stage has already produced the per-platform `CreativeStrategy` (run separately by the
-    WorkflowService, §1 stage-chaining), so the workflow STARTS AT THE CREATOR with that
-    strategy as input and the `dispatcher → strategist` legs are dropped. The creator and
-    everything downstream are byte-identical either way. When False (the default) the graph
-    is exactly as before — `dispatcher → strategist → creator → …` — so nothing regresses.
+    `roundtable_entry` swaps the front of the graph: when True the roundtable stage
+    has already produced the per-platform `CreativeStrategy` (run separately by the
+    WorkflowService, stage-chained ahead of this graph), so the workflow STARTS AT THE
+    CREATOR with that strategy as input and the `dispatcher → strategist` legs are
+    dropped. The creator and everything downstream are identical either way. When False
+    (the default) the graph is the full `dispatcher → strategist → creator → …`.
 
     `media_only` (Case 4: the brief's `content_types` omit `text`) collapses the graph to
     `media_entry → media_producer`: with no copy to draft/review/approve, the whole
@@ -130,8 +130,8 @@ def build_workflow(
         )
         # Human verdict routes by message type: reject → creator (re-draft); both approve and
         # approve_after_edit → media_producer (emit FinalDraft). Brand-voice rule distillation
-        # is no longer auto in-graph — it runs at the service layer only after the user confirms
-        # learning (POST /tasks/{id}/confirm-learning), transcript-aware. The media_producer is
+        # is not in the graph — it runs at the service layer only after the user confirms
+        # learning (POST /tasks/{id}/confirm-learning). The media_producer is
         # the sole output node: it enriches every approved draft with the animated card + video.
         .add_edge(human_gate, creator)
         .add_edge(human_gate, media_producer)

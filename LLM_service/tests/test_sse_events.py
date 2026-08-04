@@ -1,7 +1,7 @@
 """
-SSE progress stream + the api surface (replaces test_status_events / test_api).
+SSE progress stream + the api surface.
 
-Covers the §7.2 event envelope bridged from the MAF workflow to SSE
+Covers the event envelope bridged from the MAF workflow to SSE
 (`GET /tasks/{id}/events`), the RequestPort resume endpoint (`POST /review`), the
 confirm-learning archivist (`POST /confirm-learning`), and the durability guarantee:
 the workflow's checkpoint persists on the RequestPort pause and a fresh workflow
@@ -19,7 +19,7 @@ import time
 import httpx
 import pytest
 
-from LLM_service.api import WorkflowService, create_app
+from LLM_service.api import WorkflowService, _verdict_from_payload, create_app
 from LLM_service.core.services import factory, mock, postgres
 from LLM_service.tests.conftest import run_app
 from LLM_service.workflow import HumanVerdict, build_workflow
@@ -57,13 +57,121 @@ async def test_draft_ready_result_streamed_per_platform():
     assert ready == {"linkedin", "instagram"}
 
 
-async def test_events_follow_the_72_envelope():
+async def test_every_post_intake_stage_is_platform_tagged():
+    """Everything after intake runs per platform, so its progress says which one.
+
+    The graph really is per-platform from the dispatcher on — the strategist calls
+    `plan_strategy` once per platform with that platform's `skills/<platform>.md`,
+    the creator fans out, and the reviewer/gate/media_producer are per-platform —
+    so a subscriber can run one lane per platform. `_platforms_of` reads the tag
+    from the payload: a message's own `platform` when it has one, otherwise the
+    run's `target_platforms` (supplied by the backend at `POST /tasks` and carried
+    on every brief-level message). The envelope's `platform` is single-valued, so
+    a payload covering N platforms yields N events.
+
+    The subtlety it exists for: `executor_invoked` carries the single inbound
+    message, but `executor_completed` carries a **list** of the messages the
+    executor emitted. Reading `.platform` off that list yields None every time,
+    which used to close `reviewer/linkedin running` with an untagged
+    `reviewer done` — leaving that platform spinning forever in a subscribed UI.
+    """
+    svc = WorkflowService()
+    await svc.start(_START, task_id="t1")
+    await svc.review("t1", {p: {"decision": "approve"} for p in ("linkedin", "instagram")})
+
+    tagged = {}
+    for e in svc.buffered_events("t1"):
+        if e["type"] == "progress":
+            tagged.setdefault((e["node"], e["status"]), []).append(e["platform"])
+
+    both = {"linkedin", "instagram"}
+    for node in ("dispatcher", "strategist", "creator", "reviewer", "media_producer"):
+        assert set(tagged[(node, "running")]) == both, f"{node} running"
+        assert set(tagged[(node, "done")]) == both, f"{node} done"
+
+    # The gate is tagged on both the pause (from the HumanReviewRequest) and the
+    # resume (from the verdict, which `review()` stamps with its platform).
+    assert set(tagged[("human_gate", "interrupted")]) == both
+    assert set(tagged[("human_gate", "running")]) == both
+    # …the one exception: at the pause MAF reports the gate "completed" with an
+    # EMPTY payload (it yielded a request instead of emitting a message), so there
+    # is nothing to attribute. The tag is never invented, so that one stays None —
+    # the `interrupted` before it and the real `done` after it carry the platform.
+    assert set(tagged[("human_gate", "done")]) == both | {None}
+
+
+async def test_verdict_carries_the_platform_it_answers():
+    """`review()` stamps each verdict with its pending request's platform."""
+    svc = WorkflowService()
+    await svc.start(_START, task_id="t1")
+    pending = {p["request_id"]: p["platform"] for p in (await svc.get("t1"))["pending"]}
+    assert set(pending.values()) == {"linkedin", "instagram"}
+
+    verdict = _verdict_from_payload({"decision": "approve"}, "linkedin")
+    assert verdict.platform == "linkedin"
+    # Optional: a directly-constructed verdict (tests, CLI) stays valid.
+    assert HumanVerdict(decision="approve").platform is None
+
+
+async def test_events_follow_the_envelope():
     svc = WorkflowService()
     await svc.start(_START, task_id="t1")
     for e in svc.buffered_events("t1"):
         assert _ENVELOPE_KEYS <= set(e)
         assert e["type"] in ("progress", "result")
         assert isinstance(e["ts"], float)
+
+
+async def test_session_title_set_immediately_then_upgraded_off_path():
+    """The history-sidebar title is off the hot path: the `running` snapshot carries a
+    deterministic topic-derived title instantly (zero added latency), and a concurrent cheap-tier
+    call upgrades it in place — landing on the snapshot and as one `session_title` SSE event."""
+    svc = WorkflowService()
+    inputs = {"topic": "our brand new ethiopia single origin harvest celebration",
+              "target_platforms": ["linkedin"]}
+    running = await svc.start(inputs, task_id="tt", background=True)
+    # Zero-latency: the running snapshot already carries a deterministic title (no LLM waited on).
+    fallback = running["title"]
+    assert fallback
+
+    task = svc._tasks["tt"]
+    await task.title_runner   # let the concurrent, off-path cheap-tier upgrade land
+    await task.runner         # let the run itself drive to the gate
+
+    snap = await svc.get("tt")
+    assert snap["title"]
+    titles = [e for e in svc.buffered_events("tt") if e["type"] == "session_title"]
+    # The mock upgrade (first 6 words) differs from the truncated fallback → exactly one event,
+    # and the snapshot title matches the upgraded one.
+    assert len(titles) == 1
+    assert titles[0]["title"] == snap["title"] != fallback
+
+
+async def test_session_title_present_on_plain_inline_run_without_extra_event():
+    """A plain inline run (no background, no live listener — the test/programmatic path) gets the
+    deterministic title on the snapshot but spawns no concurrent upgrade: no stray task is left
+    pending and no session_title event is emitted."""
+    svc = WorkflowService()
+    await svc.start(_START, task_id="t_inline")  # background defaults to False, no event_listener
+    snap = await svc.get("t_inline")
+    assert snap["title"] == "ethiopia harvest"       # the raw-topic fallback (uncased)
+    assert svc._tasks["t_inline"].title_runner is None
+    assert not [e for e in svc.buffered_events("t_inline") if e["type"] == "session_title"]
+
+
+async def test_session_title_upgraded_for_a_live_inline_listener():
+    """A live consumer — the CLI's `event_listener` (or the HTTP background path) — opts the
+    off-path title upgrade in even on an inline run. `_dispatch` settles the concurrent title task
+    before returning, so the polished title is on the snapshot and exactly one session_title event
+    reached the listener. This is what `main.py` surfaces live."""
+    seen: list[dict] = []
+    svc = WorkflowService()
+    await svc.start(_START, task_id="t_live", event_listener=seen.append)
+    assert svc._tasks["t_live"].title_runner is not None   # a live consumer triggered the upgrade
+    snap = await svc.get("t_live")
+    assert snap["title"] == "Ethiopia Harvest"             # mock name_session Title-Cases the topic
+    titles = [e for e in seen if e["type"] == "session_title"]
+    assert len(titles) == 1 and titles[0]["title"] == "Ethiopia Harvest"
 
 
 # ── B. Review resume → completion + final results ────────────────────────────
@@ -158,7 +266,7 @@ async def test_api_start_persists_a_workflow_checkpoint():
     assert checkpoints
 
 
-# ── D2. Roundtable discussion streams over the same SSE channel (Phase 4) ─────
+# ── D2. Roundtable discussion streams over the same SSE channel ───────────────
 
 _RT_START = {
     "topic": "spring single-origin coffee launch",
@@ -191,6 +299,49 @@ async def test_roundtable_streams_utterances_then_consensus():
         assert e["platform"] == "linkedin" and e["table_id"] == "linkedin"
         assert e["speaker"] and e["agent_id"] == e["speaker"] and e["role"] and e["text"]
     assert consensus[0]["strategy"]["linkedin"] and consensus[0]["converged"] is True
+
+
+async def test_roundtable_announces_each_speaker_before_their_turn():
+    """The manager's mic handoff streams as a `speaker_scheduled` event BEFORE that
+    speaker's `agent_utterance` — the live "who has the floor" signal for the UI."""
+    svc = WorkflowService()
+    await svc.run_roundtable(_RT_START, "linkedin", task_id="rt_sched", max_rounds=4)
+    events = svc.buffered_events("rt_sched")
+
+    scheduled = [e for e in events if e["type"] == "speaker_scheduled"]
+    assert scheduled, "expected the manager to announce each upcoming speaker"
+    for e in scheduled:
+        assert _ENVELOPE_KEYS <= set(e)
+        assert e["table_id"] == "linkedin" and e["speaker"] and e["agent_id"] == e["speaker"]
+
+    # Every persona turn was announced first: a matching (speaker, round) scheduled event
+    # appears in the stream strictly before the utterance itself.
+    for i, e in enumerate(events):
+        if e["type"] != "agent_utterance":
+            continue
+        assert any(
+            s["type"] == "speaker_scheduled"
+            and s["speaker"] == e["speaker"]
+            and s["round_index"] == e["round_index"]
+            for s in events[:i]
+        ), f"utterance by {e['speaker']} (round {e['round_index']}) was never announced"
+
+
+async def test_roundtable_convening_is_announced_before_any_turn():
+    """The moment a table starts it emits a round-0 `moderator` speaker_scheduled — the
+    client's "the table is convening" signal while the (production) manager is still in its
+    silent plan phase, so the stream is never dead air between task start and the first
+    real mic handoff."""
+    svc = WorkflowService()
+    await svc.run_roundtable(_RT_START, "linkedin", task_id="rt_convene", max_rounds=4)
+    events = svc.buffered_events("rt_convene")
+
+    discussion = [e for e in events if e["type"] in ("speaker_scheduled", "agent_utterance")]
+    opener = discussion[0]
+    assert opener["type"] == "speaker_scheduled"
+    assert opener["speaker"] == "moderator" and opener["round_index"] == 0
+    assert opener["table_id"] == "linkedin"
+    assert _ENVELOPE_KEYS <= set(opener)
 
 
 async def test_roundtable_user_utterance_appears_in_the_stream():
@@ -483,6 +634,54 @@ def test_http_video_render_trigger(http_server, monkeypatch):
         assert download.content == b"fake-mp4-bytes"
 
         assert client.get(f"{http_server}/video-jobs/nope").status_code == 404
+
+
+def test_http_video_download_redirects_for_a_remote_lambda_url(http_server, monkeypatch):
+    """When render_storyboard (workflow/video/render.py) returns an https:// URL
+    (the VIDEO_RENDER_BACKEND=lambda path — the output lives in S3, never on this
+    process's disk), the download route 307-redirects to it instead of trying to
+    FileResponse a local path. Local-backend behaviour (the Path case) is covered
+    by test_http_video_render_trigger above; this is the same trigger/poll flow
+    with only the faked render's return value changed."""
+    import LLM_service.workflow.video.assets as assets_module
+    import LLM_service.workflow.video.jobs as jobs_module
+
+    remote_url = "https://bucket.s3.amazonaws.com/renders/job-xyz/output.mp4"
+
+    async def _fake_remote_render(renderable, *, job_dir, settings, timeout_s=240.0):
+        return remote_url
+
+    async def _no_download(url):
+        return None
+
+    monkeypatch.setattr(jobs_module, "render_storyboard", _fake_remote_render)
+    monkeypatch.setattr(assets_module, "_download", _no_download)
+
+    with httpx.Client(timeout=10) as client:
+        started = client.post(f"{http_server}/tasks", json={
+            "topic": "harvest", "target_platforms": ["linkedin"], "business_id": "biz_render_remote",
+            "content_types": ["text", "video"],
+        })
+        task_id = started.json()["task_id"]
+        client.post(f"{http_server}/tasks/{task_id}/review",
+                    json={"verdicts": {"linkedin": {"decision": "approve"}}})
+
+        triggered = client.post(f"{http_server}/tasks/{task_id}/render-video",
+                                 json={"platform": "linkedin"})
+        job_id = triggered.json()["job_id"]
+
+        job = None
+        for _ in range(50):
+            job = client.get(f"{http_server}/video-jobs/{job_id}").json()
+            if job["status"] != "pending":
+                break
+            time.sleep(0.05)
+        assert job is not None and job["status"] == "done", job
+        assert job["output_path"] == remote_url
+
+        download = client.get(f"{http_server}/video-jobs/{job_id}/download", follow_redirects=False)
+        assert download.status_code == 307
+        assert download.headers["location"] == remote_url
         assert client.get(f"{http_server}/video-jobs/nope/download").status_code == 404
 
 

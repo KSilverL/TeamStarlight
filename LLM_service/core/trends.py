@@ -1,6 +1,6 @@
 """
-The one gated, guarded read of the daily trends snapshot, shared by every consumer
-(docs/TREND_SCOUT_IMPLEMENTATION.md Phase 4): the roundtable's persona context, the
+The one gated, guarded read of the daily trends snapshot, shared by every consumer:
+the roundtable's persona context, the
 linear strategist, and the intake copilot all call `read_current_trends()` instead of
 re-implementing the toggle + degrade rule.
 

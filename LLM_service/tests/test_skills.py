@@ -1,5 +1,5 @@
 """
-Platform skills — the creator's static injection layer (M4).
+Platform skills — the creator's static injection layer.
 
 Verifies the creator's static layer has real content to read: the skill files load,
 the declared character limit is enforced by the copywriter, and a platform without a
@@ -17,7 +17,7 @@ from LLM_service.skills import char_limit, load_skill, parse_char_limit
 # ── Skill loading ─────────────────────────────────────────────────────────────
 
 def test_platform_skills_load_with_real_content():
-    for platform in ("linkedin", "twitter", "instagram"):
+    for platform in ("linkedin", "twitter", "instagram", "facebook"):
         skill = load_skill(platform)
         assert skill and "Character limit:" in skill
         assert "Tone" in skill or "tone" in skill
@@ -29,6 +29,7 @@ def test_x_aliases_to_twitter_skill_and_limits():
     assert char_limit("x") == 280
     assert char_limit("linkedin") == 3000
     assert char_limit("instagram") == 2200
+    assert char_limit("facebook") == 63206
     # an unlisted platform has no skill / no limit and degrades gracefully
     assert load_skill("tiktok") == ""
     assert char_limit("tiktok") is None

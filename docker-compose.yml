@@ -1,5 +1,4 @@
 services:
-
   # ---------------------------------------------------------------------------
   # Frontend — Next.js production build
   # ---------------------------------------------------------------------------
@@ -7,18 +6,19 @@ services:
     build:
       context: frontend_service
       dockerfile: Dockerfile
+      args:
+        # Build-time only (see Dockerfile) — the browser's direct WS to LLM_service's
+        # realtime voice endpoint (MVP; no Java WS proxy yet).
+        NEXT_PUBLIC_LLM_SERVICE_WS_URL: ${NEXT_PUBLIC_LLM_SERVICE_WS_URL}
     ports:
       - "3000:3000"
     environment:
-      # # Demo agent (brand card)
-      # - BRAND_AGENT_URL=http://brand-agent:8000
       # Main LLM service (text generation + MAF workflow /tasks + video render jobs)
       - TEXT_AGENT_URL=http://llm:8080
       - LLM_SERVICE_URL=http://llm:8080
       # Java backend (signup / login)
       - BACKEND_URL=http://backend:8081
     depends_on:
-      # - brand-agent
       - llm
       - backend
 
@@ -35,6 +35,11 @@ services:
       - LLM_SERVICE_BASE_URL=http://llm:8080
       # Supabase credentials — override here or in a .env file if needed.
       # Defaults are already baked into application.properties.
+      # LinkedIn/Meta OAuth — must match the redirect URI registered on the respective Developer
+      # app, and where to send the browser back to after the OAuth round-trip.
+      - LINKEDIN_REDIRECT_URI=${LINKEDIN_REDIRECT_URI:-http://localhost:8081/linkedin/callback}
+      - META_REDIRECT_URI=${META_REDIRECT_URI:-http://localhost:8081/meta/callback}
+      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-http://localhost:3000}
     depends_on:
       - llm
 
@@ -45,35 +50,104 @@ services:
   # ---------------------------------------------------------------------------
   llm:
     build:
-      # Context is the repo root, not LLM_service/ — the image also bundles the
-      # sibling video_renderer/ Node project (local Remotion CLI render subprocess).
       context: .
       dockerfile: LLM_service/Dockerfile
     ports:
       - "8080:8080"
     environment:
+      # Set to true for local development without Azure credentials.
       - USE_MOCK=false
+
+      # Video renderer
+      - VIDEO_RENDER_BACKEND=${VIDEO_RENDER_BACKEND:-local}
+
       - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
       - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
       - AZURE_OPENAI_CHAT_DEPLOYMENT=${AZURE_OPENAI_CHAT_DEPLOYMENT}
+      - USE_MOCK_VOICEOVER=${USE_MOCK_VOICEOVER}
+      - AZURE_SPEECH_KEY=${AZURE_SPEECH_KEY}
+      - AZURE_SPEECH_REGION=${AZURE_SPEECH_REGION}
+      - VOICEOVER_DEFAULT_VOICE=${VOICEOVER_DEFAULT_VOICE}
+      - USE_MOCK_MUSIC_GENERATION=${USE_MOCK_MUSIC_GENERATION}
+      # Web search (Bing grounding via Azure AI Foundry agents). FOUNDRY_PROJECT_ENDPOINT
+      # must be set here too — get_web_search() raises without it once USE_MOCK_WEB_SEARCH
+      # is false, since it's the endpoint the WEB_SEARCH_AGENT_* names below resolve against.
+      - FOUNDRY_PROJECT_ENDPOINT=${FOUNDRY_PROJECT_ENDPOINT}
+      - USE_MOCK_WEB_SEARCH=false
+      - WEB_SEARCH_AGENT_NAME=${WEB_SEARCH_AGENT_NAME}
+      - WEB_SEARCH_AGENT_VERSION=${WEB_SEARCH_AGENT_VERSION}
+      - REVIEW_SEARCH_AGENT_NAME=${REVIEW_SEARCH_AGENT_NAME}
+      - REVIEW_SEARCH_AGENT_VERSION=${REVIEW_SEARCH_AGENT_VERSION}
+
       - DATABASE_URL=${DATABASE_URL}
+      - POSTGRES_SSLMODE=${POSTGRES_SSLMODE}
+
       - USE_MOCK_IMAGE_SEARCH=false
       - USE_MOCK_BACKGROUND_REMOVAL=false
+
       - PEXELS_API_KEY=${PEXELS_API_KEY}
       - REMOVEBG_API_KEY=${REMOVEBG_API_KEY}
+
+      - GEOAPIFY_API_KEY=${GEOAPIFY_API_KEY}
+      - GEOAPIFY_MAP_STYLE=${GEOAPIFY_MAP_STYLE}
+
       - USE_MOCK_MUSIC_GENERATION=true
       - USE_MOCK_SAFETY=true
-      # - SOUNDRAW_API_KEY=${SOUNDRAW_API_KEY}
 
-  # ---------------------------------------------------------------------------
-  # Brand Agent — FastAPI LLM service (demo, isolated from LLM_service core)
-  # Requires ANTHROPIC_API_KEY to be set in the environment or a .env file.
-  # ---------------------------------------------------------------------------
-  # brand-agent:
-  #   build:
-  #     context: LLM_service/demos/brand_agent
-  #     dockerfile: Dockerfile
-  #   ports:
-  #     - "8000:8000"
-  #   environment:
-  #     - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # Voice
+      - USE_MOCK_VOICE=${USE_MOCK_VOICE}
+      - AZURE_VOICELIVE_ENDPOINT=${AZURE_VOICELIVE_ENDPOINT}
+      - AZURE_VOICELIVE_MODEL=${AZURE_VOICELIVE_MODEL}
+      - AZURE_VOICELIVE_API_VERSION=${AZURE_VOICELIVE_API_VERSION}
+      - AZURE_VOICELIVE_API_KEY=${AZURE_VOICELIVE_API_KEY}
+      - AZURE_VOICELIVE_VOICE=${AZURE_VOICELIVE_VOICE}
+
+      # Store
+      - USE_MOCK_STORE=false
+
+      # Roundtable
+      - ROUNDTABLE_ENABLED=${ROUNDTABLE_ENABLED}
+      - ROUNDTABLE_MAX_ROUNDS=${ROUNDTABLE_MAX_ROUNDS}
+      - ROUNDTABLE_PERSONA_MAX_TOKENS=${ROUNDTABLE_PERSONA_MAX_TOKENS}
+      - ROUNDTABLE_PERSONA_REASONING_EFFORT=${ROUNDTABLE_PERSONA_REASONING_EFFORT}
+      - ROUNDTABLE_PERSONA_VERBOSITY=${ROUNDTABLE_PERSONA_VERBOSITY}
+      - ROUNDTABLE_MANAGER_MODEL=${ROUNDTABLE_MANAGER_MODEL}
+      - ROUNDTABLE_PERSONA_MODEL=${ROUNDTABLE_PERSONA_MODEL}
+      - ROUNDTABLE_CONTROL_TIMEOUT=${ROUNDTABLE_CONTROL_TIMEOUT}
+      - AZURE_PERSONA_ENDPOINT=${AZURE_PERSONA_ENDPOINT}
+      - AZURE_PERSONA_API_KEY=${AZURE_PERSONA_API_KEY}
+      - TREND_SCOUT_ENABLED=${TREND_SCOUT_ENABLED}
+
+      # Code generation
+      - CODEGEN_MAX_TOTAL_ATTEMPTS=${CODEGEN_MAX_TOTAL_ATTEMPTS}
+      - CODEGEN_MAX_TOTAL_SECONDS=${CODEGEN_MAX_TOTAL_SECONDS}
+      - CODEGEN_MODEL=${CODEGEN_MODEL}
+      - CODEGEN_REASONING_EFFORT=${CODEGEN_REASONING_EFFORT}
+      - CODEGEN_MAX_TOKENS=${CODEGEN_MAX_TOKENS}
+      - CODEGEN_PLAN_MAX_TOKENS=${CODEGEN_PLAN_MAX_TOKENS}
+      - CODEGEN_PLAN_REASONING_EFFORT=${CODEGEN_PLAN_REASONING_EFFORT}
+      - CODEGEN_MAX_RETRIES=${CODEGEN_MAX_RETRIES}
+      - CODEGEN_REVIEW_MAX_TOKENS=${CODEGEN_REVIEW_MAX_TOKENS}
+      - CODEGEN_CONVERT_MAX_TOKENS=${CODEGEN_CONVERT_MAX_TOKENS}
+      - CODEGEN_CONVERT_REASONING_EFFORT=${CODEGEN_CONVERT_REASONING_EFFORT}
+
+      # Voiceover (Azure Speech TTS) — off by default (mock), opt-in per render via
+      # POST /tasks/{id}/render-video's narration_text field either way.
+      - ROUNDTABLE_TTS_KEY=${ROUNDTABLE_TTS_KEY}
+      - ROUNDTABLE_TTS_REGION=${ROUNDTABLE_TTS_REGION}
+      # Cloud (Remotion Lambda) video rendering — off by default (VIDEO_RENDER_BACKEND
+      # defaults to "local", the subprocess path this image is already built for).
+      # Uncomment once a function + stable site are deployed (see .env.example).
+      # - AWS_REGION=${AWS_REGION}
+      # - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      # - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      # - REMOTION_LAMBDA_FUNCTION_NAME=${REMOTION_LAMBDA_FUNCTION_NAME}
+      # - REMOTION_LAMBDA_SERVE_URL=${REMOTION_LAMBDA_SERVE_URL}
+
+      # Higgsfield
+      - USE_MOCK_VIDEO_GENERATION=false
+      - HIGGSFIELD_API_KEY=${HIGGSFIELD_API_KEY}
+      - HIGGSFIELD_API_SECRET=${HIGGSFIELD_API_SECRET}
+      - HIGGSFIELD_IMAGE_MODEL=${HIGGSFIELD_IMAGE_MODEL}
+      - HIGGSFIELD_TEXT_MODEL=${HIGGSFIELD_TEXT_MODEL}
+      - HIGGSFIELD_MAX_DURATION_S=15

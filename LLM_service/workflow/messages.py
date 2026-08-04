@@ -43,8 +43,8 @@ DEFAULT_CONTENT_TYPES = ["text"]  # not-default-on for brand/video; the backend 
 
 
 class Brief(BaseModel):
-    """The structured creative brief — the workflow input. In M3 the intake layer
-    (voice/text) produces this; for M1 it is constructed directly."""
+    """The structured creative brief — the workflow input. Usually produced by the
+    intake layer (voice/text); tests and callers may construct it directly."""
 
     topic: str
     target_platforms: List[str]
@@ -121,11 +121,21 @@ class HumanVerdict(BaseModel):
 
     decision ∈ {"approve", "approve_after_edit", "reject"}. On approve_after_edit,
     `edited_draft` carries the human's final text. On reject, the platform is
-    re-dispatched to the creator for a fresh attempt."""
+    re-dispatched to the creator for a fresh attempt.
+
+    `platform` makes the verdict self-describing, like every other message in the
+    graph. It is which platform's draft this verdict answers — the service fills it
+    in from the pending request at `POST /review` (callers key verdicts by platform
+    there, so it is never something the client has to repeat). Without it the
+    resumed gate is the one post-intake step whose progress events cannot say which
+    platform they belong to: MAF hands the executor a bare verdict, so the payload
+    would carry no attribution at all. Optional with a None default so older
+    checkpoints deserialize and direct constructions in tests stay valid."""
 
     decision: str
     edited_draft: Optional[str] = None
     reason: Optional[str] = None
+    platform: Optional[str] = None
 
 
 class BrandRule(BaseModel):
@@ -141,7 +151,11 @@ class ApprovedDraft(BaseModel):
     """human_gate / archivist → media_producer: a draft the human approved (directly
     or after an edit), on its way to media production. Carries the `brief` so the
     media_producer can derive the brand card / video from `topic` + `tone_hint`, and
-    any `proposed_rules` the archivist distilled (passed straight through to FinalDraft)."""
+    any `proposed_rules` the archivist distilled (passed straight through to FinalDraft).
+
+    `strategy` carries the roundtable's per-platform consensus forward (it is otherwise
+    dropped at the gate) — on a text+video run it holds the agreed VIDEO direction, so the
+    media_producer's storyboard reflects the discussion, not just the final caption."""
 
     platform: str
     draft: str
@@ -150,6 +164,7 @@ class ApprovedDraft(BaseModel):
     needs_human_intervention: bool = False
     proposed_rules: List[BrandRule] = Field(default_factory=list)
     brief: Brief
+    strategy: str = ""
 
 
 class FinalDraft(BaseModel):

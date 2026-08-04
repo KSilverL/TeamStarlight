@@ -1,15 +1,16 @@
 """
-Dual-entry intake (new in M3).
+Dual-entry intake.
 
 The whole point: the voice and text entries share one conversation state machine,
 one system prompt + function set, and one CreativeBrief product — only the transport
 differs. These tests prove that the same script produces an identical brief whether
 typed or spoken (mock), that the multi-turn slot-filling and copilot suggest_topic tool work,
-and that the brief feeds the M1/M2 workflow with zero changes. Fully mocked/offline.
+and that the brief feeds the workflow with zero changes. Fully mocked/offline.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import time
 
@@ -20,8 +21,9 @@ from LLM_service.api import IntakeService, WorkflowService, create_app
 from LLM_service.core.config import reset_settings
 from LLM_service.core.services import factory
 from LLM_service.tests.conftest import run_app
-from LLM_service.intake import CreativeBrief, PriorSessionContext, build_intake
+from LLM_service.intake import CreativeBrief, PriorSessionContext, RealtimeVoiceIntake, build_intake
 from LLM_service.intake.base import (
+    MAX_INTAKE_FOLLOWUPS,
     BriefConversation,
     ConversationalIntake,
     _render_prior_context,
@@ -48,6 +50,36 @@ async def _drive(session, opening, turns, session_id="sess-test"):
         messages.append(result["assistant_message"])
     brief = await session.get_brief(sid)
     return brief, messages
+
+
+def _b64(text: str) -> str:
+    """Mock-mode "audio": base64 of the literal spoken words (MockRealtimeVoice's
+    offline convention, mirroring MockVoice's transcribe_turn)."""
+    return base64.b64encode(text.encode()).decode("ascii")
+
+
+async def _drive_realtime(opening, turns=(), session_id="sess-rt-test", **open_kwargs):
+    """Run a scripted realtime conversation directly against RealtimeVoiceIntake +
+    its RealtimeVoiceSession (no WS), pumping events exactly like the WS handler
+    does. Returns the intake (brief_partial()/is_complete()/get_brief() available)."""
+    intake = RealtimeVoiceIntake()
+    session = await intake.open(session_id, **open_kwargs)
+
+    async def _consume_one_turn() -> None:
+        async for event in session.events():
+            await intake.handle_event(event)
+            if event.type == "response_done":
+                return
+
+    pending = list(turns)
+    if opening:
+        await session.send_audio(audio_b64=_b64(opening))
+        await _consume_one_turn()
+    while not intake.is_complete() and pending:
+        await session.send_audio(audio_b64=_b64(pending.pop(0)))
+        await _consume_one_turn()
+    await session.close()
+    return intake
 
 
 # ── Each entry produces a structurally valid CreativeBrief ────────────────────
@@ -174,7 +206,7 @@ async def test_prior_context_none_leaves_behaviour_unchanged():
 
 
 async def test_prior_context_folds_into_prompt_and_rides_onto_brief(monkeypatch):
-    """Case 2: a non-empty recap folds a 前情提要 block into the fill_brief system prompt (so the
+    """Case 2: a non-empty recap folds a recap block into the fill_brief system prompt (so the
     LLM resolves against it), the conversation still completes, and the recap rides onto the brief."""
     llm = factory.get_llm()  # cached singleton the intake engine will call
     captured: dict = {}
@@ -191,8 +223,11 @@ async def test_prior_context_folds_into_prompt_and_rides_onto_brief(monkeypatch)
         "sess-cont", _ONE_SHOT, target_platforms=["linkedin"], prior_context=_PRIOR)
     assert started["complete"] is True
 
-    # The recap was folded into the prompt the LLM saw.
-    assert "前情提要" in captured["system_prompt"]
+    # The recap was folded into the prompt the LLM saw. Asserted against the
+    # renderer's own output rather than a literal heading, so rewording the block
+    # (or translating it) stays a free edit — what must hold is that whatever
+    # `_render_prior_context` produces reaches the prompt intact.
+    assert _render_prior_context(_PRIOR) in captured["system_prompt"]
     assert "autumn cold brew launch" in captured["system_prompt"]
     assert "lead with the seasonal angle" in captured["system_prompt"]
 
@@ -204,11 +239,21 @@ async def test_prior_context_folds_into_prompt_and_rides_onto_brief(monkeypatch)
 
 
 def test_render_prior_context_empty_is_blank_nonempty_has_block():
-    """The renderer is the Phase-5 degrade point: an empty recap produces no block (prompt
-    unchanged); a recap with signal produces the 前情提要 section."""
+    """The renderer is the degrade point: an empty recap produces no block (prompt
+    unchanged); a recap with signal produces the recap section.
+
+    Asserts on the recap's CONTENT, not on its heading — the wording and language
+    of the block are prose the prompt author should be free to change without
+    breaking a test."""
     assert _render_prior_context(PriorSessionContext(parent_session_id="sess-prev")) == ""
+
     block = _render_prior_context(_PRIOR)
-    assert block.startswith("\n") and "前情提要" in block
+    assert block.startswith("\n")           # appends to the system prompt, not inline
+    assert block.strip().startswith("##")   # a section of its own
+    # Every field carrying signal reaches the block.
+    assert "autumn cold brew launch" in block
+    assert "lead with the seasonal angle" in block
+    assert "heavy discount framing" in block
     assert "keep it warm and local" in block
 
 
@@ -267,7 +312,7 @@ async def test_copilot_topic_suggestion_waits_for_the_goal():
 
 
 async def test_copilot_suggest_topic_rides_trends_when_enabled(monkeypatch):
-    """Phase 4 (trend scout spread): with TREND_SCOUT_ENABLED, suggest_topic — which fires
+    """Trend scout spread: with TREND_SCOUT_ENABLED, suggest_topic — which fires
     exactly when the user doesn't know what to post — proposes from today's trends (the
     MockStore fixture's first pick lands verbatim in the suggested topic). Toggle off
     (the test above) stays trend-free."""
@@ -280,6 +325,101 @@ async def test_copilot_suggest_topic_rides_trends_when_enabled(monkeypatch):
 
     picked = await factory.get_store().get_trends(limit=6)
     assert picked and picked[0].text in brief.topic
+
+
+# ── Realtime speech-to-speech (native GPT-Realtime, not cascaded STT-then-chat) ──
+# RealtimeVoiceIntake is NOT a ConversationalIntake — it's driven by tool_call events
+# straight off a live session, never a fill_brief text completion. These tests prove
+# it reuses the SAME brief-completion rules (via BriefConversation.apply_tool_result)
+# as the text/cascaded-voice engines, just fed from a different transport shape.
+
+async def test_realtime_voice_one_shot_completes_with_zero_followups():
+    intake = await _drive_realtime(_ONE_SHOT)
+    assert intake.is_complete() is True
+    brief = intake.get_brief()
+    assert isinstance(brief, CreativeBrief)
+    assert brief.intake_mode == "voice"
+    assert brief.topic and brief.target_platforms and brief.user_intent
+    assert brief.route == "direct_generation"
+
+
+async def test_realtime_voice_multi_turn_fills_incrementally():
+    """Platforms are backend-supplied (seeded at `open()`, same as ConversationalIntake.start);
+    a sparse opening leaves the goal missing, filled by one `update_brief` tool round trip."""
+    intake = RealtimeVoiceIntake()
+    session = await intake.open(
+        "sess-rt-multi", target_platforms=["linkedin", "instagram"],
+    )
+    await session.send_audio(audio_b64=_b64(_MULTI_OPEN))
+    async for event in session.events():
+        await intake.handle_event(event)
+        if event.type == "response_done":
+            break
+    assert intake.is_complete() is False
+    assert intake.brief_partial().get("topic")
+    assert intake.brief_partial()["target_platforms"] == ["linkedin", "instagram"]
+    assert "user_intent" not in intake.brief_partial()
+
+    await session.send_audio(audio_b64=_b64(_MULTI_TURNS[1]))
+    async for event in session.events():
+        await intake.handle_event(event)
+        if event.type == "response_done":
+            break
+    await session.close()
+
+    assert intake.is_complete() is True
+    brief = intake.get_brief()
+    assert brief.target_platforms == ["linkedin", "instagram"]
+    assert brief.user_intent == "drive signups from local coffee lovers"
+
+
+async def test_realtime_voice_suggest_topic_narrates_result():
+    """copilot_mode over the realtime path: the suggest_topic tool call's result MUST
+    flow back in via send_tool_result so the model narrates it — not synthesized by
+    our own code (there is no _respond() here, unlike the text engine)."""
+    intake = RealtimeVoiceIntake()
+    session = await intake.open("sess-rt-copilot", target_platforms=["linkedin"])
+    spoken: list[str] = []
+    await session.send_audio(audio_b64=_b64(_COPILOT))
+    async for event in session.events():
+        await intake.handle_event(event)
+        if event.type == "output_transcript_delta" and event.text:
+            spoken.append(event.text)
+        if event.type == "response_done":
+            break
+    await session.close()
+
+    assert intake.is_complete() is True
+    topic = intake.brief_partial()["topic"]
+    assert any(topic in line for line in spoken)          # the model spoke the suggestion
+    brief = intake.get_brief()
+    assert brief.route == "copilot_mode"
+
+
+async def test_realtime_voice_followup_cap_force_completes():
+    """Mirrors test_followups_are_capped_then_force_completed for the realtime path: a
+    turn with no extractable signal (no tool call at all) still counts toward the cap,
+    and hitting it force-completes AND nudges the model to wrap up out loud."""
+    intake = RealtimeVoiceIntake()
+    session = await intake.open("sess-rt-cap", target_platforms=["linkedin"])
+
+    async def _consume_one_turn():
+        async for event in session.events():
+            await intake.handle_event(event)
+            if event.type == "response_done":
+                return
+
+    for _ in range(MAX_INTAKE_FOLLOWUPS + 1):
+        if intake.is_complete():
+            break
+        await session.send_audio(audio_b64=_b64("   "))
+        await _consume_one_turn()
+    await session.close()
+
+    assert intake.is_complete() is True
+    brief = intake.get_brief()
+    assert brief.topic and brief.user_intent
+    assert brief.route == "copilot_mode"           # topic came from the suggest_topic fallback
 
 
 # ── The brief feeds the M1/M2 workflow with no changes (acceptance) ──────────
@@ -409,24 +549,37 @@ def test_http_summarize_handoff_then_continue_intake(http_server):
         assert client.post(f"{http_server}/summarize-handoff", json={"session_id": ""}).status_code == 400
 
 
-def test_voice_websocket_bridges_a_turn():
-    """FastAPI gives us a real WebSocket voice endpoint (the stdlib server could only
-    501): a turn frame runs on the shared intake engine and the reply comes back."""
+def test_voice_websocket_bridges_realtime_speech_to_speech():
+    """WS /intake/{sid}/voice now bridges native speech-to-speech (mock transport in
+    tests): a `start` control frame opens the session, then base64 "audio" frames
+    drive the SAME brief-completion engine the direct RealtimeVoiceIntake tests
+    exercise, and the finished brief is fetchable over the unchanged REST endpoint."""
     from fastapi.testclient import TestClient
 
     app = create_app()
     client = TestClient(app)
-    started = client.post(
-        "/intake", json={"mode": "voice", "session_id": "sess-ws", "opening_input": _MULTI_OPEN}
-    )
-    sid = started.json()["session_id"]
 
-    with client.websocket_connect(f"/intake/{sid}/voice") as ws:
-        ws.send_json({"user_input": _MULTI_TURNS[0]})
-        reply = ws.receive_json()
-        assert "assistant_message" in reply and "complete" in reply
+    with client.websocket_connect("/intake/sess-ws/voice") as ws:
+        ws.send_json({"type": "start", "target_platforms": ["linkedin", "instagram"]})
+        ws.send_json({"type": "audio", "audio": _b64(_ONE_SHOT)})
 
-    # an unknown session is reported then the socket closes
-    with client.websocket_connect("/intake/nope/voice") as ws:
-        ws.send_json({"user_input": "hi"})
-        assert ws.receive_json()["status"] == 404
+        seen_types = set()
+        complete = False
+        for _ in range(50):
+            frame = ws.receive_json()
+            seen_types.add(frame.get("type"))
+            if frame.get("type") == "brief_update":
+                complete = frame["complete"]
+                if complete:
+                    break
+        assert complete is True
+        assert "transcript" in seen_types and "audio" in seen_types
+
+    brief = client.get("/intake/sess-ws/brief").json()
+    assert brief["intake_mode"] == "voice"
+    assert brief["target_platforms"] == ["linkedin", "instagram"]
+
+    # a malformed first frame (not `{"type": "start", ...}`) is rejected up front
+    with client.websocket_connect("/intake/sess-ws-bad/voice") as ws:
+        ws.send_json({"type": "audio", "audio": "abc"})
+        assert ws.receive_json()["status"] == 400

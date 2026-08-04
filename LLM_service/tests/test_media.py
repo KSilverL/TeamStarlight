@@ -1,9 +1,9 @@
 """
-Post-approval media generation (the "生成 HTML / 生成视频" ideas, ported from the demos).
+Post-approval media generation.
 
 The media_producer turns an approved draft into two on-brand artifacts via the LLM
-service: a self-contained animated HTML card (replacing the old static preview card)
-and a dynamic, composable video storyboard (StoryboardSpec) — an ordered list of typed
+service: a self-contained animated HTML card and a composable video storyboard
+(StoryboardSpec) — an ordered list of typed
 slides drawn from the slide registry, not a fixed scene count. These tests cover the
 mock generators in isolation and end-to-end through the workflow (approve and
 approve_after_edit). Fully mocked / offline.
@@ -60,6 +60,21 @@ async def test_approved_final_draft_carries_html_card_and_video_storyboard(workf
     assert "@keyframes" in out.html_card
     assert out.video_storyboard is not None
     assert {s.type for s in out.video_storyboard.slides} <= SLIDE_TYPES
+
+
+async def test_video_direction_threads_from_strategy_into_the_storyboard(workflow, make_brief):
+    """The per-platform strategy (the roundtable/strategist consensus) is carried on
+    ApprovedDraft.strategy and passed to the video generator as `direction`, so the storyboard
+    reflects the discussion — not just the approved caption. The mock echoes the direction into
+    the hook slide's narration, giving a deterministic assertion that the thread is intact."""
+    res = await workflow.run(make_brief(platforms=("linkedin",), content_types=["text", "video"]))
+    req = res.get_request_info_events()[0]
+    strategy = req.data.strategy  # the direction the panel agreed for this platform
+    assert strategy  # non-empty: there is a real direction to thread
+
+    out = (await workflow.run(responses={req.request_id: HumanVerdict(decision="approve")})).get_outputs()[0]
+    hook = next(s for s in out.video_storyboard.slides if s.type == "hook")
+    assert strategy in (hook.narration or "")  # the agreed direction reached the generator
 
 
 async def test_content_types_gate_which_media_is_produced(workflow, make_brief):
