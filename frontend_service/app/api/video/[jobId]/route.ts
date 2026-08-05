@@ -1,6 +1,9 @@
 import { NextRequest } from "next/server";
 
-const LLM_URL = process.env.LLM_SERVICE_URL ?? "http://localhost:8080";
+// Routed through the Java backend, which is where identity is VERIFIABLE (it holds the JWT
+// signing key) and therefore where the brand a run reads and writes gets decided. Talking to the
+// Python service directly would mean `business_id` is whatever the caller typed.
+const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:8081";
 
 export async function GET(
   _request: NextRequest,
@@ -9,7 +12,7 @@ export async function GET(
   const { jobId } = await params;
 
   try {
-    const upstream = await fetch(`${LLM_URL}/video-jobs/${jobId}`);
+    const upstream = await fetch(`${BACKEND_URL}/video-jobs/${jobId}`);
 
     if (!upstream.ok) {
       const text = await upstream.text();

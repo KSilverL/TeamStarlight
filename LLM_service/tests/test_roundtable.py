@@ -393,25 +393,33 @@ async def test_multi_platform():
         assert rounds == sorted(rounds)
 
 
-async def test_agent_utterance_audio_follows_each_persona_turn():
-    """Each persona turn gets a matching TTS readback event — fired in the background
-    (never inline on the turn-completion path, see runner._synthesize_turn_audio), so
-    tests must drain the tracked background tasks before asserting completeness. The
-    user's own turns (no PERSONA_VOICES entry) never get one — we don't read the
-    human's words back to them."""
-    import base64
-
+async def _drain_audio_tasks() -> None:
+    """TTS is fire-and-forget, so clips may still be in flight the instant run_table returns —
+    drain the tracked set (_synthesize_turn_audio registers into it) before asserting."""
     from LLM_service.workflow.roundtable import runner as roundtable_runner
-    from LLM_service.workflow.roundtable.personas import PERSONA_VOICES
 
-    collected: list[dict] = []
-    await run_table(PLATFORM, _brief(), on_event=lambda ev: collected.append(ev))
-
-    # Fire-and-forget tasks may still be in flight the instant run_table returns —
-    # drain them (the same set _synthesize_turn_audio registers into) before asserting.
     pending = list(roundtable_runner._background_tasks)
     if pending:
         await asyncio.gather(*pending)
+
+
+async def test_agent_utterance_audio_follows_each_persona_turn():
+    """Each persona turn gets a matching TTS readback event — fired in the background
+    (never inline on the turn-completion path, see runner._synthesize_turn_audio). The
+    user's own turns (no PERSONA_VOICES entry) never get one — we don't read the
+    human's words back to them.
+
+    The event carries a URL, not the bytes: the mp3 goes to the audio store and is served by
+    `GET /tasks/{id}/audio/...`, so the SSE log (replayed on reconnect, and mirrored to the
+    store) never grows by megabytes of base64."""
+    from LLM_service.workflow.roundtable import audio_store
+    from LLM_service.workflow.roundtable.personas import PERSONA_VOICES
+
+    audio_store.clear()
+    collected: list[dict] = []
+    await run_table(
+        PLATFORM, _brief(), task_id="rt-audio", on_event=lambda ev: collected.append(ev))
+    await _drain_audio_tasks()
 
     utterances = [e for e in collected if e["type"] == "agent_utterance"]
     audio_events = {
@@ -427,8 +435,43 @@ async def test_agent_utterance_audio_follows_each_persona_turn():
             continue
         audio = audio_events[key]
         assert audio["table_id"] == turn["table_id"]
-        decoded = base64.b64decode(audio["audio_b64"])
-        assert len(decoded) > 0  # MockVoiceover's real (silent) mp3 bytes, not a placeholder
+        assert "audio_b64" not in audio  # the bytes never ride on the event any more
+        assert audio["audio_url"] == (
+            f"/tasks/rt-audio/audio/{PLATFORM}/{turn['speaker']}/{turn['round_index']}")
+        # …and the URL actually resolves to MockVoiceover's real (silent) mp3 bytes.
+        stored = audio_store.get(
+            task_id="rt-audio", table_id=PLATFORM,
+            speaker=turn["speaker"], round_index=turn["round_index"])
+        assert stored and len(stored) > 0
+
+
+async def test_turn_audio_skipped_without_a_task_id():
+    """No task id → no addressable URL, so synthesis is skipped rather than emitting an event
+    that points nowhere. (A bare run_table is a test/CLI shape; every HTTP run has a task.)"""
+    from LLM_service.workflow.roundtable import audio_store
+
+    audio_store.clear()
+    collected: list[dict] = []
+    await run_table(PLATFORM, _brief(), on_event=lambda ev: collected.append(ev))
+    await _drain_audio_tasks()
+
+    assert [e for e in collected if e["type"] == "agent_utterance"]  # turns still happen
+    assert not [e for e in collected if e["type"] == "agent_utterance_audio"]
+
+
+async def test_audio_store_is_bounded_and_lru():
+    """The store is capped so a long-lived process can't grow without limit — the very failure
+    mode moving the clips off the event log is meant to fix. Overflow evicts the oldest."""
+    from LLM_service.workflow.roundtable import audio_store
+
+    audio_store.clear()
+    for i in range(audio_store.MAX_CLIPS + 5):
+        audio_store.put(
+            task_id="t", table_id="linkedin", speaker="s", round_index=i, audio=b"x")
+    assert audio_store.get(task_id="t", table_id="linkedin", speaker="s", round_index=0) is None
+    newest = audio_store.MAX_CLIPS + 4
+    assert audio_store.get(
+        task_id="t", table_id="linkedin", speaker="s", round_index=newest) == b"x"
 
 
 async def test_multi_platform_streams_over_sse():

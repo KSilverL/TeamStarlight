@@ -16,7 +16,6 @@ Event mapping is per docs/roundtable_api_notes.md:
 from __future__ import annotations
 
 import asyncio
-import base64
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
@@ -28,6 +27,7 @@ from ...core.events import (
 )
 from ...core.services import factory
 from ..messages import Brief, CreativeStrategy
+from . import audio_store
 from .builder import RoundtableBuild, build_roundtable
 from .context import build_persona_context
 from .manager import BeforeRound
@@ -42,26 +42,41 @@ _background_tasks: set[asyncio.Task] = set()
 
 def _synthesize_turn_audio(
     turn: DiscussionTurn, table_id: str, on_event: Callable[[dict], None],
+    task_id: Optional[str],
 ) -> None:
-    """Speak `turn`'s line in its persona's voice and emit it as a follow-up event once
-    ready — NEVER on the turn-completion path itself, so a slow/failed TTS call can
-    never delay the next persona from being scheduled. The user's own turns (no entry
-    in PERSONA_VOICES) are silently skipped — we don't read the human's words back to
-    them. Synthesis failures degrade to "no audio for this turn", matching
-    VoiceoverService's documented contract (never a reason to abort anything)."""
+    """Speak `turn`'s line in its persona's voice, park the mp3 in the audio store, and emit
+    a follow-up event carrying its URL once ready — NEVER on the turn-completion path itself,
+    so a slow/failed TTS call can never delay the next persona from being scheduled. The
+    user's own turns (no entry in PERSONA_VOICES) are silently skipped — we don't read the
+    human's words back to them. Synthesis failures degrade to "no audio for this turn",
+    matching VoiceoverService's documented contract (never a reason to abort anything).
+
+    The clip is referenced by URL rather than inlined as base64 so the event log (replayed in
+    full on every reconnect, and now persisted) stays small — see audio_store.py. That needs a
+    `task_id` to address the clip, so a table run WITHOUT one (a bare `run_table` in tests, or
+    any caller that isn't a registered task) skips synthesis entirely: there would be no
+    endpoint to serve the bytes from, and an event pointing nowhere is worse than no event."""
     voice = PERSONA_VOICES.get(turn.speaker)
-    if voice is None:
+    if voice is None or not task_id:
         return
 
     async def _go() -> None:
         try:
-            audio = await factory.get_voiceover_generation().synthesize(
+            speech = await factory.get_voiceover_generation().synthesize(
                 text=turn.text, voice=voice)
         except Exception:
             return
+        # `synthesize` returns a SynthesizedSpeech (audio + duration), not raw bytes — the
+        # clip is `.audio`. Reading it wrongly here is invisible at runtime: this coroutine is
+        # fire-and-forget, so the resulting TypeError is swallowed with the task and the turn
+        # simply never gets a readback event.
+        url = audio_store.put(
+            task_id=task_id, table_id=table_id, speaker=turn.speaker,
+            round_index=turn.round_index, audio=speech.audio,
+        )
         on_event(agent_utterance_audio_event(
             table_id=table_id, speaker=turn.speaker,
-            round_index=turn.round_index, audio_b64=base64.b64encode(audio).decode("ascii"),
+            round_index=turn.round_index, audio_url=url,
         ))
 
     task = asyncio.create_task(_go())
@@ -220,7 +235,7 @@ async def run_table(
                 ))
                 # TTS readback: fires in the background and arrives as a separate,
                 # later event — never blocks this turn or the next one being scheduled.
-                _synthesize_turn_audio(turn, platform, on_event)
+                _synthesize_turn_audio(turn, platform, on_event, task_id)
         elif etype == "output":
             consensus_text = getattr(data, "text", None) or (str(data) if data is not None else "")
 
@@ -282,7 +297,11 @@ async def run_tables(
             platform, brief, context=context, max_rounds=max_rounds,
             task_id=task_id, user_turn_timeout=user_turn_timeout, before_round=before_round,
         )
-        return await run_table(platform, brief, build=build, on_event=on_event)
+        # `task_id` rides along even though `build` already carries it (for the user seat):
+        # `run_table` needs it in its own right to address this table's turn audio in the
+        # audio store, and the fan-out is the path every HTTP run takes.
+        return await run_table(
+            platform, brief, build=build, on_event=on_event, task_id=task_id)
 
     if sequential is None:  # back-compat: a terminal prompt hook implies one table at a time
         sequential = before_round is not None

@@ -1,6 +1,9 @@
 import { NextRequest } from "next/server";
 
-const LLM_URL = process.env.LLM_SERVICE_URL ?? "http://localhost:8080";
+// Routed through the Java backend, which is where identity is VERIFIABLE (it holds the JWT
+// signing key) and therefore where the brand a run reads and writes gets decided. Talking to the
+// Python service directly would mean `business_id` is whatever the caller typed.
+const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:8081";
 
 export async function POST(request: NextRequest) {
   const body = await request.json();
@@ -15,10 +18,18 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  // The token is what tells the backend which brand this run belongs to. Without it the run is a
+  // cold start (no brand voice, no learned preferences) — which is what an anonymous caller gets,
+  // by design. Note the backend re-derives the identity from the token and DISCARDS any
+  // `business_id` in the body, so there is nothing to gain by sending one from here.
+  const authHeader = request.headers.get("Authorization");
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (authHeader) headers.Authorization = authHeader;
+
   try {
-    const upstream = await fetch(`${LLM_URL}/tasks`, {
+    const upstream = await fetch(`${BACKEND_URL}/tasks`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(body),
     });
     const data = await upstream.json();

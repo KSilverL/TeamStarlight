@@ -20,9 +20,10 @@ from __future__ import annotations
 import time
 
 import httpx
+import pytest
 from agent_framework import WorkflowRunState
 
-from LLM_service.api import WorkflowService, create_app
+from LLM_service.api import ApiError, WorkflowService, create_app
 from LLM_service.core.services import factory
 from LLM_service.tests.conftest import run_app
 from LLM_service.workflow import HumanVerdict, build_workflow
@@ -400,6 +401,54 @@ async def test_a_blocked_gate_is_machine_readable():
         # re-approving unchanged copy is screened and blocked again.
         assert payload["allowed_decisions"] == ["approve_after_edit", "reject", "discard"]
     assert pending["block_reason"] == draft_ready["block_reason"]
+
+
+async def test_blocked_gate_refuses_a_decision_it_did_not_offer():
+    """`allowed_decisions` is enforced, not merely advertised.
+
+    It was advertised-only for a while, and a plain `approve` came back 200. Nothing unsafe
+    shipped — the screen re-runs on whatever is approved, so the same copy was blocked again —
+    but the caller got a silent loop (approve → blocked → approve → blocked) instead of the
+    answer the response was already carrying. The 400 names the ways out, so a client that
+    ignored the field still learns them.
+    """
+    svc = WorkflowService()
+    await svc.start({
+        "topic": "spring single-origin coffee launch", "target_platforms": ["linkedin"],
+        "user_intent": "drive signups", "business_id": "biz_test_0001",
+    }, task_id="enforce-1")
+    snapshot = await svc.review("enforce-1", {"linkedin": {
+        "decision": "approve_after_edit", "edited_draft": UNSAFE_EDIT}})
+    assert snapshot["pending"][0]["blocked"] is True
+
+    for refused in ("approve", "APPROVE", ""):
+        with pytest.raises(ApiError) as exc:
+            await svc.review("enforce-1", {"linkedin": {"decision": refused}})
+        assert exc.value.status == 400
+        for allowed in ("approve_after_edit", "reject", "discard"):
+            assert allowed in str(exc.value)
+
+    # The gate is untouched by a refused verdict — still open, still blocked.
+    assert (await svc.get("enforce-1"))["pending"][0]["blocked"] is True
+
+    # …and each way out it DOES offer still resolves it.
+    settled = await svc.review("enforce-1", {"linkedin": {
+        "decision": "discard", "reason": "not worth the rework"}})
+    assert settled["status"] == "completed"
+
+
+async def test_an_ordinary_gate_still_accepts_a_plain_approve():
+    """The enforcement above must bite ONLY on a blocked gate — an ordinary one is unchanged."""
+    svc = WorkflowService()
+    await svc.start({
+        "topic": "spring single-origin coffee launch", "target_platforms": ["linkedin"],
+        "user_intent": "drive signups", "business_id": "biz_test_0001",
+    }, task_id="enforce-2")
+
+    snapshot = await svc.review("enforce-2", {"linkedin": {"decision": "approve"}})
+
+    assert snapshot["status"] == "completed"
+    assert len(snapshot["outputs"]) == 1
 
 
 async def test_service_records_a_discard_on_both_surfaces():

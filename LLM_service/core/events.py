@@ -139,14 +139,21 @@ def agent_utterance_audio_event(
     table_id: str,
     speaker: str,
     round_index: int,
-    audio_b64: str,
+    audio_url: str,
 ) -> dict:
-    """The synthesized speech (base64 mp3) for a turn `agent_utterance_event` already
-    emitted. Fired separately and later — TTS synthesis runs in the background so it
-    never delays the live text discussion (mirrors how `speaker_scheduled_event` is
-    already a second, separately-timed event for the same turn, just on the other
-    side of it). The frontend matches it back to the right bubble via `speaker` +
-    `round_index`, the same pair `agent_utterance_event` carries."""
+    """The synthesized speech for a turn `agent_utterance_event` already emitted is ready and
+    fetchable at `audio_url`. Fired separately and later — TTS synthesis runs in
+    the background so it never delays the live text discussion (mirrors how
+    `speaker_scheduled_event` is already a second, separately-timed event for the same turn,
+    just on the other side of it). The frontend matches it back to the right bubble via
+    `speaker` + `round_index`, the same pair `agent_utterance_event` carries.
+
+    `audio_url` is a **reference, not the bytes** — the mp3 itself lives in
+    `workflow/roundtable/audio_store.py` and is served by `GET /tasks/{id}/audio/...`. It used
+    to be an inline base64 `audio_b64` field, which meant every reconnect replayed megabytes
+    of binary out of the event log and a big audio frame could sit ahead of a latency-
+    sensitive `round_control` prompt on the same connection. A client written against the old
+    shape simply finds no `audio_b64`, plays nothing, and is otherwise unaffected."""
     return {
         "type": AGENT_UTTERANCE_AUDIO,
         "node": speaker,
@@ -158,7 +165,7 @@ def agent_utterance_audio_event(
         "speaker": speaker,
         "agent_id": speaker,
         "round_index": round_index,
-        "audio_b64": audio_b64,
+        "audio_url": audio_url,
     }
 
 

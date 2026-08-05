@@ -43,7 +43,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -69,6 +69,7 @@ from .workflow.executors.compliance import BLOCKED_ALLOWED_DECISIONS
 from .workflow.learning import archive_conversation
 from .workflow.learning.archivist import _intake_user_turns
 from .workflow.messages import CONTENT_TYPES, DEFAULT_CONTENT_TYPES, CreativeStrategy
+from .workflow.roundtable import audio_store
 from .workflow.roundtable import control as _round_control
 from .workflow.roundtable.gate import notify as _notify_user_gate
 from .workflow.roundtable.gate import raise_hand as _raise_user_hand
@@ -90,6 +91,27 @@ from .core.video_schema import StoryboardSpec
 
 # Sentinel pushed to SSE subscribers when a task finishes, so the stream closes.
 _STREAM_DONE = object()
+
+# ── Task-state durability (see WorkflowService._flush / _rehydrate) ───────────────────────
+# The task registry used to live ONLY in this process's memory, so a restart lost every
+# task: `GET /tasks/{id}` 404'd even though the MAF checkpoint that could describe the run
+# was still in the store. The registry's own view (event log + snapshot fields) is now
+# mirrored into the store under a namespaced checkpoint key, exactly like the roundtable's
+# utterance queue does (workflow/roundtable/queue.py) — no new store contract.
+_STATE_PREFIX = "api-task:"
+# Mid-run writes are coalesced behind this debounce so a chatty roundtable doesn't issue one
+# store write per utterance; every state that MATTERS (a gate pause, completion, an error) is
+# additionally flushed with an awaited write at that exact moment, so durability never
+# depends on the timer having fired.
+_PERSIST_DEBOUNCE_SECONDS = 1.0
+# Strong refs to in-flight background flushes — asyncio only holds tasks weakly, so without
+# this a write could be garbage-collected mid-flight (same idiom as roundtable/runner.py).
+_persist_tasks: set = set()
+
+
+def _state_key(task_id: str) -> str:
+    """Checkpoint key namespacing one task's mirrored API state."""
+    return f"{_STATE_PREFIX}{task_id}"
 
 
 class ApiError(Exception):
@@ -222,6 +244,29 @@ def _compliance_payload(request) -> dict:
     }
 
 
+def _reject_disallowed_on_blocked_gate(pending: dict, verdict: dict, platform: str) -> None:
+    """Enforce `allowed_decisions` on a gate the compliance screen blocked.
+
+    The gate has been *advertising* these three ever since the screen was added, but nothing
+    checked them — a plain `approve` was accepted with a 200. Nothing unsafe shipped as a result:
+    the screen re-runs on whatever is approved, so the same copy was simply blocked again. What
+    the caller got instead of an error was a silent loop — approve, blocked, approve, blocked —
+    with the service's own answer (`allowed_decisions`) sitting right there in the response saying
+    why it would never work.
+
+    So this closes the gap between what the contract says and what it does. It only ever fires on
+    a blocked gate; an ordinary one keeps accepting every decision it always did.
+    """
+    if not pending.get("blocked"):
+        return
+    decision = str((verdict or {}).get("decision", "")).strip().lower()
+    if decision not in BLOCKED_ALLOWED_DECISIONS:
+        raise ApiError(400, (
+            f"'{platform}' was blocked by the content-safety screen; "
+            f"'{decision or 'none'}' cannot resolve it. Use one of: "
+            f"{', '.join(BLOCKED_ALLOWED_DECISIONS)}"))
+
+
 def _roundtable_mode_from_inputs(inputs: dict) -> str:
     """Pop + validate the per-request step-mode switch. "auto" (the default) never prompts —
     today's hands-off flow; "manual" pauses every table at each round boundary for the user's
@@ -266,12 +311,23 @@ class _Task:
         self.runner: Optional[asyncio.Task] = None    # background drive task (HTTP non-blocking path)
         self.title: Optional[str] = None              # short session title for the history sidebar
         self.title_runner: Optional[asyncio.Task] = None  # concurrent, off-path title-generation task
+        self.persist_runner: Optional[asyncio.Task] = None  # pending coalesced state flush (_mark_dirty)
         self.lock = asyncio.Lock()                    # serializes resumes: two concurrent /review calls
         # (e.g. auto-approving two platforms' drafts back-to-back) must not both drive the same
         # underlying `workflow` at once — that races on `task.pending` and can 409 a legitimate call.
         self.error: Optional[str] = None              # set if the run raised; surfaced in the snapshot
         self.status = "running"
         self.done = False
+        # The next `seq` to stamp on a published event. Tracked explicitly rather than derived
+        # from len(self.events) because a task REHYDRATED from the store must carry on from where
+        # the previous process stopped: a client that has already seen seq 40 drops everything
+        # `<= 40`, so a restarted run that began numbering at 0 again would be silently ignored
+        # forever by that client. See `_restore_state`.
+        self.next_seq = 0
+        # True when this record was rebuilt from the store after a restart (or on a process that
+        # never ran it). Its snapshot and event log are real; its MAF `workflow` is not — there is
+        # no live run to resume, so the write paths refuse with a clear 409 instead of a 500.
+        self.recovered = False
 
 
 class WorkflowService:
@@ -291,19 +347,158 @@ class WorkflowService:
             raise ApiError(404, f"unknown task_id: {task_id}")
         return task
 
+    async def _require_live(self, task_id: str) -> _Task:
+        """`_require` for the paths that need a task this process is actually RUNNING — anything
+        that drives the MAF workflow or steers a live roundtable. A rehydrated record (see
+        `_rehydrate`) can answer reads but holds no workflow and no in-flight coroutine, so those
+        calls get an explanatory 409 rather than an AttributeError surfacing as a 500.
+
+        It resolves through the store too, so the 409 is what a client gets on the FIRST call
+        after a restart as well — not a 404 that wrongly reads as "that task never existed"."""
+        task = await self._resolve(task_id)
+        if task.recovered:
+            raise ApiError(409, (
+                f"task {task_id} was recovered from storage after a restart: its history is "
+                "readable but the run cannot be resumed in this process"))
+        return task
+
+    # ── Durable task state (mirror → store; rebuild ← store) ──────────────────
+
+    def _persisted_state(self, task: _Task) -> dict:
+        """Everything needed to answer `GET /tasks/{id}` and replay `GET /tasks/{id}/events`
+        after a restart. Deliberately the registry's OWN view — not MAF's checkpoint, which
+        already persists separately and describes the graph rather than the client contract.
+
+        Note what is NOT here: the persona audio clips. They are referenced by URL now
+        (workflow/roundtable/audio_store.py) precisely so the durable log stays small; writing
+        them back in would re-create the bloat this is meant to remove."""
+        return {
+            "task_id": task.task_id,
+            "brief": task.brief.model_dump() if task.brief is not None else None,
+            "events": list(task.events),
+            "next_seq": task.next_seq,
+            "status": task.status,
+            "done": task.done,
+            "error": task.error,
+            "title": task.title,
+            "pending": dict(task.pending),
+            "outputs": dict(task.outputs),
+            "discarded": dict(task.discarded),
+            "proposed_rules": list(task.proposed_rules),
+            "preference_summary": task.preference_summary,
+            "conversation": list(task.conversation),
+            "roundtable_transcript": list(task.roundtable_transcript),
+            "last_verdicts": list(task.last_verdicts),
+            "original_drafts": dict(task.original_drafts),
+        }
+
+    @staticmethod
+    def _restore_state(task: _Task, data: dict) -> None:
+        """Inverse of `_persisted_state`. `next_seq` is recovered defensively from the events
+        themselves when the stored counter is missing or behind — the one invariant that must
+        hold is that no future event reuses a seq a client has already seen and discarded."""
+        task.events = list(data.get("events") or [])
+        highest = max((int(e.get("seq", -1)) for e in task.events), default=-1)
+        task.next_seq = max(int(data.get("next_seq") or 0), highest + 1)
+        task.status = data.get("status") or "running"
+        task.done = bool(data.get("done"))
+        task.error = data.get("error")
+        task.title = data.get("title")
+        task.pending = dict(data.get("pending") or {})
+        task.outputs = dict(data.get("outputs") or {})
+        task.discarded = dict(data.get("discarded") or {})
+        task.proposed_rules = list(data.get("proposed_rules") or [])
+        task.preference_summary = data.get("preference_summary")
+        task.conversation = list(data.get("conversation") or [])
+        task.roundtable_transcript = list(data.get("roundtable_transcript") or [])
+        task.last_verdicts = list(data.get("last_verdicts") or [])
+        task.original_drafts = dict(data.get("original_drafts") or {})
+
+    async def _flush(self, task: _Task) -> None:
+        """Mirror one task's state to the store. Best-effort by design: the store is not on the
+        critical path of a run, so a write failure degrades to "this task won't survive a
+        restart" — never to a failed request or a hung stream."""
+        try:
+            await factory.get_store().save_checkpoint(
+                task_id=_state_key(task.task_id), data=self._persisted_state(task))
+        except Exception:
+            pass
+
+    def _mark_dirty(self, task: _Task) -> None:
+        """Queue a coalesced background flush (called from the sync `_publish`). At most one is
+        pending per task, so a burst of roundtable utterances costs ONE store write rather than
+        one each. Callers that need a guaranteed write await `_flush` directly instead."""
+        if task.persist_runner is not None and not task.persist_runner.done():
+            return  # a flush is already queued — it will pick this event up too
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no loop (a purely synchronous caller) — the awaited flushes still cover us
+
+        async def _later() -> None:
+            await asyncio.sleep(_PERSIST_DEBOUNCE_SECONDS)
+            await self._flush(task)
+
+        task.persist_runner = loop.create_task(_later())
+        _persist_tasks.add(task.persist_runner)
+        task.persist_runner.add_done_callback(_persist_tasks.discard)
+
+    async def _rehydrate(self, task_id: str) -> Optional[_Task]:
+        """Rebuild a task record from the store, or None if it was never mirrored there. This is
+        what makes a restart (or a request that lands on a different replica) return the run's
+        real history instead of a bare 404 — see `_require_live` for what such a record cannot do."""
+        try:
+            data = await factory.get_store().load_checkpoint(task_id=_state_key(task_id))
+        except Exception:
+            return None
+        if not data:
+            return None
+        brief_data = data.get("brief")
+        try:
+            brief = Brief(**brief_data) if brief_data else None
+        except Exception:
+            brief = None
+        task = _Task(task_id, None, brief)
+        self._restore_state(task, data)
+        task.recovered = True
+        if task.status == "running":
+            # Nothing is driving it here, and the process that was has gone. Saying "running"
+            # would leave a client polling forever for a completion that can never arrive.
+            task.status = "error"
+            task.error = "run interrupted by a service restart"
+        # Terminal REGARDLESS of the status it stopped at (a gate pause included): with no live
+        # workflow this record can never emit another event, so an SSE stream over it must close
+        # after the replay instead of holding the connection open for a future that cannot come.
+        task.done = True
+        self._tasks[task_id] = task
+        return task
+
+    async def _resolve(self, task_id: str) -> _Task:
+        """`_require`, but falling back to the store for a task this process doesn't hold."""
+        task = self._tasks.get(task_id)
+        if task is not None:
+            return task
+        task = await self._rehydrate(task_id)
+        if task is None:
+            raise ApiError(404, f"unknown task_id: {task_id}")
+        return task
+
     # ── Event translation (MAF event → SSE envelope) + publish ────────────────
 
     def _publish(self, task: _Task, event: dict) -> None:
-        # A stable, monotonic per-task index baked into the stored event, so a client that
-        # reconnects (GET /tasks/{id}/events replays the full buffer — see `events()`) can tell
-        # a replayed event from a new one and avoid re-firing event-driven side effects
-        # (e.g. auto-approving a human-gate draft a second time, which 409s).
-        event["seq"] = len(task.events)
+        # A stable, monotonic per-task index baked into the stored event. It is both the SSE
+        # frame's `id:` (so a reconnect resumes from where it left off instead of replaying the
+        # whole buffer — see `events()`) and the client's dedupe key, so a replay can't re-fire
+        # event-driven side effects (e.g. auto-approving a human-gate draft twice, which 409s).
+        # Counted off `task.next_seq`, not len(events), so it survives a rehydrate.
+        event["seq"] = task.next_seq
+        task.next_seq += 1
         task.events.append(event)
         for q in task.subscribers:
             q.put_nowait(event)
         if task.event_listener is not None:  # live, in-process stream (the CLI prints as it lands)
             task.event_listener(event)
+        self._mark_dirty(task)  # coalesced mirror to the store; never on this call's critical path
 
     @staticmethod
     def _platforms_of(data) -> list[str]:
@@ -465,6 +660,10 @@ class WorkflowService:
             self._publish(task, progress_event("workflow", DONE))
             for q in task.subscribers:
                 q.put_nowait(_STREAM_DONE)
+        # The segment settled (paused at the gate, or finished). Mirror it with an AWAITED write
+        # rather than leaving it to the debounce: these are exactly the states a client would
+        # come back for after a restart, so their durability must not depend on a timer.
+        await self._flush(task)
         return self._snapshot(task)
 
     async def _dispatch(self, task: _Task, coro, *, background: bool, running: dict) -> dict:
@@ -501,6 +700,7 @@ class WorkflowService:
             self._publish(task, progress_event("workflow", ERROR))
             for q in list(task.subscribers):
                 q.put_nowait(_STREAM_DONE)
+            await self._flush(task)  # a failed run is still a run a client will ask about
             if reraise:
                 raise
             return self._snapshot(task)
@@ -662,7 +862,7 @@ class WorkflowService:
             return await self._drive(task, message=brief)
 
     async def review(self, task_id: str, verdicts: dict) -> dict:
-        task = self._require(task_id)
+        task = await self._require_live(task_id)
         if not isinstance(verdicts, dict) or not verdicts:
             raise ApiError(400, "'verdicts' must be a non-empty object keyed by platform")
 
@@ -680,6 +880,7 @@ class WorkflowService:
                 if verdict is None:
                     continue  # leave un-addressed platforms pending
                 platform = data["platform"]
+                _reject_disallowed_on_blocked_gate(data, verdict, platform)
                 responses[req_id] = _verdict_from_payload(verdict, platform)
                 # Record the AI draft the human reviewed + the verdict, so confirm-learning can
                 # distil brand rules (AI-vs-final diff) and trace a learned preference to the edit.
@@ -703,7 +904,7 @@ class WorkflowService:
         conversation into DB-ready preference skills and writes them STRAIGHT to the store, for
         BOTH channels: brand voice (→ Brand_Voice_Profile, transcript-aware so a plain approve
         learns too) and per-user (→ user_skills). Nothing is learned otherwise."""
-        task = self._require(task_id)
+        task = await self._require_live(task_id)
         if not task.done:
             raise ApiError(409, "task is not complete; nothing to confirm yet")
         if not learn or not get_settings().learning_enabled:
@@ -721,6 +922,7 @@ class WorkflowService:
         )
         task.proposed_rules = result["brand_rules"]            # what was stored (for the snapshot)
         task.preference_summary = result["preference_summary"]
+        await self._flush(task)  # both land on the snapshot — keep the mirrored copy in step
         return {"task_id": task_id, "learned": True, **result}
 
     async def summarize_handoff(
@@ -806,7 +1008,7 @@ class WorkflowService:
         synthesized from what was said so far); `auto` ends the prompts for the rest of that
         table. enough/auto are sticky and next/speak latest-wins, so answering while the table
         is mid-turn (not yet waiting) is safe — it is consumed at the next boundary."""
-        self._require(task_id)  # 404 before touching any control state
+        await self._require_live(task_id)  # 404/409 before touching any control state
         if not (table_id or "").strip():
             raise ApiError(400, "'table_id' is required")
         if action not in _round_control.ACTIONS:
@@ -852,6 +1054,7 @@ class WorkflowService:
             task.done = True
             for q in list(task.subscribers):  # consensus is the last event — close live streams
                 q.put_nowait(_STREAM_DONE)
+            await self._flush(task)
             return {"task_id": task_id, "platform": platform,
                     "consensus": result.consensus.model_dump()}
 
@@ -892,6 +1095,7 @@ class WorkflowService:
             task.done = True
             for q in list(task.subscribers):
                 q.put_nowait(_STREAM_DONE)
+            await self._flush(task)
             return {"task_id": task_id,
                     "consensuses": [r.consensus.model_dump() for r in results]}
 
@@ -901,7 +1105,9 @@ class WorkflowService:
         )
 
     async def get(self, task_id: str) -> dict:
-        return self._snapshot(self._require(task_id))
+        # Falls back to the store, so a task started before a restart (or on another replica)
+        # answers with its real history instead of a 404.
+        return self._snapshot(await self._resolve(task_id))
 
     def get_final_draft(self, task_id: str, platform: str) -> Optional[dict]:
         """The FinalDraft dict (including `video_storyboard`) media_producer already
@@ -915,20 +1121,29 @@ class WorkflowService:
         buffer). Unlike `events()`, this never waits for future events."""
         return list(self._require(task_id).events)
 
-    async def events(self, task_id: str):
-        """Async generator of events for SSE: replays the buffer, then follows
-        live until the task completes. Yields `None` (a heartbeat) every 15s of
-        inactivity so the route can keep the connection alive — an idle proxy/browser
-        timeout would otherwise force a reconnect, which replays the whole buffer and
-        can re-trigger a client's already-handled side effects."""
-        task = self._require(task_id)
+    async def events(self, task_id: str, *, from_seq: Optional[int] = None):
+        """Async generator of events for SSE: replays the buffer, then follows live until the
+        task completes. Yields `None` (a heartbeat) every 15s of inactivity so the route can
+        keep the connection alive — an idle proxy/browser timeout would otherwise force a
+        reconnect.
+
+        `from_seq` makes that reconnect INCREMENTAL: only events with a strictly greater `seq`
+        are replayed, so a client resuming a long discussion re-reads a handful of events
+        instead of the entire history. It comes from the SSE `Last-Event-ID` header (which the
+        browser sends automatically, because every frame carries an `id:`) or an explicit
+        `?from_seq=` for non-browser clients. Omitted → the full replay, unchanged.
+
+        Dedupe is by `seq`, not object identity: a rehydrated task's events are freshly
+        decoded dicts, so identity says nothing about whether the client has seen them."""
+        task = await self._resolve(task_id)
         q: asyncio.Queue = asyncio.Queue()
         task.subscribers.append(q)
         try:
-            seen: set[int] = set()
+            floor = -1 if from_seq is None else int(from_seq)
             for ev in list(task.events):
-                seen.add(id(ev))
-                yield ev
+                if int(ev.get("seq", -1)) > floor:
+                    floor = int(ev.get("seq", floor))
+                    yield ev
             if task.done:
                 return
             while True:
@@ -939,9 +1154,10 @@ class WorkflowService:
                     continue
                 if ev is _STREAM_DONE:
                     return
-                if id(ev) in seen:
-                    continue
-                seen.add(id(ev))
+                seq = int(ev.get("seq", -1))
+                if seq <= floor:
+                    continue  # already replayed above (published while we were catching up)
+                floor = seq
                 yield ev
         finally:
             if q in task.subscribers:
@@ -1948,23 +2164,78 @@ async def get_task(request: Request, task_id: str) -> dict:
     return await _workflow(request).get(task_id)
 
 
+def _resume_seq(request: Request) -> Optional[int]:
+    """Where a reconnecting SSE client wants the replay to resume from, or None for "the
+    beginning" (the original behaviour, and what a first connect always gets).
+
+    Two sources, explicit first: `?from_seq=` for non-browser clients (a backend relay), and
+    the standard `Last-Event-ID` header, which a browser's EventSource sends **by itself** on
+    an automatic reconnect because every frame below carries an `id:`. Anything unparseable is
+    treated as absent — a malformed resume marker must degrade to a full replay (correct, just
+    chattier), never to an error or a silently truncated stream.
+
+    NB for anything proxying this endpoint: `Last-Event-ID` has to be FORWARDED upstream. If it
+    is dropped, resume silently never engages and every reconnect replays everything again —
+    with no error anywhere to show for it."""
+    for raw in (request.query_params.get("from_seq"), request.headers.get("Last-Event-ID")):
+        if raw is None:
+            continue
+        try:
+            return int(str(raw).strip())
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 @tasks_router.get("/{task_id}/events", summary="Stream progress/result events (SSE)")
 async def task_events(request: Request, task_id: str) -> StreamingResponse:
     svc = _workflow(request)
     await svc.get(task_id)  # 404 early if the task is unknown (before we start streaming)
+    from_seq = _resume_seq(request)
 
     async def event_stream():
-        async for ev in svc.events(task_id):
+        async for ev in svc.events(task_id, from_seq=from_seq):
             # `None` is a heartbeat (see `events()`): an SSE comment line, ignored by
             # EventSource but enough to keep an idle proxy/browser from timing out the
-            # connection and forcing a reconnect (which replays the whole buffer).
-            yield ": keep-alive\n\n" if ev is None else f"data: {json.dumps(ev, default=str)}\n\n"
+            # connection and forcing a reconnect. Heartbeats carry no `id:` — they are not
+            # events and must not move the client's resume marker.
+            if ev is None:
+                yield ": keep-alive\n\n"
+                continue
+            # `id:` is what makes the reconnect incremental: the browser stores the last one
+            # it saw and returns it as `Last-Event-ID`. It is the same `seq` already inside the
+            # payload, so a client that dedupes on `seq` keeps working untouched.
+            yield f"id: {ev.get('seq', '')}\ndata: {json.dumps(ev, default=str)}\n\n"
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@tasks_router.get(
+    "/{task_id}/audio/{table_id}/{speaker}/{round_index}",
+    summary="Fetch one roundtable turn's TTS clip",
+)
+async def task_turn_audio(
+    request: Request, task_id: str, table_id: str, speaker: str, round_index: int
+):
+    """The mp3 an `agent_utterance_audio` event pointed at with its `audio_url`.
+
+    The clip is served here rather than inlined in the event so the SSE stream — replayed on
+    reconnect and mirrored to the store — stays small, and so a large audio frame never sits
+    ahead of a latency-sensitive `round_control` prompt on the same connection.
+
+    404 covers "never synthesized" and "evicted from the bounded cache" alike; both mean the
+    same thing to a caller (no audio for this turn), and neither is an error worth escalating —
+    TTS is decoration on a discussion that already happened."""
+    audio = audio_store.get(
+        task_id=task_id, table_id=table_id, speaker=speaker, round_index=round_index)
+    if audio is None:
+        raise ApiError(404, "no audio for that turn")
+    return Response(content=audio, media_type=audio_store.AUDIO_MEDIA_TYPE,
+                    headers={"Cache-Control": "no-store"})
 
 
 @tasks_router.post("/{task_id}/review", summary="Resume the human gate with per-platform verdicts")
