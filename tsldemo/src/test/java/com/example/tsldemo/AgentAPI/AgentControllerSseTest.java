@@ -99,6 +99,35 @@ class AgentControllerSseTest {
     }
 
     @Test
+    @DisplayName("a compliance block survives the SSE relay intact")
+    void complianceBlockSurvivesTheRelay() throws Exception {
+        // The gate re-opens over SSE, not just on the snapshot, and these three keys are how a
+        // client knows a plain `approve` will now be refused. Relaying them through a typed DTO
+        // would have deleted them silently; this pins the untyped path that replaced it.
+        Map<String, Object> blocked = new LinkedHashMap<>();
+        blocked.put("type", "result");
+        blocked.put("status", "draft_ready");
+        blocked.put("platform", "linkedin");
+        blocked.put("seq", 7);
+        blocked.put("draft", "the copy that tripped the screen");
+        blocked.put("blocked", true);
+        blocked.put("block_reason", "self-harm");
+        blocked.put("allowed_decisions", java.util.List.of("approve_after_edit", "reject", "discard"));
+
+        MockMvc mvc = mvc(streaming(blocked));
+        MvcResult started = mvc.perform(MockMvcRequestBuilders.get("/tasks/t1/events")).andReturn();
+        String body = mvc.perform(MockMvcRequestBuilders.asyncDispatch(started))
+                .andReturn().getResponse().getContentAsString();
+
+        assertThat(body).contains("\"blocked\":true");
+        assertThat(body).contains("\"block_reason\":\"self-harm\"");
+        assertThat(body).contains("approve_after_edit").contains("reject").contains("discard");
+        // …and `approve` is NOT among them: offering it would be offering a button the service
+        // answers 400 to.
+        assertThat(body).doesNotContain("\"approve\"");
+    }
+
+    @Test
     @DisplayName("a turn's audio is served as mpeg bytes, and a missing clip as a 404")
     void audioIsServedAsBytes() throws Exception {
         byte[] mp3 = {(byte) 0xFF, (byte) 0xFB, 0x10};
