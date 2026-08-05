@@ -140,6 +140,9 @@ type VideoSlide =
 
 interface VideoStoryboard {
   brandName: string;
+  /** The storyboard's creative theme (StoryboardSpec.theme) — used as the byline in the
+   *  LinkedIn preview. Optional here because only that card reads it. */
+  theme?: string;
   primaryColor: string;
   secondaryColor: string;
   accentColor: string;
@@ -239,7 +242,14 @@ interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
-  variant?: "status" | "draft" | "text-preview" | "html-preview" | "roundtable" | "plan-preview";
+  variant?:
+    | "status"
+    | "draft"
+    | "text-preview"
+    | "html-preview"
+    | "roundtable"
+    | "plan-preview"
+    | "linkedin-post";
   platform?: Platform;
   draft?: DraftContent;
   html?: string;
@@ -257,6 +267,10 @@ interface Message {
   // of on Post Now. Absent whenever the user named no time, which is the common case.
   publishAt?: string;
   videoStoryboard?: VideoStoryboard;
+  // The storyboard's own gate (variant === "linkedin-post"). Separate from `approval`, which
+  // gates the copy: on a text+video post the user signs off the two in sequence inside one card,
+  // and the storyboard can be sent back for changes after the copy is already approved.
+  storyboardApproval?: ApprovalStatus;
   // User-attached reference images (base64 data URLs) for image-to-video generation
   // (Higgsfield backend). Threaded from the compose box onto the storyboard message so
   // the render trigger can forward them; the free Remotion backend ignores them.
@@ -568,6 +582,10 @@ export default function ChatPage() {
   // table_id -> the id of that table's RoundtableStage message, so later agent_utterance /
   // round_control events for the same table update the SAME card instead of spawning new ones.
   const roundtableMsgIdRef = useRef<Map<string, string>>(new Map());
+  // `${taskId}:${platform}` -> the id of that run's LinkedIn post-mockup message. A LinkedIn
+  // post is reviewed as ONE evolving card (copy → storyboard → render → publish), so every
+  // later event for the same run patches that card instead of stacking another one.
+  const linkedInCardIdRef = useRef<Map<string, string>>(new Map());
 
   // Roundtable auto-play: when on, each persona's TTS clip plays automatically as it
   // arrives (agent_utterance_audio always lands after that persona's text turn, since
@@ -955,22 +973,60 @@ export default function ChatPage() {
     setAttachments((prev) => prev.filter((_, i) => i !== index));
   }
 
-  function handleApproval(messageId: string, approval: ApprovalStatus) {
+  /**
+   * Sends the user's verdict on a text draft to the human gate.
+   *
+   * @param editedText the copy as it stands in the card when Approve was clicked. When it
+   *   differs from what the agent wrote, the verdict becomes `approve_after_edit` and the gate
+   *   swaps the edited copy in as the approved draft — so media_producer storyboards from the
+   *   user's words, and the final post publishes them. Unchanged text sends a plain `approve`.
+   * @param reason free-text feedback on a rejection, threaded back to the creator for the
+   *   re-draft. Optional: rejecting without saying why still works.
+   */
+  function handleApproval(
+    messageId: string,
+    approval: ApprovalStatus,
+    editedText?: string,
+    reason?: string
+  ) {
     const msg = messages.find((m) => m.id === messageId);
     const platformLabel = platformMap[msg?.platform ?? ""]?.label ?? "platform";
 
+    const edited = editedText?.trim();
+    const wasEdited =
+      approval === "approved" && !!edited && edited !== (msg?.draft?.text ?? "").trim();
+
     setMessages((prev) =>
-      prev.map((m) => (m.id === messageId ? { ...m, approval } : m))
+      prev.map((m) =>
+        m.id === messageId
+          ? {
+              ...m,
+              approval,
+              // Keep the card (and everything downstream that reads it — the video caption, the
+              // post body) on the copy the user actually approved, not the draft they replaced.
+              ...(wasEdited ? { draft: { ...m.draft, text: edited! } } : {}),
+            }
+          : m
+      )
     );
 
     // For workflow drafts, submit the verdict to the human gate so the MAF
     // pipeline can continue (media_producer runs after approval, creator re-drafts after reject).
     if (msg?.workflowTaskId && msg.platform) {
-      const decision = approval === "approved" ? "approve" : "reject";
+      const decision =
+        approval !== "approved" ? "reject" : wasEdited ? "approve_after_edit" : "approve";
       fetch(`/api/tasks/${msg.workflowTaskId}/review`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ verdicts: { [msg.platform]: { decision } } }),
+        body: JSON.stringify({
+          verdicts: {
+            [msg.platform]: {
+              decision,
+              ...(wasEdited ? { edited_draft: edited } : {}),
+              ...(reason?.trim() ? { reason: reason.trim() } : {}),
+            },
+          },
+        }),
       }).catch(() => {
         // Non-fatal: the SSE stream will surface an error event if the review fails.
       });
@@ -1002,6 +1058,63 @@ export default function ChatPage() {
       return [...prev.slice(0, idx), full, ...prev.slice(idx)];
     });
     return id;
+  }
+
+  // ── LinkedIn post mockup — one growing card per (task, platform) ─────────────
+
+  /**
+   * Applies `patch` to a run's LinkedIn post card, creating it on first contact.
+   *
+   * The card is the post itself, not a step in it: the copy arrives first (draft_ready), the
+   * storyboard lands in its media slot afterwards (final), and the render replaces that — all
+   * in the same mockup, so the user is always looking at the thing they're about to publish.
+   * Keyed by task AND platform because one run can draft for several platforms at once.
+   */
+  function upsertLinkedInCard(
+    taskId: string,
+    platform: Platform,
+    patch: (m: Message) => Partial<Message>
+  ) {
+    const key = `${taskId}:${platform}`;
+    setMessages((prev) => {
+      const existingId = linkedInCardIdRef.current.get(key);
+      if (existingId) {
+        return prev.map((m) => (m.id === existingId ? { ...m, ...patch(m) } : m));
+      }
+      const id = newId();
+      linkedInCardIdRef.current.set(key, id);
+      const base: Message = {
+        id,
+        role: "assistant",
+        content: "Here's how your LinkedIn post is shaping up:",
+        variant: "linkedin-post",
+        platform,
+        workflowTaskId: taskId,
+        timestamp: new Date(),
+      };
+      return [...prev, { ...base, ...patch(base) }];
+    });
+  }
+
+  /** Signs off (or sends back) the storyboard stage. Purely local: by the time a storyboard
+   *  exists the workflow has already yielded its output, so there is no gate to answer —
+   *  approving it just unlocks the render. */
+  function setStoryboardApproval(messageId: string, approval: ApprovalStatus) {
+    setMessages((prev) =>
+      prev.map((m) => (m.id === messageId ? { ...m, storyboardApproval: approval } : m))
+    );
+  }
+
+  /** Swaps in a revised storyboard after the user asked for changes, leaving it pending so
+   *  they can look at the revision and either accept it or push back again. */
+  function patchLinkedInStoryboard(messageId: string, storyboard: VideoStoryboard) {
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === messageId
+          ? { ...m, videoStoryboard: storyboard, storyboardApproval: "pending" }
+          : m
+      )
+    );
   }
 
   // ── Roundtable stage helpers — one growing stage per table_id ────────────────
@@ -1115,6 +1228,10 @@ export default function ChatPage() {
     // Each call is a fresh task with its own tables — table_ids (== platform names) are
     // reused across runs, so a stale map entry would otherwise append onto a dead card.
     roundtableMsgIdRef.current.clear();
+    // Keyed by task id, so these can't collide across runs — cleared only to stop the map
+    // growing for the length of the session. Storyboard revisions patch by message id, so an
+    // earlier run's card stays fully interactive after this.
+    linkedInCardIdRef.current.clear();
 
     // 1. Start the MAF workflow task.
     let taskId: string;
@@ -1264,23 +1381,35 @@ export default function ChatPage() {
       // immediately — they never asked to review the underlying text copy.
       if (type === "result" && status === "draft_ready") {
         if (contentTypes.includes("text")) {
-          pushMessage({
-            role: "assistant",
-            content: `Here's your ${platform} draft — approve or request changes:`,
-            variant: "text-preview",
-            platform: platform as Platform,
+          const draftFields = {
             draft: { text: event.draft as string },
-            workflowTaskId: taskId,
             needsHumanIntervention: (event.needs_human_intervention as boolean) ?? false,
-            approval: "pending",
+            approval: "pending" as ApprovalStatus,
             // When a video was also requested, the single publish is the native video post
-            // (caption = this copy) from the storyboard card below — so hide this card's own
-            // text/image post buttons to avoid a competing second post.
+            // (caption = this copy) — so no competing text-only post is offered.
             videoAlsoRequested: contentTypes.includes("video"),
             // Set only when this turn's request actually named a time; the card falls back to
             // Post Now otherwise.
             publishAt: requestedPublishAtRef.current || undefined,
-          });
+          };
+          if (platform === "linkedin") {
+            // LinkedIn reviews the whole post in one mockup card. Upsert rather than push so a
+            // re-draft after "Request changes" lands back in the SAME card as fresh pending copy,
+            // instead of leaving the rejected version sitting above it.
+            upsertLinkedInCard(taskId, "linkedin", () => ({
+              content: "Here's how your LinkedIn post is shaping up — edit the copy if you like, then approve:",
+              ...draftFields,
+            }));
+          } else {
+            pushMessage({
+              role: "assistant",
+              content: `Here's your ${platform} draft — approve or request changes:`,
+              variant: "text-preview",
+              platform: platform as Platform,
+              workflowTaskId: taskId,
+              ...draftFields,
+            });
+          }
           if (sessionIdRef.current) {
             persistMessage(sessionIdRef.current, "assistant", event.draft as string);
           }
@@ -1317,18 +1446,35 @@ export default function ChatPage() {
         // storyboard is data only at this point — rendering the MP4 is a separate,
         // explicitly-triggered job (see VideoStoryboardCard's "Render Video" button).
         if (event.video_storyboard && contentTypes.includes("video")) {
-          pushMessage({
-            role: "assistant",
-            content: `Brand video storyboard — ${platform}:`,
+          const storyboardFields = {
             videoStoryboard: event.video_storyboard as VideoStoryboard,
-            platform: platform as Platform,
-            workflowTaskId: taskId,
-            approval: "approved",
             referenceImages: pendingRefsRef.current.length ? pendingRefsRef.current : undefined,
-            // Carry the approved copy so the video card prefills its caption with it — a text+video
-            // task then publishes as one native video post with the generated copy as the caption.
-            draft: contentTypes.includes("text") ? { text: event.draft as string } : undefined,
-          });
+          };
+          if (platform === "linkedin") {
+            // Slot the storyboard into the media area of the card the copy is already in. A
+            // video-only run never hit the gate, so there may be no card yet — upsert creates
+            // one, carrying the storyboard straight to its own approval step.
+            upsertLinkedInCard(taskId, "linkedin", () => ({
+              content: "Storyboard's ready — take a look before we render it:",
+              ...storyboardFields,
+              storyboardApproval: "pending",
+              // media_producer generates from the approved (possibly edited) copy, so `draft`
+              // here is the text the user signed off — the caption this publishes with.
+              draft: contentTypes.includes("text") ? { text: event.draft as string } : undefined,
+            }));
+          } else {
+            pushMessage({
+              role: "assistant",
+              content: `Brand video storyboard — ${platform}:`,
+              platform: platform as Platform,
+              workflowTaskId: taskId,
+              approval: "approved",
+              ...storyboardFields,
+              // Carry the approved copy so the video card prefills its caption with it — a text+video
+              // task then publishes as one native video post with the generated copy as the caption.
+              draft: contentTypes.includes("text") ? { text: event.draft as string } : undefined,
+            });
+          }
         }
       }
     };
@@ -1719,6 +1865,23 @@ export default function ChatPage() {
         {/* Messages */}
         <div className="flex-1 overflow-y-auto px-6 py-6 space-y-5">
           {messages.map((msg) => {
+            // Checked before the storyboard branch below, which keys off field presence rather
+            // than variant: once a storyboard lands in a LinkedIn card's media area it would
+            // otherwise flip the whole post mockup over to the bare storyboard card.
+            if (msg.variant === "linkedin-post") {
+              return (
+                <LinkedInPostCard
+                  key={msg.id}
+                  message={msg}
+                  onApprove={(editedText) => handleApproval(msg.id, "approved", editedText)}
+                  onReject={(reason) => handleApproval(msg.id, "rejected", undefined, reason)}
+                  onStoryboardApprove={() => setStoryboardApproval(msg.id, "approved")}
+                  onStoryboardPatch={(storyboard) => patchLinkedInStoryboard(msg.id, storyboard)}
+                  formatTime={formatTime}
+                />
+              );
+            }
+
             // Workflow final event: storyboard delivered directly (no job polling
             // needed for this part) — actually rendering the MP4 is a separate,
             // explicitly-triggered job the card kicks off on demand.
@@ -3723,6 +3886,670 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
         <p className="text-xs text-[#9E9893] px-4 pb-3">
           {formatTime(message.timestamp)}
         </p>
+      </div>
+    </div>
+  );
+}
+
+// ── LinkedIn Post Card ────────────────────────────────────────────────────────
+
+interface LinkedInPostCardProps {
+  message: Message;
+  /** Approve the copy. Receives the text as it stands in the editor, which may differ from
+   *  what the agent wrote — the caller turns that into an `approve_after_edit` verdict. */
+  onApprove: (editedText: string) => void;
+  onReject: (reason: string) => void;
+  onStoryboardApprove: () => void;
+  onStoryboardPatch: (storyboard: VideoStoryboard) => void;
+  formatTime: (d: Date) => string;
+}
+
+/** The publish moment as a LinkedIn feed post would show it: "now", "2h", "3d". */
+function relativePostAge(at: Date): string {
+  const mins = Math.max(0, Math.floor((Date.now() - at.getTime()) / 60000));
+  if (mins < 1) return "now";
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
+}
+
+/**
+ * One LinkedIn post, reviewed in place from first draft to publish.
+ *
+ * The card IS the post: the copy sits where the copy will sit, the storyboard (and then the
+ * rendered MP4) sits where the media will sit, and each stage's controls hang off the bottom of
+ * the same mockup. That replaces a read-only draft card and a separate, ungated storyboard card
+ * whose relationship to each other — one post, not two — was never visible.
+ *
+ * Four stages, driven by the message rather than local state so an SSE re-draft lands correctly:
+ *   A. copy       `approval === "pending"`             — editable, Approve / Request changes
+ *   B. storyboard `storyboardApproval === "pending"`   — Approve / Request changes (regenerates)
+ *   C. render     storyboard approved                  — Render video
+ *   D. publish    render done                          — Post, or Post now / Schedule (text only)
+ *
+ * Scheduling is offered on text-only posts only. A video publishes through
+ * /linkedin/post-video, while the scheduler is text-only (scheduled_post carries no media), so
+ * scheduling a video post would be a promise nothing downstream could keep.
+ */
+function LinkedInPostCard({
+  message,
+  onApprove,
+  onReject,
+  onStoryboardApprove,
+  onStoryboardPatch,
+  formatTime,
+}: LinkedInPostCardProps) {
+  const draftText = message.draft?.text ?? "";
+  const hashtags = message.draft?.hashtags ?? [];
+  const approval = message.approval;
+  const storyboard = message.videoStoryboard;
+  const storyboardApproval = message.storyboardApproval;
+  // Video is part of this post either because the run asked for one, or because a storyboard has
+  // already landed (a video-only run never sets the flag).
+  const hasVideo = !!message.videoAlsoRequested || !!storyboard;
+
+  // The copy editor is uncontrolled and read on submit: there is no save step, so nothing about
+  // editing can gate the pipeline. `key` remounts it with fresh text when the agent re-drafts.
+  const textRef = useRef<HTMLTextAreaElement>(null);
+
+  const [rejectOpen, setRejectOpen] = useState(false);
+  const [rejectText, setRejectText] = useState("");
+
+  // Storyboard revision.
+  const [sbFeedbackOpen, setSbFeedbackOpen] = useState(false);
+  const [sbFeedback, setSbFeedback] = useState("");
+  const [sbStatus, setSbStatus] = useState<"idle" | "revising" | "error">("idle");
+  const [sbError, setSbError] = useState<string | null>(null);
+
+  // Render — same contract as VideoStoryboardCard: start a job, then poll it.
+  const [renderState, setRenderState] = useState<"idle" | "pending" | "done" | "error">("idle");
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [renderError, setRenderError] = useState<string | null>(null);
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  const [refs, setRefs] = useState<string[]>(message.referenceImages ?? []);
+
+  // Publishing.
+  const [postStatus, setPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
+  const [postError, setPostError] = useState<string | null>(null);
+
+  // Scheduling (text-only posts). Seeded from the moment the agent read out of the request, so
+  // "post this Friday at 10" opens on Schedule with Friday 10:00 already filled in.
+  const [agentDate, agentTime] = splitPublishAt(message.publishAt);
+  const [postMode, setPostMode] = useState<"now" | "schedule">(agentDate ? "schedule" : "now");
+  const [scheduleDate, setScheduleDate] = useState(agentDate);
+  const [scheduleTime, setScheduleTime] = useState(agentTime);
+  const [scheduleStatus, setScheduleStatus] =
+    useState<"idle" | "scheduling" | "scheduled" | "error">("idle");
+  const [scheduleError, setScheduleError] = useState<string | null>(null);
+
+  // A video-only run drafts no copy, so there is nothing to approve and nothing to caption the
+  // post with — the body doubles as the caption box until the post goes out.
+  const captionEntry = !draftText.trim() && postStatus !== "posted";
+  const bodyEditable = approval === "pending" || captionEntry;
+
+  /** The copy as it will actually publish: body plus hashtags. Reads the editor while it is
+   *  open, so an in-progress edit (or a caption typed on a video-only run) is what publishes. */
+  function captionText() {
+    const live = textRef.current?.value;
+    const body = live !== undefined && live !== null ? live : draftText;
+    return hashtags.length > 0 ? `${body}\n\n${hashtags.join(" ")}` : body;
+  }
+
+  function autoGrow(el: HTMLTextAreaElement) {
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }
+
+  async function reviseStoryboard() {
+    if (!message.workflowTaskId || !message.platform || !sbFeedback.trim()) return;
+    setSbStatus("revising");
+    setSbError(null);
+    try {
+      const res = await fetch("/api/storyboard", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          taskId: message.workflowTaskId,
+          platform: message.platform,
+          feedback: sbFeedback.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error || !data.storyboard) {
+        setSbStatus("error");
+        setSbError(data.error ?? "Could not revise the storyboard.");
+        return;
+      }
+      onStoryboardPatch(data.storyboard as VideoStoryboard);
+      setSbStatus("idle");
+      setSbFeedback("");
+      setSbFeedbackOpen(false);
+    } catch {
+      setSbStatus("error");
+      setSbError("Could not reach the backend.");
+    }
+  }
+
+  async function startRender() {
+    if (!message.workflowTaskId || !message.platform) return;
+    setRenderState("pending");
+    setRenderError(null);
+    setElapsed(0);
+    try {
+      const res = await fetch("/api/video", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          taskId: message.workflowTaskId,
+          platform: message.platform,
+          ...(refs.length > 0 ? { referenceImages: refs } : {}),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setRenderState("error");
+        setRenderError(data.error ?? "Could not start the render.");
+        return;
+      }
+      setJobId(data.jobId as string);
+    } catch {
+      setRenderState("error");
+      setRenderError("Could not reach the video backend.");
+    }
+  }
+
+  useEffect(() => {
+    if (renderState !== "pending" || !jobId) return;
+
+    // The render is a Remotion CLI subprocess (asset fetch + headless Chromium) — tens of
+    // seconds, so poll on a 3s cadence rather than anything tighter.
+    const poll = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/video/${jobId}`);
+        const data = await res.json();
+        if (data.status === "done") {
+          setDownloadUrl(data.downloadUrl as string);
+          setRenderState("done");
+        } else if (data.status === "error") {
+          setRenderState("error");
+          setRenderError(data.error ?? "Render failed.");
+        }
+      } catch {
+        // transient network error — keep polling
+      }
+    }, 3000);
+
+    const tick = setInterval(() => setElapsed((s) => s + 1), 1000);
+    return () => {
+      clearInterval(poll);
+      clearInterval(tick);
+    };
+  }, [renderState, jobId]);
+
+  async function handlePost() {
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setPostStatus("error");
+      setPostError("Log in, then connect LinkedIn from your Brand Profile before posting.");
+      return;
+    }
+    // Read once: the editor is the source of truth while it's open, and LinkedIn rejects an
+    // empty post either way — better to say so here than to round-trip for the same answer.
+    const message = captionText();
+    if (!message.trim()) {
+      setPostStatus("error");
+      setPostError("Write a caption for this post first.");
+      return;
+    }
+    setPostStatus("posting");
+    setPostError(null);
+    try {
+      // A text+video post publishes once, as a native video post with this copy as the caption.
+      const res = hasVideo
+        ? await fetch("/api/linkedin/post-video", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ jobId, message }),
+          })
+        : await fetch("/api/linkedin/post", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ message }),
+          });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setPostStatus("error");
+        setPostError(data.error ?? "Failed to post to LinkedIn.");
+        return;
+      }
+      setPostStatus("posted");
+    } catch {
+      setPostStatus("error");
+      setPostError("Could not reach the backend.");
+    }
+  }
+
+  /**
+   * Queues a text-only post instead of publishing it now.
+   *
+   * Goes through the shared scheduling API so it lands in the same persisted queue the content
+   * calendar reads — one place to see, edit and cancel it, and a schedule that survives a backend
+   * restart. The browser's timezone rides along so "10:00" means 10:00 where the user is.
+   */
+  async function handleSchedule() {
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      setScheduleStatus("error");
+      setScheduleError("Log in, then connect LinkedIn from your Brand Profile before scheduling.");
+      return;
+    }
+    if (!scheduleDate || !scheduleTime) {
+      setScheduleStatus("error");
+      setScheduleError("Pick a date and time first.");
+      return;
+    }
+    setScheduleStatus("scheduling");
+    setScheduleError(null);
+    try {
+      const res = await fetch("/api/schedule/posts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          platform: "linkedin",
+          message: captionText(),
+          date: scheduleDate,
+          time: scheduleTime,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          page_ids: [],
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setScheduleStatus("error");
+        setScheduleError(data.error ?? "Failed to schedule the post.");
+        return;
+      }
+      setScheduleStatus("scheduled");
+    } catch {
+      setScheduleStatus("error");
+      setScheduleError("Could not reach the backend.");
+    }
+  }
+
+  // The storyboard names the brand, so the mockup's author row can too once one exists.
+  const brandName = storyboard?.brandName?.trim() || "Your brand";
+  const initial = brandName.charAt(0).toUpperCase();
+
+  const stageLabel =
+    postStatus === "posted"
+      ? "Published"
+      : scheduleStatus === "scheduled"
+        ? "Scheduled"
+        : approval === "pending"
+          ? "Copy — needs your approval"
+          : approval === "rejected"
+            ? "Rewriting the copy…"
+            : storyboardApproval === "pending"
+              ? "Storyboard — needs your approval"
+              : renderState === "done"
+                ? "Ready to publish"
+                : hasVideo && !storyboard
+                  ? "Building the storyboard…"
+                  : "Ready to render";
+
+  return (
+    <div className="w-full max-w-lg">
+      <p className="text-sm text-[#6B6561] mb-2">{message.content}</p>
+
+      <div className="bg-white border border-[#E8E3DA] rounded-2xl overflow-hidden shadow-sm">
+        {/* Preview strip — this is a composition mockup, never a live post. */}
+        <div className="flex items-center justify-between px-4 py-2 bg-[#F8F5EE] border-b border-[#E8E3DA]">
+          <span className="flex items-center gap-1.5 text-xs font-semibold text-[#6B6561]">
+            <span className="w-4 h-4 rounded-sm bg-[#0A66C2] text-white text-[10px] font-bold flex items-center justify-center">
+              in
+            </span>
+            LinkedIn preview
+          </span>
+          <span className="text-[10px] font-medium text-[#6B6561] bg-white border border-[#E8E3DA] px-2 py-0.5 rounded-full">
+            {stageLabel}
+          </span>
+        </div>
+
+        {/* Author row */}
+        <div className="flex items-center gap-3 px-4 pt-4">
+          <div className="w-12 h-12 rounded-full bg-[#0A66C2] text-white text-lg font-semibold flex items-center justify-center shrink-0">
+            {initial}
+          </div>
+          <div className="min-w-0">
+            <div className="text-sm font-semibold text-[#1B1A17] truncate">{brandName}</div>
+            <div className="text-xs text-[#6B6561] truncate">
+              {storyboard?.theme || "Brand page"}
+            </div>
+            <div className="flex items-center gap-1 text-xs text-[#9E9893]">
+              {relativePostAge(message.timestamp)} ·
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                <path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm7 9h-3a15 15 0 0 0-1.1-5.2A8 8 0 0 1 19 11ZM12 4c.9 1.3 1.7 3.6 1.9 7h-3.8C10.3 7.6 11.1 5.3 12 4ZM9.1 5.8A15 15 0 0 0 8 11H5a8 8 0 0 1 4.1-5.2ZM5 13h3a15 15 0 0 0 1.1 5.2A8 8 0 0 1 5 13Zm7 7c-.9-1.3-1.7-3.6-1.9-7h3.8c-.2 3.4-1 5.7-1.9 7Zm2.9-1.8A15 15 0 0 0 16 13h3a8 8 0 0 1-4.1 5.2Z" />
+              </svg>
+            </div>
+          </div>
+        </div>
+
+        {/* Post body — editable while the copy is still up for approval. */}
+        <div className="px-4 pt-3">
+          {message.needsHumanIntervention && approval === "pending" && (
+            <div className="mb-3 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-xs text-amber-700">
+              The AI reviewer flagged this draft after multiple attempts — your direct input is needed.
+            </div>
+          )}
+
+          {bodyEditable ? (
+            <textarea
+              // Callback ref so the box is already sized to the draft on mount — `rows` alone
+              // would scroll a long post until the first keystroke grew it.
+              ref={(el) => {
+                textRef.current = el;
+                if (el) autoGrow(el);
+              }}
+              key={draftText}
+              defaultValue={draftText}
+              onInput={(e) => autoGrow(e.currentTarget)}
+              rows={3}
+              aria-label="Post copy"
+              placeholder={captionEntry ? "Write the caption for this post…" : undefined}
+              className="w-full bg-transparent text-sm text-[#1B1A17] leading-relaxed resize-none rounded-lg px-2 py-1 -mx-2 border border-transparent placeholder:text-[#9E9893] hover:border-[#E8E3DA] focus:bg-[#F8F5EE] focus:border-[#0A66C2] focus:outline-none transition-colors"
+            />
+          ) : (
+            draftText && (
+              <p className="text-sm text-[#1B1A17] whitespace-pre-wrap leading-relaxed">
+                {draftText}
+              </p>
+            )
+          )}
+
+          {hashtags.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mt-2">
+              {hashtags.map((tag) => (
+                <span key={tag} className="text-xs text-[#0A66C2] font-medium">
+                  {tag}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Media area — the storyboard stands in for the video until the MP4 exists. */}
+        {(storyboard || renderState !== "idle") && (
+          <div className="mt-3 bg-[#F8F5EE] border-y border-[#E8E3DA] p-3">
+            {renderState === "done" && downloadUrl ? (
+              <video src={downloadUrl} controls className="w-full rounded-lg bg-black" />
+            ) : storyboard ? (
+              <StoryboardPreview storyboard={storyboard} />
+            ) : null}
+
+            {renderState === "pending" && (
+              <div className="flex flex-col items-center justify-center gap-2 text-[#9E9893] py-4">
+                <svg className="animate-spin" width={28} height={28} viewBox="0 0 24 24" fill="none">
+                  <circle cx="12" cy="12" r="10" stroke="#E8E3DA" strokeWidth="3" />
+                  <path d="M12 2a10 10 0 0 1 10 10" stroke="#FF4800" strokeWidth="3" strokeLinecap="round" />
+                </svg>
+                <p className="text-xs font-medium text-center">Rendering video… {elapsed}s elapsed</p>
+              </div>
+            )}
+
+            {renderState === "error" && (
+              <p className="text-xs text-red-600 text-center mt-3">{renderError}</p>
+            )}
+          </div>
+        )}
+
+        {/* Engagement bar — deliberately count-free: this post doesn't exist yet, and inventing
+            reactions for it would be inventing data. */}
+        <div className="flex items-center justify-around px-2 py-1.5 mt-1 border-t border-[#E8E3DA] text-[#9E9893]">
+          {["Like", "Comment", "Repost", "Send"].map((action) => (
+            <span key={action} className="flex-1 text-center text-xs font-medium py-1.5 select-none">
+              {action}
+            </span>
+          ))}
+        </div>
+
+        {/* ── Review controls ─────────────────────────────────────────────────── */}
+        <div className="bg-[#F8F5EE] border-t border-[#E8E3DA] px-4 py-3 space-y-2">
+          {/* Stage A — the copy */}
+          {approval === "pending" && (
+            <>
+              <p className="text-[11px] text-[#9E9893]">
+                Edit the copy above if you want — your changes go through with the approval.
+              </p>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => onApprove(textRef.current?.value ?? draftText)}
+                  className="flex-1 bg-green-600 hover:bg-green-500 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                >
+                  Approve copy
+                </button>
+                <button
+                  onClick={() => setRejectOpen((open) => !open)}
+                  className="flex-1 bg-white hover:bg-[#E8E3DA] text-[#1B1A17] text-sm font-medium py-2 rounded-lg transition-colors border border-[#E8E3DA]"
+                >
+                  Request changes
+                </button>
+              </div>
+              {rejectOpen && (
+                <div className="space-y-2 pt-1">
+                  <textarea
+                    value={rejectText}
+                    onChange={(e) => setRejectText(e.target.value)}
+                    placeholder="What should change? (optional)"
+                    rows={2}
+                    className="w-full bg-white border border-[#E8E3DA] rounded-lg px-3 py-2 text-xs text-[#1B1A17] placeholder:text-[#9E9893] resize-none focus:outline-none focus:border-[#0A66C2]"
+                  />
+                  <button
+                    onClick={() => onReject(rejectText)}
+                    className="w-full bg-[#1B1A17] hover:bg-black text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                  >
+                    Send back for a rewrite
+                  </button>
+                </div>
+              )}
+            </>
+          )}
+
+          {approval === "rejected" && (
+            <p className="text-xs text-[#6B6561]">
+              Sent back — the new draft will land in this same post.
+            </p>
+          )}
+
+          {/* Between approving the copy and the storyboard arriving. */}
+          {approval === "approved" && hasVideo && !storyboard && (
+            <p className="text-xs text-[#6B6561]">
+              Copy approved. Building the video storyboard from it…
+            </p>
+          )}
+
+          {/* Stage B — the storyboard */}
+          {storyboard && storyboardApproval === "pending" && (
+            <>
+              <div className="flex gap-2">
+                <button
+                  onClick={onStoryboardApprove}
+                  disabled={sbStatus === "revising"}
+                  className="flex-1 bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                >
+                  Approve storyboard
+                </button>
+                <button
+                  onClick={() => setSbFeedbackOpen((open) => !open)}
+                  disabled={sbStatus === "revising"}
+                  className="flex-1 bg-white hover:bg-[#E8E3DA] disabled:opacity-50 text-[#1B1A17] text-sm font-medium py-2 rounded-lg transition-colors border border-[#E8E3DA]"
+                >
+                  Request changes
+                </button>
+              </div>
+              {sbFeedbackOpen && (
+                <div className="space-y-2 pt-1">
+                  <textarea
+                    value={sbFeedback}
+                    onChange={(e) => setSbFeedback(e.target.value)}
+                    placeholder="What should change? e.g. 'open on the stat, drop the pie chart'"
+                    rows={2}
+                    disabled={sbStatus === "revising"}
+                    className="w-full bg-white border border-[#E8E3DA] rounded-lg px-3 py-2 text-xs text-[#1B1A17] placeholder:text-[#9E9893] resize-none focus:outline-none focus:border-[#0A66C2] disabled:opacity-60"
+                  />
+                  <button
+                    onClick={reviseStoryboard}
+                    disabled={sbStatus === "revising" || !sbFeedback.trim()}
+                    className="w-full bg-[#FF4800] hover:bg-[#E03E00] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                  >
+                    {sbStatus === "revising" ? "Reworking the storyboard…" : "Rework storyboard"}
+                  </button>
+                  <p className="text-[11px] text-[#9E9893]">
+                    Only the storyboard changes — your approved copy stays as it is.
+                  </p>
+                </div>
+              )}
+              {sbStatus === "error" && sbError && <p className="text-xs text-red-600">{sbError}</p>}
+            </>
+          )}
+
+          {/* Stage C — render */}
+          {storyboard &&
+            storyboardApproval === "approved" &&
+            (renderState === "idle" || renderState === "error") && (
+              <>
+                {refs.length > 0 && (
+                  <div className="mb-1">
+                    <p className="text-[10px] text-[#9E9893] mb-1.5">
+                      Reference image{refs.length !== 1 ? "s" : ""} — the video is generated from these:
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      {refs.map((src, i) => (
+                        <div key={i} className="relative">
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img
+                            src={src}
+                            alt={`reference ${i + 1}`}
+                            className="w-12 h-12 object-cover rounded-md border border-[#E8E3DA]"
+                          />
+                          <button
+                            onClick={() => setRefs((prev) => prev.filter((_, j) => j !== i))}
+                            aria-label={`Remove reference ${i + 1}`}
+                            className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-[#1B1A17] text-white text-[10px] flex items-center justify-center shadow hover:bg-[#FF4800] transition-colors"
+                          >
+                            ×
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                <button
+                  onClick={startRender}
+                  className="w-full bg-[#FF4800] hover:bg-[#E03E00] text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                >
+                  {renderState === "error" ? "Retry render" : "Render video"}
+                </button>
+              </>
+            )}
+
+          {/* Stage D — publish */}
+          {postStatus === "posted" ? (
+            <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+              ✓ Posted to LinkedIn
+            </div>
+          ) : scheduleStatus === "scheduled" ? (
+            <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+              ✓ Scheduled for {scheduleDate} at {scheduleTime}
+            </div>
+          ) : (
+            <>
+              {/* Video: one publish, now. The scheduler is text-only, so there is nothing
+                  honest to offer here beyond posting it. */}
+              {hasVideo && renderState === "done" && (
+                <button
+                  onClick={handlePost}
+                  disabled={postStatus === "posting"}
+                  className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                >
+                  {postStatus === "posting" ? "Uploading & posting…" : "Post to LinkedIn"}
+                </button>
+              )}
+
+              {/* Text-only: post now, or queue it for a future date. */}
+              {!hasVideo && approval === "approved" && (
+                <>
+                  <div className="flex gap-1 p-1 bg-white border border-[#E8E3DA] rounded-lg">
+                    {(["now", "schedule"] as const).map((mode) => (
+                      <button
+                        key={mode}
+                        onClick={() => setPostMode(mode)}
+                        className={`flex-1 text-xs font-medium py-1.5 rounded-md transition-colors ${
+                          postMode === mode
+                            ? "bg-[#0A66C2] text-white"
+                            : "text-[#6B6561] hover:bg-[#F8F5EE]"
+                        }`}
+                      >
+                        {mode === "now" ? "Post now" : "Schedule"}
+                      </button>
+                    ))}
+                  </div>
+
+                  {postMode === "now" ? (
+                    <button
+                      onClick={handlePost}
+                      disabled={postStatus === "posting"}
+                      className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                    >
+                      {postStatus === "posting" ? "Posting…" : "Post to LinkedIn"}
+                    </button>
+                  ) : (
+                    <>
+                      {agentDate && (
+                        <p className="text-[11px] text-[#9E9893]">
+                          Timed from your request — adjust it here if that&apos;s not what you meant.
+                        </p>
+                      )}
+                      <div className="flex gap-2">
+                        <input
+                          type="date"
+                          value={scheduleDate}
+                          onChange={(e) => setScheduleDate(e.target.value)}
+                          aria-label="Publish date"
+                          className="flex-1 bg-white border border-[#E8E3DA] rounded-lg px-2 py-1.5 text-xs text-[#1B1A17] focus:outline-none focus:border-[#0A66C2]"
+                        />
+                        <input
+                          type="time"
+                          value={scheduleTime}
+                          onChange={(e) => setScheduleTime(e.target.value)}
+                          aria-label="Publish time"
+                          className="flex-1 bg-white border border-[#E8E3DA] rounded-lg px-2 py-1.5 text-xs text-[#1B1A17] focus:outline-none focus:border-[#0A66C2]"
+                        />
+                      </div>
+                      <button
+                        onClick={handleSchedule}
+                        disabled={scheduleStatus === "scheduling"}
+                        className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                      >
+                        {scheduleStatus === "scheduling" ? "Scheduling…" : "Schedule post"}
+                      </button>
+                    </>
+                  )}
+                </>
+              )}
+
+              {postStatus === "error" && postError && (
+                <p className="text-xs text-red-600 text-center">{postError}</p>
+              )}
+              {scheduleStatus === "error" && scheduleError && (
+                <p className="text-xs text-red-600 text-center">{scheduleError}</p>
+              )}
+            </>
+          )}
+        </div>
+
+        <p className="text-xs text-[#9E9893] px-4 pb-3 pt-2">{formatTime(message.timestamp)}</p>
       </div>
     </div>
   );
