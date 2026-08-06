@@ -856,6 +856,52 @@ class WorkflowService:
         trigger only needs {task_id, platform} — never a full storyboard round-trip."""
         return self._require(task_id).outputs.get(platform)
 
+    async def regenerate_storyboard(self, task_id: str, platform: str, feedback: str) -> dict:
+        """Re-generate one platform's video storyboard from the user's feedback, leaving the
+        approved copy alone.
+
+        The storyboard is produced after the human gate (media_producer), so by the time the
+        user sees it the workflow has already yielded its output and there is no gate left to
+        send a verdict to. Without this, disliking a storyboard meant re-running the whole
+        task — regenerating new copy the user had already approved just to get different slides.
+
+        The revision replaces `video_storyboard` on the stored FinalDraft, which is what
+        VideoService.start reads (`get_final_draft`) — so the next render picks up the revision
+        with no extra plumbing, and iterating twice compares against the newest storyboard
+        rather than the original.
+        """
+        feedback = (feedback or "").strip()
+        if not feedback:
+            raise ApiError(400, "'feedback' is required — say what should change about the storyboard")
+
+        task = self._require(task_id)
+        final = task.outputs.get(platform)
+        if final is None:
+            raise ApiError(404, f"no finished draft for platform '{platform}' on task {task_id}")
+        previous = final.get("video_storyboard")
+        if not previous:
+            raise ApiError(409, f"platform '{platform}' has no video storyboard yet")
+
+        raw = await factory.get_llm().generate_video_storyboard(
+            topic=task.brief.topic,
+            # A media-only run has no text deliverable, so the FinalDraft's draft is blank —
+            # fall back to the topic rather than asking the LLM to re-storyboard nothing.
+            draft=final.get("draft") or task.brief.topic,
+            tone_hint=task.brief.tone_hint,
+            platform=platform,
+            skill=load_skill("brand_video_storyboard"),
+            direction=feedback,
+            # Framed as a follow-up turn (what we produced, what the user wants changed) so the
+            # revision edits that storyboard rather than starting over from the brief.
+            history=[
+                {"role": "assistant", "content": json.dumps(previous)},
+                {"role": "user", "content": feedback},
+            ],
+        )
+        final["video_storyboard"] = StoryboardSpec(**raw).model_dump()
+        task.outputs[platform] = final
+        return {"video_storyboard": final["video_storyboard"]}
+
     def buffered_events(self, task_id: str) -> list[dict]:
         """Non-blocking snapshot of the event log so far (the SSE replay
         buffer). Unlike `events()`, this never waits for future events."""
@@ -1753,6 +1799,17 @@ class RenderVideoRequest(BaseModel):
     )
 
 
+class RegenerateStoryboardRequest(BaseModel):
+    """Revise one platform's storyboard in place — POST /tasks/{task_id}/regenerate-storyboard.
+    Only the storyboard is re-generated; the approved copy is untouched."""
+
+    platform: str = Field(..., description="Which finished platform draft's storyboard to revise")
+    feedback: str = Field(
+        ..., description="What should change about the storyboard, in the user's own words "
+        "(e.g. 'drop the pie chart and open on the stat instead')."
+    )
+
+
 class CreatePlanRequest(BaseModel):
     """Generate a multi-date posting plan (strategy + schedule, never copy) —
     POST /plans. Returned as a `draft` for the user to review/edit; activate it with
@@ -1993,6 +2050,18 @@ async def render_video(request: Request, task_id: str, body: RenderVideoRequest)
         narration_enabled=body.narration_enabled,
         reference_images=body.reference_images,
     )
+
+
+@tasks_router.post(
+    "/{task_id}/regenerate-storyboard",
+    summary="Revise one platform's video storyboard from user feedback",
+)
+async def regenerate_storyboard(
+    request: Request, task_id: str, body: RegenerateStoryboardRequest
+) -> dict:
+    """Returns the revised `video_storyboard` and stores it against the task, so a later
+    `/render-video` renders the revision. The approved copy is never re-generated."""
+    return await _workflow(request).regenerate_storyboard(task_id, body.platform, body.feedback)
 
 
 @intake_router.post("", summary="Open an intake conversation (voice or text)")
