@@ -4,6 +4,9 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useState } from "react";
 
+import { readToken, useSession } from "../_lib/session";
+import AlreadySignedIn from "../components/AlreadySignedIn";
+
 /** Inner component reads search params (must be wrapped in Suspense). */
 function LoginForm() {
   const router = useRouter();
@@ -15,21 +18,34 @@ function LoginForm() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
+  // Three states, not a boolean — see useSession: "checking" is the server render, where the
+  // honest answer is that localStorage hasn't been read yet.
+  const { status, email: signedInAs } = useSession();
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
     setLoading(true);
 
     try {
+      // Sent so the backend can refuse a second login on its own account. The panel this page
+      // shows a signed-in visitor is the friendly half of that rule; this is the enforced half.
+      const token = readToken();
       const res = await fetch("/api/auth/login", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify({ email, password }),
       });
 
       const data = await res.json();
 
       if (!res.ok) {
+        // A 409 ("already signed in") can only land if a session appeared after this form
+        // rendered — another tab. That tab's write fires a `storage` event, so useSession has
+        // already swapped this page over to the panel by the time the message would be read.
         setError(data.error ?? "Login failed. Please try again.");
         return;
       }
@@ -43,6 +59,9 @@ function LoginForm() {
       setLoading(false);
     }
   }
+
+  if (status === "checking") return null;
+  if (status === "signed-in") return <AlreadySignedIn email={signedInAs} />;
 
   return (
     <div className="w-full max-w-md bg-white border border-[#E8E3DA] rounded-2xl p-8 shadow-sm">

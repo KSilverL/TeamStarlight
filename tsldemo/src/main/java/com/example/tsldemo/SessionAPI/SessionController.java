@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import com.example.tsldemo.auth.JwtUtil;
@@ -22,6 +23,7 @@ import com.example.tsldemo.ApiDTOS.IntakeResponse;
 import com.example.tsldemo.ApiDTOS.IntakeTurnRequest;
 import com.example.tsldemo.ApiDTOS.Output;
 import com.example.tsldemo.ApiDTOS.TaskSnapshot;
+import com.example.tsldemo.Business;
 import com.example.tsldemo.Message;
 import com.example.tsldemo.Session;
 import com.example.tsldemo.AgentAPI.NewsroomRunner;
@@ -86,6 +88,48 @@ public class SessionController {
 	}
 	
 	
+	/**
+	 * Names a session, so the sidebar has something to show besides a timestamp.
+	 *
+	 * The title is worked out by the LLM service and handed to the browser in the POST /tasks
+	 * response (and refined over SSE), which left it living in React state and dying on reload
+	 * — the column existed, the setter existed, nothing joined them. This is that join.
+	 *
+	 * Unlike the rest of this controller, it checks the caller: a title is the one part of a
+	 * session another business could otherwise rewrite by guessing an id.
+	 */
+	@PatchMapping("/api/sessions/{id}")
+	public ResponseEntity<?> updateSession(
+			@PathVariable String id,
+			@RequestBody Map<String, String> body,
+			@RequestHeader(value = "Authorization", required = false) String authHeader) {
+
+		int businessId = jwtUtil.extractBusinessId(authHeader);
+		if (businessId == -1) {
+			return ResponseEntity.status(401).body(Map.of("error", "Missing or invalid authorization token"));
+		}
+
+		String title = body.get("title");
+		// Nothing to do rather than an error: a blank title is the caller having none yet, and
+		// writing it would erase a good one.
+		if (title == null || title.isBlank()) {
+			return ResponseEntity.ok(Map.of("updated", false));
+		}
+
+		Optional<Session> found = service.getSessionBy(id);
+		if (found.isEmpty()) {
+			return ResponseEntity.status(404).body(Map.of("error", "No such session"));
+		}
+		Business owner = found.get().getUser();
+		if (owner == null || owner.getId() != businessId) {
+			return ResponseEntity.status(403).body(Map.of("error", "Not your session"));
+		}
+
+		service.setSessionTitle(id, title);
+		return ResponseEntity.ok(Map.of("updated", true));
+	}
+
+
 	private static class MessageRequest {
 		public String role;
 		public String content;

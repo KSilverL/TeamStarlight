@@ -961,7 +961,7 @@ class IntakeService:
         self, *, message: str, today: str, target_platforms: Optional[list] = None,
         known: Optional[dict] = None, history: Optional[list] = None,
         followups_asked: int = 0, business_id: Optional[str] = None,
-        user_id: Optional[str] = None,
+        user_id: Optional[str] = None, force_plan: bool = False,
     ) -> dict:
         """Route one chat turn: one post now, or a campaign across a date range?
 
@@ -969,7 +969,11 @@ class IntakeService:
         posts for next month" produced one post *about* planning LinkedIn posts. A
         `single_post` answer means the caller carries on to `POST /tasks` exactly as before;
         `posting_plan` means it keeps turning this until `complete`, then takes the result to
-        `/plans/clarify` and `POST /plans`."""
+        `/plans/clarify` and `POST /plans`.
+
+        `force_plan` skips the fork: the caller's user has asked for a plan explicitly (the
+        chat's Posting plan toggle), so the turn is a campaign whatever the sentence looks
+        like on its own."""
         if not (message or "").strip():
             raise ApiError(400, "missing required field: message")
 
@@ -989,6 +993,7 @@ class IntakeService:
             followups_asked=followups_asked,
             business_id=business_id,
             user_id=user_id,
+            force_plan=force_plan,
         )
 
     def _require(self, session_id: str) -> IntakeSession:
@@ -1716,6 +1721,10 @@ class ClassifyRequest(BaseModel):
         "cap the conversation fills the gaps itself rather than interrogating further.")
     business_id: Optional[str] = None
     user_id: Optional[str] = None
+    force_plan: bool = Field(
+        False, description="The user asked for a posting plan outright (a UI control, not an "
+        "inference). Overrides a `single_post` verdict — the classification still runs, since "
+        "it is what extracts the goal and the date window from the message.")
 
 
 class IntakeStartRequest(BaseModel):
@@ -2088,6 +2097,7 @@ async def intake_classify(request: Request, body: ClassifyRequest) -> dict:
         followups_asked=body.followups_asked,
         business_id=body.business_id,
         user_id=body.user_id,
+        force_plan=body.force_plan,
     )
 
 

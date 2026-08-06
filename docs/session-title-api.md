@@ -37,6 +37,28 @@ data: {"type":"session_title","task_id":"sess-7f3a1b2c",
 - **Frontend**: show the snapshot's `title` immediately, then **replace in place** when the update
   arrives. CSS-ellipsize to one line.
 
+## Where it is stored
+
+The title belongs to the LLM service's task, but the **sidebar** is drawn from the Java
+service's sessions table — so a title that is never written there survives only until the page
+is reloaded. The chat saves it with:
+
+```http
+PATCH /api/sessions/{id}          (Java, :8081 — proxied at the same path by Next.js)
+Authorization: Bearer <jwt>
+Content-Type: application/json
+
+{ "title": "Ethiopia Harvest Launch" }
+```
+
+`200 {"updated": true}`, or `{"updated": false}` when the title was blank — nothing is written
+in that case, because an empty title would erase a good one. `401` without a valid token,
+`404` for an unknown session, `403` when the session belongs to another business.
+
+The chat sends it twice per session at most: once for the snapshot's fallback title (so a
+reload has *something*), and once more if the polished title arrives. It is fire-and-forget —
+a failed save costs the sidebar its label, not the user their session.
+
 ## Keep in mind
 
 - The event may **never arrive** — that just means the fallback was already fine. Keep the

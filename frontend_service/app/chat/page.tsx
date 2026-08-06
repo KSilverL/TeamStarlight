@@ -624,6 +624,10 @@ export default function ChatPage() {
   // "manual" pauses each roundtable table at round boundaries for a 4-way user prompt
   // (round_control); "auto" (default) never prompts — the backend's own default.
   const [roundtableMode, setRoundtableMode] = useState<"auto" | "manual">("auto");
+  // When on, every turn is a campaign: the classifier still reads the message for a goal and a
+  // date window, but its single_post verdict is overridden. Off, the classifier decides alone —
+  // which is how a terse "posts for the launch" ends up as one post about a launch.
+  const [planningMode, setPlanningMode] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
   // Up to 3 reference images the user attaches to the current turn (image-to-video).
@@ -703,6 +707,24 @@ export default function ChatPage() {
   // ── Posting-plan path ───────────────────────────────────────────────────────
 
   /**
+   * What to do when the classifier can't be reached, which depends on whether the user asked.
+   *
+   * Left to itself, a failed classification falls through to the ordinary post path — the right
+   * call when the plan was only ever a guess we were making on the user's behalf. With planning
+   * mode on it is the wrong call twice over: they asked for a schedule, and quietly handing them
+   * a single post instead is the exact failure this toggle exists to prevent.
+   */
+  function classifyUnavailable(): boolean {
+    if (!planningMode) return false;
+    const message =
+      "I couldn't reach the planner, so I haven't built a posting plan. Try again in a moment — " +
+      "or switch Posting plan off in the sidebar and I'll write a single post instead.";
+    pushMessage({ role: "assistant", content: message });
+    if (sessionIdRef.current) persistMessage(sessionIdRef.current, "assistant", message);
+    return true;  // handled — do not fall through to the single-post path
+  }
+
+  /**
    * Handles one turn of a campaign request, and reports whether it took it.
    *
    * Returns false for an ordinary "write me a post" turn, which then flows on to `genWorkflow`
@@ -734,12 +756,15 @@ export default function ChatPage() {
           target_platforms: selectedPlatforms,
           known: campaignRef.current?.known,
           followups_asked: campaignRef.current?.followupsAsked ?? 0,
+          // The user asked for a plan outright. The call still happens — it is what reads the
+          // goal and the dates out of the sentence — but its verdict is no longer a vote.
+          force_plan: planningMode,
         }),
       });
       result = await res.json();
-      if (!res.ok || result.error) return false;  // fall back to the ordinary post path
+      if (!res.ok || result.error) return classifyUnavailable();
     } catch {
-      return false;  // classifying is an optimisation, never a reason to refuse the message
+      return classifyUnavailable();  // classifying is an optimisation, never a reason to refuse
     }
 
     if (result.intent !== "posting_plan") {
@@ -911,6 +936,9 @@ export default function ChatPage() {
   // Guards against later prompts in the same session overwriting the name —
   // the session is named once, from the first task's title.
   const sessionTitleRef = useRef<string | null>(null);
+  // True while the name is the placeholder POST /tasks derives from the topic, which the LLM's
+  // own shorter title (session_title, over SSE) is allowed to replace exactly once.
+  const titleIsProvisionalRef = useRef(false);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -936,8 +964,10 @@ export default function ChatPage() {
     if (loadingSessionId) return;
     setLoadingSessionId(session.id);
 	sessionTitleRef.current = session.title ?? null;
+	// A saved title is settled, not a placeholder — nothing in this session may rename it.
+	titleIsProvisionalRef.current = false;
 	setSessionTitle(session.title ?? null);
-	
+
     try {
       const token = localStorage.getItem("starlight_token");
       const res = await fetch(`/api/sessions/${session.id}/messages`, {
@@ -975,14 +1005,79 @@ export default function ChatPage() {
       setLoadingSessionId(null);
     }
   }
-  
-  function applySessionTitle(title: string) {
-    if (sessionTitleRef.current) return; // already named this session
+
+  /**
+   * Back to a blank chat, without a page reload.
+   *
+   * The inverse of `loadSession`, and it has to reset everything that one sets plus everything
+   * a run leaves behind — most importantly the live SSE stream, which would otherwise keep
+   * writing a dead session's roundtable into the new one. No backend call: a session is
+   * registered lazily by the first `handleSend`, so "new chat" is purely forgetting this one.
+   *
+   * The sidebar list is left alone deliberately. The session being left is still the user's,
+   * and it stays there to go back to.
+   */
+  function startNewChat() {
+    if (isLoading || loadingSessionId) return;
+
+    if (workflowEsRef.current) {
+      workflowEsRef.current.close();
+      workflowEsRef.current = null;
+    }
+
+    setMessages(INITIAL_MESSAGES);
+    setInput("");
+    setAttachments([]);
+    pendingRefsRef.current = [];
+
+    historyRef.current = [];
+    sessionIdRef.current = null;
+    setActiveSessionId(null);
+
+    setSessionTitle(null);
+    sessionTitleRef.current = null;
+    titleIsProvisionalRef.current = false;
+
+    campaignRef.current = null;
+    requestedPublishAtRef.current = "";
+
+    roundtableMsgIdRef.current.clear();
+    socialCardIdRef.current.clear();
+    streamingAssistantRef.current = null;
+
+    // Platforms, content types, roundtable and planning modes survive: those are how this user
+    // works, not part of the conversation they just closed.
+  }
+
+  /**
+   * Names the session — on screen and in the database.
+   *
+   * Two titles arrive for one session. `POST /tasks` answers immediately with a deterministic
+   * one derived from the topic, and the LLM's short version follows over SSE a moment later.
+   * The first is provisional precisely so the second can replace it; anything after that is
+   * ignored, because later prompts in the same session must not rename it.
+   *
+   * The PATCH is fire-and-forget. A session that fails to save its name still works — it just
+   * shows its date in the sidebar next time, which is exactly where this started.
+   */
+  function applySessionTitle(title: string, { provisional = true }: { provisional?: boolean } = {}) {
+    // Named already, and not by a placeholder this call is entitled to replace.
+    if (sessionTitleRef.current && !(titleIsProvisionalRef.current && !provisional)) return;
+
     sessionTitleRef.current = title;
+    titleIsProvisionalRef.current = provisional;
     setSessionTitle(title);
     setPastSessions((prev) =>
       prev.map((s) => (s.id === sessionIdRef.current ? { ...s, title } : s))
     );
+
+    if (sessionIdRef.current) {
+      fetch(`/api/sessions/${sessionIdRef.current}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ title }),
+      }).catch(() => {});
+    }
   }
 
   function formatDate(isoString: string) {
@@ -1010,6 +1105,14 @@ export default function ChatPage() {
     setContentTypes((prev) =>
       prev.includes(type) ? prev.filter((t) => t !== type) : [...prev, type]
     );
+  }
+
+  function togglePlanningMode() {
+    // Switching off abandons any half-gathered campaign. Left in place, a campaign that had
+    // asked for its dates would keep claiming turns after the user had visibly opted out of
+    // planning — the next message would answer a question they no longer wanted asked.
+    if (planningMode) campaignRef.current = null;
+    setPlanningMode(!planningMode);
   }
 
   function readFileAsDataUrl(file: File): Promise<string> {
@@ -1353,6 +1456,16 @@ export default function ChatPage() {
       const node = event.node as string;
       const status = event.status as string;
       const platform = event.platform as string | undefined;
+
+      // The LLM's own short title, generated off the hot path and arriving a beat after the
+      // run begins. It replaces the placeholder the POST /tasks response set, and saves.
+      if (type === "session_title") {
+        const title = event.title;
+        if (typeof title === "string" && title.trim()) {
+          applySessionTitle(title, { provisional: false });
+        }
+        return;
+      }
 
       if (type === "progress") {
         // Show each executor once per platform to avoid duplicate status lines.
@@ -1750,6 +1863,18 @@ export default function ChatPage() {
           <p className="text-xs text-[#9E9893] mt-0.5">AI Content Assistant</p>
         </div>
 
+        {/* Pinned above the scrolling list: starting over shouldn't require scrolling past
+            however many past sessions the user has. */}
+        <div className="px-5 pt-5 flex-shrink-0">
+          <button
+            onClick={startNewChat}
+            disabled={isLoading || loadingSessionId !== null}
+            className="w-full bg-[#FF4800] hover:bg-[#E03E00] disabled:opacity-50 text-white text-sm font-medium py-2.5 rounded-xl transition-colors"
+          >
+            + New chat
+          </button>
+        </div>
+
         <div className="flex-1 overflow-y-auto p-5 space-y-7">
           {/* Past Sessions */}
           {pastSessions.length > 0 && (
@@ -1881,6 +2006,39 @@ export default function ChatPage() {
             <p className="text-[10px] text-[#BDB6AE] mt-1.5 leading-relaxed">
               When on, each table pauses for your call between rounds (next / speak / enough /
               auto). Off runs the discussion hands-off.
+            </p>
+          </div>
+
+          {/* Planning mode */}
+          <div>
+            <h3 className="text-xs font-semibold text-[#9E9893] uppercase tracking-wider mb-3">
+              Planning
+            </h3>
+            <button
+              onClick={togglePlanningMode}
+              aria-pressed={planningMode}
+              className={`flex items-center justify-between w-full px-3 py-2 rounded-lg text-sm transition-colors border ${
+                planningMode
+                  ? "bg-[#FFF0EB] text-[#FF4800] border-[#FFCBB8]"
+                  : "text-[#6B6561] border-[#E8E3DA] hover:bg-[#F2EDE4]"
+              }`}
+            >
+              <span>Posting plan</span>
+              <span
+                className={`w-9 h-5 rounded-full relative transition-colors flex-shrink-0 ${
+                  planningMode ? "bg-[#FF4800]" : "bg-[#E8E3DA]"
+                }`}
+              >
+                <span
+                  className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+                    planningMode ? "translate-x-4" : "translate-x-0"
+                  }`}
+                />
+              </span>
+            </button>
+            <p className="text-[10px] text-[#BDB6AE] mt-1.5 leading-relaxed">
+              When on, your message becomes a dated schedule of posts across a period rather than
+              one post. Expect a question or two about the goal and the dates.
             </p>
           </div>
 

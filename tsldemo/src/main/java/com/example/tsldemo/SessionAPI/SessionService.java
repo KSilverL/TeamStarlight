@@ -124,11 +124,21 @@ public class SessionService {
 		
 	}
 	
-	public void setSessionTitle(String id, String title) {
-		Session s = repo.getReferenceById(id);
+	/** Names a session, reporting whether one by that id existed to name.
+	 *
+	 *  findById rather than getReferenceById: the reference is a lazy proxy that only discovers
+	 *  a missing row when something touches it, which turns "no such session" into an
+	 *  EntityNotFoundException thrown from the middle of this method instead of an answer the
+	 *  caller can turn into a 404. */
+	public boolean setSessionTitle(String id, String title) {
+		Optional<Session> found = repo.findById(id);
+		if (found.isEmpty()) {
+			return false;
+		}
+		Session s = found.get();
 		s.setTitle(title);
 		repo.save(s);
-		
+		return true;
 	}
 	
 	public Session deleteSession(String id) {
