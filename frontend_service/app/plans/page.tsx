@@ -1,11 +1,17 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, Suspense } from "react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import DashboardSidebar from "../components/DashboardSidebar";
+import { useTaskEvents, type TaskEvent } from "../_lib/useTaskEvents";
 
 type Platform = "x" | "facebook" | "tiktok" | "linkedin";
 type ContentType = "text" | "video" | "brand";
+
+/** How much deliberation each slot's copy gets. Chosen when the campaign is commissioned;
+ * see LLM_service/core/plan_schema.py. */
+type DraftMode = "roundtable" | "fast";
 
 interface PlanItem {
   item_id: string;
@@ -27,6 +33,7 @@ interface Plan {
   start_date: string;
   end_date: string;
   status: "draft" | "active" | string;
+  draft_mode?: DraftMode;
   strategy_summary?: string;
   items: PlanItem[];
   created_at: string;
@@ -66,13 +73,17 @@ const DELIVERY_STATE: Record<string, { verb: string; className: string; icon: st
   cancelled: { verb: "cancelled", className: "text-[#9E9893] line-through", icon: "–" },
 };
 
-/** How often to re-read a plan while its campaign is being drafted. */
+/** How often to re-read a plan while its campaign is being written. */
 const POLL_INTERVAL_MS = 5000;
 
-/** Polls to keep running after a confirm even with nothing yet `generating`. Slots are started
- * one at a time with a pause between them, so the first can take a few seconds to appear —
- * this covers that gap, and is bounded so a campaign that fails to start can't poll forever. */
-const CONFIRM_GRACE_TICKS = 6;
+/** Consecutive polls that may return an unchanged plan before we stop asking.
+ *
+ * Slots are drafted one at a time, so a campaign is legitimately "in progress" while several
+ * of its slots are still `planned` and nothing at all is happening on screen. Polling on that
+ * alone would never stop for a campaign whose chain died (a backend restart mid-run leaves the
+ * rest `planned` until the next daily sweep). Any status change resets the count, so a live
+ * campaign polls indefinitely and a stalled one gives up after a couple of quiet minutes. */
+const IDLE_POLL_LIMIT = 24;
 
 const STATUS_BADGE: Record<string, string> = {
   planned: "bg-[#F2EDE4] text-[#6B6561]",
@@ -83,7 +94,64 @@ const STATUS_BADGE: Record<string, string> = {
   error: "bg-red-100 text-red-700",
 };
 
+/** The stages a slot passes through while its copy is written, in order.
+ *
+ * Writing one post is minutes of work behind a single "generating" status, and a spinner
+ * held for that long reads as a hang. These are the stages the task stream already reports
+ * — the agents discussing, the copy being written, the reviewer checking it — named so the
+ * wait says what is being waited for. */
+const DRAFT_PHASES = ["discussing", "writing", "reviewing", "ready"] as const;
+type DraftPhase = (typeof DRAFT_PHASES)[number];
+
+const PHASE_LABEL: Record<DraftPhase, string> = {
+  discussing: "Agents discussing",
+  writing: "Writing the post",
+  reviewing: "Checking it over",
+  ready: "Ready for you",
+};
+
+/** The fast path skips the discussion, so its stepper must not show a stage that will never
+ * happen — an step that stays grey forever looks like something went wrong. */
+function phasesFor(mode: DraftMode): readonly DraftPhase[] {
+  return mode === "fast" ? DRAFT_PHASES.filter((p) => p !== "discussing") : DRAFT_PHASES;
+}
+
+/** Seconds elapsed since `since`, ticking once a second while `running`.
+ *
+ * Every wait in this view is long enough that a user starts wondering whether it is stuck.
+ * A number that visibly moves is the cheapest possible answer to that. */
+function useElapsedSeconds(since: number | null, running: boolean): number {
+  const [seconds, setSeconds] = useState(0);
+
+  useEffect(() => {
+    if (since === null || !running) return;
+    const tick = () => setSeconds(Math.floor((Date.now() - since) / 1000));
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [since, running]);
+
+  return seconds;
+}
+
+/** `useSearchParams` opts the tree into client-side rendering, which Next requires a Suspense
+ * boundary around. The fallback matches the loading state the page shows anyway. */
 export default function PlansPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex h-screen bg-[#F8F5EE] text-[#1B1A17] overflow-hidden">
+          <DashboardSidebar active="plans" />
+          <p className="p-8 text-sm text-[#9E9893] italic">Loading plans…</p>
+        </div>
+      }
+    >
+      <PlansView />
+    </Suspense>
+  );
+}
+
+function PlansView() {
   const [plans, setPlans] = useState<Plan[]>([]);
   const [loadingPlans, setLoadingPlans] = useState(true);
   const [selectedPlanId, setSelectedPlanId] = useState<string | null>(null);
@@ -120,29 +188,41 @@ export default function PlansPage() {
     }
   }
 
-  async function loadPlan(planId: string) {
-    setLoadingPlan(true);
-    setSelectedPlanId(planId);
-    setError(null);
-    try {
-      const res = await fetch(`/api/plans/${planId}`, { headers: authHeaders() });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        setError(data.error ?? "Failed to load plan.");
-        setSelectedPlan(null);
-        return;
+  const loadPlan = useCallback(
+    async (planId: string) => {
+      setLoadingPlan(true);
+      setSelectedPlanId(planId);
+      setError(null);
+      try {
+        const res = await fetch(`/api/plans/${planId}`, { headers: authHeaders() });
+        const data = await res.json();
+        if (!res.ok || data.error) {
+          setError(data.error ?? "Failed to load plan.");
+          setSelectedPlan(null);
+          return;
+        }
+        setSelectedPlan(data as Plan);
+      } catch {
+        setError("Could not reach the backend.");
+      } finally {
+        setLoadingPlan(false);
       }
-      setSelectedPlan(data as Plan);
-    } catch {
-      setError("Could not reach the backend.");
-    } finally {
-      setLoadingPlan(false);
-    }
-  }
+    },
+    [authHeaders]
+  );
 
   useEffect(() => {
     loadPlans();
   }, []);
+
+  // Arriving from the chat's "Track them in Posting Plans" link, which names the campaign the
+  // user just confirmed. Without this they land on "No plan selected" and have to find, in a
+  // list of every campaign they have ever made, the one they were looking at a second ago.
+  const requestedPlanId = useSearchParams().get("plan");
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetches first; the plan lands in the promise callback, not synchronously
+    if (requestedPlanId) loadPlan(requestedPlanId);
+  }, [requestedPlanId, loadPlan]);
 
   function handlePlanCreated(plan: Plan) {
     setPlans((prev) => [plan, ...prev]);
@@ -456,8 +536,9 @@ interface PlanDetailProps {
 
 function PlanDetail({ plan, authHeaders, onUpdated, onError }: PlanDetailProps) {
   const [confirming, setConfirming] = useState(false);
-  // Polls remaining in the post-confirm grace window (see the effect below).
-  const [graceTicks, setGraceTicks] = useState(0);
+  // How the user wants this campaign written. Only settable while it is still a draft —
+  // afterwards it is a fact about work already commissioned, and the header just reports it.
+  const [draftMode, setDraftMode] = useState<DraftMode>(plan.draft_mode ?? "roundtable");
   // What each slot actually put on the content calendar. Kept here rather than per-card so it
   // costs one request per plan instead of one per slot, and so any card that schedules
   // something refreshes the whole plan's view of the truth.
@@ -493,26 +574,41 @@ function PlanDetail({ plan, authHeaders, onUpdated, onError }: PlanDetailProps) 
     }
   }, [planId, authHeaders, onUpdated]);
 
-  // Confirming starts every slot drafting in the background, so the statuses on screen go
-  // stale the moment it returns. Poll while there is visibly work in flight, plus a short
-  // grace window after a confirm to cover the seconds before the first slot flips to
-  // `generating` — without that the page looks like nothing happened.
-  const isDrafting = planActive && plan.items.some((i) => i.status === "generating");
+  // Confirming commissions the whole campaign, and the slots are then written one at a time
+  // in the background — so the statuses on screen go stale the moment it returns, and stay
+  // that way for as long as there is a post still to write.
+  //
+  // The gate is deliberately "anything left to write", not "something is writing right now".
+  // Between one slot finishing and the next starting there is a real gap with nothing
+  // `generating`; a poll that stopped there would freeze the page mid-campaign and only
+  // recover if the user reloaded it.
+  const queue = plan.items.filter((i) => i.status !== "skipped");
+  const writingIndex = queue.findIndex((i) => i.status === "generating");
+  const unwritten = queue.filter((i) => i.status === "planned" || i.status === "generating");
+  const campaignRunning = planActive && unwritten.length > 0;
   // "Ready" means the copy exists and is yours to look at — drafted, reviewed, or already
-  // scheduled. Skipped slots count too: they are settled, just not by writing anything.
-  const draftedCount = plan.items.filter(
-    (i) => i.status !== "planned" && i.status !== "generating"
-  ).length;
+  // scheduled. Skipped slots aren't in the queue at all: they were never going to be written.
+  const writtenCount = queue.length - unwritten.length;
+
+  const pollSignature = plan.items.map((i) => i.status).join(",");
+  const [poll, setPoll] = useState({ signature: pollSignature, idle: 0 });
+  if (poll.signature !== pollSignature) {
+    // Adjusting state during render, rather than in an effect: the campaign moved, so it has
+    // earned a fresh budget of polls, and waiting a render to say so would spend one of them.
+    setPoll({ signature: pollSignature, idle: 0 });
+  }
 
   useEffect(() => {
-    if (!isDrafting && graceTicks === 0) return;
+    if (!campaignRunning || poll.idle >= IDLE_POLL_LIMIT) return;
 
     const timer = setTimeout(() => {
-      setGraceTicks((n) => Math.max(0, n - 1));
+      // A new object each tick, so this effect re-runs and schedules the following poll —
+      // the tick count is what keeps the chain going as well as what bounds it.
+      setPoll((prev) => ({ ...prev, idle: prev.idle + 1 }));
       reloadPlan();
     }, POLL_INTERVAL_MS);
     return () => clearTimeout(timer);
-  }, [isDrafting, graceTicks, reloadPlan]);
+  }, [campaignRunning, poll, reloadPlan]);
 
   async function handleConfirm() {
     onError(null);
@@ -520,17 +616,17 @@ function PlanDetail({ plan, authHeaders, onUpdated, onError }: PlanDetailProps) 
     try {
       const res = await fetch(`/api/plans/${plan.plan_id}/confirm`, {
         method: "POST",
-        headers: authHeaders(),
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ draft_mode: draftMode }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
         onError(data.error ?? "Failed to confirm plan.");
         return;
       }
-      // The response still shows every slot as `planned` — drafting starts after it returns.
-      // The grace window is what turns that into a live view.
+      // The response still shows every slot as `planned` — the first one starts writing a
+      // beat later. The poll above is what turns that into a live view.
       onUpdated(data as Plan);
-      setGraceTicks(CONFIRM_GRACE_TICKS);
     } catch {
       onError("Could not reach the backend.");
     } finally {
@@ -552,6 +648,9 @@ function PlanDetail({ plan, authHeaders, onUpdated, onError }: PlanDetailProps) 
       </div>
       <p className="text-xs text-[#9E9893] mb-4">
         {plan.start_date} → {plan.end_date}
+        {plan.status === "active" && (
+          <> · written {plan.draft_mode === "fast" ? "in fast mode" : "by the roundtable"}</>
+        )}
       </p>
 
       {plan.strategy_summary && (
@@ -562,6 +661,7 @@ function PlanDetail({ plan, authHeaders, onUpdated, onError }: PlanDetailProps) 
 
       {plan.status === "draft" && (
         <>
+          <DraftModePicker value={draftMode} onChange={setDraftMode} postCount={plan.items.length} />
           <button
             onClick={handleConfirm}
             disabled={confirming}
@@ -570,19 +670,24 @@ function PlanDetail({ plan, authHeaders, onUpdated, onError }: PlanDetailProps) 
             {confirming ? "Confirming…" : `Confirm Plan — write all ${plan.items.length} posts`}
           </button>
           <p className="mb-5 text-xs text-[#9E9893] leading-relaxed">
-            Every slot gets drafted now, so you can review the whole campaign at once. Nothing
-            publishes until you approve it.
+            The posts are written one at a time, in order, so you can watch each one take shape.
+            Nothing publishes until you approve it.
           </p>
         </>
       )}
       {plan.status === "active" && (
         <div className="mb-5">
-          {isDrafting ? (
-            <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 inline-flex items-center gap-2">
-              <span className="w-1.5 h-1.5 rounded-full bg-[#FF4800] animate-pulse flex-shrink-0" />
-              Writing your campaign — {draftedCount} of {plan.items.length} posts ready. You can
-              review each one as it lands.
-            </p>
+          {campaignRunning ? (
+            <CampaignProgress
+              written={writtenCount}
+              total={queue.length}
+              // Between one post finishing and the next starting nothing is `generating`.
+              // Naming the post that just finished is truer than naming none: the campaign
+              // has reached that point, it just hasn't left it yet.
+              current={writingIndex >= 0 ? writingIndex : writtenCount}
+              live={writingIndex >= 0}
+              topic={queue[writingIndex >= 0 ? writingIndex : Math.min(writtenCount, queue.length - 1)]?.topic}
+            />
           ) : (
             <p className="text-xs text-green-700 bg-green-50 border border-green-200 rounded-lg px-3 py-2 inline-block">
               ✓ Active — approve a post to queue it for its planned date. Nothing publishes until
@@ -594,21 +699,139 @@ function PlanDetail({ plan, authHeaders, onUpdated, onError }: PlanDetailProps) 
 
       <h2 className="text-sm font-semibold text-[#6B6561] mb-3">Schedule</h2>
       <div className="space-y-3">
-        {plan.items.map((item) => (
-          <PlanItemCard
-            key={item.item_id}
-            planId={plan.plan_id}
-            item={item}
-            editable={plan.status === "draft"}
-            planActive={planActive}
-            scheduledPosts={scheduledByItem[item.item_id] ?? []}
-            onScheduled={loadScheduled}
-            authHeaders={authHeaders}
-            onUpdated={onUpdated}
-            onError={onError}
-          />
-        ))}
+        {plan.items.map((item) => {
+          // Where this slot sits in the writing queue, so a slot that has not started can say
+          // how long it expects to wait rather than showing nothing at all.
+          const position = queue.findIndex((i) => i.item_id === item.item_id);
+          return (
+            <PlanItemCard
+              key={item.item_id}
+              planId={plan.plan_id}
+              item={item}
+              editable={plan.status === "draft"}
+              planActive={planActive}
+              draftMode={plan.draft_mode ?? "roundtable"}
+              queuePosition={position}
+              queueLength={queue.length}
+              campaignRunning={campaignRunning}
+              scheduledPosts={scheduledByItem[item.item_id] ?? []}
+              onScheduled={loadScheduled}
+              authHeaders={authHeaders}
+              onUpdated={onUpdated}
+              onError={onError}
+            />
+          );
+        })}
       </div>
+    </div>
+  );
+}
+
+// ── How the campaign gets written ─────────────────────────────────────────────
+
+const DRAFT_MODE_OPTIONS: { id: DraftMode; label: string; blurb: string; perPost: string }[] = [
+  {
+    id: "roundtable",
+    label: "Roundtable",
+    blurb: "A table of agents argues each post out before it's written.",
+    perPost: "~3 min a post",
+  },
+  {
+    id: "fast",
+    label: "Fast",
+    blurb: "Straight to the writing. Same brand voice, no deliberation.",
+    perPost: "~20 sec a post",
+  },
+];
+
+/**
+ * The one decision worth making before committing to a campaign.
+ *
+ * It is offered here, at the confirm, rather than back when the schedule was generated: the
+ * schedule is cheap and endlessly editable, while this governs minutes of work per post and
+ * only starts mattering the moment the user says go. Ten posts is the difference between half
+ * a minute and half an hour, which is far too large to decide on the user's behalf.
+ */
+function DraftModePicker({
+  value,
+  onChange,
+  postCount,
+}: {
+  value: DraftMode;
+  onChange: (mode: DraftMode) => void;
+  postCount: number;
+}) {
+  return (
+    <div className="mb-4">
+      <p className="text-xs font-semibold text-[#6B6561] mb-2">How should these be written?</p>
+      <div className="grid sm:grid-cols-2 gap-2">
+        {DRAFT_MODE_OPTIONS.map((option) => {
+          const active = option.id === value;
+          return (
+            <button
+              key={option.id}
+              onClick={() => onChange(option.id)}
+              aria-pressed={active}
+              className={`text-left rounded-xl border px-3 py-2.5 transition-colors ${
+                active
+                  ? "border-[#FF4800] bg-[#FFF0EB]"
+                  : "border-[#E8E3DA] bg-white hover:border-[#C8C2BA]"
+              }`}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-sm font-medium text-[#1B1A17]">{option.label}</span>
+                <span className={`text-[10px] font-medium ${active ? "text-[#FF4800]" : "text-[#9E9893]"}`}>
+                  {option.perPost}
+                </span>
+              </div>
+              <p className="text-[11px] text-[#6B6561] mt-0.5 leading-relaxed">{option.blurb}</p>
+            </button>
+          );
+        })}
+      </div>
+      <p className="text-[11px] text-[#9E9893] mt-1.5">
+        {postCount} posts, written in turn — roughly{" "}
+        {value === "fast" ? `${Math.ceil((postCount * 20) / 60)} min` : `${postCount * 3} min`} in all.
+      </p>
+    </div>
+  );
+}
+
+/** Where the campaign has got to, as a position in a queue rather than a proportion.
+ *
+ * "3 of 8" is the honest shape of sequential drafting, and it is only honest because the
+ * backend really does write one post at a time — there is always exactly one to point at. */
+function CampaignProgress({
+  written,
+  total,
+  current,
+  live,
+  topic,
+}: {
+  written: number;
+  total: number;
+  current: number;
+  live: boolean;
+  topic?: string;
+}) {
+  return (
+    <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3">
+      <div className="flex items-center gap-2 mb-2">
+        <span className="w-1.5 h-1.5 rounded-full bg-[#FF4800] animate-pulse flex-shrink-0" />
+        <p className="text-xs font-medium text-amber-900">
+          {live ? `Writing post ${current + 1} of ${total}` : `Post ${current} of ${total} done — starting the next`}
+        </p>
+      </div>
+      <div className="h-1.5 rounded-full bg-amber-200/70 overflow-hidden">
+        <div
+          className="h-full bg-[#FF4800] rounded-full transition-[width] duration-700 ease-out"
+          style={{ width: `${total ? (written / total) * 100 : 0}%` }}
+        />
+      </div>
+      <p className="text-[11px] text-amber-800 mt-1.5 leading-relaxed">
+        {topic ? <span className="font-medium">{topic}</span> : "Getting started"} · they arrive in
+        order, and you can review each one as it lands.
+      </p>
     </div>
   );
 }
@@ -620,6 +843,11 @@ interface PlanItemCardProps {
   item: PlanItem;
   editable: boolean;
   planActive: boolean;
+  draftMode: DraftMode;
+  /** This slot's place in the writing queue (skipped slots excluded), or -1 if it isn't in one. */
+  queuePosition: number;
+  queueLength: number;
+  campaignRunning: boolean;
   scheduledPosts: ScheduledSlotPost[];
   onScheduled: () => void;
   authHeaders: () => Record<string, string>;
@@ -632,6 +860,10 @@ function PlanItemCard({
   item,
   editable,
   planActive,
+  draftMode,
+  queuePosition,
+  queueLength,
+  campaignRunning,
   scheduledPosts,
   onScheduled,
   authHeaders,
@@ -687,11 +919,16 @@ function PlanItemCard({
 
   const badgeClass = STATUS_BADGE[item.status] ?? "bg-[#F2EDE4] text-[#6B6561]";
 
-  // NEW: decide whether this item can show "Generate Draft Now" (untouched, still
-  // "planned"), or should auto-load an already-existing draft (the cron already
-  // executed it, or you generated it earlier and reloaded the page).
+  // Decide whether this item can show "Generate Draft Now" (untouched, still "planned"), or
+  // should auto-load an already-existing draft (the cron already executed it, or you
+  // generated it earlier and reloaded the page).
   const canGenerateNow = planActive && item.status === "planned";
   const canShowDraft = planActive && item.status !== "planned" && item.status !== "skipped";
+  // A slot the campaign has not reached yet. It shows its place in the queue rather than the
+  // "Generate Draft Now" button: offering that here invites the user to jump the queue and
+  // start a second run alongside the one already going, which is the thing writing in turn
+  // exists to avoid. The button is still there once the campaign has finished its pass.
+  const isQueued = canGenerateNow && campaignRunning;
 
   return (
     <div className="bg-white border border-[#E8E3DA] rounded-xl px-4 py-3">
@@ -793,19 +1030,28 @@ function PlanItemCard({
         )}
       </div>
 
-      {/* NEW: shows "Generate Draft Now" for untouched items, or auto-loads the
-          draft (from the cron or an earlier manual run) for executed items. */}
-      {(canGenerateNow || canShowDraft) && (
-        <ItemDraftPreview
-          planId={planId}
-          itemId={item.item_id}
-          existingTaskId={item.task_id}
-          itemStatus={item.status}
-          scheduledPosts={scheduledPosts}
-          onScheduled={onScheduled}
-          authHeaders={authHeaders}
-          onError={onError}
-        />
+      {/* Its place in the queue while the campaign works towards it, "Generate Draft Now" for
+          an untouched slot once the campaign is done, or the live draft for a slot the
+          campaign has reached (or that the cron / an earlier manual run already wrote). */}
+      {isQueued ? (
+        <p className="mt-3 pt-3 border-t border-[#E8E3DA] text-xs text-[#9E9893] flex items-center gap-2">
+          <span className="w-1.5 h-1.5 rounded-full bg-[#C8C2BA] flex-shrink-0" />
+          Queued — post {queuePosition + 1} of {queueLength}
+        </p>
+      ) : (
+        (canGenerateNow || canShowDraft) && (
+          <ItemDraftPreview
+            planId={planId}
+            itemId={item.item_id}
+            existingTaskId={item.task_id}
+            itemStatus={item.status}
+            draftMode={draftMode}
+            scheduledPosts={scheduledPosts}
+            onScheduled={onScheduled}
+            authHeaders={authHeaders}
+            onError={onError}
+          />
+        )
       )}
     </div>
   );
@@ -818,10 +1064,24 @@ interface ItemDraftPreviewProps {
   itemId: string;
   existingTaskId: string | null;
   itemStatus: string;
+  draftMode: DraftMode;
   scheduledPosts: ScheduledSlotPost[];
   onScheduled: () => void;
   authHeaders: () => Record<string, string>;
   onError: (msg: string | null) => void;
+}
+
+/** One thing an agent said at the roundtable, kept to show the discussion happening. */
+type Utterance = { key: string; speaker: string; text: string; platform: string };
+
+/** How many turns of the discussion to keep on screen. Enough to read as a conversation
+ * in progress; few enough that a twelve-round table doesn't push the plan off the page. */
+const UTTERANCE_WINDOW = 5;
+
+/** Tidy an agent id ("brand_voice") into something worth reading ("Brand voice"). */
+function speakerName(raw: string): string {
+  const words = raw.replace(/[_-]+/g, " ").trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
 /** The Facebook Page ids picked in the Brand Profile. Java falls back to every Page on the
@@ -853,38 +1113,116 @@ function ItemDraftPreview({
   itemId,
   existingTaskId,
   itemStatus,
+  draftMode,
   scheduledPosts,
   onScheduled,
   authHeaders,
   onError,
 }: ItemDraftPreviewProps) {
   const [status, setStatus] = useState<"idle" | "starting" | "generating" | "ready" | "approved" | "rejected">("idle");
-  const [statusLabel, setStatusLabel] = useState("");
   // Keyed by platform: a slot can target several, and each gets its own draft and verdict.
+  // While the copy is streaming these hold the text so far; `draft_ready` replaces them with
+  // the finished version, which is what the review is actually against.
   const [drafts, setDrafts] = useState<Record<string, string>>({});
-  const [taskId, setTaskId] = useState<string | null>(existingTaskId);
+  const [streaming, setStreaming] = useState(false);
+  // The fast path never discusses anything, so it opens on the stage it really starts at —
+  // a stepper whose first step can never light up reads as something having gone wrong.
+  const [phase, setPhase] = useState<DraftPhase>(draftMode === "fast" ? "writing" : "discussing");
+  const [utterances, setUtterances] = useState<Utterance[]>([]);
+  const [speakerUp, setSpeakerUp] = useState<string | null>(null);
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [taskId, setTaskId] = useState<string | null>(null);
   const [skipped, setSkipped] = useState<SkipReason[]>([]);
   const [isReviewing, setIsReviewing] = useState(false);
   const [isScheduling, setIsScheduling] = useState(false);
 
   const draftEntries = Object.entries(drafts);
+  const settled = status === "ready" || status === "approved" || status === "rejected";
+  const elapsed = useElapsedSeconds(startedAt, !settled);
 
-  // Auto-connect on mount if this item already has a task (e.g. the cron executed
-  // it in the background, or you generated it earlier and reloaded the page) — the
-  // SSE stream replays its full history, so we still catch draft_ready even though
-  // we weren't watching when it first happened.
-  useEffect(() => {
-    if (existingTaskId && (itemStatus === "generating" || itemStatus === "awaiting_review" || itemStatus === "done")) {
-      setTaskId(existingTaskId);
-      setStatus(itemStatus === "done" ? "approved" : "generating");
-      watchTask(existingTaskId);
+  // Attach as soon as this item has a task — because the campaign reached it, the cron ran it,
+  // or it was generated earlier and the page has been reloaded since. The stream replays its
+  // whole history, so the copy written while nobody was watching still arrives: the deltas
+  // first, retyping the post as it was written, then the `draft_ready` that supersedes them.
+  //
+  // Adjusted during render rather than in an effect, so the card never paints its idle state
+  // for a slot that is visibly mid-flight before correcting itself a frame later.
+  const watchable =
+    itemStatus === "generating" || itemStatus === "awaiting_review" || itemStatus === "done";
+  if (existingTaskId && watchable && existingTaskId !== taskId) {
+    setTaskId(existingTaskId);
+    setStartedAt(Date.now());
+    if (status === "idle") setStatus(itemStatus === "done" ? "approved" : "generating");
+  }
+
+  useTaskEvents(taskId, (event: TaskEvent) => {
+    switch (event.type) {
+      case "speaker_scheduled":
+        setPhase("discussing");
+        setSpeakerUp(String(event.speaker ?? ""));
+        break;
+
+      case "agent_utterance":
+        setPhase("discussing");
+        setSpeakerUp(null);
+        setUtterances((prev) =>
+          [
+            ...prev,
+            {
+              key: `${event.seq ?? prev.length}`,
+              speaker: String(event.speaker ?? "agent"),
+              text: String(event.text ?? ""),
+              platform: event.platform ?? "",
+            },
+          ].slice(-UTTERANCE_WINDOW)
+        );
+        break;
+
+      case "draft_delta": {
+        // The copy, as it is written. Appended in `seq` order — the hook guarantees that, and
+        // guarantees each event arrives once, which is what makes plain concatenation safe.
+        setPhase("writing");
+        setStreaming(true);
+        const platform = String(event.platform ?? "linkedin");
+        const text = String(event.text ?? "");
+        setDrafts((prev) => ({ ...prev, [platform]: (prev[platform] ?? "") + text }));
+        break;
+      }
+
+      case "progress":
+        // The reviewer running is the only progress event worth a stage of its own; the rest
+        // are already covered by what the discussion and the copy are visibly doing.
+        if (event.node === "reviewer" && event.status === "running") {
+          setStreaming(false);
+          setPhase("reviewing");
+        }
+        break;
+
+      case "result":
+        if (event.status === "draft_ready") {
+          // The authoritative copy. It REPLACES the streamed accumulation rather than adding
+          // to it, so a delta lost to a dropped connection can't leave a mangled post on
+          // screen — the worst case is the text settling into its final form on arrival.
+          // Recording the platform also matters for the review: approving has to send a
+          // verdict for every drafted platform, or the task stays half-reviewed and can
+          // never be scheduled.
+          const platform = String(event.platform ?? "linkedin");
+          setDrafts((prev) => ({ ...prev, [platform]: String(event.draft ?? "") }));
+          setStreaming(false);
+          setPhase("ready");
+          setStatus((prev) => (prev === "approved" ? "approved" : "ready"));
+        }
+        if (event.status === "final") {
+          setStreaming(false);
+          setStatus("approved");
+        }
+        break;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [existingTaskId, itemStatus]);
+  });
 
   async function handleGenerateNow() {
     setStatus("starting");
-    setStatusLabel("Starting draft…");
+    setStartedAt(Date.now());
     onError(null);
     try {
       const res = await fetch(`/api/plans/${planId}/items/${itemId}/execute`, {
@@ -896,63 +1234,23 @@ function ItemDraftPreview({
       if (!res.ok || data.error) {
         onError(data.error ?? "Failed to start draft generation.");
         setStatus("idle");
+        setStartedAt(null);
         return;
       }
       const newTaskId = data.task?.task_id as string | undefined;
       if (!newTaskId) {
         onError("No task returned from execute.");
         setStatus("idle");
+        setStartedAt(null);
         return;
       }
       setTaskId(newTaskId);
       setStatus("generating");
-      watchTask(newTaskId);
     } catch {
       onError("Could not reach the backend.");
       setStatus("idle");
+      setStartedAt(null);
     }
-  }
-
-  function watchTask(id: string) {
-    const es = new EventSource(`/api/tasks/${id}/events`);
-    let lastSeq = -1;
-
-    es.onmessage = (e) => {
-      let event: Record<string, unknown>;
-      try {
-        event = JSON.parse(e.data as string);
-      } catch {
-        return;
-      }
-      const seq = event.seq as number | undefined;
-      if (typeof seq === "number") {
-        if (seq <= lastSeq) return;
-        lastSeq = seq;
-      }
-
-      const type = event.type as string;
-      const evtStatus = event.status as string;
-
-      if (type === "progress" && evtStatus === "running") {
-        setStatusLabel("Writing draft…");
-      }
-
-      if (type === "result" && evtStatus === "draft_ready") {
-        // Record which platform this draft is for — approving has to send a verdict for every
-        // one of them, or the task stays half-reviewed and can never be scheduled.
-        const platform = (event.platform as string) || "linkedin";
-        setDrafts((prev) => ({ ...prev, [platform]: event.draft as string }));
-        setStatus((prev) => (prev === "approved" ? "approved" : "ready"));
-      }
-
-      if (type === "result" && evtStatus === "final") {
-        setStatus("approved");
-      }
-    };
-
-    es.onerror = () => {
-      es.close();
-    };
   }
 
   async function handleDecision(decision: "approve" | "reject") {
@@ -1043,11 +1341,14 @@ function ItemDraftPreview({
 
   return (
     <div className="mt-3 pt-3 border-t border-[#E8E3DA]">
-      {(status === "starting" || (status === "generating" && draftEntries.length === 0)) && (
-        <div className="flex items-center gap-2 text-xs text-[#9E9893] italic">
-          <span className="w-1.5 h-1.5 rounded-full bg-[#FF4800] animate-pulse flex-shrink-0" />
-          {statusLabel || "Loading draft…"}
-        </div>
+      {!settled && (
+        <PhaseStepper phase={phase} mode={draftMode} elapsed={elapsed} starting={status === "starting"} />
+      )}
+
+      {/* The discussion, while there is one to watch. It collapses the moment the copy starts
+          arriving: by then the interesting thing on screen is the post, not how it was argued. */}
+      {!settled && phase === "discussing" && (
+        <RoundtableFeed utterances={utterances} speakerUp={speakerUp} />
       )}
 
       {draftEntries.length > 0 && (
@@ -1060,7 +1361,14 @@ function ItemDraftPreview({
                   {platform}
                 </p>
               )}
-              <p className="text-sm text-[#1B1A17] whitespace-pre-wrap leading-relaxed">{text}</p>
+              <p className="text-sm text-[#1B1A17] whitespace-pre-wrap leading-relaxed">
+                {text}
+                {/* A caret while the words are still coming, so a pause between chunks reads
+                    as the model thinking rather than the post being finished. */}
+                {streaming && (
+                  <span className="inline-block w-[2px] h-[1em] align-[-0.15em] ml-0.5 bg-[#FF4800] animate-pulse" />
+                )}
+              </p>
             </div>
           ))}
 
@@ -1100,6 +1408,121 @@ function ItemDraftPreview({
           isScheduling={isScheduling}
           onSchedule={scheduleApprovedItem}
         />
+      )}
+    </div>
+  );
+}
+
+// ── What is happening while a post is being written ──────────────────────────
+
+/**
+ * The stages of writing one post, with the live one named and timed.
+ *
+ * This replaces a single pulsing dot reading "Loading draft…" — which was accurate and
+ * useless, because it looked identical two seconds and four minutes in. The stages come
+ * straight off the task stream, so the thing on screen is what the backend is actually
+ * doing rather than an animation running on a timer.
+ */
+function PhaseStepper({
+  phase,
+  mode,
+  elapsed,
+  starting,
+}: {
+  phase: DraftPhase;
+  mode: DraftMode;
+  elapsed: number;
+  starting: boolean;
+}) {
+  const phases = phasesFor(mode);
+  const currentIndex = phases.indexOf(phase);
+
+  return (
+    <div className="mb-3">
+      <div className="flex items-center gap-2 mb-2">
+        <svg className="animate-spin flex-shrink-0" width={14} height={14} viewBox="0 0 24 24" fill="none">
+          <circle cx="12" cy="12" r="10" stroke="#E8E3DA" strokeWidth="3" />
+          <path d="M12 2a10 10 0 0 1 10 10" stroke="#FF4800" strokeWidth="3" strokeLinecap="round" />
+        </svg>
+        <p className="text-xs font-medium text-[#1B1A17]">
+          {starting ? "Starting…" : PHASE_LABEL[phase]}
+        </p>
+        {/* Only once it has been long enough to wonder — a counter that starts at zero on
+            every card is noise, not reassurance. */}
+        {elapsed >= 3 && <span className="text-[11px] text-[#9E9893]">{elapsed}s</span>}
+      </div>
+
+      {/* One column per stage, so each label sits under the bar it describes. */}
+      <div className="flex items-start gap-1.5">
+        {phases.map((step, index) => {
+          const done = currentIndex > index;
+          const live = currentIndex === index;
+          return (
+            <div key={step} className="flex-1 min-w-0">
+              <span
+                className={`block h-1 rounded-full ${
+                  done ? "bg-[#FF4800]" : live ? "bg-[#FF4800]/40 animate-pulse" : "bg-[#E8E3DA]"
+                }`}
+              />
+              <span
+                className={`block text-[10px] mt-1 truncate ${
+                  live ? "text-[#FF4800] font-medium" : done ? "text-[#9E9893]" : "text-[#C8C2BA]"
+                }`}
+              >
+                {PHASE_LABEL[step]}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The roundtable, while it is sitting.
+ *
+ * The agents' turns already stream on the same connection as everything else and were simply
+ * being dropped, which left the longest part of writing a post — the discussion — as dead air.
+ * Showing them turns the wait into the reason the post is worth waiting for.
+ */
+function RoundtableFeed({
+  utterances,
+  speakerUp,
+}: {
+  utterances: Utterance[];
+  speakerUp: string | null;
+}) {
+  if (utterances.length === 0 && !speakerUp) {
+    return (
+      <p className="mb-3 text-xs text-[#9E9893] italic flex items-center gap-2">
+        <span className="w-1.5 h-1.5 rounded-full bg-[#FF4800] animate-pulse flex-shrink-0" />
+        Gathering the table…
+      </p>
+    );
+  }
+
+  // A slot targeting several platforms seats one table per platform, and their turns arrive
+  // interleaved on the one stream. Tag the speaker with its table when there is more than one
+  // in play, or the feed reads as a single conversation talking past itself.
+  const manyTables = new Set(utterances.map((u) => u.platform)).size > 1;
+
+  return (
+    <div className="mb-3 space-y-1.5">
+      {utterances.map((u) => (
+        <div key={u.key} className="text-xs leading-relaxed">
+          <span className="font-semibold text-[#FF4800]">{speakerName(u.speaker)}</span>
+          {manyTables && u.platform && (
+            <span className="text-[10px] text-[#9E9893]"> · {u.platform}</span>
+          )}
+          <span className="text-[#6B6561]"> — {u.text}</span>
+        </div>
+      ))}
+      {speakerUp && (
+        <p className="text-xs text-[#9E9893] italic flex items-center gap-2">
+          <span className="w-1.5 h-1.5 rounded-full bg-[#FF4800] animate-pulse flex-shrink-0" />
+          {speakerName(speakerUp)} is thinking…
+        </p>
       )}
     </div>
   );

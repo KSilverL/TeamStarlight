@@ -57,6 +57,48 @@ async def test_draft_ready_result_streamed_per_platform():
     assert ready == {"linkedin", "instagram"}
 
 
+async def test_draft_deltas_concatenate_to_the_draft_they_precede():
+    """Copy streams as it is written, and the stream is not a lossy preview of the draft.
+
+    A client accumulates `draft_delta.text` in `seq` order and shows the result; the
+    `draft_ready` that follows must agree with what it already put on screen, or the post
+    visibly rewrites itself the moment it finishes."""
+    svc = WorkflowService()
+    await svc.start(_START, task_id="t1")
+    events = svc.buffered_events("t1")
+
+    for platform in ("linkedin", "instagram"):
+        deltas = [e for e in events if e["type"] == "draft_delta" and e["platform"] == platform]
+        assert deltas, f"no copy streamed for {platform}"
+        # Ordering is the client's whole contract: it appends in `seq` order and never sorts.
+        assert [e["seq"] for e in deltas] == sorted(e["seq"] for e in deltas)
+
+        ready = next(
+            e for e in events
+            if e["type"] == "result" and e["status"] == "draft_ready" and e["platform"] == platform
+        )
+        assert "".join(e["text"] for e in deltas) == ready["draft"]
+        # And the streaming really did precede the finished copy, rather than being
+        # replayed after it — a "live" view that arrives late is just a slower reveal.
+        assert deltas[-1]["seq"] < ready["seq"]
+
+
+async def test_a_rejected_platform_streams_its_rework_separately():
+    """A re-draft streams too, tagged with its own attempt so a client can start the new
+    copy from scratch instead of appending it to the rejected version."""
+    svc = WorkflowService()
+    await svc.start(_START, task_id="t1")
+    pending = {p["platform"]: p["request_id"] for p in (await svc.get("t1"))["pending"]}
+    await svc.review("t1", {"linkedin": {"decision": "reject", "comment": "too corporate"}})
+
+    reworked = [
+        e for e in svc.buffered_events("t1")
+        if e["type"] == "draft_delta" and e["platform"] == "linkedin" and e["attempt"] > 1
+    ]
+    assert reworked, "the rework produced no streamed copy"
+    assert pending  # the gate really had paused before the reject
+
+
 async def test_every_post_intake_stage_is_platform_tagged():
     """Everything after intake runs per platform, so its progress says which one.
 
@@ -118,7 +160,7 @@ async def test_events_follow_the_envelope():
     await svc.start(_START, task_id="t1")
     for e in svc.buffered_events("t1"):
         assert _ENVELOPE_KEYS <= set(e)
-        assert e["type"] in ("progress", "result")
+        assert e["type"] in ("progress", "result", "draft_delta")
         assert isinstance(e["ts"], float)
 
 

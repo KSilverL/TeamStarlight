@@ -43,8 +43,12 @@ def azure_llm(reply: str) -> azure.AzureLLM:
 
     async def _complete(
         messages, *, model=None, temperature=None, max_tokens=None,
-        reasoning_effort=None, verbosity=None, max_retries=None,
+        reasoning_effort=None, verbosity=None, max_retries=None, on_delta=None,
     ):
+        # The seam's contract includes the streamed variant: a caller that passes
+        # `on_delta` must receive the text through it as well as by return.
+        if on_delta is not None:
+            on_delta(reply)
         return reply
 
     llm._complete = _complete  # type: ignore[assignment]

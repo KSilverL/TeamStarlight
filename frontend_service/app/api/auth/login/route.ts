@@ -9,10 +9,17 @@ export async function POST(request: NextRequest) {
     return Response.json({ error: "Email and password are required" }, { status: 400 });
   }
 
+  // Forwarded so Java can refuse a login from someone who already holds a session (409). Not
+  // checked here: verifying the signature needs the secret, which only Java has.
+  const authHeader = request.headers.get("Authorization");
+
   try {
     const upstream = await fetch(`${BACKEND_URL}/login`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(authHeader ? { Authorization: authHeader } : {}),
+      },
       body: JSON.stringify({ email, password }),
     });
 

@@ -48,6 +48,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Stre
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .core.config import get_settings, load_dotenv
+from .core.emitter import emitter_bound
 from .core.events import (
     DONE,
     ERROR,
@@ -77,6 +78,7 @@ from .workflow.roundtable.context import build_persona_context
 from .workflow.roundtable.personas import render_brand_profile, render_user_skills
 from .workflow.video.jobs import get_render_job, start_render_job
 from .core.plan_schema import (
+    DRAFT_MODES,
     PlanClarification,
     PlanItem,
     PostingPlan,
@@ -192,14 +194,30 @@ def _brief_from_inputs(inputs: dict) -> Brief:
     )
 
 
+def _valid_draft_mode(raw) -> str:
+    """Validate a plan's draft_mode ('roundtable' | 'fast'), 400 on anything else."""
+    mode = str(raw or "roundtable").strip().lower()
+    if mode not in DRAFT_MODES:
+        raise ApiError(400, f"'draft_mode' must be one of {', '.join(DRAFT_MODES)}")
+    return mode
+
+
+def _draft_mode_from_inputs(inputs: dict) -> str:
+    """The deliberation mode a new plan's slots will be written with. Omitted → the
+    roundtable, so a caller that has never heard of this field gets what it always got."""
+    return _valid_draft_mode(inputs.get("draft_mode"))
+
+
 def _roundtable_mode_from_inputs(inputs: dict) -> str:
-    """Pop + validate the per-request step-mode switch. "auto" (the default) never prompts —
+    """Pop + validate the per-request roundtable switch. "auto" (the default) never prompts —
     today's hands-off flow; "manual" pauses every table at each round boundary for the user's
-    4-way choice (next / speak / enough / auto) via POST /tasks/{id}/round-control. Popped so
-    the remaining inputs stay a pure brief."""
+    4-way choice (next / speak / enough / auto) via POST /tasks/{id}/round-control; "off"
+    skips the discussion entirely and runs the original dispatcher → strategist → creator
+    path, for a caller that has chosen speed over deliberation (a campaign's fast mode).
+    Popped so the remaining inputs stay a pure brief."""
     mode = str(inputs.pop("roundtable_mode", None) or "auto").strip().lower()
-    if mode not in ("auto", "manual"):
-        raise ApiError(400, "'roundtable_mode' must be 'auto' or 'manual'")
+    if mode not in ("auto", "manual", "off"):
+        raise ApiError(400, "'roundtable_mode' must be 'auto', 'manual' or 'off'")
     return mode
 
 
@@ -382,6 +400,17 @@ class WorkflowService:
     # ── Drive one run segment (start or resume) until the next pause / end ─────
 
     async def _drive(self, task: _Task, *, message=None, responses=None) -> dict:
+        """Drain the workflow with this task's publisher bound as the ambient event sink.
+
+        The binding is what lets the creator stream copy as it writes (see core/emitter.py):
+        `_translate` only ever sees whole messages, so a draft that takes half a minute to
+        write has nothing to report until it is finished. Bound here rather than in `start`
+        because a resume (`review` → a rejected platform re-drafts) goes through this same
+        method and must stream too."""
+        with emitter_bound(lambda ev: self._publish(task, ev)):
+            return await self._drain(task, message=message, responses=responses)
+
+    async def _drain(self, task: _Task, *, message=None, responses=None) -> dict:
         # Answered gates stop being pending the moment we resume with their response — before
         # the stream even starts, not after it drains (see below for why "after" is wrong).
         if responses:
@@ -515,7 +544,9 @@ class WorkflowService:
             raise ApiError(409, f"task_id already exists: {task_id}")
         rt_mode = _roundtable_mode_from_inputs(inputs)  # 400 on a bad value, before any spawn
         brief = _brief_from_inputs(inputs)  # validates synchronously (HTTP 400) before any spawn
-        roundtable = get_settings().roundtable_enabled
+        # The setting is the deployment's ceiling; "off" is one caller declining it for this
+        # run. Neither can turn the roundtable ON where the other has ruled it out.
+        roundtable = get_settings().roundtable_enabled and rt_mode != "off"
         text_requested = "text" in brief.content_types
         # A CALLER-supplied hook (the CLI menu) owns the terminal, so tables must run one at a
         # time; the service's own step-mode hook (below) is per-table (SSE + /round-control),
@@ -961,7 +992,7 @@ class IntakeService:
         self, *, message: str, today: str, target_platforms: Optional[list] = None,
         known: Optional[dict] = None, history: Optional[list] = None,
         followups_asked: int = 0, business_id: Optional[str] = None,
-        user_id: Optional[str] = None,
+        user_id: Optional[str] = None, force_plan: bool = False,
     ) -> dict:
         """Route one chat turn: one post now, or a campaign across a date range?
 
@@ -969,7 +1000,11 @@ class IntakeService:
         posts for next month" produced one post *about* planning LinkedIn posts. A
         `single_post` answer means the caller carries on to `POST /tasks` exactly as before;
         `posting_plan` means it keeps turning this until `complete`, then takes the result to
-        `/plans/clarify` and `POST /plans`."""
+        `/plans/clarify` and `POST /plans`.
+
+        `force_plan` skips the fork: the caller's user has asked for a plan explicitly (the
+        chat's Posting plan toggle), so the turn is a campaign whatever the sentence looks
+        like on its own."""
         if not (message or "").strip():
             raise ApiError(400, "missing required field: message")
 
@@ -989,6 +1024,7 @@ class IntakeService:
             followups_asked=followups_asked,
             business_id=business_id,
             user_id=user_id,
+            force_plan=force_plan,
         )
 
     def _require(self, session_id: str) -> IntakeSession:
@@ -1385,6 +1421,7 @@ class PlanService:
             start_date=start_date,
             end_date=end_date,
             status="draft",
+            draft_mode=_draft_mode_from_inputs(inputs),
             strategy_summary=spec.strategy_summary,
             recommended_cadence=spec.recommended_cadence,
             follow_up_questions=list(spec.follow_up_questions),
@@ -1454,10 +1491,18 @@ class PlanService:
             business_id=business_id, user_id=user_id, status=status)
         return {"plans": plans}
 
-    async def confirm(self, plan_id: str) -> dict:
+    async def confirm(self, plan_id: str, *, draft_mode: Optional[str] = None) -> dict:
+        """Activate a draft plan, which is what releases its slots to be written.
+
+        `draft_mode` is accepted here and not only at creation because confirming is the
+        moment the choice becomes real: until then the plan is a schedule the user is
+        still editing, and how much deliberation each slot gets is a decision about work
+        that has not started. Omitted → whatever the plan already carries."""
         plan = await self._require(plan_id)
         if plan.get("status") != "draft":
             raise ApiError(409, f"plan {plan_id} is not a draft (status={plan.get('status')})")
+        if draft_mode is not None:
+            plan["draft_mode"] = _valid_draft_mode(draft_mode)
         plan["status"] = "active"
         await self._save(plan)
         return plan
@@ -1532,6 +1577,10 @@ class PlanService:
             "user_id": plan.get("user_id"),
             "content_types": list(item.get("content_types") or ["text"]),
         }
+        # The campaign's deliberation setting, applied per slot. A plan stored before
+        # draft_mode existed reads as "roundtable" and behaves exactly as it did.
+        if plan.get("draft_mode") == "fast":
+            inputs["roundtable_mode"] = "off"
         # WorkflowService.start 409s on a duplicate task_id, so a double-execute that
         # raced past the item-status guard still cannot start a second run.
         snapshot = await self._workflow.start(inputs, task_id=task_id, background=True)
@@ -1716,6 +1765,10 @@ class ClassifyRequest(BaseModel):
         "cap the conversation fills the gaps itself rather than interrogating further.")
     business_id: Optional[str] = None
     user_id: Optional[str] = None
+    force_plan: bool = Field(
+        False, description="The user asked for a posting plan outright (a UI control, not an "
+        "inference). Overrides a `single_post` verdict — the classification still runs, since "
+        "it is what extracts the goal and the date window from the message.")
 
 
 class IntakeStartRequest(BaseModel):
@@ -1832,6 +1885,20 @@ class CreatePlanRequest(BaseModel):
     answers: Optional[dict[str, str]] = Field(
         None, description="Answers to the follow_up_questions from a prior POST /plans/clarify, "
         "keyed by the question — so the very first draft is already tailored to them.")
+    draft_mode: Optional[str] = Field(
+        None, description="How much deliberation each slot's copy gets: 'roundtable' (the "
+        "default — the full agent discussion per slot, minutes each) or 'fast' (straight to "
+        "the strategist/creator, seconds each). Changeable again at confirm time.")
+
+
+class ConfirmPlanRequest(BaseModel):
+    """Activate a draft plan — POST /plans/{plan_id}/confirm. The body is optional; it
+    exists so the user can settle how their campaign gets written at the moment they
+    commit to it, rather than back when the schedule was first generated."""
+    model_config = ConfigDict(extra="allow")
+
+    draft_mode: Optional[str] = Field(
+        None, description="'roundtable' or 'fast'. Omitted → keep what the plan carries.")
 
 
 class ClarifyPlanRequest(BaseModel):
@@ -2088,6 +2155,7 @@ async def intake_classify(request: Request, body: ClassifyRequest) -> dict:
         followups_asked=body.followups_asked,
         business_id=body.business_id,
         user_id=body.user_id,
+        force_plan=body.force_plan,
     )
 
 
@@ -2264,8 +2332,11 @@ async def refine_plan(request: Request, plan_id: str, body: RefinePlanRequest) -
 
 
 @plans_router.post("/{plan_id}/confirm", summary="Activate a draft plan")
-async def confirm_plan(request: Request, plan_id: str) -> dict:
-    return await _plans(request).confirm(plan_id)
+async def confirm_plan(
+    request: Request, plan_id: str, body: Optional[ConfirmPlanRequest] = None
+) -> dict:
+    return await _plans(request).confirm(
+        plan_id, draft_mode=(body.draft_mode if body else None))
 
 
 @plans_router.patch("/{plan_id}/items/{item_id}", summary="Edit or skip one plan item")

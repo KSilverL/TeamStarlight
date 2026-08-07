@@ -4,6 +4,9 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
+import { readToken, useSession } from "../_lib/session";
+import AlreadySignedIn from "../components/AlreadySignedIn";
+
 export default function SignUpPage() {
   const router = useRouter();
 
@@ -16,6 +19,9 @@ export default function SignUpPage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
+  // See login/page.tsx for why this is three states rather than a boolean.
+  const { status, email: signedInAs } = useSession();
+
   function handleChange(e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) {
     setForm((prev) => ({ ...prev, [e.target.name]: e.target.value }));
   }
@@ -26,15 +32,21 @@ export default function SignUpPage() {
     setLoading(true);
 
     try {
+      const token = readToken();
       const res = await fetch("/api/auth/signup", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify(form),
       });
 
       const data = await res.json();
 
       if (!res.ok) {
+        // A 409 ("already signed in") means a session appeared after this form rendered —
+        // useSession picks that up from the `storage` event and swaps in the panel itself.
         setError(data.error ?? "Sign up failed. Please try again.");
         return;
       }
@@ -65,6 +77,9 @@ export default function SignUpPage() {
 
       {/* Form */}
       <main className="flex-1 flex items-center justify-center px-6 py-16">
+        {status === "checking" ? null : status === "signed-in" ? (
+          <AlreadySignedIn email={signedInAs} />
+        ) : (
         <div className="w-full max-w-md bg-white border border-[#E8E3DA] rounded-2xl p-8 shadow-sm">
           <h1 className="text-2xl font-bold text-[#1B1A17] mb-1">Create your account</h1>
           <p className="text-sm text-[#6B6561] mb-6">
@@ -155,6 +170,7 @@ export default function SignUpPage() {
             </button>
           </form>
         </div>
+        )}
       </main>
     </div>
   );

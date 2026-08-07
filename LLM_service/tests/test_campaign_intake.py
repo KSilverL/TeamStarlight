@@ -98,6 +98,61 @@ async def test_campaign_requests_route_to_the_planner(conversation, message):
     assert result["intent"] == "posting_plan"
 
 
+# ── force_plan: the user saying so, rather than us inferring it ──────────────
+#
+# The chat's Posting plan toggle. Everything above is the classifier reading intent out of a
+# sentence, which is guesswork and is wrong often enough to matter — "posts for the launch" is
+# a campaign to a human and a single post to a model. When the user has stated it outright,
+# the guess stops being a vote.
+
+@pytest.mark.parametrize("message", [
+    "Write me a LinkedIn post about our new espresso blend",
+    "Something about the roastery",
+])
+async def test_force_plan_overrides_a_single_post_verdict(conversation, message):
+    # These are the exact messages that route to a single post when left alone (above).
+    result = await _turn(conversation, message, force_plan=True)
+
+    assert result["intent"] == "posting_plan"
+
+
+async def test_force_plan_asks_for_what_it_still_needs(conversation):
+    # Forcing the intent does not force completeness. A message the classifier read as a
+    # one-off carries no goal and no window — it had no reason to look for either — so the
+    # forced campaign starts empty and has to ask, exactly as if the classifier had chosen
+    # this route itself. That is the clarify machinery doing its job, not a gap.
+    result = await _turn(conversation, "posts please", force_plan=True)
+
+    assert result["intent"] == "posting_plan"
+    assert result["complete"] is False
+    assert result["question"]
+    assert result["followups_asked"] == 1
+
+
+async def test_force_plan_keeps_what_earlier_turns_settled(conversation):
+    # The answers to those questions still accumulate the ordinary way — forcing the intent
+    # changes which pipeline runs, not how the conversation remembers itself.
+    result = await _turn(
+        conversation,
+        "to launch our coffee subscription",
+        force_plan=True,
+        known={"start_date": "2026-09-01", "end_date": "2026-09-30"},
+        followups_asked=1,
+    )
+
+    assert result["intent"] == "posting_plan"
+    assert result["complete"] is True
+    assert result["campaign"]["start_date"] == "2026-09-01"
+    assert result["campaign"]["end_date"] == "2026-09-30"
+
+
+async def test_without_force_plan_the_classifier_still_decides(conversation):
+    # The flag defaults off, so nothing about the existing behaviour moves.
+    result = await _turn(conversation, "Write me a LinkedIn post about our espresso blend")
+
+    assert result["intent"] == "single_post"
+
+
 # ── publish_at: when a one-off post should go out ────────────────────────────
 #
 # The chat could always write a post and always schedule one, but never in the same breath:
@@ -334,6 +389,19 @@ def test_classify_requires_today(client):
 
     assert response.status_code == 400
     assert "today" in response.json()["error"]
+
+
+def test_classify_honours_force_plan_over_the_wire(client):
+    body = {
+        "message": "Write me a LinkedIn post about our new espresso blend",
+        "today": TODAY,
+        "target_platforms": ["linkedin"],
+    }
+
+    assert client.post("/intake/classify", json=body).json()["intent"] == "single_post"
+    assert client.post(
+        "/intake/classify", json={**body, "force_plan": True}
+    ).json()["intent"] == "posting_plan"
 
 
 def test_classify_rejects_an_empty_message(client):
