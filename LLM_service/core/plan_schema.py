@@ -33,6 +33,13 @@ from pydantic import BaseModel, Field, field_validator
 PLAN_STATUSES = ("draft", "active", "completed", "archived")
 ITEM_STATUSES = ("planned", "generating", "awaiting_review", "done", "skipped", "error")
 
+# How much deliberation each of this plan's slots gets when its copy is written.
+# "roundtable" runs the full agent discussion before drafting (minutes per slot);
+# "fast" goes straight down the strategist → creator path (seconds per slot). A
+# campaign is many slots run back to back, which is exactly where that difference
+# stops being an implementation detail and becomes the user's decision.
+DRAFT_MODES = ("roundtable", "fast")
+
 
 def _valid_iso_date(raw: str) -> str:
     """Validate a YYYY-MM-DD date string, normalising to the ISO form. Raises
@@ -113,6 +120,9 @@ class PostingPlan(BaseModel):
     start_date: str
     end_date: str
     status: Literal[PLAN_STATUSES] = "draft"  # type: ignore[valid-type]
+    # Defaulted, so every plan stored before this field existed reads back as the
+    # deliberated mode it was actually generated with.
+    draft_mode: Literal[DRAFT_MODES] = "roundtable"  # type: ignore[valid-type]
     strategy_summary: str = ""
     recommended_cadence: str = ""
     follow_up_questions: List[str] = Field(default_factory=list)

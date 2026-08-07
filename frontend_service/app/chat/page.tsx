@@ -192,6 +192,35 @@ function localToday(): string {
   return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
 }
 
+/**
+ * A sidebar title for a campaign, out of its goal.
+ *
+ * A single post is named by the LLM service — `POST /tasks` returns a title and refines it over
+ * SSE. A campaign never touches that pipeline; it goes to `/plans` instead, which is why
+ * planning sessions showed a bare timestamp for ever. The goal is the right raw material: the
+ * classifier already extracts it as a short phrase in the user's own terms, so it needs
+ * tidying rather than generating.
+ *
+ * Same contract as `_clean_title` in LLM_service/api.py — strip wrapping quotes, collapse
+ * whitespace, clamp to 48 chars, empty in / empty out — plus a leading capital, because a goal
+ * reads as a fragment ("launch the subscription") and a title should not.
+ */
+function titleFromGoal(goal: string): string {
+  const cleaned = (goal ?? "")
+    .trim()
+    .replace(/^["'“”‘’]+|["'“”‘’]+$/g, "")
+    .split(/\s+/)
+    .join(" ")
+    .trim();
+  if (!cleaned) return "";
+
+  const clamped =
+    cleaned.length > 48
+      ? cleaned.slice(0, 48).replace(/[ ,.;:—-]+$/, "") + "…"
+      : cleaned;
+  return clamped.charAt(0).toUpperCase() + clamped.slice(1);
+}
+
 // ── Posting plans in chat ─────────────────────────────────────────────────────
 
 /** One dated slot on a campaign schedule. Strategy, never copy — the posts themselves are
@@ -218,6 +247,11 @@ interface Plan {
   recommended_cadence?: string;
   items: PlanItem[];
 }
+
+/** How much deliberation each of a campaign's posts gets when it is written: the full agent
+ * roundtable, or straight to the writing. Chosen at confirm, because that is when the work
+ * is commissioned — see LLM_service/core/plan_schema.py. */
+type DraftMode = "roundtable" | "fast";
 
 /**
  * Where a campaign request has got to, across turns.
@@ -335,6 +369,10 @@ const CONTENT_TYPES: { id: ContentType; label: string }[] = [
   { id: "video", label: "Video" },
   { id: "brand", label: "Brand Animation" },
 ];
+
+/** How many past sessions the sidebar shows before it needs asking. Enough to cover the last
+ *  day or two of work, few enough that the controls below stay on screen. */
+const SESSIONS_COLLAPSED_COUNT = 6;
 
 const INITIAL_MESSAGES: Message[] = [
   {
@@ -806,6 +844,13 @@ export default function ChatPage() {
    * ask, this falls straight through to building the plan.
    */
   async function startClarify(campaign: Record<string, string>) {
+    // Name the session here, the moment the campaign is settled — not after the plan is built.
+    // A campaign that reaches this point has a goal by definition (it is one of the planner's
+    // required fields), and naming it now means a schedule that fails to generate still leaves
+    // a session the user can recognise tomorrow.
+    const title = titleFromGoal(campaign.goal ?? "");
+    if (title) applySessionTitle(title, { provisional: false });
+
     pushMessage({ role: "assistant", content: "Working out the shape of this campaign…", variant: "status" });
 
     let data: Record<string, unknown> = {};
@@ -930,6 +975,10 @@ export default function ChatPage() {
   const requestedPublishAtRef = useRef<string>("");
 
   const [pastSessions, setPastSessions] = useState<SessionSummary[]>([]);
+  // The sidebar shows the most recent few by default. The list is unbounded and grows for the
+  // life of the account, and pushing Platforms and Content Type off the screen costs more than
+  // a month-old session is worth — one click brings the rest back.
+  const [showAllSessions, setShowAllSessions] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [sessionTitle, setSessionTitle] = useState<string | null>(null);
@@ -939,6 +988,21 @@ export default function ChatPage() {
   // True while the name is the placeholder POST /tasks derives from the topic, which the LLM's
   // own shorter title (session_title, over SSE) is allowed to replace exactly once.
   const titleIsProvisionalRef = useRef(false);
+
+  // Collapsed, the sidebar shows the newest few — but never hides the session being viewed,
+  // which would leave the list with nothing highlighted and the user unable to tell where
+  // they are. Sessions are sorted newest-first, so slicing keeps that order.
+  const visibleSessions = showAllSessions
+    ? pastSessions
+    : pastSessions.filter(
+        (s, i) => i < SESSIONS_COLLAPSED_COUNT || s.id === activeSessionId
+      );
+  const hiddenSessionCount = pastSessions.length - visibleSessions.length;
+  // Two reasons to show the control, and it needs both: something is hidden and can be
+  // revealed, or the list is expanded and can be put back. Testing only the first would take
+  // "Show less" away the moment it worked; testing only overflow would offer "Show 0 more" in
+  // the case where pinning the active session happens to make the whole list visible anyway.
+  const showSessionsToggle = showAllSessions || hiddenSessionCount > 0;
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -1883,7 +1947,7 @@ export default function ChatPage() {
                 Past Sessions
               </h3>
               <div className="space-y-1.5">
-                {pastSessions.map((s) => {
+                {visibleSessions.map((s) => {
                   const isActive = s.id === activeSessionId;
                   const isLoading = s.id === loadingSessionId;
                   return (
@@ -1909,6 +1973,32 @@ export default function ChatPage() {
                   );
                 })}
               </div>
+
+              {showSessionsToggle && (
+                <button
+                  onClick={() => setShowAllSessions((open) => !open)}
+                  aria-expanded={showAllSessions}
+                  className="flex items-center gap-1.5 w-full px-3 py-2 mt-1.5 rounded-lg text-[11px] font-medium text-[#9E9893] hover:text-[#1B1A17] hover:bg-[#F2EDE4] transition-colors"
+                >
+                  <svg
+                    width="10"
+                    height="10"
+                    viewBox="0 0 10 10"
+                    fill="none"
+                    aria-hidden="true"
+                    className={`transition-transform ${showAllSessions ? "rotate-180" : ""}`}
+                  >
+                    <path
+                      d="M2 3.5L5 6.5L8 3.5"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                  {showAllSessions ? "Show less" : `Show ${hiddenSessionCount} more`}
+                </button>
+              )}
             </div>
           )}
 
@@ -3120,6 +3210,7 @@ function PlanCard({
 }: PlanCardProps) {
   const [feedback, setFeedback] = useState("");
   const [busy, setBusy] = useState<"refining" | "confirming" | null>(null);
+  const [draftMode, setDraftMode] = useState<DraftMode>("roundtable");
 
   const isDraft = plan.status === "draft";
 
@@ -3157,7 +3248,8 @@ function PlanCard({
     try {
       const res = await fetch(`/api/plans/${plan.plan_id}/confirm`, {
         method: "POST",
-        headers: authHeaders(),
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ draft_mode: draftMode }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
@@ -3166,8 +3258,8 @@ function PlanCard({
       }
       onPlanChanged(data as Plan);
       onNotice(
-        `Confirmed — I'm writing all ${plan.items.length} posts now. They'll appear in your ` +
-        `review queue as they're ready, and nothing publishes until you approve it.`
+        `Confirmed — I'm writing your ${plan.items.length} posts now, one at a time. Follow ` +
+        `along in Posting Plans; nothing publishes until you approve it.`
       );
     } catch {
       onNotice("Could not reach the planning service.");
@@ -3255,6 +3347,41 @@ function PlanCard({
               </button>
             </div>
 
+            {/* The one thing worth deciding before committing: ten posts is the difference
+                between half a minute and half an hour of model work. */}
+            <div className="flex gap-1.5">
+              {(
+                [
+                  { id: "roundtable", label: "Roundtable", cost: "~3 min a post" },
+                  { id: "fast", label: "Fast", cost: "~20 sec a post" },
+                ] as const
+              ).map((option) => {
+                const active = draftMode === option.id;
+                return (
+                  <button
+                    key={option.id}
+                    onClick={() => setDraftMode(option.id)}
+                    disabled={busy !== null}
+                    aria-pressed={active}
+                    className={`flex-1 rounded-lg border px-2 py-1.5 text-left transition-colors disabled:opacity-50 ${
+                      active
+                        ? "border-[#FF4800] bg-[#FFF0EB]"
+                        : "border-[#E8E3DA] bg-white hover:border-[#C8C2BA]"
+                    }`}
+                  >
+                    <span className="block text-[11px] font-medium text-[#1B1A17]">
+                      {option.label}
+                    </span>
+                    <span
+                      className={`block text-[10px] ${active ? "text-[#FF4800]" : "text-[#9E9893]"}`}
+                    >
+                      {option.cost}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
             <button
               onClick={handleConfirm}
               disabled={busy !== null}
@@ -3265,7 +3392,8 @@ function PlanCard({
                 : `Confirm — write all ${plan.items.length} posts`}
             </button>
             <p className="text-[11px] text-[#9E9893] text-center leading-relaxed">
-              Every post is drafted for you to review. Nothing publishes until you approve it.
+              Written one at a time, in order, for you to review. Nothing publishes until you
+              approve it.
             </p>
           </div>
         ) : (
@@ -3273,8 +3401,14 @@ function PlanCard({
             <p className="text-xs text-green-700 font-medium mb-1">
               ✓ Confirmed — writing {plan.items.length} posts
             </p>
-            <Link href="/plans" className="text-xs text-[#FF4800] hover:underline">
-              Track them in Posting Plans →
+            {/* Named, so the link lands on THIS campaign. Without the id it opens on "No plan
+                selected" and the user has to find, among every plan they've ever made, the one
+                they were looking at a second ago. */}
+            <Link
+              href={`/plans?plan=${plan.plan_id}`}
+              className="text-xs text-[#FF4800] hover:underline"
+            >
+              Watch them being written →
             </Link>
           </div>
         )}

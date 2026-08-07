@@ -20,7 +20,8 @@ without real network access; a real run without the SDK/creds fails loudly.
 from __future__ import annotations
 
 import json
-from typing import AsyncIterator, List, Optional
+import logging
+from typing import AsyncIterator, Callable, List, Optional
 
 from agent_framework import (
     BaseChatClient,
@@ -48,6 +49,8 @@ from .base import (
     VoiceoverService,
     VoiceService,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _voice_live_ws_url(settings: Settings) -> str:
@@ -181,7 +184,7 @@ class AzureLLM(LLMService):
         self, messages: List[dict], *, model: Optional[str] = None,
         temperature: Optional[float] = None, max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None, verbosity: Optional[str] = None,
-        max_retries: Optional[int] = None,
+        max_retries: Optional[int] = None, on_delta: Optional[Callable[[str], None]] = None,
     ) -> str:
         """Single seam through which all chat traffic flows (overridable in tests).
         `model` overrides the deployment for one call (e.g. the cheap summary tier);
@@ -200,7 +203,11 @@ class AzureLLM(LLMService):
         only (`with_options` copies the client but keeps the same underlying httpx
         connection pool, so this is not a per-call connection leak). The codegen
         path passes 0 — see Settings.codegen_max_retries for why retrying a
-        300s-timeout reasoning call is actively harmful."""
+        300s-timeout reasoning call is actively harmful.
+        `on_delta`, when given, asks for a STREAMED completion and is called with each
+        text chunk as it arrives; the full text is still returned, so a caller that
+        wants both live output and the finished string gets them from one call. Every
+        other call site passes None and issues exactly the request it always did."""
         client = self._ensure_client()
         if max_retries is not None:
             client = client.with_options(max_retries=max_retries)
@@ -216,8 +223,38 @@ class AzureLLM(LLMService):
             kwargs["temperature"] = temperature
         if max_tokens is not None:
             kwargs["max_completion_tokens"] = max_tokens
+        if on_delta is not None:
+            try:
+                return await self._stream(client, kwargs, on_delta)
+            except Exception as exc:  # noqa: BLE001
+                # Streaming is a presentation upgrade, not a capability the copy depends
+                # on — a deployment with streaming disabled, or a connection that drops
+                # mid-stream, must still produce a draft. Fall back to the plain call the
+                # rest of the service uses rather than failing the run for a nicer UI.
+                logger.warning(
+                    "streamed completion failed (%s); falling back to a non-streamed call",
+                    exc,
+                )
         resp = await client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content or ""
+
+    @staticmethod
+    async def _stream(client, kwargs: dict, on_delta: Callable[[str], None]) -> str:
+        """Issue `kwargs` as a streamed completion, feeding each chunk to `on_delta` and
+        returning the accumulated text. Split out so the fallback above wraps the whole
+        streamed attempt — including a mid-stream drop, which is the failure that matters:
+        a stream that dies after 200 characters must re-request the full completion, not
+        hand back a truncated draft."""
+        chunks: List[str] = []
+        stream = await client.chat.completions.create(**kwargs, stream=True)
+        async for chunk in stream:
+            if not chunk.choices:
+                continue  # Azure's content-filter frames carry no choices
+            text = chunk.choices[0].delta.content or ""
+            if text:
+                chunks.append(text)
+                on_delta(text)
+        return "".join(chunks)
 
     async def chat(self, messages: List[dict]) -> str:
         return await self._complete(messages)
@@ -591,6 +628,7 @@ class AzureLLM(LLMService):
         history: Optional[List[dict]] = None,
         feedback: str = "",
         prior_draft: str = "",
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> str:
         # On a re-draft, steer with the specific reason the prior version was rejected
         # (the human's gate comment / the reviewer's note) rather than a generic "vary
@@ -631,7 +669,8 @@ class AzureLLM(LLMService):
         # the system prompt and the current request, so a follow-up continues the thread.
         return await self._complete(
             [{"role": "system", "content": system}, *(history or []),
-             {"role": "user", "content": user}]
+             {"role": "user", "content": user}],
+            on_delta=on_delta,  # None → the same non-streamed request as every other call
         )
 
     async def render_html_card(

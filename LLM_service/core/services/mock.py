@@ -19,7 +19,7 @@ import copy
 import html as _html
 import re
 from datetime import date, datetime, timedelta, timezone
-from typing import AsyncIterator, Dict, List, Optional
+from typing import AsyncIterator, Callable, Dict, List, Optional
 
 from agent_framework import (
     BaseChatClient,
@@ -191,6 +191,16 @@ _PLATFORM_TAGS: Dict[str, str] = {
     "linkedin": "#Leadership", "instagram": "#instagood",
     "x": "#news", "tiktok": "#fyp #foryou", "facebook": "",
 }
+
+
+def _word_chunks(text: str) -> List[str]:
+    """Split `text` into word-sized slices that concatenate back to it exactly.
+
+    Whitespace rides with the word that follows it, so joining the slices is a plain
+    `"".join` with no reconstruction rules — the same contract a real token stream has,
+    which is the point: the offline path must be indistinguishable to every consumer.
+    """
+    return re.findall(r"\s*\S+|\s+", text)
 
 
 def _enforce_char_limit(post: str, limit: Optional[int]) -> str:
@@ -857,6 +867,7 @@ class MockLLM(LLMService):
         history: Optional[List[dict]] = None,
         feedback: str = "",
         prior_draft: str = "",
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> str:
         await asyncio.sleep(_MOCK_LATENCY)
         tone = tone_hint or "on-brand"
@@ -894,6 +905,13 @@ class MockLLM(LLMService):
         # observable (production reworks the copy against it). Empty on the first pass.
         if feedback:
             post += f"\n\nReworked to address: {feedback}"
+        if on_delta is not None:
+            # Hand the finished post back a word at a time, so an offline run drives the
+            # same streaming code path as production — the frontend's delta accumulation
+            # and the executor's coalescing are then exercised by the whole mocked suite,
+            # not only by a live Azure deployment nobody runs in CI.
+            for chunk in _word_chunks(post):
+                on_delta(chunk)
         return post
 
     async def render_html_card(

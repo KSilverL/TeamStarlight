@@ -55,9 +55,11 @@ public class PlanService {
 
     
     @SuppressWarnings("unchecked")
-    public Map<String, Object> confirmPlan(String planId) {
+    public Map<String, Object> confirmPlan(String planId, Map<String, Object> body) {
         return restClient.post()
                 .uri(llmServiceBaseUrl + "/plans/" + planId + "/confirm")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(body != null ? body : Map.of())
                 .retrieve()
                 .body(Map.class);
     }

@@ -20,6 +20,7 @@ from typing import Optional
 # ── Event `type` discriminator ────────────────────────────────────────────────
 PROGRESS = "progress"               # "the task is now at executor X"
 RESULT = "result"                   # "executor X produced this content"
+DRAFT_DELTA = "draft_delta"         # a slice of copy as the model writes it
 AGENT_UTTERANCE = "agent_utterance" # "a roundtable participant just spoke"
 AGENT_UTTERANCE_AUDIO = "agent_utterance_audio"  # the TTS clip for an already-emitted turn
 SPEAKER_SCHEDULED = "speaker_scheduled"  # "the manager just handed the mic to a participant"
@@ -82,6 +83,29 @@ def result_event(
     if payload:
         event.update(payload)
     return event
+
+
+def draft_delta_event(*, platform: str, text: str, attempt: int = 1) -> dict:
+    """A slice of a draft as the creator writes it, ahead of the `draft_ready` result.
+
+    Deliberately NOT a `result` event: `draft_ready` is the authoritative copy the human
+    gate reviews, and a subscriber must be able to tell "the text so far" from "the text".
+    A client appends these in `seq` order and lets `draft_ready` overwrite the accumulation,
+    so a dropped or coalesced delta can never leave a corrupted draft on screen.
+
+    `text` is a slice, not the running total — the deltas for one (platform, attempt)
+    concatenate to the final draft. `attempt` distinguishes a rework's stream from the
+    original's, since a rejected platform re-enters the creator and streams again."""
+    return {
+        "type": DRAFT_DELTA,
+        "node": "creator",
+        "phase": NODE_PHASE["creator"],
+        "platform": platform,
+        "status": RUNNING,
+        "ts": time.time(),
+        "text": text,
+        "attempt": attempt,
+    }
 
 
 def session_title_event(*, task_id: str, title: str) -> dict:

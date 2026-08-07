@@ -107,7 +107,7 @@ async def test_write_copy_threads_history_into_the_prompt():
     captured: dict = {}
     llm = AzureLLM(get_settings())
 
-    async def _complete(messages):
+    async def _complete(messages, **_kwargs):
         captured["messages"] = messages
         return "continued copy"
 
