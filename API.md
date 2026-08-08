@@ -702,11 +702,18 @@ overrides:
 | `narration_text` | agent's per-slide narration | Override with your own single whole-video script (replaces the per-slide lines) |
 | `narration_voice` | agent-picked voice persona (Azure Dragon HD) | Override the voice with a provider voice id (e.g. `en-GB-RyanNeural`) |
 | `narration_enabled` | `true` | Set `false` for a music-only render with no narration |
+| `music_enabled` | `true` | Set `false` to suppress the backing track, overriding the agent's own `audio.musicEnabled` choice |
 
 ```json
-// request — silent-narration render
+// request — music-only render (no narration). The music mixes at -9dB rather than
+// the -18dB it sits at under a voiceover, so it still carries the video.
 { "platform": "instagram", "narration_enabled": false }
 ```
+
+Both tracks are also the storyboard agent's to decide: it drops the music by setting
+`audio.musicEnabled: false`, and drops the voice by leaving every slide's `narration`
+(and `audio.narrationScript`) null — so a brief like *"no music, just the voiceover"*
+needs no request flag at all. The two fields above are hard overrides on top of that.
 
 Errors: `404` if the task/platform has no finished draft yet; `409` if that platform's run did
 not request `"video"` (no storyboard to render).

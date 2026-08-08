@@ -1676,14 +1676,13 @@ def _silent_mp3(duration_seconds: float) -> bytes:
 
 
 class MockMusicGeneration(MusicGenerationService):
-    """Offline stand-in for Soundraw: returns a real (silent) MP3 sized to
-    `duration_seconds`, so the music-resolution pipeline — including Remotion's
+    """Offline stand-in for the real music providers: returns a real (silent) MP3 sized
+    to `duration_seconds`, so the music-resolution pipeline — including Remotion's
     ffprobe inspection of the file — works end to end without real credentials
     or network access.
 
-    TODO: circle back and wire up a real SOUNDRAW_API_KEY (see SoundrawMusic in
-    media_assets.py) once its request/response contract is verified against a
-    live account — this mock only proves the pipeline plumbing, not real audio.
+    For actual audio set USE_MOCK_MUSIC_GENERATION=false; JamendoMusic (a free
+    JAMENDO_CLIENT_ID) is the real provider, with the bundled library behind it.
     """
 
     async def generate(self, *, mood: str, genre: str, duration_seconds: float, energy: str) -> bytes:

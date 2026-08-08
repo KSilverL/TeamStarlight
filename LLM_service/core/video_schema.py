@@ -562,8 +562,20 @@ class AudioSpec(BaseModel):
     StoryboardSpec (None → the legacy fixed-music, no-narration behavior), so any
     storyboard JSON persisted before this field existed still validates and renders
     unchanged. workflow/video/{music,voiceover}.py consume these; the resolved track
-    PATHS (not this spec) are what reach the renderer via RenderableStoryboard."""
+    PATHS (not this spec) are what reach the renderer via RenderableStoryboard.
 
+    Both tracks are independently suppressible by the LLM: `musicEnabled=False` drops
+    the backing music, and leaving every slide's `narration` (plus `narrationScript`)
+    null drops the voiceover. RenderVideoRequest's music_enabled/narration_enabled are
+    hard overrides layered on top of these — see workflow/video/jobs.py."""
+
+    musicEnabled: bool = Field(
+        True,
+        description="Whether the video has a backing music track at all. True (default) for "
+        "almost everything. Set false ONLY when the brief calls for it — a sombre or serious "
+        "subject, a spoken-word piece where music would distract, or an explicit request for "
+        "no music. When false, musicMood/musicGenre/musicEnergy are ignored.",
+    )
     musicMood: MusicMood = Field("inspiring", description="Emotional tone of the backing track")
     musicGenre: MusicGenre = Field("corporate", description="Musical style of the backing track")
     musicEnergy: MusicEnergy = Field("medium", description="Pace/intensity of the backing track")

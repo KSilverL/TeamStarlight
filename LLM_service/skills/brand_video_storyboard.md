@@ -262,6 +262,10 @@ null when you give per-slide narration).
 ### Music (`audio` block)
 
 Always include an `audio` object. Pick music that matches the brand's energy and the story:
+- `musicEnabled`: `true` for almost every video. Set it to `false` only when the brief calls
+  for it — a sombre or serious subject, a spoken-word piece where a bed would distract, or an
+  explicit "no music" request. When `false` the three fields below are ignored, exactly as
+  every slide's `narration` being `null` means the video has no voice.
 - `musicMood`: *inspiring*, *uplifting*, *energetic*, *calm*, *dramatic*, or *playful*.
 - `musicGenre`: *corporate*, *cinematic*, *electronic*, *acoustic*, *hiphop*, or *ambient*.
 - `musicEnergy`: *low*, *medium*, or *high* — match the `transition`/`backgroundStyle`

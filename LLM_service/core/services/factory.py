@@ -214,12 +214,17 @@ def get_music_generation() -> MusicGenerationService:
         s = get_settings()
         if s.mock_music_generation():
             return mock.MockMusicGeneration()
-        # Prefer the local royalty-free library (offline, no key) when it's populated;
-        # Soundraw is the generative fallback and is enterprise-gated.
+        # Jamendo first: it's the only provider where the agent's mood/genre/energy
+        # actually varies the track. The local library is the offline/no-key fallback
+        # (one track, so mood has no audible effect there), and Soundraw — generative,
+        # enterprise-gated — is last.
+        if s.has_jamendo:
+            return media_assets.JamendoMusic(s)
         if s.has_music_library:
             return media_assets.BundledMusicLibrary(s)
         _require(s.has_soundraw, "Background music",
-                 "a populated MUSIC_LIBRARY_DIR/manifest.json (see assets/music/README.md), "
+                 "JAMENDO_CLIENT_ID (free, from devportal.jamendo.com), a populated "
+                 "MUSIC_LIBRARY_DIR/manifest.json (see assets/music/README.md), "
                  "or SOUNDRAW_API_KEY", "USE_MOCK_MUSIC_GENERATION=true")
         return media_assets.SoundrawMusic(s)
     return _cached("music_generation", build)

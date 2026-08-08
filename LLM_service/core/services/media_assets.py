@@ -13,9 +13,10 @@ unavailable, e.g. in pure-mock test runs.
 from __future__ import annotations
 
 import json
+import math
 import random
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from ..config import Settings
 from .base import (
@@ -47,6 +48,15 @@ _GEOCODE_MIN_CONFIDENCE = 0.5
 # Placeholder — Soundraw's exact generation endpoint/request/response contract has
 # not been verified against their live docs/account. See SoundrawMusic's docstring.
 _SOUNDRAW_GENERATE_URL = "https://api.soundraw.io/v1/generate"
+# Jamendo: ~500k Creative-Commons tracks, free API key from devportal.jamendo.com.
+# See JamendoMusic for the query mapping and the licensing caveat.
+_JAMENDO_TRACKS_URL = "https://api.jamendo.com/v3.0/tracks"
+# A backing track is ~3-8 MB. Cap generously but not unboundedly — see _CLIP_MAX_BYTES
+# in workflow/video/assets.py for the same reasoning applied to stock footage.
+_MUSIC_MAX_BYTES = 20 * 1024 * 1024
+# Upper bound of the requested duration window. A track only needs to be at least as
+# long as the video (Remotion clips it); this just stops the filter asking for epics.
+_MUSIC_MAX_TRACK_SECONDS = 600
 
 
 class PexelsImageSearch(ImageSearchService):
@@ -326,9 +336,112 @@ class GeoapifyStaticMap:
             return resp.content
 
 
+class JamendoMusic(MusicGenerationService):
+    """Background music from the Jamendo API — the default real provider.
+
+    Jamendo's /tracks search maps almost 1:1 onto this ABC's (mood, genre, energy)
+    arguments, so the storyboard LLM's choices finally change what you hear: `mood` and
+    `genre` become `fuzzytags` (fuzzy OR matching over Jamendo's tag vocabulary), and
+    `energy` becomes `speed`. `vocalinstrumental=instrumental` is pinned on every query
+    — a lyric vocal fighting the narration is worse than no music at all.
+
+    Licensing: the free API tier is non-commercial and the catalogue is Creative
+    Commons. Commercially distributing a render would need a Jamendo Licensing
+    subscription — see LLM_service/assets/music/README.md.
+    """
+
+    # Our MusicEnergy vocabulary is a subset of Jamendo's `speed` (which also has
+    # verylow/veryhigh), so this is a straight pass-through with a safe default.
+    _SPEED_BY_ENERGY = {"low": "low", "medium": "medium", "high": "high"}
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    def _base_params(self) -> Dict[str, Any]:
+        return {
+            "client_id": self._settings.jamendo_client_id,
+            "format": "json",
+            "limit": 20,
+            # Popularity is a decent proxy for "produced well enough to sit under a
+            # brand video"; the catalogue is community-uploaded and uneven.
+            "order": "popularity_total",
+            "vocalinstrumental": "instrumental",
+            "audioformat": "mp32",
+        }
+
+    def _attempts(self, *, mood: str, genre: str, energy: str, seconds: int) -> List[Dict[str, Any]]:
+        """Progressively looser queries, tried in order until one returns tracks.
+
+        The tightest query (mood + genre + speed + a duration floor) can legitimately
+        match nothing in a 500k-track catalogue, and returning silence would be the
+        worst outcome — so each step drops the least important constraint. Mood is the
+        last thing to go because it dominates how the video feels, mirroring
+        BundledMusicLibrary._WEIGHTS."""
+        speed = self._SPEED_BY_ENERGY.get(energy, "medium")
+        floor = min(seconds, _MUSIC_MAX_TRACK_SECONDS)
+        tags = f"{mood}+{genre}"
+        return [
+            {"fuzzytags": tags, "speed": speed,
+             "durationbetween": f"{floor}_{_MUSIC_MAX_TRACK_SECONDS}"},
+            {"fuzzytags": tags, "speed": speed},   # drop the duration floor
+            {"fuzzytags": tags},                   # drop the speed filter
+            {"fuzzytags": mood},                   # mood alone — last resort
+        ]
+
+    async def generate(self, *, mood: str, genre: str, duration_seconds: float, energy: str) -> bytes:
+        import httpx  # lazy import
+
+        seconds = max(1, math.ceil(duration_seconds))
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            results: List[dict] = []
+            for extra in self._attempts(mood=mood, genre=genre, energy=energy, seconds=seconds):
+                resp = await client.get(_JAMENDO_TRACKS_URL, params={**self._base_params(), **extra})
+                resp.raise_for_status()
+                payload = resp.json()
+                # Jamendo signals application-level errors with HTTP 200 and a non-success
+                # status in the envelope, so raise_for_status() above is not enough.
+                status = (payload.get("headers") or {}).get("status")
+                if status != "success":
+                    raise RuntimeError(f"Jamendo search failed: {payload.get('headers')!r}")
+                results = payload.get("results") or []
+                if results:
+                    break
+
+            if not results:
+                raise RuntimeError(
+                    f"Jamendo returned no instrumental tracks for mood={mood!r} genre={genre!r} "
+                    f"energy={energy!r} even after relaxing the query"
+                )
+
+            # Random pick over the matches, for the same reason BundledMusicLibrary
+            # randomises its tie-break: repeated renders of one brief shouldn't always
+            # land on the identical track.
+            track = random.choice(results)
+            # `audiodownload` is the full-quality file but is withheld for some artists;
+            # `audio` is the always-present streaming URL and is fine to fetch directly.
+            url = track.get("audiodownload") if track.get("audiodownload_allowed") else None
+            url = url or track.get("audio")
+            if not url:
+                raise RuntimeError(f"Jamendo track {track.get('id')!r} exposed no audio URL")
+
+            async with client.stream("GET", url) as track_resp:
+                track_resp.raise_for_status()
+                chunks: List[bytes] = []
+                total = 0
+                async for chunk in track_resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > _MUSIC_MAX_BYTES:
+                        raise RuntimeError(f"Jamendo track exceeded {_MUSIC_MAX_BYTES} bytes")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+
+
 class BundledMusicLibrary(MusicGenerationService):
     """Background music from a local, pre-curated royalty-free library — the offline,
-    zero-cost, zero-key default (Soundraw's generation API is enterprise-gated).
+    zero-cost, zero-key FALLBACK behind JamendoMusic, used when no JAMENDO_CLIENT_ID is
+    configured (or the machine has no network). Note the shipped library is a single
+    track, so mood/genre/energy have no audible effect on this path — that variety is
+    what Jamendo provides.
 
     Reads `<music_dir>/manifest.json` — a list of tracks each tagged with `mood`,
     `genre`, and `energy` (the same vocab as video_schema's MusicMood/MusicGenre/

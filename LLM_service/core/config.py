@@ -261,12 +261,15 @@ class Settings:
     geoapify_map_style: Optional[str] = None
 
     # ── Background music ────────────────────────────────────────────────────────
-    # Soundraw is a generative option but is enterprise-gated; the default real
-    # provider is a local, curated royalty-free library (media_assets.BundledMusicLibrary):
-    # zero key, zero cost, offline. `music_library_dir` overrides where its tracks +
-    # manifest.json live (default: LLM_service/assets/music/). The bundled library is
-    # used when USE_MOCK_MUSIC_GENERATION=false and the library has ≥1 tagged track;
-    # Soundraw is only reached if no library is populated.
+    # Provider order (see services/factory.get_music_generation): Jamendo first — a free
+    # API key from devportal.jamendo.com over ~500k Creative-Commons tracks, and the only
+    # provider where the agent's mood/genre/energy actually changes what you hear. Behind
+    # it, a local curated library (media_assets.BundledMusicLibrary) keeps offline and
+    # no-key machines working; `music_library_dir` overrides where its tracks +
+    # manifest.json live (default: LLM_service/assets/music/), and it is used when the
+    # library has ≥1 tagged track. Soundraw is a generative option but enterprise-gated,
+    # so it is only reached when neither of the above is available.
+    jamendo_client_id: Optional[str] = None
     music_library_dir: Optional[str] = None
     soundraw_api_key: Optional[str] = None
 
@@ -491,6 +494,10 @@ class Settings:
         return bool(self.geoapify_api_key)
 
     @property
+    def has_jamendo(self) -> bool:
+        return bool(self.jamendo_client_id)
+
+    @property
     def has_soundraw(self) -> bool:
         return bool(self.soundraw_api_key)
 
@@ -643,6 +650,7 @@ def _load() -> Settings:
         removebg_api_key=os.getenv("REMOVEBG_API_KEY"),
         geoapify_api_key=os.getenv("GEOAPIFY_API_KEY"),
         geoapify_map_style=os.getenv("GEOAPIFY_MAP_STYLE") or None,
+        jamendo_client_id=os.getenv("JAMENDO_CLIENT_ID"),
         music_library_dir=os.getenv("MUSIC_LIBRARY_DIR"),
         soundraw_api_key=os.getenv("SOUNDRAW_API_KEY"),
         # Shared Azure Speech credential — used by BOTH the roundtable persona TTS

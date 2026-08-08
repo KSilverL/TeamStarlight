@@ -1151,7 +1151,8 @@ class VideoService:
     async def start(
         self, task_id: str, platform: str, *,
         narration_text: Optional[str] = None, narration_voice: Optional[str] = None,
-        narration_enabled: bool = True, reference_images: Optional[list[str]] = None,
+        narration_enabled: bool = True, music_enabled: bool = True,
+        reference_images: Optional[list[str]] = None,
     ) -> dict:
         draft = self._workflow.get_final_draft(task_id, platform)
         if draft is None:
@@ -1162,7 +1163,7 @@ class VideoService:
         doc = await start_render_job(
             task_id=task_id, platform=platform, storyboard=StoryboardSpec(**storyboard),
             narration_text=narration_text, narration_voice=narration_voice,
-            narration_enabled=narration_enabled,
+            narration_enabled=narration_enabled, music_enabled=music_enabled,
             reference_images=_decode_reference_images(reference_images),
         )
         return {"job_id": doc["id"], "status": doc["status"]}
@@ -1845,6 +1846,12 @@ class RenderVideoRequest(BaseModel):
         True, description="Whether to render narration at all. True (default) uses the "
         "agent's script (or narration_text override); false suppresses narration entirely."
     )
+    music_enabled: bool = Field(
+        True, description="Whether to render backing music at all. True (default) defers to "
+        "the storyboard LLM's own choice (audio.musicEnabled); false suppresses music "
+        "entirely, overriding the agent. Set both this and narration_enabled false for a "
+        "fully silent render."
+    )
     reference_images: Optional[list[str]] = Field(
         None, description="1-3 user-attached reference images as base64 data URLs "
         "(or raw base64), passed to the Higgsfield backend for image-to-video. "
@@ -2114,7 +2121,7 @@ async def render_video(request: Request, task_id: str, body: RenderVideoRequest)
     return await _video(request).start(
         task_id, body.platform,
         narration_text=body.narration_text, narration_voice=body.narration_voice,
-        narration_enabled=body.narration_enabled,
+        narration_enabled=body.narration_enabled, music_enabled=body.music_enabled,
         reference_images=body.reference_images,
     )
 

@@ -50,7 +50,8 @@ def _job_dir(settings: Settings, job_id: str) -> Path:
 async def _run_job(
     job_id: str, storyboard: StoryboardSpec, settings: Settings,
     *, narration_text: Optional[str] = None, narration_voice: Optional[str] = None,
-    narration_enabled: bool = True, reference_images: Optional[list[bytes]] = None,
+    narration_enabled: bool = True, music_enabled: bool = True,
+    reference_images: Optional[list[bytes]] = None,
 ) -> None:
     store = factory.get_store()
     job_dir = _job_dir(settings, job_id)
@@ -116,19 +117,26 @@ async def _run_job(
                 )
 
         # ── Music, sized to the (possibly stretched) final length ─────────────────
-        # renderable_total_frames mirrors metadata.ts's transition-adjusted total, so
-        # the music track doesn't run past the final frame.
-        total_frames = renderable_total_frames(
-            [s.durationFrames for s in renderable.slides], renderable.transition,
-        )
-        total_seconds = total_frames / renderable.fps
-        music_kwargs = (
-            {"mood": audio.musicMood, "genre": audio.musicGenre, "energy": audio.musicEnergy}
-            if audio else {}
-        )
-        renderable.musicLocalPath = await resolve_storyboard_music(
-            job_dir=job_dir, duration_seconds=total_seconds, **music_kwargs,
-        )
+        # Two independent off-switches, mirroring narration: music_enabled=False is the
+        # caller's hard override, audio.musicEnabled=False is the storyboard LLM's own
+        # choice (a sombre brief, an explicit "no music"). A legacy storyboard with no
+        # audio block keeps music on. Skipping leaves musicLocalPath None, which the
+        # renderer already treats as "silent", so there's nothing to unset.
+        if music_enabled and (audio is None or audio.musicEnabled):
+            # renderable_total_frames mirrors metadata.ts's transition-adjusted total, so
+            # the music track doesn't run past the final frame. This must stay AFTER the
+            # narration block above, which stretches slides to fit their lines.
+            total_frames = renderable_total_frames(
+                [s.durationFrames for s in renderable.slides], renderable.transition,
+            )
+            total_seconds = total_frames / renderable.fps
+            music_kwargs = (
+                {"mood": audio.musicMood, "genre": audio.musicGenre, "energy": audio.musicEnergy}
+                if audio else {}
+            )
+            renderable.musicLocalPath = await resolve_storyboard_music(
+                job_dir=job_dir, duration_seconds=total_seconds, **music_kwargs,
+            )
         output_path = await render_storyboard(renderable, job_dir=job_dir, settings=settings)
         await store.update_video_job(job_id=job_id, status="done", output_path=str(output_path), error=None)
     except RenderError as exc:
@@ -146,7 +154,8 @@ async def _run_job(
 async def start_render_job(
     *, task_id: str, platform: str, storyboard: StoryboardSpec,
     narration_text: Optional[str] = None, narration_voice: Optional[str] = None,
-    narration_enabled: bool = True, reference_images: Optional[list[bytes]] = None,
+    narration_enabled: bool = True, music_enabled: bool = True,
+    reference_images: Optional[list[bytes]] = None,
 ) -> dict:
     """Create a `pending` video job row and kick off the render in the background.
     Returns the freshly created job document (id, task_id, platform, status=pending, ...).
@@ -157,7 +166,9 @@ async def start_render_job(
     references; ignored by the Remotion (local/lambda) backends.
     Narration is on by default: the storyboard LLM authors a script + voice persona on
     `storyboard.audio`, which is used unless `narration_text`/`narration_voice` override
-    it, or `narration_enabled=False` suppresses narration entirely. `reference_images`
+    it, or `narration_enabled=False` suppresses narration entirely. Music is likewise on
+    by default, with two off-switches: the LLM's own `storyboard.audio.musicEnabled=False`,
+    or `music_enabled=False` here as a hard override. `reference_images`
     (optional) are the user's attached images, passed to the Higgsfield backend as
     image-to-video references; ignored by the Remotion (local/lambda) backends."""
     store = factory.get_store()
@@ -170,7 +181,8 @@ async def start_render_job(
         _run_job(
             job_id, storyboard, settings,
             narration_text=narration_text, narration_voice=narration_voice,
-            narration_enabled=narration_enabled, reference_images=reference_images,
+            narration_enabled=narration_enabled, music_enabled=music_enabled,
+            reference_images=reference_images,
         )
     )
     _RUNNING_JOBS.add(job_task)
