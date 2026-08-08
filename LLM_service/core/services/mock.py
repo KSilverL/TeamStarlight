@@ -40,6 +40,7 @@ from ..video_schema import StoryboardSpec
 from .base import (
     BackgroundRemovalService,
     ImageSearchService,
+    VideoSearchService,
     LLMService,
     MusicGenerationService,
     RealtimeEvent,
@@ -1593,6 +1594,34 @@ class MockImageSearch(ImageSearchService):
                 "photographer": "Mock Photographer",
                 "width": 1080,
                 "height": 1080,
+            }
+            for i in range(max(per_page, 0))
+        ]
+
+
+class MockVideoSearch(VideoSearchService):
+    """Deterministic, offline stand-in for Pexels Videos: one placeholder clip
+    candidate per query (no network), so the asset-resolution pipeline and its tests
+    never need real credentials.
+
+    The URL is intentionally undownloadable, exactly like MockImageSearch's — that
+    makes the default mock run exercise _resolve_clip's real degradation ladder
+    (localPath stays None, the slide renders mosaic-only), which is the path most
+    likely to be hit in production."""
+
+    async def search(
+        self, *, query: str, orientation: str = "portrait", per_page: int = 1,
+        target_width: int = 1080, target_height: int = 1920,
+    ) -> List[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return [
+            {
+                "url": f"https://mock.pexels.local/video/{i}/{query.replace(' ', '-')}.mp4",
+                "width": target_width,
+                "height": target_height,
+                "fps": 30,
+                "duration": 12.0,
+                "photographer": "Mock Videographer",
             }
             for i in range(max(per_page, 0))
         ]

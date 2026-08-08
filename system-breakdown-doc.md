@@ -677,7 +677,9 @@ target either a local subprocess or Remotion Lambda.
    `llm.generate_video_storyboard(...)`, returning a `StoryboardSpec` — an ordered list of typed
    slides validated by a Pydantic discriminated union (`core/video_schema.py`). The slide-type
    catalogue is now: `hook`, `counter_stat`, `collage`, `outro`, `pie_chart`, `line_chart`,
-   `bar_chart`, `node_diagram`, `comparison_table`, **`map`** (pin/journey slides, new), and
+   `bar_chart`, `node_diagram`, `comparison_table`, **`map`** (pin/journey slides),
+   **`statement`** and **`media_statement`** (big per-word typographic beats over an animated
+   pixel mosaic / stock footage, new), and
    **`generated`** (an open-ended, LLM-authored scene, new — see step 2b). Most template slide
    types also now accept a per-slide `variant` (e.g. poster/split hooks, orbit/ticker stats,
    donut/exploded pie), and the storyboard as a whole can carry a shared `backdrop`/`transition`.

@@ -19,3 +19,6 @@ LLM_service/.video_jobs/
 video_renderer/node_modules/
 video_renderer/out/
 video_renderer/.remotion/
+
+# No need to upload videos to the repo.
+*.mp*

@@ -3,7 +3,7 @@ import { AbsoluteFill, Img, staticFile, useCurrentFrame, useVideoConfig } from "
 import type { HookSlide as HookSlideProps } from "../types";
 import { textColorForTheme, type Theme } from "./theme";
 import { blurIn, maskWipe, riseSoft, springEnter } from "../design/animations";
-import { BackdropOrbs, GradientWash, GridPattern } from "../design/backdrops";
+import { BackdropOrbs, GradientWash, GridPattern, PixelMosaic } from "../design/backdrops";
 import { Kicker } from "../design/components";
 import { bodyFont, displayFont } from "../design/fonts";
 import { SHAPE_CLIP, SHAPE_RADIUS } from "../design/shapes";
@@ -16,8 +16,9 @@ const LocalBackground: React.FC<{
   background: HookSlideProps["background"];
   accentColor: string;
   secondaryColor: string;
+  primaryColor: string;
   theme?: Theme;
-}> = ({ background, accentColor, secondaryColor, theme }) => {
+}> = ({ background, accentColor, secondaryColor, primaryColor, theme }) => {
   switch (background) {
     case "gradient":
       return <GradientWash accentColor={accentColor} secondaryColor={secondaryColor} strength={0.28} />;
@@ -25,6 +26,18 @@ const LocalBackground: React.FC<{
       return <BackdropOrbs accentColor={accentColor} secondaryColor={secondaryColor} opacity={0.35} />;
     case "grid":
       return <GridPattern color={textColorForTheme(theme)} opacity={0.1} />;
+    case "mosaic":
+      // Lower contrast than the statement slides use: this sits behind a headline
+      // AND a cut-out photo, so the field has to stay quieter than when it's the
+      // only thing on screen.
+      return (
+        <PixelMosaic
+          primaryColor={primaryColor}
+          secondaryColor={secondaryColor}
+          accentColor={accentColor}
+          contrast={0.7}
+        />
+      );
     case "solid":
     default:
       return null;
@@ -53,7 +66,7 @@ export const HookSlide: React.FC<{ slide: HookSlideProps; accentColor: string; s
     return (
       <AbsoluteFill style={{ backgroundColor: primaryColor, justifyContent: "center", padding: "0 8%" }}>
         <GradientWash accentColor={accentColor} secondaryColor={secondaryColor} strength={0.35} />
-        <LocalBackground background={slide.background} accentColor={accentColor} secondaryColor={secondaryColor} theme={theme} />
+        <LocalBackground background={slide.background} accentColor={accentColor} secondaryColor={secondaryColor} primaryColor={primaryColor} theme={theme} />
         <div style={{ ...enter }}>
           {kicker}
           <h1 style={{ color: textColor, fontSize: fontSize.display, fontWeight: 800, fontFamily: displayFont, margin: "12px 0 0", lineHeight: 1.02 }}>
@@ -74,7 +87,7 @@ export const HookSlide: React.FC<{ slide: HookSlideProps; accentColor: string; s
     const headlineEnter = riseSoft(frame, { delay: 8 });
     return (
       <AbsoluteFill style={{ backgroundColor: primaryColor }}>
-        <LocalBackground background={slide.background} accentColor={accentColor} secondaryColor={secondaryColor} theme={theme} />
+        <LocalBackground background={slide.background} accentColor={accentColor} secondaryColor={secondaryColor} primaryColor={primaryColor} theme={theme} />
         <AbsoluteFill style={{ ...imgWipe, clipPath: SHAPE_CLIP.diagonalCut }}>
           <Img src={staticFile(slide.imageLocalPath as string)} style={{ width: "100%", height: "62%", objectFit: "cover" }} />
         </AbsoluteFill>
@@ -96,7 +109,7 @@ export const HookSlide: React.FC<{ slide: HookSlideProps; accentColor: string; s
   const headlineEnter = riseSoft(frame);
   return (
     <AbsoluteFill style={{ backgroundColor: primaryColor, justifyContent: "center", alignItems: "center" }}>
-      <LocalBackground background={slide.background} accentColor={accentColor} secondaryColor={secondaryColor} theme={theme} />
+      <LocalBackground background={slide.background} accentColor={accentColor} secondaryColor={secondaryColor} primaryColor={primaryColor} theme={theme} />
       {hasImage && (
         <div
           style={{

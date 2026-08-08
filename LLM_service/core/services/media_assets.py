@@ -18,9 +18,15 @@ from pathlib import Path
 from typing import List, Optional
 
 from ..config import Settings
-from .base import BackgroundRemovalService, ImageSearchService, MusicGenerationService
+from .base import (
+    BackgroundRemovalService,
+    ImageSearchService,
+    MusicGenerationService,
+    VideoSearchService,
+)
 
 _PEXELS_SEARCH_URL = "https://api.pexels.com/v1/search"
+_PEXELS_VIDEO_SEARCH_URL = "https://api.pexels.com/videos/search"
 _REMOVEBG_URL = "https://api.remove.bg/v1.0/removebg"
 _GEOAPIFY_STATICMAP_URL = "https://maps.geoapify.com/v1/staticmap"
 # Basemap style preset per storyboard theme (see
@@ -68,6 +74,119 @@ class PexelsImageSearch(ImageSearchService):
             for photo in data.get("photos", [])
             if photo.get("src")
         ]
+
+
+
+# Clip guards, all applied client-side: /videos/search accepts only orientation,
+# size, locale, page and per_page — the min_duration/max_duration parameters exist
+# on /videos/popular, not here.
+_CLIP_MIN_DURATION_S = 4.0
+# A clip shorter than this seams visibly when <Loop> wraps it under a longer slide.
+_CLIP_MAX_DURATION_S = 60.0
+# Longer than this is a big download for the ~5s we actually show.
+_CLIP_MAX_PIXELS = 2560 * 1440
+# 4K renditions are 100MB+ for a canvas that is at most 1920 across.
+
+
+def _pick_rendition(video_files: List[dict], target_w: int, target_h: int) -> Optional[dict]:
+    """Choose ONE encoding of a Pexels clip to download.
+
+    The ordering is deliberate:
+      1. mp4 only. Pexels also serves video/quicktime, and headless Chromium's
+         HEVC-in-MOV support is unreliable — a decode failure aborts the render
+         outright rather than degrading, so it is not worth the risk.
+      2. Drop anything above _CLIP_MAX_PIXELS.
+      3. Prefer the SMALLEST rendition that still covers the canvas: least upscale
+         for the fewest bytes. Taking `original` instead wastes ~100MB of download
+         and Chromium decode time to draw into a 1080-wide frame.
+      4. Nothing big enough -> the largest available; soft beats absent.
+      5. Tie-break toward 24-31fps — a 60fps rendition doubles the bytes for no
+         benefit at FPS=30.
+    """
+    def is_mp4(f: dict) -> bool:
+        declared = f.get("file_type")
+        if declared:
+            # A declared type always wins. Sniffing the URL as a fallback here would
+            # re-admit a video/quicktime rendition whose link merely happens to end
+            # in .mp4 — which is the exact case this guard exists for.
+            return declared == "video/mp4"
+        # No file_type at all: fall back to the URL, accepting that a Pexels link may
+        # carry a query string, so match the path rather than the whole string.
+        return str(f.get("link", "")).split("?")[0].endswith(".mp4")
+
+    mp4s = [
+        f for f in video_files
+        if is_mp4(f) and f.get("link") and f.get("width") and f.get("height")
+    ]
+    usable = [f for f in mp4s if f["width"] * f["height"] <= _CLIP_MAX_PIXELS]
+    if not usable:
+        return None
+
+    def fps_penalty(f: dict) -> int:
+        fps = f.get("fps") or 30
+        return 0 if 24 <= fps <= 31 else 1
+
+    covering = [f for f in usable if f["width"] >= target_w and f["height"] >= target_h]
+    if covering:
+        return min(covering, key=lambda f: (f["width"] * f["height"], fps_penalty(f)))
+    return max(usable, key=lambda f: (f["width"] * f["height"], -fps_penalty(f)))
+
+
+class PexelsVideoSearch(VideoSearchService):
+    """Pexels Videos (/videos/search), authenticated with the same PEXELS_API_KEY
+    the photo search uses — no extra credential."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    async def search(
+        self, *, query: str, orientation: str = "portrait", per_page: int = 1,
+        target_width: int = 1080, target_height: int = 1920,
+    ) -> List[dict]:
+        import httpx  # lazy import, matches the rest of core/services/*
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                _PEXELS_VIDEO_SEARCH_URL,
+                headers={"Authorization": self._settings.pexels_api_key},
+                params={
+                    "query": query,
+                    "orientation": orientation,
+                    "size": "medium",
+                    # Over-fetch: the duration/aspect guards below discard candidates,
+                    # and we want a survivor rather than an empty result.
+                    "per_page": max(1, min(per_page * 5, 20)),
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        target_ratio = target_width / max(target_height, 1)
+        out: List[dict] = []
+        for video in data.get("videos", []):
+            duration = float(video.get("duration") or 0)
+            if not (_CLIP_MIN_DURATION_S <= duration <= _CLIP_MAX_DURATION_S):
+                continue
+            rendition = _pick_rendition(video.get("video_files") or [], target_width, target_height)
+            if rendition is None:
+                continue
+            # Pexels' `orientation` filter applies to the SOURCE asset, and its
+            # renditions don't always share that shape — re-check the one we picked,
+            # or a landscape clip gets cropped to a vertical sliver in the card.
+            ratio = rendition["width"] / max(rendition["height"], 1)
+            if abs(ratio - target_ratio) / target_ratio > 0.25:
+                continue
+            out.append({
+                "url": rendition["link"],
+                "width": rendition["width"],
+                "height": rendition["height"],
+                "fps": rendition.get("fps") or 30,
+                "duration": duration,
+                "photographer": (video.get("user") or {}).get("name"),
+            })
+            if len(out) >= per_page:
+                break
+        return out
 
 
 class RemoveBgService(BackgroundRemovalService):

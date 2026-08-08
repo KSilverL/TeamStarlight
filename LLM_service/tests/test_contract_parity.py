@@ -309,6 +309,139 @@ async def test_voiceover_synthesize_parity():
         assert isinstance(out.duration_seconds, float) and out.duration_seconds > 0
 
 
+# ── Stock-footage search (Pexels Videos) ───────────────────────────────
+
+_LAST_REQUEST: dict = {}
+
+
+def _pexels_video_payload(videos):
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"videos": videos}
+
+    class _Client:
+        def __init__(self, *a, **k):
+            # Swallow the real client's constructor kwargs (timeout=...).
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, *a, **k):
+            _LAST_REQUEST.clear()
+            _LAST_REQUEST.update(k)
+            return _Resp()
+
+    return _Client
+
+
+def _video(duration, files, name="Ada"):
+    return {"duration": duration, "video_files": files, "user": {"name": name}}
+
+
+def _file(w, h, file_type="video/mp4", fps=30):
+    return {"link": f"https://cdn.example/{w}x{h}.mp4", "file_type": file_type,
+            "width": w, "height": h, "fps": fps}
+
+
+async def _search_against(videos, **kwargs):
+    """Run PexelsVideoSearch against a canned /videos/search payload."""
+    import httpx
+
+    from LLM_service.core.services.media_assets import PexelsVideoSearch
+
+    settings = get_settings()
+    original = httpx.AsyncClient
+    httpx.AsyncClient = _pexels_video_payload(videos)
+    try:
+        return await PexelsVideoSearch(settings).search(query="city street night", **kwargs)
+    finally:
+        httpx.AsyncClient = original
+
+
+async def test_video_search_parity():
+    """MockVideoSearch and PexelsVideoSearch must return the same result KEY SET —
+    callers (assets.py::_resolve_clip) read the same fields from either."""
+    m = await mock.MockVideoSearch().search(query="city street night")
+    a = await _search_against([_video(12.0, [_file(1080, 1920)])])
+    assert m and a
+    assert set(m[0]) == set(a[0]) == {"url", "width", "height", "fps", "duration", "photographer"}
+    assert isinstance(a[0]["duration"], float)
+
+
+async def test_video_search_picks_the_least_upscale_mp4():
+    """The only nontrivial logic in the impl: prefer the SMALLEST rendition that
+    still covers the canvas. Picking `original`/4K instead wastes ~100MB of download
+    and Chromium decode time to draw into a 1080-wide frame."""
+    out = await _search_against([_video(12.0, [
+        _file(640, 1138),    # too small
+        _file(1080, 1920),   # smallest that covers -> expected
+        _file(1440, 2560),   # covers, but bigger
+    ])])
+    assert out[0]["width"] == 1080
+
+
+async def test_video_search_rejects_4k_and_quicktime():
+    """4K blows the size budget; quicktime risks an HEVC decode failure, which
+    aborts a render outright instead of degrading.
+
+    The quicktime case deliberately uses a link ending in `.mp4`: a declared
+    file_type must win over URL sniffing, or a .mp4-looking link smuggles a MOV past
+    the guard."""
+    only_4k = await _search_against([_video(12.0, [_file(3840, 2160)])])
+    assert only_4k == []
+    only_mov = await _search_against([_video(12.0, [_file(1080, 1920, file_type="video/quicktime")])])
+    assert only_mov == []
+
+
+async def test_video_search_sniffs_the_url_only_when_file_type_is_absent():
+    """Pexels links can carry a query string, so match the path, not the whole URL."""
+    from LLM_service.core.services.media_assets import _pick_rendition
+
+    untyped = {"link": "https://cdn.example/clip.mp4?dl=1", "width": 1080, "height": 1920, "fps": 30}
+    assert _pick_rendition([untyped], 1080, 1920) is untyped
+    not_a_video = {"link": "https://cdn.example/clip.webm", "width": 1080, "height": 1920, "fps": 30}
+    assert _pick_rendition([not_a_video], 1080, 1920) is None
+
+
+async def test_video_search_falls_back_to_the_largest_when_nothing_covers():
+    """Soft footage beats no footage."""
+    out = await _search_against([_video(12.0, [_file(540, 960), _file(720, 1280)])])
+    assert out[0]["width"] == 720
+
+
+async def test_video_search_enforces_duration_bounds_client_side():
+    """/videos/search has no min_duration/max_duration parameters (those are on
+    /videos/popular), so the guard has to run here."""
+    assert await _search_against([_video(3.0, [_file(1080, 1920)])]) == []
+    assert await _search_against([_video(120.0, [_file(1080, 1920)])]) == []
+    assert await _search_against([_video(12.0, [_file(1080, 1920)])]) != []
+
+
+async def test_video_search_rejects_a_rendition_shaped_wrong_for_the_canvas():
+    """Pexels' `orientation` filter applies to the source asset and its renditions
+    don't always share that shape — an unchecked landscape clip gets cropped to a
+    vertical sliver inside a 9:16 card."""
+    out = await _search_against([_video(12.0, [_file(1920, 1080)])],
+                                target_width=1080, target_height=1920)
+    assert out == []
+
+
+async def test_video_search_sends_orientation_and_auth():
+    """Orientation is the highest-leverage guard (it is what keeps a landscape clip
+    out of a 9:16 slide), so assert it actually reaches the wire along with the key."""
+    await _search_against([], orientation="square")
+    assert _LAST_REQUEST["params"]["orientation"] == "square"
+    assert _LAST_REQUEST["params"]["query"] == "city street night"
+    assert "Authorization" in _LAST_REQUEST["headers"]
+
+
 # ── Cross-language slide-variant parity (Python spec ⟷ types.ts) ──────────────
 # The renderer's types.ts is hand-mirrored from video_schema.py with no automated
 # check on the TS side; this guards the `variant` Literal unions specifically, since
@@ -316,11 +449,12 @@ async def test_voiceover_synthesize_parity():
 # (it would fall through to the default treatment with no error).
 
 _TYPES_TS = Path(__file__).resolve().parents[1] / ".." / "video_renderer" / "src" / "types.ts"
+_REGISTRY_TS = Path(__file__).resolve().parents[1] / ".." / "video_renderer" / "src" / "registry.ts"
 
 
 # The "style-selector" fields whose Literal union the LLM picks from and the
 # renderer switches on — a drift here silently degrades to a default treatment.
-_STYLE_FIELDS = ("variant", "layout", "shape")
+_STYLE_FIELDS = ("variant", "layout", "shape", "background")
 
 
 def _ts_field_union(types_src: str, type_literal: str, field: str) -> set[str]:
@@ -334,7 +468,20 @@ def _ts_field_union(types_src: str, type_literal: str, field: str) -> set[str]:
     line = re.search(re.escape(field) + r"\??:\s*([^;]+);", block.group(0))
     if not line:
         return set()
-    return set(re.findall(r"\"([^\"]+)\"", line.group(1)))
+    literals = set(re.findall(r"\"([^\"]+)\"", line.group(1)))
+    if literals:
+        return literals
+    # The field references a shared type alias instead of inlining its literals
+    # (`background?: BackgroundStyle;`). Resolve one level, or every alias-typed
+    # style field is a silent blind spot that always compares equal to nothing.
+    alias = re.search(r"\b([A-Z]\w+)\b", line.group(1))
+    if alias:
+        decl = re.search(
+            r"export type " + re.escape(alias.group(1)) + r"\s*=\s*([^;]+);", types_src
+        )
+        if decl:
+            return set(re.findall(r"\"([^\"]+)\"", decl.group(1)))
+    return set()
 
 
 def _spec_style_unions():
@@ -367,6 +514,38 @@ def test_slide_style_unions_match_types_ts():
             f"{field} drift for {type_literal!r}: Python has {sorted(py_union)}, "
             f"types.ts has {sorted(ts_union)}"
         )
+
+
+def test_slide_registry_ts_covers_every_slide_type():
+    """SLIDE_REGISTRY's keys must equal SLIDE_TYPES minus "generated" (deliberately
+    absent there — it resolves through GENERATED_REGISTRY at runtime instead).
+
+    The TS side already compile-errors on a MISSING component, because the registry
+    is typed `Record<Exclude<Slide["type"], "generated">, ...>`. What nothing caught
+    until now is the other direction: a slide type added in Python that types.ts and
+    registry.ts never learned about, which the LLM would then happily emit and the
+    renderer would throw on mid-render."""
+    from LLM_service.core.video_schema import SLIDE_TYPES
+
+    src = _REGISTRY_TS.read_text(encoding="utf-8")
+    block = re.search(r"export const SLIDE_REGISTRY[^=]*=\s*\{(.*?)\n\};", src, re.DOTALL)
+    assert block, "SLIDE_REGISTRY object literal not found in registry.ts"
+    ts_keys = set(re.findall(r"^\s*([a-z_]+):", block.group(1), re.MULTILINE))
+    assert ts_keys == SLIDE_TYPES - {"generated"}
+
+
+def test_types_ts_declares_every_slide_type():
+    """Every SLIDE_TYPES literal has a `type: "<literal>"` interface in types.ts.
+
+    test_slide_style_unions_match_types_ts only iterates the style fields of
+    interfaces it already found, so an entirely MISSING interface slips past it —
+    _ts_field_union would assert, but only for a type that happens to declare a
+    style field."""
+    from LLM_service.core.video_schema import SLIDE_TYPES
+
+    declared = set(re.findall(r'type:\s*"([a-z_]+)";', _TYPES_TS.read_text(encoding="utf-8")))
+    missing = sorted(SLIDE_TYPES - declared)
+    assert not missing, f"slide types missing an interface in types.ts: {missing}"
 
 
 async def test_plan_scene_design_parity():

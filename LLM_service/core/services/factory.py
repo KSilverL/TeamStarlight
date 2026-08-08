@@ -22,6 +22,7 @@ from . import azure, higgsfield, media_assets, mock, postgres, web_search
 from .base import (
     BackgroundRemovalService,
     ImageSearchService,
+    VideoSearchService,
     LLMService,
     MusicGenerationService,
     RealtimeVoiceService,
@@ -41,6 +42,7 @@ __all__ = [
     "get_realtime_voice",
     "get_chat_client",
     "get_image_search",
+    "get_video_search",
     "get_live_image_search",
     "get_background_removal",
     "get_music_generation",
@@ -182,6 +184,19 @@ def get_image_search() -> ImageSearchService:
         _require(s.has_pexels, "Pexels", "PEXELS_API_KEY", "USE_MOCK_IMAGE_SEARCH=true")
         return media_assets.PexelsImageSearch(s)
     return _cached("image_search", build)
+
+
+def get_video_search() -> VideoSearchService:
+    """Stock FOOTAGE for media_statement slides. Distinct from get_video_generation
+    (which synthesizes a clip with an AI model); this one searches a stock library.
+    Shares PEXELS_API_KEY with get_image_search — no separate credential."""
+    def build() -> VideoSearchService:
+        s = get_settings()
+        if s.mock_video_search():
+            return mock.MockVideoSearch()
+        _require(s.has_pexels, "Pexels video", "PEXELS_API_KEY", "USE_MOCK_VIDEO_SEARCH=true")
+        return media_assets.PexelsVideoSearch(s)
+    return _cached("video_search", build)
 
 
 def get_background_removal() -> BackgroundRemovalService:

@@ -4,3 +4,11 @@ out/
 # Per-job scratch components written by workflow/video/codegen.py's self-repair
 # loop (bespoke `generated` slides + their preview-render entry points/outputs).
 src/generated/
+
+# Scratch assets for the scripts/fixtures/*.json renders, passed via --public-dir.
+# statement-media.json wants a stock clip at clips/stock.mp4. Use a real-world
+# encoded mp4 (a downloaded Pexels clip, or docs/sample-videos/*.mp4) — the local
+# Remotion compositor raises "No frame found at position N" on locally re-encoded
+# or mid-GOP-trimmed x264 files, which is a fixture problem, not a renderer bug.
+# Never commit media.
+.fixture-assets/

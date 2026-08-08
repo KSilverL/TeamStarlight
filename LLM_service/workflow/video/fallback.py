@@ -39,7 +39,9 @@ from ...core.video_schema import (
     RenderMapSlide,
     RenderNodeDiagramSlide,
     RenderOutroSlide,
+    RenderMediaStatementSlide,
     RenderPieChartSlide,
+    RenderStatementSlide,
     ResolvedImage,
     TemplateSlideSpec,
     clamp_duration,
@@ -91,6 +93,19 @@ def _render_without_assets(slide, *, suggested_frames):
         return RenderCollageSlide(
             headline=slide.headline, layout=slide.layout,
             resolvedImages=[ResolvedImage(query=q, localPath=None) for q in slide.imageQueries],
+            durationFrames=duration,
+        )
+    if slide.type == "statement":
+        return RenderStatementSlide(
+            text=slide.text, kicker=slide.kicker, emphasisWords=slide.emphasisWords,
+            variant=slide.variant, durationFrames=duration,
+        )
+    if slide.type == "media_statement":
+        # No asset resolution here (see module docstring), so the clip stays
+        # unresolved and MediaStatementSlide degrades to its mosaic treatment.
+        return RenderMediaStatementSlide(
+            text=slide.text, kicker=slide.kicker, emphasisWords=slide.emphasisWords,
+            variant=slide.variant, mediaLocalPath=None, mediaDurationFrames=None,
             durationFrames=duration,
         )
     if slide.type == "outro":
