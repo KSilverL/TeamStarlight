@@ -319,9 +319,11 @@ _ASSET_GETTERS = [
     ("get_background_removal", "USE_MOCK_BACKGROUND_REMOVAL", {"REMOVEBG_API_KEY": "rmbg"},
      "RemoveBgService", "Remove.bg"),
     ("get_music_generation", "USE_MOCK_MUSIC_GENERATION", {"SOUNDRAW_API_KEY": "snd"},
-     "SoundrawMusic", "Soundraw"),
+     "SoundrawMusic", "Background music"),
+    # Azure Speech TTS is shared with the roundtable persona readback, so it reads the
+    # ROUNDTABLE_TTS_* pair — NOT AZURE_SPEECH_*, which no longer exists.
     ("get_voiceover_generation", "USE_MOCK_VOICEOVER",
-     {"AZURE_SPEECH_KEY": "sp", "AZURE_SPEECH_REGION": "westeurope"},
+     {"ROUNDTABLE_TTS_KEY": "sp", "ROUNDTABLE_TTS_REGION": "westeurope"},
      "AzureSpeechVoiceover", "Azure Speech"),
     ("get_video_generation", "USE_MOCK_VIDEO_GENERATION",
      {"HIGGSFIELD_API_KEY": "hf", "HIGGSFIELD_API_SECRET": "hf-secret"},
@@ -330,12 +332,21 @@ _ASSET_GETTERS = [
 
 
 @pytest.fixture
-def asset_env(monkeypatch):
-    """Clear every render-pipeline toggle + key, then let a test set what it needs."""
+def asset_env(monkeypatch, tmp_path):
+    """Clear every render-pipeline toggle + key, then let a test set what it needs.
+
+    Music is the one two-tier getter: the bundled royalty-free library wins over
+    Soundraw whenever it is populated, and LLM_service/assets/music/ IS populated in
+    this repo — so leaving MUSIC_LIBRARY_DIR at its default would make every
+    `SOUNDRAW_API_KEY` case in the table resolve to BundledMusicLibrary instead. Point
+    it at an empty directory so the table means what it says (toggle + key → that
+    vendor); the library-first precedence gets its own test below.
+    """
     for getter, toggle, creds, _cls, _name in _ASSET_GETTERS:
         monkeypatch.delenv(toggle, raising=False)
         for key in creds:
             monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "no-music"))
     reset_settings()
     reset_services()
     yield monkeypatch
@@ -386,3 +397,49 @@ def test_asset_services_follow_the_global_mock_switch(asset_env):
     reset_services()
     for getter, _toggle, _creds, cls, _name in _ASSET_GETTERS:
         assert type(getattr(factory, getter)()).__name__ == cls
+
+
+# ── Music: the bundled library outranks Soundraw ──────────────────────────────
+# The only asset getter with two production tiers. Soundraw's generation API is
+# enterprise-gated, so a populated local royalty-free library is the zero-key,
+# zero-cost default and is preferred even when a Soundraw key IS present. The
+# generic table above deliberately points MUSIC_LIBRARY_DIR at an empty directory,
+# which is exactly the case these two pin down.
+
+def _write_music_library(tmp_path):
+    """A minimal populated library: manifest.json with one tagged track."""
+    lib = tmp_path / "music"
+    lib.mkdir()
+    (lib / "manifest.json").write_text(
+        '{"tracks": [{"file": "chill.mp3", "mood": "calm",'
+        ' "genre": "ambient", "energy": "low"}]}',
+        encoding="utf-8",
+    )
+    return lib
+
+
+def test_populated_music_library_wins_over_soundraw(asset_env, tmp_path):
+    from LLM_service.core.services import factory
+
+    asset_env.setenv("USE_MOCK_MUSIC_GENERATION", "false")
+    asset_env.setenv("MUSIC_LIBRARY_DIR", str(_write_music_library(tmp_path)))
+    asset_env.setenv("SOUNDRAW_API_KEY", "snd")   # present, and still not chosen
+    reset_settings()
+    reset_services()
+    assert type(factory.get_music_generation()).__name__ == "BundledMusicLibrary"
+
+
+def test_music_library_with_no_tracks_falls_through_to_soundraw(asset_env, tmp_path):
+    """A manifest that parses but lists nothing reads as 'no library', not as an error."""
+    from LLM_service.core.services import factory
+
+    lib = tmp_path / "empty-music"
+    lib.mkdir()
+    (lib / "manifest.json").write_text('{"tracks": []}', encoding="utf-8")
+
+    asset_env.setenv("USE_MOCK_MUSIC_GENERATION", "false")
+    asset_env.setenv("MUSIC_LIBRARY_DIR", str(lib))
+    asset_env.setenv("SOUNDRAW_API_KEY", "snd")
+    reset_settings()
+    reset_services()
+    assert type(factory.get_music_generation()).__name__ == "SoundrawMusic"

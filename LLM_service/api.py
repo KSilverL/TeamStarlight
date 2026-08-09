@@ -37,7 +37,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
+import time
 import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -58,6 +60,8 @@ from .core.events import (
     round_control_event,
     session_title_event,
 )
+from .core.logs import bind as bind_log_context
+from .core.logs import configure_logging, log_context
 from .core.services import factory
 from .core.services.base import RealtimeVoiceSession
 from .intake import IntakeSession, PriorSessionContext, RealtimeVoiceIntake, build_intake
@@ -104,6 +108,9 @@ _STATE_PREFIX = "api-task:"
 # additionally flushed with an awaited write at that exact moment, so durability never
 # depends on the timer having fired.
 _PERSIST_DEBOUNCE_SECONDS = 1.0
+# Named explicitly, not `__name__`: this module is the `python -m LLM_service.api` entry point,
+# so `__name__` is "__main__" in the one context that matters most — production.
+_log = logging.getLogger("LLM_service.api")
 # Strong refs to in-flight background flushes — asyncio only holds tasks weakly, so without
 # this a write could be garbage-collected mid-flight (same idiom as roundtable/runner.py).
 _persist_tasks: set = set()
@@ -296,6 +303,21 @@ class _Task:
         self.task_id = task_id
         self.workflow = workflow
         self.brief = brief
+        # The kwargs `build_workflow` was called with — which of the three graph fronts this
+        # run uses (default / roundtable_entry / media_only). Mirrored to the store because
+        # ANOTHER replica adopting this run has to rebuild the SAME graph: the choice depends
+        # on `ROUNDTABLE_ENABLED` as it was at start time, which that replica cannot re-derive
+        # (the toggle may have been flipped, or it may simply differ mid-rollout).
+        self.build_kwargs: dict = {}
+        # Set on a task adopted from a checkpoint: the checkpoint to restore on the NEXT
+        # `_drive`, cleared once used (subsequent segments continue from live state).
+        self.resume_checkpoint_id: Optional[str] = None
+        # This process's id while it holds the cross-replica resume lease; None when it
+        # doesn't (a run it started itself never needs one — nobody else has the workflow).
+        self.lease_owner: Optional[str] = None
+        # Set while a store-backed tailer is feeding this record from another replica's
+        # events (B-2). Cancelled when the last SSE subscriber goes away.
+        self.tailer: Optional[asyncio.Task] = None
         self.events: list[dict] = []                 # full event log (SSE replay)
         self.subscribers: list[asyncio.Queue] = []   # live SSE queues
         self.pending: dict[str, dict] = {}           # request_id -> HumanReviewRequest data
@@ -317,6 +339,10 @@ class _Task:
         # underlying `workflow` at once — that races on `task.pending` and can 409 a legitimate call.
         self.error: Optional[str] = None              # set if the run raised; surfaced in the snapshot
         self.status = "running"
+        # When this record became terminal (monotonic seconds), or None while it is still live.
+        # The eviction sweep's clock — see WorkflowService._evict_finished. Must be assigned
+        # BEFORE `done` below, which is a property whose setter stamps it.
+        self.finished_at: Optional[float] = None
         self.done = False
         # The next `seq` to stamp on a published event. Tracked explicitly rather than derived
         # from len(self.events) because a task REHYDRATED from the store must carry on from where
@@ -329,6 +355,27 @@ class _Task:
         # no live run to resume, so the write paths refuse with a clear 409 instead of a 500.
         self.recovered = False
 
+    # `done` is a property purely so becoming terminal always stamps `finished_at`. There are
+    # five places that flip it (a settled segment, a failed run, the two roundtable endpoints,
+    # a restore from the mirror) and eviction only ever considers a STAMPED record — so a new
+    # terminal path that forgot to set the clock would silently make its tasks immortal. This
+    # makes forgetting impossible.
+    @property
+    def done(self) -> bool:
+        return self._done
+
+    @done.setter
+    def done(self, value: bool) -> None:
+        self._done = bool(value)
+        if not self._done:
+            # Back off a terminal state — the gate re-opened (a compliance block bounces an
+            # approved draft back for another verdict). It is live again and must not be evicted.
+            self.finished_at = None
+        elif self.finished_at is None:
+            # First transition only: re-settling an already-terminal task (e.g. confirm-learning
+            # flushing again) must not push its eviction deadline back indefinitely.
+            self.finished_at = time.monotonic()
+
 
 class WorkflowService:
     """Async wrapper over the MAF workflow. One instance == one task registry."""
@@ -337,9 +384,78 @@ class WorkflowService:
         self._tasks: dict[str, _Task] = {}
         self._checkpoint_storage = checkpoint_storage
         self._workflow_factory = workflow_factory
+        # Identifies THIS registry across replicas: the resume lease's owner, and the tag
+        # that stops a replica re-ingesting its own published events. Per-instance rather
+        # than per-process so two registries in one test are genuinely two "replicas".
+        self._node_id = f"node-{uuid.uuid4().hex[:12]}"
 
     def _storage(self):
         return self._checkpoint_storage or factory.get_checkpoint_storage()
+
+    # ── Registry retention ────────────────────────────────────────────────────
+
+    def _register(self, task: _Task) -> None:
+        """Put a run in the registry, then sweep finished ones.
+
+        The sweep is deliberately driven by REGISTRATION rather than a background timer: growth
+        is what needs bounding, so the one moment the registry can grow is the one moment worth
+        checking. No timer to own, cancel, or leak, and an idle process does no work at all.
+
+        Insert first so the cap is measured against the registry the caller will actually be
+        left with (sweeping first counts one task short, which lets it drift one over the cap
+        forever); `keep` then makes sure the arrival can't be what the sweep drops.
+        """
+        self._tasks[task.task_id] = task
+        self._evict_finished(keep=task.task_id)
+
+    def _evict_finished(self, *, keep: Optional[str] = None) -> None:
+        """Drop finished task records so a long-lived process stops growing without bound.
+
+        Safe because the registry is a CACHE of the store mirror, not the source of truth:
+        `_persisted_state` writes every field `_snapshot` and the SSE replay read, and `_resolve`
+        rehydrates on a miss. An evicted run therefore answers `GET /tasks/{id}` and
+        `GET /tasks/{id}/events` with exactly the history it had — it just answers them as a
+        `recovered` record, so the write paths give the same 409 a restart already gives.
+
+        Two things disqualify a record, and each one is a way eviction could be observed:
+          • not terminal — a paused human gate, a running roundtable and their in-memory MAF
+            workflow live HERE and nowhere else; dropping one would strand the run;
+          • a live SSE subscriber — that stream reads `task.events` off this object directly.
+
+        A queued `_mark_dirty` flush is deliberately NOT a disqualifier, though it looks like one.
+        Its closure holds the task object, so the record simply outlives the dict entry by up to
+        the debounce and then writes the state it already had. That write cannot diverge from a
+        record rehydrated in the meantime either: terminal states are flushed with an awaited
+        write before the run returns, and a rehydrated record is `recovered`, so every path that
+        could mutate it answers 409. Treating it as a disqualifier, on the other hand, would have
+        made this whole sweep a no-op — a debounced flush is still pending after nearly every run.
+        """
+        settings = get_settings()
+        ttl, cap = settings.task_retention_seconds, settings.task_registry_max
+        if ttl <= 0 and cap <= 0:
+            return
+
+        candidates = sorted(  # oldest terminal first
+            (task.finished_at, task_id)
+            for task_id, task in self._tasks.items()
+            if task.done and task.finished_at is not None and not task.subscribers
+            and task_id != keep
+        )
+        if not candidates:
+            return
+
+        now = time.monotonic()
+        doomed = {tid for finished_at, tid in candidates if ttl > 0 and now - finished_at >= ttl}
+        if cap > 0:
+            # Age alone can't bound a burst of short runs inside one retention window, so trim
+            # back to the cap from the oldest end regardless of how recently they finished.
+            overflow = len(self._tasks) - cap
+            for _finished_at, tid in candidates:
+                if len(doomed) >= overflow:
+                    break
+                doomed.add(tid)
+        for tid in doomed:
+            self._tasks.pop(tid, None)
 
     def _require(self, task_id: str) -> _Task:
         task = self._tasks.get(task_id)
@@ -348,19 +464,115 @@ class WorkflowService:
         return task
 
     async def _require_live(self, task_id: str) -> _Task:
-        """`_require` for the paths that need a task this process is actually RUNNING — anything
-        that drives the MAF workflow or steers a live roundtable. A rehydrated record (see
-        `_rehydrate`) can answer reads but holds no workflow and no in-flight coroutine, so those
-        calls get an explanatory 409 rather than an AttributeError surfacing as a 500.
+        """`_require` for the paths that DRIVE a run — the MAF workflow or a live roundtable.
 
-        It resolves through the store too, so the 409 is what a client gets on the FIRST call
-        after a restart as well — not a 404 that wrongly reads as "that task never existed"."""
+        A record this process didn't start (rehydrated after a restart, or a request that
+        landed on another replica) holds no workflow, so it can't simply be driven. It is
+        first offered to `_adopt`, which rebuilds the graph around the run's MAF checkpoint
+        and takes a cross-replica lease — that is what lets any replica answer `/review`.
+
+        Only when adoption genuinely can't work does this still 409 (see `_adopt` for the
+        three cases). It resolves through the store, so a first call after a restart gets
+        that answer too — never a 404 that wrongly reads as "that task never existed"."""
         task = await self._resolve(task_id)
         if task.recovered:
-            raise ApiError(409, (
-                f"task {task_id} was recovered from storage after a restart: its history is "
-                "readable but the run cannot be resumed in this process"))
+            await self._adopt(task)
         return task
+
+    # ── Adoption: take over a run this process did not start (B-1) ────────────
+
+    def _lease_name(self, task_id: str) -> str:
+        return f"task-resume:{task_id}"
+
+    async def _adopt(self, task: _Task) -> None:
+        """Rebuild a recovered task's workflow from its MAF checkpoint so THIS process can
+        drive it. Raises ApiError(409) — with a reason — when that isn't possible.
+
+        The three cases that cannot be adopted, and why each is a 409 rather than a retry:
+
+        • **No checkpoint.** Either the run never reached one, or it is a roundtable-only
+          task (`POST /roundtable[s]`), whose record is an event sink with no graph at all.
+          There is nothing to resume; re-running it is the caller's decision, not ours.
+        • **A terminal run.** Completed or errored. Its state is the answer already.
+        • **Another replica holds the lease.** It is mid-resume for this same run. Driving
+          one workflow from two processes corrupts it; a 409 tells the caller to retry.
+
+        The lease is held for the resume, not for the task's life: a replica that dies
+        mid-segment must not strand the run, and the TTL is what bounds that.
+        """
+        settings = get_settings()
+        if task.status in ("completed", "error") or task.brief is None:
+            raise ApiError(409, (
+                f"task {task.task_id} is {task.status} and holds no resumable run: its "
+                "history is readable but there is nothing left to drive"))
+
+        storage = self._storage()
+        workflow_name = f"{WORKFLOW_NAME}:{task.task_id}"
+        try:
+            # `get_latest`, not a sort of `list_checkpoints`: each storage backend defines
+            # its own notion of newest, and PostgresCheckpointStorage says so explicitly —
+            # it orders by insertion `seq` precisely BECAUSE it makes no assumption about
+            # the checkpoint timestamp's type. Sorting on `timestamp` here would re-impose
+            # that assumption from the outside, and resuming from a stale checkpoint replays
+            # work the run already did.
+            latest = await storage.get_latest(workflow_name=workflow_name)
+        except Exception:
+            latest = None
+        if latest is None:
+            raise ApiError(409, (
+                f"task {task.task_id} has no workflow checkpoint to resume from — it was "
+                "recovered from storage and cannot be continued in this process"))
+
+        owner = self._node_id
+        lease = self._lease_name(task.task_id)
+        try:
+            got = await factory.get_store().try_acquire_lease(
+                name=lease, owner=owner, ttl_seconds=settings.task_resume_lease_seconds)
+        except Exception:
+            # A store that can't lease is a store that can't coordinate. Adopting anyway
+            # would risk two replicas driving one workflow, which is worse than refusing.
+            _log.warning("resume_lease_unavailable", extra={"task_id": task.task_id},
+                         exc_info=True)
+            raise ApiError(409, (
+                f"task {task.task_id} cannot be resumed right now: the coordination store "
+                "is unavailable"))
+        if not got:
+            raise ApiError(409, (
+                f"task {task.task_id} is being resumed by another replica — retry shortly"))
+
+        task.workflow = self._workflow_factory(
+            name=workflow_name, checkpoint_storage=storage, **task.build_kwargs)
+        task.resume_checkpoint_id = latest.checkpoint_id
+        # Clearing `recovered` also retires any tailer feeding this record: from here on we
+        # are the driver, publishing locally, and a follower re-reading the mirror would
+        # fight us for the same in-memory state. Its loop notices on the next tick; cancel
+        # so it cannot get one more `_ingest_remote` in first.
+        task.recovered = False
+        if task.tailer is not None:
+            task.tailer.cancel()
+            task.tailer = None
+        task.lease_owner = owner
+        # It was forced terminal by `_rehydrate` so a dead record's SSE stream would close.
+        # It is live again now, and `_drive` will re-settle both fields when the segment ends.
+        task.done = False
+        _log.info("run_adopted", extra={
+            "task_id": task.task_id, "checkpoint_id": latest.checkpoint_id,
+            "build_kwargs": task.build_kwargs, "status": task.status})
+
+    async def _release_lease(self, task: _Task) -> None:
+        """Give the resume lease back once the segment has settled, so the next `/review`
+        (very likely on a different replica) doesn't have to wait out the TTL."""
+        owner, task.lease_owner = task.lease_owner, None
+        if owner is None:
+            return
+        try:
+            await factory.get_store().release_lease(
+                name=self._lease_name(task.task_id), owner=owner)
+        except Exception:
+            # Best-effort: the lease expires on its own. Losing the release costs the next
+            # caller a wait, never correctness.
+            _log.warning("resume_lease_release_failed", extra={"task_id": task.task_id},
+                         exc_info=True)
 
     # ── Durable task state (mirror → store; rebuild ← store) ──────────────────
 
@@ -375,6 +587,9 @@ class WorkflowService:
         return {
             "task_id": task.task_id,
             "brief": task.brief.model_dump() if task.brief is not None else None,
+            # The graph shape, so another replica can rebuild an identical workflow around
+            # the MAF checkpoint rather than guessing it from today's settings.
+            "build_kwargs": dict(task.build_kwargs),
             "events": list(task.events),
             "next_seq": task.next_seq,
             "status": task.status,
@@ -397,6 +612,7 @@ class WorkflowService:
         """Inverse of `_persisted_state`. `next_seq` is recovered defensively from the events
         themselves when the stored counter is missing or behind — the one invariant that must
         hold is that no future event reuses a seq a client has already seen and discarded."""
+        task.build_kwargs = dict(data.get("build_kwargs") or {})
         task.events = list(data.get("events") or [])
         highest = max((int(e.get("seq", -1)) for e in task.events), default=-1)
         task.next_seq = max(int(data.get("next_seq") or 0), highest + 1)
@@ -418,11 +634,25 @@ class WorkflowService:
         """Mirror one task's state to the store. Best-effort by design: the store is not on the
         critical path of a run, so a write failure degrades to "this task won't survive a
         restart" — never to a failed request or a hung stream."""
+        store = factory.get_store()
         try:
-            await factory.get_store().save_checkpoint(
+            await store.save_checkpoint(
                 task_id=_state_key(task.task_id), data=self._persisted_state(task))
         except Exception:
-            pass
+            # Swallowed on purpose (see above) — but not silently. This is the failure that
+            # turns "the run survives a restart" into "it doesn't", and it used to leave no
+            # trace at all, so the loss only showed up later as an unexplained 404/409.
+            _log.warning("task_state_flush_failed", extra={"task_id": task.task_id},
+                         exc_info=True)
+            return
+        # Ring the doorbell for any replica tailing this run (B-2). STRICTLY after the write:
+        # the notification means "there is something new to read", so sending it first would
+        # just make the reader find the old state and wait a full poll for the new one.
+        try:
+            await store.notify_task(task_id=task.task_id, seq=task.next_seq)
+        except Exception:
+            # Pure latency, never correctness — the tailer's periodic re-read still converges.
+            _log.debug("task_notify_failed", extra={"task_id": task.task_id}, exc_info=True)
 
     def _mark_dirty(self, task: _Task) -> None:
         """Queue a coalesced background flush (called from the sync `_publish`). At most one is
@@ -462,15 +692,23 @@ class WorkflowService:
         self._restore_state(task, data)
         task.recovered = True
         if task.status == "running":
-            # Nothing is driving it here, and the process that was has gone. Saying "running"
-            # would leave a client polling forever for a completion that can never arrive.
+            # Caught mid-superstep: no pending request to answer, so there is nothing a
+            # `/review` could resume it WITH, and the process that was driving it is gone.
+            # Saying "running" would leave a client polling forever for a completion that
+            # can never arrive.
             task.status = "error"
             task.error = "run interrupted by a service restart"
-        # Terminal REGARDLESS of the status it stopped at (a gate pause included): with no live
-        # workflow this record can never emit another event, so an SSE stream over it must close
-        # after the replay instead of holding the connection open for a future that cannot come.
-        task.done = True
-        self._tasks[task_id] = task
+            task.done = True
+        # NB `done` is otherwise left exactly as the mirror recorded it. It used to be forced
+        # True for every recovered record, so that a stream over a record nothing could ever
+        # add to would close rather than hang. That is no longer the whole truth: a run paused
+        # at the gate is resumable by ANY replica now (`_adopt`), and its stream is fed from
+        # the store by `_tail_remote` — so calling it terminal here would end a stream whose
+        # run is very much alive, and would let `confirm_learning` fire on an unfinished run.
+        # Through `_register` like a fresh run: rehydrated records are cached in the registry
+        # too, so a client walking many old ids would otherwise refill the memory eviction just
+        # freed. Being already terminal, each one is immediately a candidate itself.
+        self._register(task)
         return task
 
     async def _resolve(self, task_id: str) -> _Task:
@@ -623,11 +861,19 @@ class WorkflowService:
         if responses:
             for req_id in responses:
                 task.pending.pop(req_id, None)
-        stream = (
-            task.workflow.run(message, stream=True)
-            if message is not None
-            else task.workflow.run(responses=responses, stream=True)
-        )
+        # An ADOPTED run (this replica didn't start it) has a freshly built, empty workflow
+        # object — its state lives in the MAF checkpoint. MAF restores and answers the
+        # pending request in ONE call, so the resume is otherwise identical to a local one.
+        # Consumed here, not in `_adopt`: only a segment that actually runs has used it, and
+        # everything after this point continues from live in-memory state.
+        checkpoint_id, task.resume_checkpoint_id = task.resume_checkpoint_id, None
+        if message is not None:
+            stream = task.workflow.run(message, stream=True)
+        elif checkpoint_id is not None:
+            stream = task.workflow.run(
+                responses=responses, checkpoint_id=checkpoint_id, stream=True)
+        else:
+            stream = task.workflow.run(responses=responses, stream=True)
         async for ev in stream:
             if ev.type == "request_info":
                 d = ev.data
@@ -654,16 +900,31 @@ class WorkflowService:
         if task.pending:
             task.status = "awaiting_review"
             task.done = False
+            # The two states a run can settle in are also the two a client waits on, so they
+            # are the ones worth a line: "how long until the gate opened" and "how long the
+            # whole thing took" are answerable from the log alone.
+            _log.info("run_awaiting_review", extra={
+                "task_id": task.task_id, "pending": len(task.pending),
+                "platforms": sorted({p.get("platform") for p in task.pending.values()
+                                     if p.get("platform")}),
+                "blocked": any(p.get("blocked") for p in task.pending.values())})
         else:
             task.status = "completed"
             task.done = True
+            _log.info("run_completed", extra={
+                "task_id": task.task_id, "outputs": len(task.outputs),
+                "discarded": len(task.discarded), "events": len(task.events)})
             self._publish(task, progress_event("workflow", DONE))
             for q in task.subscribers:
                 q.put_nowait(_STREAM_DONE)
         # The segment settled (paused at the gate, or finished). Mirror it with an AWAITED write
         # rather than leaving it to the debounce: these are exactly the states a client would
         # come back for after a restart, so their durability must not depend on a timer.
+        # Flush BEFORE releasing the lease: the next replica to adopt this run reads that
+        # mirror, and handing over the right to resume before the state it resumes from is
+        # durable is the one ordering that loses work.
         await self._flush(task)
+        await self._release_lease(task)
         return self._snapshot(task)
 
     async def _dispatch(self, task: _Task, coro, *, background: bool, running: dict) -> dict:
@@ -691,16 +952,28 @@ class WorkflowService:
         terminal error event, and close every subscriber stream (push the done sentinel). With
         `reraise` the exception still propagates (the synchronous caller surfaces HTTP 500); the
         background path swallows it (already recorded on the task) and returns the snapshot."""
+        # The background path detaches from the request, so re-bind here: asyncio copied the
+        # context at create_task, but a run spawned outside a request (the CLI, a plan item)
+        # has no task_id in it at all. One line, and every executor log under this run is
+        # attributable to it.
+        bind_log_context(task_id=task.task_id)
         try:
             return await coro
         except Exception as exc:
             task.status = "error"
             task.error = str(exc)
             task.done = True
+            # The ONLY place a failed run is recorded with its traceback. The snapshot keeps
+            # `str(exc)` and the SSE stream gets a terminal error event, but neither carries a
+            # stack — so before this, an executor blowing up in the background was invisible.
+            _log.exception("run_failed", extra={"task_id": task.task_id})
             self._publish(task, progress_event("workflow", ERROR))
             for q in list(task.subscribers):
                 q.put_nowait(_STREAM_DONE)
             await self._flush(task)  # a failed run is still a run a client will ask about
+            # A crashed segment must not hold the resume lease for its full TTL — the run
+            # may well be resumable, and the next attempt should not have to wait it out.
+            await self._release_lease(task)
             if reraise:
                 raise
             return self._snapshot(task)
@@ -786,9 +1059,20 @@ class WorkflowService:
             name=f"{WORKFLOW_NAME}:{task_id}", checkpoint_storage=self._storage(), **build_kwargs,
         )
         task = _Task(task_id, workflow, brief)
+        task.build_kwargs = dict(build_kwargs)        # so another replica can rebuild this graph
         task.conversation = list(conversation or [])  # intake transcript for per-user learning
         task.event_listener = event_listener
-        self._tasks[task_id] = task
+        self._register(task)
+        # The shape of the run, logged once. Which graph front was chosen and whether the
+        # roundtable is on are the first two things anyone asks when a run behaves oddly, and
+        # neither is recoverable from the event stream afterwards.
+        _log.info("run_started", extra={
+            "task_id": task_id, "platforms": list(brief.target_platforms),
+            "content_types": list(brief.content_types), "roundtable": roundtable,
+            "roundtable_mode": rt_mode, "entry": ("media_only" if not text_requested
+                                                  else "creator" if roundtable else "dispatcher"),
+            "business_id": brief.business_id, "user_id": brief.user_id,
+            "registry_size": len(self._tasks), "background": background})
 
         # Session title for the frontend's history sidebar — deliberately OFF the intake→roundtable
         # hot path. Set a deterministic topic-derived title NOW so the `running` snapshot already
@@ -904,7 +1188,11 @@ class WorkflowService:
         conversation into DB-ready preference skills and writes them STRAIGHT to the store, for
         BOTH channels: brand voice (→ Brand_Voice_Profile, transcript-aware so a plain approve
         learns too) and per-user (→ user_skills). Nothing is learned otherwise."""
-        task = await self._require_live(task_id)
+        # `_resolve`, not `_require_live`: every input below comes from the mirrored record
+        # (brief / transcript / conversation / outputs / drafts / verdicts) and none of it
+        # touches the MAF workflow, so this works on ANY replica — which it has to, or the
+        # user could approve on one replica and then be refused the learning step on the next.
+        task = await self._resolve(task_id)
         if not task.done:
             raise ApiError(409, "task is not complete; nothing to confirm yet")
         if not learn or not get_settings().learning_enabled:
@@ -1041,7 +1329,7 @@ class WorkflowService:
         rt_mode = _roundtable_mode_from_inputs(inputs)
         brief = _brief_from_inputs(inputs)
         task = _Task(task_id, None, brief)  # event sink only; no generation workflow
-        self._tasks[task_id] = task
+        self._register(task)
         hook = self._step_mode_hook(task) if rt_mode == "manual" else None
 
         async def _go() -> dict:
@@ -1078,7 +1366,7 @@ class WorkflowService:
         rt_mode = _roundtable_mode_from_inputs(inputs)
         brief = _brief_from_inputs(inputs)
         task = _Task(task_id, None, brief)  # event sink only; no generation workflow
-        self._tasks[task_id] = task
+        self._register(task)
         # The service hook is per-table, so step mode keeps the fan-out CONCURRENT — each
         # table pauses for its own /round-control answer while the others keep debating.
         hook = self._step_mode_hook(task) if rt_mode == "manual" else None
@@ -1121,6 +1409,121 @@ class WorkflowService:
         buffer). Unlike `events()`, this never waits for future events."""
         return list(self._require(task_id).events)
 
+    # ── Cross-replica SSE: follow a run another replica is driving (B-2) ──────
+
+    def _ensure_tailer(self, task: _Task) -> None:
+        """Start feeding `task` from the store, if it needs it and isn't already.
+
+        Needed exactly when this process holds no live run for the record — i.e. it was
+        rehydrated (`recovered`) — and the run hasn't finished. A run this replica IS
+        driving publishes into the subscriber queues directly and must NOT be tailed: it
+        would re-deliver its own events.
+        """
+        if task.done or not task.recovered:
+            return
+        if task.tailer is not None and not task.tailer.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no loop: a synchronous caller, which has no live stream to feed anyway
+        task.tailer = loop.create_task(self._tail_remote(task))
+
+    def _stop_tailer_if_idle(self, task: _Task) -> None:
+        """Stop tailing once nobody is listening — the store read exists to serve a stream."""
+        if task.subscribers or task.tailer is None:
+            return
+        task.tailer.cancel()
+        task.tailer = None
+
+    async def _tail_remote(self, task: _Task) -> None:
+        """Mirror another replica's progress into this record until the run ends.
+
+        The design in one line: **the durable event log is the channel, and `notify_task`
+        is only a doorbell.** Each wake-up (or the poll interval, whichever comes first)
+        re-reads the mirrored record and republishes anything with a `seq` this process
+        hasn't seen. That choice is what makes it robust:
+
+        • No payload limit. A `final` event can carry an entire HTML brand card; NOTIFY
+          payloads are capped at 8000 bytes. Sending a pointer and reading the log sidesteps
+          the whole question.
+        • No delivery guarantee needed. A dropped, duplicated or out-of-order doorbell costs
+          latency and nothing else, because `seq` decides what gets emitted. The periodic
+          re-read is therefore a genuine floor: if the pub/sub backend is degraded — or is
+          the mock, which only reaches its own process — this still converges.
+        • No new durable state. It reads exactly what `_rehydrate` reads.
+
+        The cost is that a remote viewer trails the driving replica by up to the flush
+        debounce plus a hop. For a human-facing progress stream that is not a real cost.
+        """
+        poll = get_settings().task_tail_poll_seconds
+        store = factory.get_store()
+        doorbell: asyncio.Queue = asyncio.Queue()
+
+        async def _listen() -> None:
+            """Convert store notifications into wake-ups. Its failure is survivable — the
+            poll below keeps the tailer correct — so it must never take the tailer down."""
+            try:
+                async for seq in store.watch_task(task_id=task.task_id):
+                    doorbell.put_nowait(seq)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _log.warning("task_watch_failed_falling_back_to_poll",
+                             extra={"task_id": task.task_id}, exc_info=True)
+
+        listener = asyncio.create_task(_listen())
+        try:
+            # `recovered` is the follow/drive discriminator, so it is a LOOP condition, not
+            # just a start condition: a `/review` can land on this very replica mid-tail, at
+            # which point `_adopt` clears it and we become the driver. Carrying on would then
+            # overwrite our own live state with an older mirror on every tick.
+            while not task.done and task.recovered:
+                try:
+                    await asyncio.wait_for(doorbell.get(), timeout=poll)
+                except asyncio.TimeoutError:
+                    pass
+                if not task.recovered:
+                    break
+                await self._ingest_remote(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A tailer that dies must not hang the stream it was feeding: close the
+            # subscribers so the client reconnects (and gets a fresh replay) instead.
+            _log.exception("task_tail_failed", extra={"task_id": task.task_id})
+            for q in list(task.subscribers):
+                q.put_nowait(_STREAM_DONE)
+        finally:
+            listener.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await listener
+
+    async def _ingest_remote(self, task: _Task) -> None:
+        """Re-read the mirror and publish whatever is new to this record's subscribers.
+
+        Deliberately NOT `_publish`: these events already have their `seq` (assigned by the
+        replica that produced them) and are already in the durable log. Re-publishing would
+        renumber them and write them back — two replicas fighting over one event log."""
+        try:
+            data = await factory.get_store().load_checkpoint(task_id=_state_key(task.task_id))
+        except Exception:
+            return  # transient store trouble: the next tick tries again
+        if not data:
+            return
+
+        seen = task.next_seq
+        fresh = [e for e in (data.get("events") or []) if int(e.get("seq", -1)) >= seen]
+        # Snapshot fields first, so a client that reacts to the terminal event and immediately
+        # re-reads `GET /tasks/{id}` cannot observe the event without the state behind it.
+        self._restore_state(task, data)
+        for ev in sorted(fresh, key=lambda e: int(e.get("seq", -1))):
+            for q in list(task.subscribers):
+                q.put_nowait(ev)
+        if task.done:
+            for q in list(task.subscribers):
+                q.put_nowait(_STREAM_DONE)
+
     async def events(self, task_id: str, *, from_seq: Optional[int] = None):
         """Async generator of events for SSE: replays the buffer, then follows live until the
         task completes. Yields `None` (a heartbeat) every 15s of inactivity so the route can
@@ -1138,6 +1541,10 @@ class WorkflowService:
         task = await self._resolve(task_id)
         q: asyncio.Queue = asyncio.Queue()
         task.subscribers.append(q)
+        # A run driven by ANOTHER replica publishes nothing into this process's queues, so
+        # without a tailer this stream would sit at the replay and then hang. Started only
+        # for a record this process isn't driving, and stopped with the last subscriber.
+        self._ensure_tailer(task)
         try:
             floor = -1 if from_seq is None else int(from_seq)
             for ev in list(task.events):
@@ -1162,6 +1569,7 @@ class WorkflowService:
         finally:
             if q in task.subscribers:
                 task.subscribers.remove(q)
+            self._stop_tailer_if_idle(task)
 
 
 class IntakeService:
@@ -2558,11 +2966,52 @@ def create_app(
     """Build the FastAPI app. Tests inject custom service instances; production uses
     fresh defaults wired to the toggle-resolved factory backends."""
 
+    configure_logging()
+
     app = FastAPI(
         title="TeamStarlight LLM Service",
         version="3.0",
         summary="MAF virtual-newsroom workflow + intake + media, for the Java backend.",
     )
+
+    @app.middleware("http")
+    async def _request_context(request: Request, call_next):
+        """Give every request an id, bind it for the whole call tree, and log one line.
+
+        The id is TAKEN from `X-Request-ID` when the caller sent one, so a trace the Java
+        backend started keeps a single id across both services instead of two unrelated
+        ones that have to be joined by timestamp. It is echoed back on the response for
+        the same reason — and so a user reporting "it failed" can quote it.
+
+        `task_id` is bound here too when the path carries one, which is what makes the
+        SSE/gate/render endpoints greppable per run without touching a single handler.
+        """
+        request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:16]
+        fields: dict = {"request_id": request_id}
+        task_id = request.path_params.get("task_id") if request.path_params else None
+        if task_id:
+            fields["task_id"] = task_id
+
+        started = time.monotonic()
+        with log_context(**fields):
+            try:
+                response = await call_next(request)
+            except Exception:
+                # An unhandled error never reaches the ApiError handler, so without this the
+                # only trace is uvicorn's bare 500. Re-raised: this observes, it doesn't catch.
+                _log.exception("http_request_failed", extra={
+                    "method": request.method, "path": request.url.path,
+                    "duration_ms": round((time.monotonic() - started) * 1000, 1)})
+                raise
+            duration_ms = round((time.monotonic() - started) * 1000, 1)
+            # Health checks fire every few seconds forever; at INFO they are the whole log.
+            level = logging.DEBUG if request.url.path == "/health" else logging.INFO
+            _log.log(level, "http_request", extra={
+                "method": request.method, "path": request.url.path,
+                "status": response.status_code, "duration_ms": duration_ms})
+            response.headers["X-Request-ID"] = request_id
+            return response
+
     app.state.workflow = service or WorkflowService()
     app.state.intake = intake or IntakeService()
     app.state.media = media or MediaService()
@@ -2590,11 +3039,18 @@ def create_app(
 def serve(host: Optional[str] = None, port: Optional[int] = None) -> None:
     import uvicorn
 
-    # Pull credentials / toggles from LLM_service/.env before resolving anything.
+    # Pull credentials / toggles from LLM_service/.env before resolving anything (LOG_LEVEL /
+    # LOG_FORMAT live there too, so this must precede configure_logging in create_app).
     load_dotenv()
     host = host or os.getenv("API_HOST", "0.0.0.0")
     port = port or int(os.getenv("API_PORT", "8080"))
-    uvicorn.run(create_app(), host=host, port=port, log_level="info")
+    app = create_app()
+    # `log_config=None` stops uvicorn installing its own handlers, so its loggers propagate to
+    # the root handler create_app() just configured and come out in the SAME shape as ours —
+    # a deployment that has to grep two log formats is one where the JSON was pointless.
+    # `access_log=False` because the middleware already logs each request, with the request id
+    # and duration uvicorn's line doesn't carry.
+    uvicorn.run(app, host=host, port=port, log_config=None, access_log=False)
 
 
 if __name__ == "__main__":

@@ -12,10 +12,12 @@ statement shapes this module emits) exercises exactly those paths offline.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import re
 import ssl as _ssl
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from agent_framework import WorkflowCheckpoint
@@ -64,9 +66,41 @@ class FakeConnection:
             removed = self._db.tables.setdefault(delete.group(1), {}).pop(args[0], None)
             return "DELETE 1" if removed is not None else "DELETE 0"
 
+        # release_lease — the `AND owner = $2` is the point of the statement, so the fake
+        # honours it rather than deleting by key.
+        lease_delete = re.match(r"DELETE FROM (\w+) WHERE name = \$1 AND owner = \$2", sql)
+        if lease_delete:
+            rows = self._db.tables.setdefault(lease_delete.group(1), {})
+            held = rows.get(args[0])
+            if held is not None and held["owner"] == args[1]:
+                rows.pop(args[0])
+                return "DELETE 1"
+            return "DELETE 0"
+
+        if sql.startswith("SELECT pg_notify"):
+            self._db.notifications.append((args[0], args[1]))
+            return "SELECT 1"
+
         raise AssertionError(f"fake asyncpg cannot handle: {sql}")
 
     async def fetchrow(self, sql: str, *args):
+        # try_acquire_lease: an upsert whose RETURNING is the answer. Modelled properly
+        # because the CAS is the whole point — INSERT-or-take-over when the row is absent,
+        # expired, or already ours; otherwise the ON CONFLICT ... WHERE filters the update
+        # out and PostgreSQL returns NO ROW, which is how the caller learns it lost.
+        lease = re.match(r"INSERT INTO (\w+) \(name, owner, expires_at\)", sql)
+        if lease and "RETURNING owner" in sql:
+            self._db.statements.append(sql)
+            rows = self._db.tables.setdefault(lease.group(1), {})
+            name, owner, ttl = args
+            now = datetime.now(timezone.utc)
+            held = rows.get(name)
+            if held is not None and held["owner"] != owner and held["expires_at"] > now:
+                return None
+            rows[name] = {"name": name, "owner": owner,
+                          "expires_at": now + timedelta(seconds=ttl)}
+            return {"owner": owner}
+
         rows = await self.fetch(sql, *args)
         return rows[0] if rows else None
 
@@ -99,22 +133,47 @@ class FakePool:
         return _Ctx()
 
 
+class FakeListenerConnection(FakeConnection):
+    """`watch_task` takes its OWN connection (LISTEN is connection-scoped, so a pooled one
+    would silently unsubscribe when handed back). This models that separate lifecycle."""
+
+    def __init__(self, db: "FakeDatabase") -> None:
+        super().__init__(db)
+        self.listeners: dict = {}
+        self.closed = False
+
+    async def add_listener(self, channel: str, callback) -> None:
+        self.listeners[channel] = callback
+        self._db.listener_conns.append(self)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 class FakeDatabase:
     def __init__(self) -> None:
         self.tables: dict[str, dict] = {}
         self.statements: list[str] = []
         self.pool_kwargs: list[dict] = []
+        self.notifications: list[tuple] = []   # (channel, payload) from pg_notify
+        self.connect_kwargs: list[dict] = []   # asyncpg.connect() — the LISTEN connection
+        self.listener_conns: list[FakeListenerConnection] = []
 
     async def create_pool(self, **kwargs) -> FakePool:
         self.pool_kwargs.append(kwargs)
         return FakePool(self)
+
+    async def connect(self, **kwargs) -> FakeListenerConnection:
+        self.connect_kwargs.append(kwargs)
+        return FakeListenerConnection(self)
 
 
 @pytest.fixture
 def fake_db(monkeypatch) -> FakeDatabase:
     """Install a fake `asyncpg`; postgres.py lazy-imports it inside `_pool()`."""
     db = FakeDatabase()
-    install_fake_module(monkeypatch, "asyncpg", create_pool=db.create_pool)
+    install_fake_module(monkeypatch, "asyncpg",
+                        create_pool=db.create_pool, connect=db.connect)
     return db
 
 
@@ -162,7 +221,7 @@ async def test_pool_is_built_once_and_creates_every_table(fake_db):
     assert isinstance(fake_db.pool_kwargs[0]["ssl"], _ssl.SSLContext)
     assert set(fake_db.tables) == {
         "brand_profiles", "user_skills", "workflow_checkpoints",
-        "video_jobs", "trends", "posting_plans",
+        "video_jobs", "trends", "posting_plans", "service_leases",
     }
 
 
@@ -347,3 +406,122 @@ async def test_checkpoint_storage_honours_sslmode(fake_db):
     storage = postgres.PostgresCheckpointStorage(_settings(postgres_sslmode="require"))
     await storage.save(_checkpoint())
     assert isinstance(fake_db.pool_kwargs[0]["ssl"], _ssl.SSLContext)
+
+
+# ── Cross-replica coordination: leases + LISTEN/NOTIFY ───────────────────────
+# The SQL that decides whether two API replicas can both drive one run. It only ever
+# executes against a real database, so the statement shapes are pinned here.
+
+async def test_lease_acquire_emits_one_conditional_upsert(fake_db):
+    store = postgres.PostgresStore(_settings())
+    assert await store.try_acquire_lease(name="task-resume:t1", owner="a", ttl_seconds=60)
+
+    sql = [s for s in fake_db.statements if "service_leases" in s and "INSERT" in s][-1]
+    # One statement decides the winner — a read-then-write is exactly the race this avoids.
+    assert "ON CONFLICT (name) DO UPDATE" in sql
+    assert "expires_at < now()" in sql and "owner = EXCLUDED.owner" in sql
+    assert "RETURNING owner" in sql
+    assert fake_db.tables["service_leases"]["task-resume:t1"]["owner"] == "a"
+
+
+async def test_lease_is_refused_while_another_owner_holds_a_live_one(fake_db):
+    store = postgres.PostgresStore(_settings())
+    assert await store.try_acquire_lease(name="L", owner="a", ttl_seconds=60)
+    assert not await store.try_acquire_lease(name="L", owner="b", ttl_seconds=60)
+    # Re-acquiring your own extends it rather than deadlocking against yourself.
+    assert await store.try_acquire_lease(name="L", owner="a", ttl_seconds=60)
+
+
+async def test_an_expired_lease_is_taken_over(fake_db):
+    """The holder died. Without this the run it was resuming is stuck forever."""
+    store = postgres.PostgresStore(_settings())
+    assert await store.try_acquire_lease(name="L", owner="dead", ttl_seconds=-1)
+    assert await store.try_acquire_lease(name="L", owner="new", ttl_seconds=60)
+    assert fake_db.tables["service_leases"]["L"]["owner"] == "new"
+
+
+async def test_release_only_touches_your_own_lease(fake_db):
+    """A zombie holder's late release must not steal the lock from whoever took over."""
+    store = postgres.PostgresStore(_settings())
+    await store.try_acquire_lease(name="L", owner="new", ttl_seconds=60)
+
+    await store.release_lease(name="L", owner="zombie")
+    assert "L" in fake_db.tables["service_leases"]          # untouched
+
+    await store.release_lease(name="L", owner="new")
+    assert "L" not in fake_db.tables["service_leases"]
+
+
+async def test_notify_sends_only_the_seq_on_a_hashed_channel(fake_db):
+    """The payload is a doorbell, never the event: NOTIFY caps payloads at 8000 bytes and a
+    `final` event can carry a whole HTML brand card."""
+    store = postgres.PostgresStore(_settings())
+    await store.notify_task(task_id="sess-42", seq=17)
+
+    channel, payload = fake_db.notifications[-1]
+    assert payload == "17"
+    assert channel == postgres._channel("sess-42")
+
+
+def test_the_channel_name_is_a_safe_bounded_identifier():
+    """A task_id is caller-supplied (the backend's session id); a channel name is a
+    PostgreSQL identifier — 63 bytes, case-folded, and injectable if interpolated raw."""
+    nasty = 'sess"; DROP TABLE service_leases; --' + "x" * 200
+    channel = postgres._channel(nasty)
+    assert channel.isidentifier() and len(channel) <= 63
+    assert postgres._channel("a") != postgres._channel("b")
+    assert postgres._channel("a") == postgres._channel("a")      # stable across calls
+
+
+async def test_watch_uses_its_own_connection_and_closes_it(fake_db):
+    """LISTEN is connection-scoped: a pooled connection handed back mid-watch would
+    silently stop delivering. The dedicated connection must also be closed on exit, or
+    every reconnecting SSE client leaks one."""
+    store = postgres.PostgresStore(_settings(postgres_sslmode="require"))
+    received: list[int] = []
+
+    async def _watch() -> None:
+        async for seq in store.watch_task(task_id="sess-42"):
+            received.append(seq)
+
+    watcher = asyncio.create_task(_watch())
+    while not fake_db.listener_conns:                # wait for LISTEN to be registered
+        await asyncio.sleep(0)
+    conn = fake_db.listener_conns[0]
+
+    assert postgres._channel("sess-42") in conn.listeners
+    assert isinstance(fake_db.connect_kwargs[0]["ssl"], _ssl.SSLContext)   # honours sslmode
+
+    conn.listeners[postgres._channel("sess-42")](conn, 1, postgres._channel("sess-42"), "9")
+    await asyncio.sleep(0)
+    assert received == [9]
+
+    watcher.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await watcher
+    assert conn.closed, "the LISTEN connection must not outlive the watch"
+
+
+async def test_a_malformed_notification_is_ignored_not_fatal(fake_db):
+    """Hints, not a contract — the consumer re-reads the log and filters by seq anyway."""
+    store = postgres.PostgresStore(_settings())
+    received: list[int] = []
+
+    async def _watch() -> None:
+        async for seq in store.watch_task(task_id="t"):
+            received.append(seq)
+
+    watcher = asyncio.create_task(_watch())
+    while not fake_db.listener_conns:
+        await asyncio.sleep(0)
+    conn = fake_db.listener_conns[0]
+    channel = postgres._channel("t")
+
+    conn.listeners[channel](conn, 1, channel, "not-a-number")
+    conn.listeners[channel](conn, 1, channel, "5")
+    await asyncio.sleep(0)
+
+    watcher.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await watcher
+    assert received == [5]

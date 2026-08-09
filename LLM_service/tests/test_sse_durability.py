@@ -22,6 +22,7 @@ HTTP server on localhost.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
@@ -29,7 +30,9 @@ import httpx
 import pytest
 
 from LLM_service.api import WorkflowService, _state_key, create_app
+from LLM_service.core.config import reset_settings
 from LLM_service.core.services import factory
+from LLM_service.workflow.builder import WORKFLOW_NAME
 from LLM_service.tests.conftest import run_app
 from LLM_service.workflow.roundtable import audio_store
 
@@ -267,28 +270,61 @@ async def test_get_answers_after_a_restart_instead_of_404():
     assert after["title"] == before["title"]
 
 
+async def _replay_only(svc: WorkflowService, task_id: str, **kwargs) -> list[dict]:
+    """Collect the REPLAY portion of an events() stream, then stop.
+
+    A stream over a run that is merely paused no longer ends by itself: since B-1 any replica
+    can resume it, and `_tail_remote` keeps feeding it, so draining to exhaustion would wait
+    for a close that correctly never comes. Stop at the first quiet moment instead — the HTTP
+    helper `_read_replay` above takes exactly the same approach for the same reason."""
+    out: list[dict] = []
+    stream = svc.events(task_id, **kwargs)
+    try:
+        while True:
+            ev = await asyncio.wait_for(stream.__anext__(), timeout=0.5)
+            if ev is None:
+                break                       # heartbeat: the replay is drained
+            out.append(ev)
+    except (StopAsyncIteration, asyncio.TimeoutError):
+        pass
+    finally:
+        await stream.aclose()
+    return out
+
+
 async def test_rehydrated_events_replay_and_seq_never_restarts():
     """The cross-hop invariant. A client that already saw seq 40 drops everything `<= 40`, so a
-    recovered task numbering from 0 again would have its events silently ignored forever.
-
-    Also pins that a recovered stream CLOSES after its replay: nothing can drive it any more, so
-    holding the connection open would strand the client on a future that cannot arrive."""
+    recovered task numbering from 0 again would have its events silently ignored forever."""
     svc = WorkflowService()
     await svc.start(_START, task_id="dur-seq")
     original = svc.buffered_events("dur-seq")
 
     revived = await _simulate_restart("dur-seq")
-    replayed = [ev async for ev in revived.events("dur-seq")]
+    replayed = await _replay_only(revived, "dur-seq")
     assert [e["seq"] for e in replayed] == [e["seq"] for e in original]
 
     # Resume works across the restart too — the marker a client held is still meaningful.
     cut = original[1]["seq"]
-    partial = [ev async for ev in revived.events("dur-seq", from_seq=cut)]
+    partial = await _replay_only(revived, "dur-seq", from_seq=cut)
     assert [e["seq"] for e in partial] == [e["seq"] for e in original[2:]]
 
     # Any NEW event continues above the highest seq the previous process issued.
     task = revived._tasks["dur-seq"]
     assert task.next_seq == original[-1]["seq"] + 1
+
+
+async def test_a_recovered_stream_closes_once_the_run_is_actually_over():
+    """The counterpart to the above: a stream is held open because the run can still be
+    resumed, NOT unconditionally. A finished run has no future to wait for, so its recovered
+    stream must still end after the replay rather than hanging the client forever."""
+    svc = WorkflowService()
+    await svc.start(_START_COMPLETES, task_id="dur-closed")   # media-only: no gate, runs to done
+    original = svc.buffered_events("dur-closed")
+
+    revived = await _simulate_restart("dur-closed")
+    replayed = [ev async for ev in revived.events("dur-closed")]   # drains, does not hang
+
+    assert [e["seq"] for e in replayed] == [e["seq"] for e in original]
 
 
 async def test_an_interrupted_run_is_reported_as_error_not_running():
@@ -310,27 +346,61 @@ async def test_an_interrupted_run_is_reported_as_error_not_running():
     assert "restart" in snap["error"]
 
 
-async def test_a_rehydrated_task_refuses_writes_with_a_clear_409():
-    """Reads are honest; writes are not possible — there is no live workflow to resume. A 409
-    that says so beats an AttributeError surfacing as a 500."""
+async def test_a_rehydrated_task_with_no_checkpoint_refuses_writes_with_a_clear_409():
+    """Writes on a record this process didn't start are attempted, not refused outright — see
+    section F. But when there is nothing to resume FROM, refusing is still the honest answer,
+    and a 409 that explains it beats an AttributeError surfacing as a 500.
+
+    Here the mirrored state survives while the MAF checkpoint does not, which is exactly what
+    a mid-rollout schema/storage mismatch looks like."""
     from LLM_service.api import ApiError
 
     svc = WorkflowService()
     await svc.start(_START, task_id="dur-write")
     revived = await _simulate_restart("dur-write")
 
+    storage = factory.get_checkpoint_storage()
+    for cp in await storage.list_checkpoints(workflow_name=f"{WORKFLOW_NAME}:dur-write"):
+        await storage.delete(cp.checkpoint_id)
+
     # Built lazily — an eagerly-created coroutine that never gets awaited (because an earlier
     # one raised) is itself a warning, and would mask which call actually failed.
     calls = (
         lambda: revived.review("dur-write", {"linkedin": {"decision": "approve"}}),
-        lambda: revived.confirm_learning("dur-write", True),
         lambda: revived.round_control("dur-write", "linkedin", "next"),
     )
     for make_call in calls:
         with pytest.raises(ApiError) as exc:
             await make_call()
         assert exc.value.status == 409
-        assert "restart" in str(exc.value)
+        assert "checkpoint" in str(exc.value)
+
+
+async def test_confirm_learning_does_not_need_the_run_to_be_local():
+    """It reads only mirrored fields and never touches the workflow, so refusing it on a
+    replica that didn't start the run would be an artificial limit — and an incoherent one
+    now that `/review` works anywhere: approve on replica B, learn on replica C."""
+    svc = WorkflowService()
+    await svc.start(_START_COMPLETES, task_id="dur-learn")   # media-only: completes on its own
+    revived = await _simulate_restart("dur-learn")
+
+    out = await revived.confirm_learning("dur-learn", True)
+    assert out["learned"] is True
+
+
+async def test_confirm_learning_still_refuses_a_run_that_has_not_finished():
+    """`done` used to be forced True on every recovered record, which would have let this
+    fire on a run still sitting at the gate. It now reflects the mirrored truth."""
+    from LLM_service.api import ApiError
+
+    svc = WorkflowService()
+    await svc.start(_START, task_id="dur-learn-early")        # parks at the gate
+    revived = await _simulate_restart("dur-learn-early")
+
+    with pytest.raises(ApiError) as exc:
+        await revived.confirm_learning("dur-learn-early", True)
+    assert exc.value.status == 409
+    assert "not complete" in str(exc.value)
 
 
 async def test_an_unknown_task_is_still_a_404():
@@ -344,9 +414,14 @@ async def test_an_unknown_task_is_still_a_404():
 
 
 def test_http_restart_round_trip(http_server):
-    """End to end over real HTTP: run to the gate, drop the registry the way a restart would,
-    and confirm the snapshot + SSE replay still answer while `POST /review` refuses cleanly."""
-    with httpx.Client(timeout=20) as client:
+    """End to end over real HTTP: run to the gate, drop the registry the way a restart (or a
+    request landing on another replica) would, and confirm the run CARRIES ON.
+
+    This is B-1's headline behaviour. It used to be a clean 409 — reads honest, writes
+    impossible — which meant every rolling deploy stranded every in-flight approval. The
+    workflow is now rebuilt around its MAF checkpoint, so the verdict is accepted and the run
+    finishes; the reads it already answered are unchanged."""
+    with httpx.Client(timeout=30) as client:
         task_id = _start_to_gate(client, http_server)
         events_url = f"{http_server}/tasks/{task_id}/events"
         before = _read_replay(client, events_url)
@@ -359,11 +434,123 @@ def test_http_restart_round_trip(http_server):
         after = _read_replay(client, events_url)
         assert [p["seq"] for _, p in after] == [p["seq"] for _, p in before]
 
-        refused = client.post(f"{http_server}/tasks/{task_id}/review",
+        _SERVICES["svc"]._tasks.clear()          # …and land the verdict on a cold registry too
+        resumed = client.post(f"{http_server}/tasks/{task_id}/review",
                               json={"verdicts": {"linkedin": {"decision": "approve"}}})
-        assert refused.status_code == 409
+        assert resumed.status_code == 200, resumed.text
+        assert resumed.json()["status"] == "completed"
+        assert resumed.json()["outputs"]        # the approved draft really was produced
 
         assert client.get(f"{http_server}/tasks/does-not-exist").status_code == 404
+
+
+# ── E. Registry retention (the in-memory task cache is bounded) ──────────────
+# The registry used to only ever grow: every run stayed resident for the life of the process.
+# It is now swept on registration. These pin the two halves of that — that finished records DO
+# get dropped and cost nothing observable when they are (section C/D is why: the mirror), and
+# that the records which live ONLY in this process are never touched.
+
+@pytest.fixture
+def retention(monkeypatch):
+    """Set TASK_RETENTION_SECONDS / TASK_REGISTRY_MAX for one test."""
+    def _set(*, ttl: str = "1800", cap: str = "500"):
+        monkeypatch.setenv("TASK_RETENTION_SECONDS", ttl)
+        monkeypatch.setenv("TASK_REGISTRY_MAX", cap)
+        reset_settings()
+    yield _set
+    reset_settings()
+
+
+async def test_a_finished_task_is_evicted_once_it_is_older_than_the_ttl(retention):
+    retention(ttl="0.0001")
+    svc = WorkflowService()
+    await svc.start(_START_COMPLETES, task_id="ret-old")
+    assert svc._tasks["ret-old"].done
+
+    await svc.start(_START_COMPLETES, task_id="ret-new")  # registration drives the sweep
+    assert "ret-old" not in svc._tasks
+
+
+async def test_an_evicted_task_still_answers_reads_with_its_real_history(retention):
+    """Eviction is a cache drop, not a delete: the mirror still has the whole run, so the
+    snapshot and the SSE replay are the same ones the resident record would have given."""
+    retention(ttl="0.0001")
+    svc = WorkflowService()
+    await svc.start(_START_COMPLETES, task_id="ret-read")
+    before = list(svc.buffered_events("ret-read"))
+    outputs_before = (await svc.get("ret-read"))["outputs"]
+
+    await svc.start(_START_COMPLETES, task_id="ret-read-other")
+    assert "ret-read" not in svc._tasks
+
+    snap = await svc.get("ret-read")                       # rehydrates from the mirror
+    assert snap["task_id"] == "ret-read"
+    assert snap["outputs"] == outputs_before
+    assert [e["seq"] for e in svc.buffered_events("ret-read")] == [e["seq"] for e in before]
+
+
+async def test_a_task_paused_at_the_human_gate_is_never_evicted(retention):
+    """The gate's MAF workflow lives in THIS process and nowhere else — evicting it would
+    strand the run behind a 409 that no restart actually caused."""
+    retention(ttl="0.0001", cap="1")
+    svc = WorkflowService()
+    await svc.start(_START, task_id="ret-gate")             # parks at the gate: not terminal
+    assert svc._tasks["ret-gate"].status == "awaiting_review"
+
+    for i in range(3):                                      # well past the cap of 1
+        await svc.start(_START_COMPLETES, task_id=f"ret-filler-{i}")
+
+    assert "ret-gate" in svc._tasks
+    resumed = await svc.review("ret-gate", {"linkedin": {"decision": "approve"}})
+    assert resumed["status"] == "completed"
+
+
+async def test_a_task_with_a_live_sse_subscriber_is_not_evicted(retention):
+    """That stream reads `task.events` off the resident object, so dropping it mid-stream
+    would silently truncate a client that is still connected."""
+    retention(ttl="0.0001")
+    svc = WorkflowService()
+    await svc.start(_START_COMPLETES, task_id="ret-watched")
+    svc._tasks["ret-watched"].subscribers.append(asyncio.Queue())
+
+    await svc.start(_START_COMPLETES, task_id="ret-watched-other")
+    assert "ret-watched" in svc._tasks
+
+
+async def test_the_cap_trims_the_oldest_finished_tasks_first(retention):
+    """A burst of short runs inside one retention window can outrun the TTL, so the cap has to
+    bound it on its own — from the oldest end, since those are the least likely to be read."""
+    retention(ttl="0", cap="3")                             # age-based eviction off entirely
+    svc = WorkflowService()
+    for i in range(6):
+        await svc.start(_START_COMPLETES, task_id=f"ret-cap-{i}")
+
+    assert len(svc._tasks) <= 3
+    assert "ret-cap-5" in svc._tasks                        # newest survives
+    assert "ret-cap-0" not in svc._tasks                    # oldest goes first
+
+
+async def test_a_reopened_gate_clears_the_eviction_clock():
+    """A compliance block bounces an approved draft back to the gate: the task goes terminal →
+    live again, and must stop being an eviction candidate when it does."""
+    svc = WorkflowService()
+    await svc.start(_START, task_id="ret-reopen")
+    task = svc._tasks["ret-reopen"]
+
+    task.done = True
+    assert task.finished_at is not None
+    task.done = False
+    assert task.finished_at is None
+
+
+async def test_retention_can_be_switched_off_entirely(retention):
+    """Both knobs at 0 restore the old unbounded behaviour — an escape hatch for anyone who
+    would rather trade memory for never seeing a post-eviction 409."""
+    retention(ttl="0", cap="0")
+    svc = WorkflowService()
+    for i in range(4):
+        await svc.start(_START_COMPLETES, task_id=f"ret-off-{i}")
+    assert len(svc._tasks) == 4
 
 
 def _start_to_gate(client: httpx.Client, base_url: str) -> str:

@@ -441,7 +441,9 @@ def test_realtime_tool_adapter_defaults_missing_parameters():
 # ── Azure Speech TTS (the render pipeline's optional narration) ──────────────
 
 def _speech_settings() -> Settings:
-    return Settings(azure_speech_key="speech-key", azure_speech_region="westeurope")
+    # ONE Azure Speech credential serves both TTS consumers — the roundtable persona
+    # readback and this render-pipeline narration — hence the roundtable-prefixed names.
+    return Settings(roundtable_tts_key="speech-key", roundtable_tts_region="westeurope")
 
 
 def test_speech_synthesis_url_is_region_scoped():
@@ -468,4 +470,8 @@ async def test_speech_synthesize_posts_ssml_with_the_subscription_key(fake_httpx
     assert kwargs["headers"]["Content-Type"] == "application/ssml+xml"
     assert kwargs["headers"]["X-Microsoft-OutputFormat"] == "audio-24khz-48kbitrate-mono-mp3"
     assert b"Our new single-origin is here." in kwargs["content"]
-    assert out == b"mp3-narration"
+    # A SynthesizedSpeech, not raw bytes: the per-slide voiceover pipeline stretches each
+    # slide to fit its narration, and only this impl knows the output format well enough
+    # to say how long the clip is (CBR 48 kbit/s → bytes × 8 / 48000).
+    assert out.audio == b"mp3-narration"
+    assert out.duration_seconds == pytest.approx(len(b"mp3-narration") * 8 / 48000)

@@ -33,12 +33,16 @@ class RecordingLLM:
         self._replies = list(replies) or [""]
         self.llm = azure.AzureLLM(Settings(**settings_over))
 
+        # Mirrors AzureLLM._complete's signature exactly. It must stay in step with it:
+        # a kwarg the real seam grows and this stub lacks raises TypeError inside the
+        # call, and the codegen entry points swallow exceptions as a soft degrade — so
+        # the drift surfaces as an empty/default result, not as an obvious signature error.
         async def _complete(messages, *, model=None, temperature=None, max_tokens=None,
-                            reasoning_effort=None, verbosity=None):
+                            reasoning_effort=None, verbosity=None, max_retries=None):
             self.calls.append({
                 "messages": messages, "model": model, "temperature": temperature,
                 "max_tokens": max_tokens, "reasoning_effort": reasoning_effort,
-                "verbosity": verbosity,
+                "verbosity": verbosity, "max_retries": max_retries,
             })
             return self._replies.pop(0) if len(self._replies) > 1 else self._replies[0]
 
