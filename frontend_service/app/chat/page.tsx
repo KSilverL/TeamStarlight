@@ -292,6 +292,14 @@ interface Message {
   // Workflow-specific fields — set when the message originates from the MAF pipeline.
   workflowTaskId?: string;
   needsHumanIntervention?: boolean;
+  // Set only when the post-approval compliance screen BLOCKED this copy and re-opened the gate.
+  // A blocked gate refuses a plain `approve` (the service answers 400), so the card must offer
+  // the decisions the gate actually accepts — which is what `allowedDecisions` carries — rather
+  // than the usual approve/reject pair. Absent on an ordinary gate, which is how a run that never
+  // tripped the screen stays byte-identical to what it was before.
+  blocked?: boolean;
+  blockReason?: string;
+  allowedDecisions?: string[];
   // Set on a text draft (variant "text-preview") when the same task also asked for a video:
   // the real publish is the native video post (video + this copy as caption), so the draft
   // card hides its own text/image post buttons and points the user to the video card below.
@@ -651,6 +659,35 @@ function newId() {
   return `m${Date.now().toString(36)}-${_msgSeq}`;
 }
 
+/**
+ * The JWT, on EVERY call that names a task.
+ *
+ * The backend refuses a run owned by another business, so a request without this reads as
+ * anonymous and is refused — including by the person who started the run. That failure is silent
+ * from the UI's point of view (a button that does nothing), which is why this lives at module
+ * scope: the roundtable stage is a separate component, and a helper it cannot reach is a helper
+ * its calls will quietly go without.
+ *
+ * Also what tells the backend which brand a run belongs to, so the brand-voice profile applies.
+ */
+function authHeaders(): Record<string, string> {
+  const token = localStorage.getItem("starlight_token");
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+/**
+ * `?access_token=…` for the two things that cannot carry a header: `EventSource` (no header
+ * support at all) and `<audio src>`. The backend accepts it as an alternative to the
+ * Authorization header purely for these; everything else uses `authHeaders()`.
+ *
+ * Empty string when logged out — an unowned run needs no credential, and sending a blank one
+ * would just be noise.
+ */
+function accessTokenQuery(): string {
+  const token = localStorage.getItem("starlight_token");
+  return token ? `?access_token=${encodeURIComponent(token)}` : "";
+}
+
 export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>(INITIAL_MESSAGES);
   const [input, setInput] = useState("");
@@ -728,18 +765,6 @@ export default function ChatPage() {
   function enqueueRoundtableAudio(url: string) {
     roundtableAudioQueueRef.current.push(url);
     playNextRoundtableAudio();
-  }
-
-  /**
-   * The JWT, for the routes that need one.
-   *
-   * The chat's own workflow calls go straight to the LLM service unauthenticated, but every
-   * plan route runs through Java, which derives `business_id` from this token — without it a
-   * plan is created against no brand, so the brand-voice profile silently never applies.
-   */
-  function authHeaders(): Record<string, string> {
-    const token = localStorage.getItem("starlight_token");
-    return token ? { Authorization: `Bearer ${token}` } : {};
   }
 
   // ── Posting-plan path ───────────────────────────────────────────────────────
@@ -1250,7 +1275,7 @@ export default function ChatPage() {
         approval !== "approved" ? "reject" : wasEdited ? "approve_after_edit" : "approve";
       fetch(`/api/tasks/${msg.workflowTaskId}/review`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({
           verdicts: {
             [msg.platform]: {
@@ -1280,6 +1305,74 @@ export default function ChatPage() {
         },
       ]);
     }, 350);
+  }
+
+  /**
+   * Resolve a gate the compliance screen blocked.
+   *
+   * A blocked gate accepts exactly three decisions, and the choice between them is the user's:
+   *  - `approve_after_edit` — they rewrite it themselves; the edit is re-screened, so it can
+   *    come back blocked again, which is the point;
+   *  - `reject` — the creator regenerates. The service folds the block reason into the rework
+   *    steer by itself, so `reason` here carries only whatever extra the user typed;
+   *  - `discard` — abandon this platform. It yields no output and the run settles without it.
+   *
+   * Deliberately NOT offered: a plain `approve`. The service refuses it with a 400 precisely so
+   * that a block cannot be waved through, and offering a button that always fails would be worse
+   * than offering none.
+   */
+  function handleBlockedDecision(
+    messageId: string,
+    decision: "approve_after_edit" | "reject" | "discard",
+    text?: string
+  ) {
+    const msg = messages.find((m) => m.id === messageId);
+    if (!msg?.workflowTaskId || !msg.platform) return;
+    const platformLabel = platformMap[msg.platform]?.label ?? "platform";
+
+    const verdict: Record<string, string> = { decision };
+    if (decision === "approve_after_edit") verdict.edited_draft = text ?? "";
+    else if (text) verdict.reason = text;
+
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === messageId
+          ? { ...m, approval: decision === "discard" ? "rejected" : "pending", blocked: false }
+          : m
+      )
+    );
+
+    fetch(`/api/tasks/${msg.workflowTaskId}/review`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ verdicts: { [msg.platform]: verdict } }),
+    })
+      .then(async (res) => {
+        if (res.ok) return;
+        // Surfaced rather than swallowed: at a blocked gate a rejected verdict means the run is
+        // still parked, and silence would leave the user waiting on something that never moves.
+        const data = await res.json().catch(() => ({}));
+        pushMessage({
+          role: "assistant",
+          content: `Could not submit that decision: ${data.error ?? res.status}`,
+          variant: "status",
+        });
+      })
+      .catch(() => {
+        pushMessage({
+          role: "assistant",
+          content: "Could not reach the backend to submit that decision.",
+          variant: "status",
+        });
+      });
+
+    const note =
+      decision === "approve_after_edit"
+        ? `Re-checking your edited ${platformLabel} copy against the safety screen…`
+        : decision === "reject"
+        ? `Regenerating ${platformLabel} copy, avoiding what was flagged…`
+        : `Dropped ${platformLabel} from this run.`;
+    pushMessage({ role: "assistant", content: note, variant: "status" });
   }
 
   function pushMessage(msg: Omit<Message, "id" | "timestamp">, insertBeforeId?: string): string {
@@ -1470,9 +1563,12 @@ export default function ChatPage() {
     // 1. Start the MAF workflow task.
     let taskId: string;
     try {
+      // The token carries the brand: the backend derives `business_id` from it, which is what
+      // makes this run read (and, on confirm-learning, write) THIS brand's voice profile instead
+      // of running against no brand at all. Logged out, it is simply absent and the run cold-starts.
       const res = await fetch("/api/tasks", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({
           topic: prompt,
           target_platforms: selectedPlatforms,
@@ -1497,7 +1593,10 @@ export default function ChatPage() {
 
     // 2. Open the SSE stream and handle events as they arrive.
     // genWorkflow() returns here so handleSend() isn't blocked — events fire asynchronously.
-    const es = new EventSource(`/api/tasks/${taskId}/events`);
+    // EventSource cannot set request headers, so an owned run's token rides as a query parameter
+    // — otherwise the backend's ownership check would refuse the one stream that carries the
+    // drafts and the discussion. The proxy turns it back into an Authorization header upstream.
+    const es = new EventSource(`/api/tasks/${taskId}/events${accessTokenQuery()}`);
     workflowEsRef.current = es;
     const seenNodes = new Set<string>();
     // GET /tasks/{id}/events replays its full buffer on every (re)connect, including after
@@ -1537,7 +1636,14 @@ export default function ChatPage() {
           const key = `${node}-${platform ?? ""}`;
           if (!seenNodes.has(key)) {
             seenNodes.add(key);
-            const label = NODE_LABELS[node];
+            // media_producer is the graph's sole output node, so it runs on EVERY task — it is
+            // what emits the finished draft. On a text-only run it renders nothing (it short-
+            // circuits on content_types and makes no model call), so announcing "Generating brand
+            // assets…" would claim work the user never asked for and that never happens.
+            const producesMedia =
+              contentTypes.includes("brand") || contentTypes.includes("video");
+            const label =
+              node === "media_producer" && !producesMedia ? undefined : NODE_LABELS[node];
             if (label) {
               pushMessage({
                 role: "assistant",
@@ -1583,20 +1689,25 @@ export default function ChatPage() {
       }
 
       // agent_utterance_audio: the TTS clip for a turn already shown — arrives later,
-      // synthesized in the background so it never held up the text discussion.
+      // synthesized in the background so it never held up the text discussion. The event
+      // carries a URL (not inline base64), so replaying the stream on a reconnect costs a
+      // few hundred bytes per turn instead of a whole mp3; the clip is fetched lazily by
+      // <Audio> when it plays. `audio_url` is the service-relative path, which our own
+      // /api proxy mirrors one-for-one.
       if (type === "agent_utterance_audio") {
-        const audioB64 = event.audio_b64 as string | undefined;
-        if (audioB64) {
-          const dataUrl = `data:audio/mpeg;base64,${audioB64}`;
+        const audioPath = event.audio_url as string | undefined;
+        if (audioPath) {
+          // Same reason as the EventSource above: an <audio> element sets no headers.
+          const audioUrl = `/api${audioPath}${accessTokenQuery()}`;
           attachRoundtableTurnAudio(
             taskId,
             event.table_id as string,
             event.speaker as string,
             event.round_index as number,
-            dataUrl
+            audioUrl
           );
           if (autoPlayRoundtableAudioRef.current) {
-            enqueueRoundtableAudio(dataUrl);
+            enqueueRoundtableAudio(audioUrl);
           }
         }
       }
@@ -1624,10 +1735,21 @@ export default function ChatPage() {
       // If they only want brand/video assets, auto-approve so media_producer runs
       // immediately — they never asked to review the underlying text copy.
       if (type === "result" && status === "draft_ready") {
-        if (contentTypes.includes("text")) {
+        // Present only when the compliance screen tripped; absent on every ordinary gate.
+        const blocked = (event.blocked as boolean) ?? false;
+        const blockReason = event.block_reason as string | undefined;
+        const allowedDecisions = event.allowed_decisions as string[] | undefined;
+
+        // A blocked gate is shown to the user even on a media-only run. They did not ask to review
+        // the copy, but they are being asked something else entirely — "this cannot ship, what do
+        // you want to do" — and that is not a question to answer on their behalf.
+        if (contentTypes.includes("text") || blocked) {
           const draftFields = {
             draft: { text: event.draft as string },
             needsHumanIntervention: (event.needs_human_intervention as boolean) ?? false,
+            blocked,
+            blockReason,
+            allowedDecisions,
             approval: "pending" as ApprovalStatus,
             // When a video was also requested, the single publish is the native video post
             // (caption = this copy) — so no competing text-only post is offered.
@@ -1636,7 +1758,7 @@ export default function ChatPage() {
             // Post Now otherwise.
             publishAt: requestedPublishAtRef.current || undefined,
           };
-          if (isMockupPlatform(platform as string)) {
+          if (isMockupPlatform(platform as string) && !blocked) {
             // The publishable platforms review the whole post in one mockup card. Upsert rather
             // than push so a re-draft after "Request changes" lands back in the SAME card as
             // fresh pending copy, instead of leaving the rejected version sitting above it.
@@ -1646,9 +1768,14 @@ export default function ChatPage() {
               ...draftFields,
             }));
           } else {
+            // A blocked gate always lands here, mockup platform or not: only DraftCard offers the
+            // three decisions such a gate accepts. The mockup card's plain approve would be
+            // refused with a 400, leaving the run stuck at a gate with no way to resolve it.
             pushMessage({
               role: "assistant",
-              content: `Here's your ${platform} draft — approve or request changes:`,
+              content: blocked
+                ? `This ${platform} draft was blocked by the content-safety check — you decide what happens next:`
+                : `Here's your ${platform} draft — approve or request changes:`,
               variant: "text-preview",
               platform: platform as Platform,
               workflowTaskId: taskId,
@@ -1659,10 +1786,13 @@ export default function ChatPage() {
             persistMessage(sessionIdRef.current, "assistant", event.draft as string);
           }
         } else {
-          // Auto-approve: submit verdict immediately so media_producer can run.
+          // Auto-approve: submit verdict immediately so media_producer can run. Only reachable
+          // for an UNBLOCKED gate — the branch above claims every blocked one. That matters: a
+          // blocked gate rejects `approve` with a 400, and this call swallows its errors, so
+          // auto-approving one would strand the run at a gate nobody is told about.
           fetch(`/api/tasks/${taskId}/review`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", ...authHeaders() },
             body: JSON.stringify({ verdicts: { [platform as string]: { decision: "approve" } } }),
           }).catch(() => {});
         }
@@ -2257,6 +2387,9 @@ export default function ChatPage() {
                   message={msg}
                   onApprove={() => handleApproval(msg.id, "approved")}
                   onReject={() => handleApproval(msg.id, "rejected")}
+                  onBlockedDecision={(decision, text) =>
+                    handleBlockedDecision(msg.id, decision, text)
+                  }
                   formatTime={formatTime}
                 />
               );
@@ -2429,6 +2562,11 @@ interface DraftCardProps {
   message: Message;
   onApprove: () => void;
   onReject: () => void;
+  /** Resolve a compliance-blocked gate. Absent for cards that can never be blocked. */
+  onBlockedDecision?: (
+    decision: "approve_after_edit" | "reject" | "discard",
+    text?: string
+  ) => void;
   formatTime: (d: Date) => string;
 }
 
@@ -2762,6 +2900,9 @@ function RoundtableStage({
   const [sayText, setSayText] = useState("");
   const [speakText, setSpeakText] = useState("");
   const [busy, setBusy] = useState(false);
+  // Why a rejected control has to be visible: the table just carries on without the user's
+  // choice, so a silent failure is indistinguishable from a dead button.
+  const [error, setError] = useState<string | null>(null);
   const feedEndRef = useRef<HTMLDivElement>(null);
 
   const taskId = message.workflowTaskId;
@@ -2801,30 +2942,50 @@ function RoundtableStage({
   );
   const turnCount = feed.filter((f) => f.kind === "turn").length;
 
+  /**
+   * Send one roundtable control (next / speak / enough / auto, raise-hand, say).
+   *
+   * Carries the token, and REPORTS failure. Both matter for the same reason: the backend refuses
+   * a run owned by another business, so a call without the token is refused even for the run's
+   * own owner — and a version of this that swallowed the response turned that into a button
+   * that simply did nothing, with no error anywhere to explain it.
+   */
   async function postJson(url: string, body: unknown) {
     try {
-      await fetch(url, {
+      const res = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify(body),
       });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setError(data.error ?? `Request failed (${res.status})`);
+        return false;
+      }
+      setError(null);
+      return true;
     } catch {
-      // Non-fatal — the SSE stream stays the source of truth; the user can retry.
+      setError("Could not reach the backend.");
+      return false;
     }
   }
 
   async function handleRaiseHand() {
     if (!taskId || !tableId) return;
-    setHandRaised(true);
-    await postJson(`/api/tasks/${taskId}/raise-hand`, { table_id: tableId });
+    // Only claim the hand is raised if the table actually took it — showing it raised after a
+    // rejected call leaves the user waiting for a turn that was never reserved.
+    if (await postJson(`/api/tasks/${taskId}/raise-hand`, { table_id: tableId })) {
+      setHandRaised(true);
+    }
   }
 
   async function handleSay() {
     if (!taskId || !tableId || !sayText.trim()) return;
     setBusy(true);
-    await postJson(`/api/tasks/${taskId}/say`, { table_id: tableId, text: sayText.trim() });
-    setSayText("");
-    setHandRaised(false);
+    if (await postJson(`/api/tasks/${taskId}/say`, { table_id: tableId, text: sayText.trim() })) {
+      setSayText("");   // keep what they typed if it did not land, so it can be retried
+      setHandRaised(false);
+    }
     setBusy(false);
   }
 
@@ -2832,12 +2993,13 @@ function RoundtableStage({
     if (!taskId || !tableId) return;
     setBusy(true);
     const text = action === "speak" && speakText.trim() ? speakText.trim() : undefined;
-    await postJson(`/api/tasks/${taskId}/round-control`, {
+    if (await postJson(`/api/tasks/${taskId}/round-control`, {
       table_id: tableId,
       action,
       ...(text ? { text } : {}),
-    });
-    setSpeakText("");
+    })) {
+      setSpeakText("");
+    }
     setBusy(false);
   }
 
@@ -3084,6 +3246,14 @@ function RoundtableStage({
                 Speak
               </button>
             </div>
+          </div>
+        )}
+
+        {/* A control the backend refused. The table carries on regardless, so without this the
+            only symptom is a button that appears to do nothing. */}
+        {error && (
+          <div className="mx-4 mb-2 rounded-lg bg-red-50 border border-red-200 px-3 py-2 text-xs text-red-700">
+            {error}
           </div>
         )}
 
@@ -3515,9 +3685,21 @@ function BrandAnimationCard({
  * Review only — there are no publish controls because the platforms this still serves
  * (X, TikTok) have no posting integration; their copy is drafted here and posted by hand.
  * LinkedIn and Facebook drafts go to SocialPostCard instead, which shows the post in that
- * network's own chrome and carries it all the way through to publishing.
+ * network's own chrome and carries it all the way through to publishing — with one exception:
+ * a gate the compliance screen blocked always lands here, whatever the platform, because this
+ * is the only card that offers the three decisions such a gate accepts.
  */
-function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps) {
+function DraftCard({
+  message,
+  onApprove,
+  onReject,
+  onBlockedDecision,
+  formatTime,
+}: DraftCardProps) {
+  // The user's rewrite of blocked copy, and whether the editor is open. Seeded with the blocked
+  // text so they are correcting it rather than starting from a blank box.
+  const [editing, setEditing] = useState(false);
+  const [editedDraft, setEditedDraft] = useState(message.draft?.text ?? "");
   const platform = platformMap[message.platform!];
   const draft = message.draft!;
   const approval = message.approval;
@@ -3543,7 +3725,22 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
 
         {/* Content */}
         <div className="p-4 space-y-3">
-          {message.needsHumanIntervention && (
+          {message.blocked && (
+            <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2 text-xs text-red-800 space-y-1">
+              <p className="font-medium">Blocked by the content-safety check — this cannot be published as written.</p>
+              {message.blockReason && (
+                <p>
+                  <span className="text-red-500">Reason: </span>
+                  {message.blockReason}
+                </p>
+              )}
+              <p className="text-red-600">
+                Approving it unchanged is not an option — the check runs again on whatever ships.
+                Edit it, regenerate it, or drop this platform.
+              </p>
+            </div>
+          )}
+          {!message.blocked && message.needsHumanIntervention && (
             <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-xs text-amber-700">
               The AI reviewer flagged this draft after multiple attempts — your direct input is needed.
             </div>
@@ -3571,8 +3768,66 @@ function DraftCard({ message, onApprove, onReject, formatTime }: DraftCardProps)
           )}
         </div>
 
-        {/* Approve / Reject */}
-        {approval === "pending" && (
+        {/* A blocked gate offers the three decisions it actually accepts — NOT approve/reject.
+            `approve` is refused by the service with a 400 so a block cannot be waved through, and
+            a button that always fails would be worse than no button. */}
+        {approval === "pending" && message.blocked && onBlockedDecision && (
+          <div className="px-4 pb-4 space-y-2">
+            {editing ? (
+              <>
+                <textarea
+                  value={editedDraft}
+                  onChange={(e) => setEditedDraft(e.target.value)}
+                  rows={6}
+                  className="w-full text-sm text-[#1B1A17] bg-white border border-[#E8E3DA] rounded-lg px-3 py-2 leading-relaxed focus:outline-none focus:border-[#FF4800]"
+                  placeholder="Rewrite the copy so it passes the safety check…"
+                />
+                <p className="text-xs text-[#9E9893]">
+                  Your edit is re-checked before anything ships, so it can come back blocked again.
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => onBlockedDecision("approve_after_edit", editedDraft)}
+                    disabled={!editedDraft.trim()}
+                    className="flex-1 bg-green-600 hover:bg-green-500 disabled:bg-[#E8E3DA] disabled:text-[#9E9893] text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                  >
+                    Submit edit
+                  </button>
+                  <button
+                    onClick={() => setEditing(false)}
+                    className="flex-1 bg-[#F2EDE4] hover:bg-[#E8E3DA] text-[#1B1A17] text-sm font-medium py-2 rounded-lg transition-colors border border-[#E8E3DA]"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => setEditing(true)}
+                  className="flex-1 min-w-[8rem] bg-[#FF4800] hover:bg-[#E64000] text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                >
+                  Edit it myself
+                </button>
+                <button
+                  onClick={() => onBlockedDecision("reject")}
+                  className="flex-1 min-w-[8rem] bg-[#F2EDE4] hover:bg-[#E8E3DA] text-[#1B1A17] text-sm font-medium py-2 rounded-lg transition-colors border border-[#E8E3DA]"
+                >
+                  Regenerate
+                </button>
+                <button
+                  onClick={() => onBlockedDecision("discard")}
+                  className="flex-1 min-w-[8rem] bg-white hover:bg-[#F8F5EE] text-[#6B6561] text-sm font-medium py-2 rounded-lg transition-colors border border-[#E8E3DA]"
+                >
+                  Drop this platform
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Approve / Reject — the ordinary gate, unchanged. */}
+        {approval === "pending" && !message.blocked && (
           <div className="flex gap-2 px-4 pb-4">
             <button
               onClick={onApprove}

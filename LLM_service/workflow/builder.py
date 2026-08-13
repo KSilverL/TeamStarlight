@@ -9,9 +9,15 @@ Graph:
                                  (human       └─ approve OR reject&retry>=3 ─▶ human_gate
                                   reject)            │
                                              human_gate (RequestPort)
-                                               ├─ approve            ─▶ media_producer ─▶ output
-                                               ├─ approve_after_edit ─▶ media_producer ─▶ output
-                                               └─ reject             ─▶ creator (re-dispatch)
+                                               ├─ approve            ─▶ compliance_gate
+                                               ├─ approve_after_edit ─▶ compliance_gate
+                                               ├─ reject             ─▶ creator (re-dispatch)
+                                               └─ discard            ─▶ (nothing: platform dropped)
+
+                                             compliance_gate (final safety screen)
+                                               ├─ pass  ─▶ media_producer ─▶ output
+                                               └─ block ─▶ human_gate (re-opens with the reason +
+                                                            3 options: edit / regenerate / discard)
 
 Brand-voice rule distillation is NOT an in-graph node anymore: it runs at the service layer
 only after the user confirms learning (POST /tasks/{id}/confirm-learning), and is then
@@ -37,6 +43,7 @@ from agent_framework import (
 )
 
 from .executors import (
+    ComplianceGateExecutor,
     CreatorExecutor,
     DispatcherExecutor,
     HumanGateExecutor,
@@ -103,6 +110,7 @@ def build_workflow(
     creator = CreatorExecutor(id="creator")
     reviewer = ReviewerExecutor(id="reviewer")
     human_gate = HumanGateExecutor(id="human_gate")
+    compliance_gate = ComplianceGateExecutor(id="compliance_gate")
 
     start_executor = creator if roundtable_entry else DispatcherExecutor(id="dispatcher")
     builder = WorkflowBuilder(
@@ -129,11 +137,19 @@ def build_workflow(
             ],
         )
         # Human verdict routes by message type: reject → creator (re-draft); both approve and
-        # approve_after_edit → media_producer (emit FinalDraft). Brand-voice rule distillation
-        # is not in the graph — it runs at the service layer only after the user confirms
-        # learning (POST /tasks/{id}/confirm-learning). The media_producer is
-        # the sole output node: it enriches every approved draft with the animated card + video.
+        # approve_after_edit → compliance_gate; `discard` sends nothing at all, so that platform
+        # simply ends here (no edge needed). Brand-voice rule distillation is not in the
+        # graph — it runs at the service layer only after the user confirms learning
+        # (POST /tasks/{id}/confirm-learning).
         .add_edge(human_gate, creator)
-        .add_edge(human_gate, media_producer)
+        .add_edge(human_gate, compliance_gate)
+        # The final safety screen on the exact bytes that will ship (the human's edit
+        # included). It passes the ApprovedDraft on to the media_producer — the sole output
+        # node, which enriches it with the animated card + video — or bounces it back to the
+        # gate as a rejected ReviewOutcome so the user is told to revise. Same type-based
+        # routing as the gate above: only the media_producer handles ApprovedDraft and only
+        # the gate handles ReviewOutcome, so each message takes exactly one of the two edges.
+        .add_edge(compliance_gate, media_producer)
+        .add_edge(compliance_gate, human_gate)
         .build()
     )

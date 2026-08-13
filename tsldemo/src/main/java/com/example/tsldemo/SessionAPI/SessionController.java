@@ -170,9 +170,17 @@ public class SessionController {
 		service.updateSession(sessionId, assistantTurn);
 		
 		if (response.complete) {
-			newsroomRunner.run(sessionId);
+			// Fire and forget. A newsroom run is minutes of work — a roundtable discussion, then
+			// drafting per platform, then a pause at the human gate that lasts as long as the
+			// person takes. Doing it inline held this HTTP request (and its worker thread) open
+			// for all of it, which no browser or gateway will wait through, and threw away the
+			// point of the LLM service returning immediately and streaming its progress.
+			//
+			// Nothing is lost by not waiting: the return value was already discarded here, and
+			// the run is followed over SSE / GET /tasks/{id} like any other.
+			newsroomRunner.runAsync(sessionId);
 		}
-        
+
 		return response;
 		
 	}

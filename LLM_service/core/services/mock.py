@@ -18,6 +18,7 @@ import base64
 import copy
 import html as _html
 import re
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import AsyncIterator, Callable, Dict, List, Optional
 
@@ -1334,6 +1335,11 @@ class MockStore(StoreService):
         self._video_jobs: Dict[str, dict] = {}
         self._trends: Optional[dict] = None  # the rolling `current` snapshot; None → fixture
         self._posting_plans: Dict[str, dict] = {}
+        # Cross-replica coordination. Both are keyed the same way the real tables/channels
+        # are, so two WorkflowService instances sharing ONE MockStore behave like two
+        # replicas sharing one database.
+        self._leases: Dict[str, tuple] = {}          # name -> (owner, expires_at monotonic)
+        self._watchers: Dict[str, list] = {}         # task_id -> [asyncio.Queue]
 
     async def get_profile(self, *, business_id: Optional[str]) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)
@@ -1398,6 +1404,45 @@ class MockStore(StoreService):
         await asyncio.sleep(_MOCK_LATENCY)
         stored = self._checkpoints.get(task_id)
         return dict(stored) if stored is not None else None
+
+    # ── Cross-replica coordination ────────────────────────────────────────────
+    # In-process stand-ins. They are not "fake" in the sense of doing nothing: a test can
+    # run two WorkflowService registries over ONE MockStore and get real lease contention
+    # and real cross-registry event delivery — which is exactly the two-replica scenario,
+    # minus the network. That is what makes the api.py logic above them testable offline.
+
+    async def try_acquire_lease(self, *, name: str, owner: str, ttl_seconds: float) -> bool:
+        await asyncio.sleep(_MOCK_LATENCY)
+        held = self._leases.get(name)
+        now = time.monotonic()
+        if held is not None and held[0] != owner and held[1] > now:
+            return False           # someone else holds it and it hasn't expired
+        self._leases[name] = (owner, now + ttl_seconds)
+        return True
+
+    async def release_lease(self, *, name: str, owner: str) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        held = self._leases.get(name)
+        if held is not None and held[0] == owner:
+            self._leases.pop(name, None)
+
+    async def notify_task(self, *, task_id: str, seq: int) -> None:
+        await asyncio.sleep(_MOCK_LATENCY)
+        for queue in list(self._watchers.get(task_id, ())):
+            queue.put_nowait(seq)
+
+    async def watch_task(self, *, task_id: str) -> AsyncIterator[int]:
+        queue: asyncio.Queue = asyncio.Queue()
+        self._watchers.setdefault(task_id, []).append(queue)
+        try:
+            while True:
+                yield await queue.get()
+        finally:
+            watchers = self._watchers.get(task_id, [])
+            if queue in watchers:
+                watchers.remove(queue)
+            if not watchers:
+                self._watchers.pop(task_id, None)
 
     async def create_video_job(self, *, job_id: str, task_id: str, platform: str, storyboard: dict) -> dict:
         await asyncio.sleep(_MOCK_LATENCY)

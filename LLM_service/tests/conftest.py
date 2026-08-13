@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import sys
 import threading
 import time
+import types
 
 # BEFORE importing anything from LLM_service: `get_settings()` reads
 # LLM_service/.env, and a developer's local .env would otherwise leak real
@@ -114,6 +116,116 @@ def checkpoint_storage() -> InMemoryCheckpointStorage:
 def workflow(checkpoint_storage):
     """A freshly built workflow wired to this test's checkpoint store."""
     return build_workflow(checkpoint_storage=checkpoint_storage)
+
+
+# ── Offline stand-ins for the credentialed (production) code paths ────────────
+# Every core/services/* production impl reaches its vendor through either `httpx`
+# or a lazy-imported SDK, and both are imported INSIDE the method — so swapping the
+# attribute / the sys.modules entry is enough to drive the real shaping code with
+# no network and no credentials. These helpers are what the *_production tests use.
+
+class FakeResponse:
+    """An httpx.Response stand-in carrying only what core/services/* reads."""
+
+    def __init__(self, *, content: bytes = b"", json_data=None, headers: dict | None = None,
+                 text: str = "", status_code: int = 200) -> None:
+        self.content = content
+        self._json = json_data
+        self.headers = headers or {}
+        self.text = text
+        self.status_code = status_code
+
+    def json(self):
+        if self._json is None:
+            raise ValueError("no JSON body scripted for this response")
+        return self._json
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            import httpx  # the real exception type, so `except httpx.HTTPError` catches it
+
+            raise httpx.HTTPError(f"HTTP {self.status_code}")
+
+
+class FakeHttpx:
+    """Records every request and answers it from `handler` (default: an empty 200).
+
+    `calls` holds (method, url, kwargs) tuples so a test can assert the exact
+    endpoint, auth header and query params a service sent — the part of a
+    credentialed call that is worth pinning and that no mock impl exercises.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict]] = []
+        self.clients: list[dict] = []  # AsyncClient(**kwargs) per constructed client
+        self.handler = lambda method, url, kwargs: FakeResponse()
+
+    def _client(self, **kwargs):
+        self.clients.append(kwargs)
+        return _FakeAsyncClient(self)
+
+    def request(self, method: str, url: str, kwargs: dict) -> FakeResponse:
+        self.calls.append((method, url, kwargs))
+        return self.handler(method, url, kwargs)
+
+    # convenience readers
+    def call(self, index: int = 0) -> tuple[str, str, dict]:
+        return self.calls[index]
+
+    @property
+    def urls(self) -> list[str]:
+        return [url for _, url, _ in self.calls]
+
+
+class _FakeAsyncClient:
+    def __init__(self, recorder: FakeHttpx) -> None:
+        self._recorder = recorder
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url, **kwargs):
+        return self._recorder.request("GET", url, kwargs)
+
+    async def post(self, url, **kwargs):
+        return self._recorder.request("POST", url, kwargs)
+
+
+@pytest.fixture
+def fake_httpx(monkeypatch):
+    """Swap `httpx.AsyncClient` for the recording fake above (the lazy `import httpx`
+    inside each service method then resolves to the patched module attribute)."""
+    import httpx
+
+    recorder = FakeHttpx()
+    monkeypatch.setattr(httpx, "AsyncClient", recorder._client)
+    return recorder
+
+
+def install_fake_module(monkeypatch, name: str, **attrs) -> types.ModuleType:
+    """Register a fake module (plus its parent packages) in `sys.modules` so a
+    lazy `import <name>` inside a production method resolves to it. monkeypatch
+    undoes every insertion at teardown, so the real SDK (if installed) is untouched."""
+    module = types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    monkeypatch.setitem(sys.modules, name, module)
+
+    parts = name.split(".")
+    # Ancestor packages must exist (real ones are reused, never replaced) …
+    for depth in range(1, len(parts)):
+        ancestor = ".".join(parts[:depth])
+        if ancestor not in sys.modules:
+            monkeypatch.setitem(sys.modules, ancestor, types.ModuleType(ancestor))
+    # … and each must expose its child as an attribute, or `from a.b import c` fails.
+    for depth in range(1, len(parts)):
+        parent = sys.modules[".".join(parts[:depth])]
+        monkeypatch.setattr(parent, parts[depth], sys.modules[".".join(parts[:depth + 1])],
+                            raising=False)
+    return module
 
 
 # ── FastAPI HTTP round-trip helper ─────────────────────────────────────────────

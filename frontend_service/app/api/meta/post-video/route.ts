@@ -3,7 +3,6 @@ import { decodeBusinessId } from "@/app/api/_lib/jwt";
 import { extractJavaError } from "@/app/api/_lib/upstream";
 
 const JAVA_SERVICE_URL = process.env.BACKEND_URL ?? "http://localhost:8081";
-const LLM_URL = process.env.LLM_SERVICE_URL ?? "http://localhost:8080";
 
 // Publishes a rendered storyboard video to one or more Facebook Pages. The browser passes the
 // render `jobId` (not the bytes); we fetch the finished MP4 from the LLM service server-side
@@ -40,7 +39,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const videoRes = await fetch(`${LLM_URL}/video-jobs/${jobId}/download`);
+    const videoRes = await fetch(`${JAVA_SERVICE_URL}/video-jobs/${jobId}/download`);
     if (!videoRes.ok) {
       return Response.json(
         { error: `Could not fetch the rendered video for job ${jobId}.` },

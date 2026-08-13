@@ -172,6 +172,9 @@ class Settings:
     postgres_video_jobs_table: str = "video_jobs"
     postgres_trends_table: str = "trends"
     postgres_posting_plans_table: str = "posting_plans"
+    # Expiring cross-replica locks (StoreService.try_acquire_lease) — what stops two API
+    # replicas resuming the same paused run at once. See migrations/005.
+    postgres_leases_table: str = "service_leases"
 
     # ── Voice Live API (voice intake) ──────────────────────────────────────────
     azure_voicelive_endpoint: Optional[str] = None
@@ -228,6 +231,39 @@ class Settings:
     # a hung table. The default mode is "auto" (no prompts), so this only bites when the caller
     # explicitly asked to be prompted.
     roundtable_control_timeout: float = 300.0
+
+    # ── API task-registry retention (api.py WorkflowService._evict_finished) ────
+    # The registry holds one in-memory record per run (event log, outputs, transcript). Every
+    # field of it is ALSO mirrored to the store, and `_resolve` rehydrates on a miss — so
+    # dropping a FINISHED record costs nothing a reader can observe, while keeping every one of
+    # them forever is an unbounded leak in a long-lived process.
+    #
+    # Only terminal records are ever dropped, so a paused human gate (which lives in this
+    # process and nowhere else) is never touched.
+    #
+    # How long a finished run stays resident. It must comfortably outlast the window in which a
+    # client still POSTs to it — `confirm-learning` is the long pole, since that arrives after
+    # the user has read the drafts. Past it, reads still answer from the mirror; only the
+    # write paths turn into the same explanatory 409 a restart already produces. 0 = never
+    # evict on age.
+    task_retention_seconds: float = 1800.0
+    # ── Cross-replica resume (api.py WorkflowService._adopt) ────────────────────
+    # How long the lease that lets ONE replica resume a given paused run is held. It must
+    # outlast a resume segment (draft → next gate: an LLM round-trip per platform, tens of
+    # seconds) and is released explicitly when the segment settles, so this only actually
+    # bites when the holder DIES mid-resume — the TTL is how long that run stays stuck.
+    task_resume_lease_seconds: float = 120.0
+    # How often a replica following someone else's run re-reads the mirrored event log
+    # (api.py `_tail_remote`). This is the FLOOR, not the normal path: `notify_task` wakes
+    # the tailer as soon as the driving replica flushes, and this only decides how fast it
+    # converges when a notification is missed or the backend can't deliver one. Lower =
+    # snappier degraded mode, more store reads per following stream.
+    task_tail_poll_seconds: float = 2.0
+    # Hard ceiling on resident records, enforced oldest-terminal-first. This is the backstop for
+    # a burst that outruns the TTL (many short runs inside one retention window); without it the
+    # TTL alone still lets memory spike arbitrarily high. 0 = no cap.
+    task_registry_max: int = 500
+
     # Per-user learning write-back from the roundtable (transcript + interjections + verdict).
     # LEARNING_ENABLED=false still READS stored skills but writes none (regression/isolation).
     learning_enabled: bool = True
@@ -274,12 +310,18 @@ class Settings:
     soundraw_api_key: Optional[str] = None
 
     # ── Azure Speech (text-to-speech — roundtable persona readback + video narration) ──
+    # ONE credential pair serves BOTH TTS consumers. The roundtable-prefixed names are
+    # historical (that seat came first); they are the shared Azure Speech key/region, and
+    # workflow/video/voiceover.py's render narration reads the same two.
+    #
+    # A parallel AZURE_SPEECH_KEY/_REGION pair used to be parsed here and read by nothing.
+    # Setting only those — which .env.example and the compose file both invited — produced
+    # a voiceover service that constructed fine and then POSTed to
+    # https://None.tts.speech.microsoft.com/..., i.e. a narration that silently never
+    # arrived (voiceover failures are a soft degrade by design). Removed rather than
+    # aliased: two names for one credential is what caused the trap.
     roundtable_tts_key: Optional[str] = None
     roundtable_tts_region: Optional[str] = None
-    # Default Neural voice when a caller doesn't specify one (POST /tasks/{id}/render-video).
-    # ── Azure Speech (voiceover text-to-speech) ─────────────────────────────────
-    azure_speech_key: Optional[str] = None
-    azure_speech_region: Optional[str] = None
     # Default voice when a persona/caller doesn't specify one. An Azure Dragon HD voice
     # (LM-based, far more natural than the older Neural voices) — same Speech endpoint;
     # note HD voices may require the S0 tier and specific regions (see .env.example).
@@ -612,6 +654,7 @@ def _load() -> Settings:
         postgres_video_jobs_table=os.getenv("POSTGRES_VIDEO_JOBS_TABLE", "video_jobs"),
         postgres_trends_table=os.getenv("POSTGRES_TRENDS_TABLE", "trends"),
         postgres_posting_plans_table=os.getenv("POSTGRES_POSTING_PLANS_TABLE", "posting_plans"),
+        postgres_leases_table=os.getenv("POSTGRES_LEASES_TABLE", "service_leases"),
         azure_voicelive_endpoint=os.getenv("AZURE_VOICELIVE_ENDPOINT"),
         azure_voicelive_model=os.getenv("AZURE_VOICELIVE_MODEL", "gpt-realtime"),
         azure_voicelive_api_version=os.getenv("AZURE_VOICELIVE_API_VERSION", "2026-04-10"),
@@ -637,6 +680,10 @@ def _load() -> Settings:
         roundtable_persona_api_key=os.getenv("AZURE_PERSONA_API_KEY"),
         roundtable_user_turn_timeout=_env_float("ROUNDTABLE_USER_TURN_TIMEOUT", 300.0),
         roundtable_control_timeout=_env_float("ROUNDTABLE_CONTROL_TIMEOUT", 300.0),
+        task_retention_seconds=_env_float("TASK_RETENTION_SECONDS", 1800.0),
+        task_resume_lease_seconds=_env_float("TASK_RESUME_LEASE_SECONDS", 120.0),
+        task_tail_poll_seconds=_env_float("TASK_TAIL_POLL_SECONDS", 2.0),
+        task_registry_max=_env_int("TASK_REGISTRY_MAX", 500),
         learning_enabled=True if learning is None else learning,
         trend_scout_enabled=bool(_env_bool("TREND_SCOUT_ENABLED")),
         trend_scout_limit=_env_int("TREND_SCOUT_LIMIT", 6),
@@ -657,8 +704,6 @@ def _load() -> Settings:
         # readback and workflow/video/voiceover.py's video narration.
         roundtable_tts_key=os.getenv("ROUNDTABLE_TTS_KEY"),
         roundtable_tts_region=os.getenv("ROUNDTABLE_TTS_REGION"),
-        azure_speech_key=os.getenv("AZURE_SPEECH_KEY"),
-        azure_speech_region=os.getenv("AZURE_SPEECH_REGION"),
         voiceover_default_voice=os.getenv("VOICEOVER_DEFAULT_VOICE", "en-US-Ava:DragonHDLatestNeural"),
 
         higgsfield_api_key=os.getenv("HIGGSFIELD_API_KEY"),

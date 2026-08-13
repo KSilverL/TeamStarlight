@@ -11,7 +11,8 @@ CheckpointStorage). Each edge in the graph is keyed by message type:
     Draft            ──▶ reviewer
     ReviewOutcome    ──▶ creator (retry) | human_gate   (switch-case edge)
     HumanReviewRequest / HumanVerdict      (RequestPort request / response)
-    ApprovedDraft    ──▶ media_producer   (from human_gate / archivist)
+    ApprovedDraft    ──▶ compliance_gate  (from human_gate) ──▶ media_producer
+    ReviewOutcome    ──▶ human_gate       (compliance_gate bounce: not publishable)
     FinalDraft       ──▶ workflow output
 
 `MAX_RETRIES` is the circuit-breaker threshold: the reviewer counts each rejection
@@ -90,7 +91,12 @@ class ReviewOutcome(BaseModel):
 
     `retry_count` is the number of rejections so far. The circuit-breaker edge
     inspects (`approved`, `retry_count`) to decide whether to loop back to the
-    creator or escalate to the human gate."""
+    creator or escalate to the human gate.
+
+    `compliance_block` is set ONLY on the outcome the compliance_gate bounces back to the
+    human gate (never by the reviewer): it holds the raw SafetyService reason, and its
+    presence is what makes "this came back because it is not publishable" machine-readable
+    all the way out to the API instead of something a client has to parse out of `comment`."""
 
     platform: str
     text: str
@@ -99,13 +105,19 @@ class ReviewOutcome(BaseModel):
     comment: str
     brief: Brief
     strategy: str
+    compliance_block: Optional[str] = None
 
 
 class HumanReviewRequest(BaseModel):
     """RequestPort payload handed to the human at the gate. `needs_human_intervention`
     is True when the draft arrived via the circuit breaker (never approved). `attempt`
     is the revision number of the draft under review, so a human reject can re-draft at
-    `attempt + 1` (a genuinely fresh version) instead of repeating the rejected copy."""
+    `attempt + 1` (a genuinely fresh version) instead of repeating the rejected copy.
+
+    `compliance_block` (forwarded from the bounced ReviewOutcome) is the raw SafetyService
+    reason when this gate re-opened because the compliance screen refused the copy the human
+    had already approved. `None` on an ordinary gate. The API surfaces it as the additive
+    `blocked` / `block_reason` fields — see api.py `_compliance_payload`."""
 
     platform: str
     draft: str
@@ -114,14 +126,18 @@ class HumanReviewRequest(BaseModel):
     brief: Brief
     strategy: str
     attempt: int = 1
+    compliance_block: Optional[str] = None
 
 
 class HumanVerdict(BaseModel):
     """The human's response at the gate.
 
-    decision ∈ {"approve", "approve_after_edit", "reject"}. On approve_after_edit,
-    `edited_draft` carries the human's final text. On reject, the platform is
-    re-dispatched to the creator for a fresh attempt.
+    decision ∈ {"approve", "approve_after_edit", "reject", "discard"}. On
+    approve_after_edit, `edited_draft` carries the human's final text. On reject, the
+    platform is re-dispatched to the creator for a fresh attempt. On **discard** the
+    platform is abandoned: the gate emits nothing, so that platform simply produces no
+    output and the run settles without it (the third way out of a compliance block —
+    see executors/compliance.py).
 
     `platform` makes the verdict self-describing, like every other message in the
     graph. It is which platform's draft this verdict answers — the service fills it
@@ -148,14 +164,20 @@ class BrandRule(BaseModel):
 
 
 class ApprovedDraft(BaseModel):
-    """human_gate / archivist → media_producer: a draft the human approved (directly
-    or after an edit), on its way to media production. Carries the `brief` so the
+    """human_gate → compliance_gate → media_producer: a draft the human approved (directly
+    or after an edit), on its way to media production via the final content-safety screen
+    (media_entry emits it directly on a media-only run). Carries the `brief` so the
     media_producer can derive the brand card / video from `topic` + `tone_hint`, and
     any `proposed_rules` the archivist distilled (passed straight through to FinalDraft).
 
     `strategy` carries the roundtable's per-platform consensus forward (it is otherwise
     dropped at the gate) — on a text+video run it holds the agreed VIDEO direction, so the
-    media_producer's storyboard reflects the discussion, not just the final caption."""
+    media_producer's storyboard reflects the discussion, not just the final caption.
+
+    `attempt` is the revision number of the draft the human approved. It matters only when
+    the compliance_gate bounces this draft back to the human gate (see compliance.py): the
+    re-drafts that follow continue the same numbering instead of restarting at 1. Optional
+    with a default so older checkpoints deserialize unchanged."""
 
     platform: str
     draft: str
@@ -165,6 +187,7 @@ class ApprovedDraft(BaseModel):
     proposed_rules: List[BrandRule] = Field(default_factory=list)
     brief: Brief
     strategy: str = ""
+    attempt: int = 1
 
 
 class FinalDraft(BaseModel):

@@ -13,10 +13,13 @@ services:
     ports:
       - "3000:3000"
     environment:
-      # Main LLM service (text generation + MAF workflow /tasks + video render jobs)
+      # Legacy single-purpose generator endpoint (POST /generate-text), still direct.
       - TEXT_AGENT_URL=http://llm:8080
-      - LLM_SERVICE_URL=http://llm:8080
-      # Java backend (signup / login)
+      # Java backend — signup/login AND the whole workflow surface (/tasks, /video-jobs,
+      # /intake/classify). The frontend no longer holds an LLM_SERVICE_URL for those: identity
+      # is only VERIFIABLE in Java (it owns the JWT signing key), so routing round it would mean
+      # `business_id` — which picks the brand profile a run reads and writes — is whatever the
+      # caller typed. Do not re-add a direct route without moving that check with it.
       - BACKEND_URL=http://backend:8081
     depends_on:
       - llm
@@ -33,6 +36,30 @@ services:
       - "8081:8081"
     environment:
       - LLM_SERVICE_BASE_URL=http://llm:8080
+      # Database: whatever application.properties / the environment already says — i.e. the same
+      # cluster this backend has always used. It is deliberately NOT redirected here.
+      #
+      # An earlier version of this file defaulted it to the local `database` service, meaning to be
+      # safe. It was the opposite: the LLM service's own DATABASE_URL still pointed at the shared
+      # cluster, so half the world was fresh and half was production. A fresh backend database
+      # restarts its business-id sequence at 1, and those ids then collided with the real plans and
+      # brand profiles the LLM service still held for businesses 1 and 2 — a test account
+      # inherited a stranger's campaigns, and the real accounts could no longer log in.
+      #
+      # The rule this encodes: the backend's database and the LLM service's store are ONE world.
+      # Move them together or not at all. `docker-compose.mock.yml` moves both.
+      #
+      # Nothing is listed here on purpose — an empty `SPRING_DATASOURCE_URL=` would not mean
+      # "unset", it would override application.properties with an empty string and fail startup.
+      # To point a deployed stack elsewhere, set the three SPRING_DATASOURCE_* vars in your `.env`.
+      # Signs the JWTs whose subject decides which brand a run reads and writes — see
+      # BriefIdentity / TaskAccess. The dev default keeps `docker compose up` working out of the
+      # box; set a real secret anywhere the stack is reachable by anyone else.
+      # Default MATCHES application.properties on purpose. Introducing a different one here would
+      # silently invalidate every token already issued — every logged-in browser gets bounced with
+      # no explanation, because the signature no longer verifies. Override it in `.env` for any
+      # deployment; changing it is a deliberate act of logging everyone out.
+      - JWT_SECRET=${JWT_SECRET:-starlight-default-secret-change-in-production}
       # Supabase credentials — override here or in a .env file if needed.
       # Defaults are already baked into application.properties.
       # LinkedIn/Meta OAuth — must match the redirect URI registered on the respective Developer
@@ -52,6 +79,20 @@ services:
     build:
       context: .
       dockerfile: LLM_service/Dockerfile
+    # ⚠️ SECURITY: this service has NO authentication of its own. It trusts `business_id` /
+    # `user_id` in the request body, and those select which brand's voice profile a run reads and
+    # writes — so anything that can reach this port can read and poison any tenant's data. It is
+    # safe only because the backend in front of it derives those from a verified token.
+    #
+    # Publishing 8080 to the host therefore keeps that hole open, and it is published here for
+    # exactly ONE reason: the browser opens a DIRECT WebSocket to /intake/{sid}/voice for realtime
+    # speech (frontend_service/app/chat/useRealtimeVoice.ts — there is no WS proxy in Java yet).
+    # Closing this properly means building that proxy and then deleting this `ports:` block; the
+    # HTTP surface already needs no host access, since every caller reaches it over the compose
+    # network as http://llm:8080.
+    #
+    # Until then, at minimum do not expose 8080 beyond the host in any deployed environment
+    # (bind it to the loopback, or drop it at the security group / firewall).
     ports:
       - "8080:8080"
     environment:
@@ -99,7 +140,7 @@ services:
       - GEOAPIFY_API_KEY=${GEOAPIFY_API_KEY}
       - GEOAPIFY_MAP_STYLE=${GEOAPIFY_MAP_STYLE}
 
-      - USE_MOCK_SAFETY=true
+      - USE_MOCK_SAFETY=false
 
       # Voice
       - USE_MOCK_VOICE=${USE_MOCK_VOICE}

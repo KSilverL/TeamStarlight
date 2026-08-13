@@ -1265,8 +1265,10 @@ function ItemDraftPreview({
     setIsReviewing(true);
     try {
       const res = await fetch(`/api/tasks/${taskId}/review`, {
+        // The token is required, not optional: a run started by this business is refused to
+        // anyone else, and an unauthenticated request counts as anyone else.
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ verdicts }),
       });
       if (!res.ok) {

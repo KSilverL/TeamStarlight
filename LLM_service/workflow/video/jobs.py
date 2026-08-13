@@ -13,12 +13,15 @@ the video subsystem — kept out of api.py itself (which stays a thin transport 
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
+import time
 import uuid
 from pathlib import Path
 from typing import List, Optional
 
 from ...core.config import Settings, get_settings
+from ...core.logs import bind as bind_log_context
 from ...core.services import factory
 from ...core.video_schema import StoryboardSpec, renderable_total_frames
 from .assets import resolve_storyboard_assets
@@ -35,6 +38,8 @@ from .voiceover import (
 # never butts right against the transition (also absorbs the small slack in the CBR
 # duration estimate). 12 frames ≈ 0.4s at 30fps.
 _NARRATION_TAIL_PAD_FRAMES = 12
+
+logger = logging.getLogger(__name__)
 
 
 # Strong references to detached render tasks. asyncio only holds tasks weakly, so a
@@ -56,6 +61,18 @@ async def _run_job(
     store = factory.get_store()
     job_dir = _job_dir(settings, job_id)
 
+    # Detached from the request that triggered it, so it owns its logging context. A render
+    # is minutes long and its failures are all soft-degrades that resolve the job row rather
+    # than raising anywhere visible — the log is the only place the story is told in full.
+    bind_log_context(job_id=job_id, platform=storyboard.platform)
+    started = time.monotonic()
+    logger.info("render_job_started", extra={
+        "backend": settings.video_render_backend, "slides": len(storyboard.slides),
+        "narration_enabled": narration_enabled})
+
+    def _elapsed() -> float:
+        return round((time.monotonic() - started) * 1000, 1)
+
     # Premium generative-AI path (Higgsfield): no Remotion, no asset/music/voiceover
     # resolution — a single clip generated from a crafted prompt (+ optional user
     # reference images), written to job_dir/output.mp4 (same output_path contract).
@@ -68,8 +85,11 @@ async def _run_job(
                 settings=settings, reference_images=reference_images,
             )
             await store.update_video_job(job_id=job_id, status="done", output_path=str(output_path), error=None)
+            logger.info("render_job_completed", extra={
+                "duration_ms": _elapsed(), "output": str(output_path)})
         except Exception as exc:  # any failure resolves the poll, never hangs it
             await store.update_video_job(job_id=job_id, status="error", error=f"AI video generation failed: {exc}")
+            logger.exception("render_job_failed", extra={"duration_ms": _elapsed()})
         return
 
     # Reap generated-slide dirs orphaned by crashed/killed past processes BEFORE
@@ -122,13 +142,15 @@ async def _run_job(
         # choice (a sombre brief, an explicit "no music"). A legacy storyboard with no
         # audio block keeps music on. Skipping leaves musicLocalPath None, which the
         # renderer already treats as "silent", so there's nothing to unset.
+        # renderable_total_frames mirrors metadata.ts's transition-adjusted total, so
+        # the music track doesn't run past the final frame. This must stay AFTER the
+        # narration block above, which stretches slides to fit their lines. Computed
+        # outside the music branch because the completion log reports it either way —
+        # a silent render still has a length worth recording.
+        total_frames = renderable_total_frames(
+            [s.durationFrames for s in renderable.slides], renderable.transition,
+        )
         if music_enabled and (audio is None or audio.musicEnabled):
-            # renderable_total_frames mirrors metadata.ts's transition-adjusted total, so
-            # the music track doesn't run past the final frame. This must stay AFTER the
-            # narration block above, which stretches slides to fit their lines.
-            total_frames = renderable_total_frames(
-                [s.durationFrames for s in renderable.slides], renderable.transition,
-            )
             total_seconds = total_frames / renderable.fps
             music_kwargs = (
                 {"mood": audio.musicMood, "genre": audio.musicGenre, "energy": audio.musicEnergy}
@@ -139,10 +161,19 @@ async def _run_job(
             )
         output_path = await render_storyboard(renderable, job_dir=job_dir, settings=settings)
         await store.update_video_job(job_id=job_id, status="done", output_path=str(output_path), error=None)
+        logger.info("render_job_completed", extra={
+            "duration_ms": _elapsed(), "output": str(output_path),
+            "total_frames": total_frames, "fps": renderable.fps,
+            "music": renderable.musicLocalPath is not None,
+            "voiceover": bool(renderable.voiceoverLocalPath or renderable.voiceoverSlidePaths)})
     except RenderError as exc:
         await store.update_video_job(job_id=job_id, status="error", error=str(exc))
+        # Expected-shaped failure (non-zero exit / timeout): the stderr tail is already in
+        # `exc`, so no traceback — but it must still be greppable next to the job id.
+        logger.error("render_job_failed", extra={"duration_ms": _elapsed(), "reason": str(exc)})
     except Exception as exc:  # any unexpected failure still resolves the poll, never hangs it
         await store.update_video_job(job_id=job_id, status="error", error=f"unexpected error: {exc}")
+        logger.exception("render_job_failed", extra={"duration_ms": _elapsed()})
     finally:
         # The per-job entry.tsx under src/generated/<job_id>/ is the render's entry
         # point, so this must run only after the render is fully over — success or

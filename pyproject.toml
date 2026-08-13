@@ -1,8 +1,50 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "teamstarlight"
 version = "0.1.0"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.139.0",
     "pydantic>=2.13.4",
+]
+
+[project.optional-dependencies]
+evaluation = [
+    "agent-framework-core==1.9.0",
+    "agent-framework-orchestrations==1.0.0",
+    "azure-ai-contentsafety>=1.0.0",
+    "httpx>=0.28.1",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=7.0.0",
+    "typing-extensions>=4.15.0",
+    "uvicorn[standard]>=0.30.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["LLM_service*", "evaluation*"]
+
+# ── Test coverage (pytest-cov; enabled by default via pytest.ini addopts) ──────────────
+[tool.coverage.run]
+source = ["LLM_service"]
+branch = true
+omit = [
+    "LLM_service/tests/*",
+    "LLM_service/scratch/*",
+    "LLM_service/main.py",       # interactive CLI (stdin-driven, not exercised by the suite)
+    "LLM_service/scenarios.py",  # non-interactive showcase script
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@(abc\\.)?abstractmethod",
+    "if __name__ == .__main__.:",
+    "class .*\\(Protocol\\):",
 ]

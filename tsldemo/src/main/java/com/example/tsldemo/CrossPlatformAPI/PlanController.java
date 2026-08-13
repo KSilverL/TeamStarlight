@@ -9,6 +9,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
 
+import com.example.tsldemo.AgentAPI.TaskAccess;
 import com.example.tsldemo.auth.JwtUtil;
 
 @RestController
@@ -19,15 +20,18 @@ public class PlanController {
     private final PlanHandoffService planHandoffService;
     private final PlanCampaignDrafter planCampaignDrafter;
     private final JwtUtil jwtUtil;
+    private final TaskAccess taskAccess;
 
     public PlanController(PlanService planService,
                           PlanHandoffService planHandoffService,
                           PlanCampaignDrafter planCampaignDrafter,
-                          JwtUtil jwtUtil) {
+                          JwtUtil jwtUtil,
+                          TaskAccess taskAccess) {
         this.planService = planService;
         this.planHandoffService = planHandoffService;
         this.planCampaignDrafter = planCampaignDrafter;
         this.jwtUtil = jwtUtil;
+        this.taskAccess = taskAccess;
     }
 
     private int requireBusinessId(String authHeader) {
@@ -135,7 +139,14 @@ public class PlanController {
             @RequestHeader(value = "Authorization", required = false) String authHeader) {
         int businessId = requireBusinessId(authHeader);
         requireOwnedPlan(planId, businessId);
-        return ResponseEntity.ok(planService.executePlanItem(planId, itemId, body));
+        Map<String, Object> result = planService.executePlanItem(planId, itemId, body);
+        // A plan slot spawns an ordinary newsroom run, so claim it for this business the same way
+        // POST /tasks does. Without this the run would be unowned and readable by anyone holding
+        // its id — the same hole, reached through a different door.
+        if (result != null && result.get("task_id") != null) {
+            taskAccess.remember(String.valueOf(result.get("task_id")), authHeader);
+        }
+        return ResponseEntity.ok(result);
     }
 
 

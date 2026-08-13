@@ -650,6 +650,53 @@ class StoreService(ABC):
         """Return the most recent checkpoint for a task, or None."""
         ...
 
+    # ── Cross-replica coordination ────────────────────────────────────────────
+    # Two primitives that let more than one API replica serve the same run. Both are
+    # deliberately small and best-effort-shaped: nothing in the service DEPENDS on them
+    # working, they only turn "only the replica that started this run can serve it" into
+    # "any replica can". See api.py's `_adopt` (leases) and `_tail_remote` (notify/watch).
+
+    @abstractmethod
+    async def try_acquire_lease(
+        self, *, name: str, owner: str, ttl_seconds: float
+    ) -> bool:
+        """Try to take a named, EXPIRING lock. True = this owner holds it.
+
+        Expiring rather than held-open because the holder is a process that can die
+        mid-run: a permanent lock would strand the task forever. Re-acquiring a lease you
+        already own must succeed (and extend it), so a replica resuming the same run twice
+        is not blocked by itself.
+        """
+        ...
+
+    @abstractmethod
+    async def release_lease(self, *, name: str, owner: str) -> None:
+        """Release a lease, if `owner` still holds it. Releasing one taken over by someone
+        else (this owner's lease expired and another replica claimed it) must be a no-op,
+        never a steal-back."""
+        ...
+
+    @abstractmethod
+    async def notify_task(self, *, task_id: str, seq: int) -> None:
+        """Announce "task `task_id` now has events up to `seq`" to every replica.
+
+        A wake-up, NOT the event itself: the payload stays tiny and size-bounded, and the
+        durable event log (`save_checkpoint` under api.py's `api-task:` namespace) stays the
+        single source of what actually happened. A watcher reads from there.
+        """
+        ...
+
+    @abstractmethod
+    def watch_task(self, *, task_id: str) -> AsyncIterator[int]:
+        """Yield the `seq` high-water mark each time some replica calls `notify_task`.
+
+        Hints, not a contract: a missed or duplicated wake-up must cost nothing but latency,
+        because the caller re-reads the log and filters by `seq` anyway. That is what lets
+        the consumer treat this as an accelerator over a periodic re-read rather than as a
+        delivery guarantee it has to trust.
+        """
+        ...
+
     @abstractmethod
     async def create_video_job(self, *, job_id: str, task_id: str, platform: str, storyboard: dict) -> dict:
         """Create a `pending` video-render job row. Returns the stored document
