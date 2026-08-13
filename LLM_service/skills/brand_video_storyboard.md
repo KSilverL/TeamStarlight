@@ -36,7 +36,8 @@ enumerates them via the `type` discriminator. Never invent a new slide type.
   `variant`: *spotlight* (default — image on a shape, headline below), *poster* (no
   image, giant headline over a gradient — bold and typographic; great for a text-only
   open), or *split* (image fills a diagonal half, headline the other — dynamic, needs
-  an `imageQuery`). Optional `background`: solid / gradient / orbs / grid.
+  an `imageQuery`). Optional `background`: solid / gradient / orbs / grid / mosaic
+  (an animated field of coloured squares in your brand's hue family).
 - **`counter_stat`** — 1-4 stat/feature cards (a number or claim + label + icon).
   Use when the brief has concrete numbers or proof points worth dwelling on. Pick a
   `variant`: *cards* (default — stacked cards), *orbit* (one hero stat huge in the
@@ -124,22 +125,46 @@ enumerates them via the `type` discriminator. Never invent a new slide type.
     completes"` with `data: {"stages": [{"label": "Collect", "icon": "♻"},
     {"label": "Sort", "icon": "▤"}, {"label": "Reprocess", "icon": "✦"}]}`.
 
+- **`statement`** — one big typographic line over an animated pixel-mosaic field,
+  where each word arrives and leaves on its own beat. Use it for the video's *idea*
+  moments: a thesis, a turn, a punchline — the beat you'd say out loud with a pause
+  either side. `text` is 4-14 words set very large, so make every word earn its
+  place. Optional `emphasisWords` (up to 3 words taken from `text`, spelled exactly
+  as they appear there) get the accent colour. Optional `kicker` is a tiny ALL-CAPS
+  eyebrow above it. `variant`: *mosaic* (default — the full mosaic field), *flat* (a
+  plain background, for a quieter beat between two loud ones), or *band* (mosaic
+  across the top of the frame, text below it).
+- **`media_statement`** — the same typographic statement, but over real stock
+  FOOTAGE instead of a mosaic. Use it when the idea needs a place, a texture, or
+  people in motion behind it. `mediaQuery` is a 2-4 word stock-video search keyword.
+  `variant`: *inset_card* (default — footage in a rounded card that bleeds off the
+  bottom, text above it), *full_bleed* (footage fills the frame behind the text), or
+  *mosaic_reveal* (the mosaic scatters away to uncover the footage, then re-forms —
+  the most cinematic; use it at most once per storyboard).
+
 ## Ordering conventions
 
 - Start with `hook` (it's the reason someone keeps watching).
 - End with `outro` (it's the only slide with a CTA).
+- A `statement` works best as a *pivot* between two other slides — a beat you'd
+  pause on. Don't place two `statement` slides back to back.
 - Put every other slide type in the middle, in whatever order best builds the
   argument — lead with the most visually striking one, and don't feel obligated to
   use every type in one storyboard. Most storyboards should use 1-3 of the
   data/visual middle slide types, not all of them at once.
 
-## Image fields are search keywords, never URLs
+## Image and video fields are search keywords, never URLs
 
 `hook.imageQuery` and `collage.imageQueries` are 2-4 word stock-photo search terms
 (e.g. `"team meeting laptop"`, `"running shoes city"`) — never a URL, file name, or
 description longer than a few words. A later step resolves these to real cut-out
 images; you only choose what to search for. Omit `imageQuery`/leave it null for a
 text-only hook slide if no image fits.
+
+`media_statement.mediaQuery` works the same way but searches stock FOOTAGE rather
+than photos (e.g. `"city street night"`, `"team working office"`). Describe the
+scene you want to see moving — don't just restate the slide's `text`. Omit it and
+the slide falls back to the mosaic treatment.
 
 ## Chart/data fields are illustrative, not looked up
 
@@ -237,6 +262,10 @@ null when you give per-slide narration).
 ### Music (`audio` block)
 
 Always include an `audio` object. Pick music that matches the brand's energy and the story:
+- `musicEnabled`: `true` for almost every video. Set it to `false` only when the brief calls
+  for it — a sombre or serious subject, a spoken-word piece where a bed would distract, or an
+  explicit "no music" request. When `false` the three fields below are ignored, exactly as
+  every slide's `narration` being `null` means the video has no voice.
 - `musicMood`: *inspiring*, *uplifting*, *energetic*, *calm*, *dramatic*, or *playful*.
 - `musicGenre`: *corporate*, *cinematic*, *electronic*, *acoustic*, *hiphop*, or *ambient*.
 - `musicEnergy`: *low*, *medium*, or *high* — match the `transition`/`backgroundStyle`

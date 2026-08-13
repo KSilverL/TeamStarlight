@@ -13,14 +13,21 @@ unavailable, e.g. in pure-mock test runs.
 from __future__ import annotations
 
 import json
+import math
 import random
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from ..config import Settings
-from .base import BackgroundRemovalService, ImageSearchService, MusicGenerationService
+from .base import (
+    BackgroundRemovalService,
+    ImageSearchService,
+    MusicGenerationService,
+    VideoSearchService,
+)
 
 _PEXELS_SEARCH_URL = "https://api.pexels.com/v1/search"
+_PEXELS_VIDEO_SEARCH_URL = "https://api.pexels.com/videos/search"
 _REMOVEBG_URL = "https://api.remove.bg/v1.0/removebg"
 _GEOAPIFY_STATICMAP_URL = "https://maps.geoapify.com/v1/staticmap"
 # Basemap style preset per storyboard theme (see
@@ -41,6 +48,15 @@ _GEOCODE_MIN_CONFIDENCE = 0.5
 # Placeholder — Soundraw's exact generation endpoint/request/response contract has
 # not been verified against their live docs/account. See SoundrawMusic's docstring.
 _SOUNDRAW_GENERATE_URL = "https://api.soundraw.io/v1/generate"
+# Jamendo: ~500k Creative-Commons tracks, free API key from devportal.jamendo.com.
+# See JamendoMusic for the query mapping and the licensing caveat.
+_JAMENDO_TRACKS_URL = "https://api.jamendo.com/v3.0/tracks"
+# A backing track is ~3-8 MB. Cap generously but not unboundedly — see _CLIP_MAX_BYTES
+# in workflow/video/assets.py for the same reasoning applied to stock footage.
+_MUSIC_MAX_BYTES = 20 * 1024 * 1024
+# Upper bound of the requested duration window. A track only needs to be at least as
+# long as the video (Remotion clips it); this just stops the filter asking for epics.
+_MUSIC_MAX_TRACK_SECONDS = 600
 
 
 class PexelsImageSearch(ImageSearchService):
@@ -68,6 +84,119 @@ class PexelsImageSearch(ImageSearchService):
             for photo in data.get("photos", [])
             if photo.get("src")
         ]
+
+
+
+# Clip guards, all applied client-side: /videos/search accepts only orientation,
+# size, locale, page and per_page — the min_duration/max_duration parameters exist
+# on /videos/popular, not here.
+_CLIP_MIN_DURATION_S = 4.0
+# A clip shorter than this seams visibly when <Loop> wraps it under a longer slide.
+_CLIP_MAX_DURATION_S = 60.0
+# Longer than this is a big download for the ~5s we actually show.
+_CLIP_MAX_PIXELS = 2560 * 1440
+# 4K renditions are 100MB+ for a canvas that is at most 1920 across.
+
+
+def _pick_rendition(video_files: List[dict], target_w: int, target_h: int) -> Optional[dict]:
+    """Choose ONE encoding of a Pexels clip to download.
+
+    The ordering is deliberate:
+      1. mp4 only. Pexels also serves video/quicktime, and headless Chromium's
+         HEVC-in-MOV support is unreliable — a decode failure aborts the render
+         outright rather than degrading, so it is not worth the risk.
+      2. Drop anything above _CLIP_MAX_PIXELS.
+      3. Prefer the SMALLEST rendition that still covers the canvas: least upscale
+         for the fewest bytes. Taking `original` instead wastes ~100MB of download
+         and Chromium decode time to draw into a 1080-wide frame.
+      4. Nothing big enough -> the largest available; soft beats absent.
+      5. Tie-break toward 24-31fps — a 60fps rendition doubles the bytes for no
+         benefit at FPS=30.
+    """
+    def is_mp4(f: dict) -> bool:
+        declared = f.get("file_type")
+        if declared:
+            # A declared type always wins. Sniffing the URL as a fallback here would
+            # re-admit a video/quicktime rendition whose link merely happens to end
+            # in .mp4 — which is the exact case this guard exists for.
+            return declared == "video/mp4"
+        # No file_type at all: fall back to the URL, accepting that a Pexels link may
+        # carry a query string, so match the path rather than the whole string.
+        return str(f.get("link", "")).split("?")[0].endswith(".mp4")
+
+    mp4s = [
+        f for f in video_files
+        if is_mp4(f) and f.get("link") and f.get("width") and f.get("height")
+    ]
+    usable = [f for f in mp4s if f["width"] * f["height"] <= _CLIP_MAX_PIXELS]
+    if not usable:
+        return None
+
+    def fps_penalty(f: dict) -> int:
+        fps = f.get("fps") or 30
+        return 0 if 24 <= fps <= 31 else 1
+
+    covering = [f for f in usable if f["width"] >= target_w and f["height"] >= target_h]
+    if covering:
+        return min(covering, key=lambda f: (f["width"] * f["height"], fps_penalty(f)))
+    return max(usable, key=lambda f: (f["width"] * f["height"], -fps_penalty(f)))
+
+
+class PexelsVideoSearch(VideoSearchService):
+    """Pexels Videos (/videos/search), authenticated with the same PEXELS_API_KEY
+    the photo search uses — no extra credential."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    async def search(
+        self, *, query: str, orientation: str = "portrait", per_page: int = 1,
+        target_width: int = 1080, target_height: int = 1920,
+    ) -> List[dict]:
+        import httpx  # lazy import, matches the rest of core/services/*
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                _PEXELS_VIDEO_SEARCH_URL,
+                headers={"Authorization": self._settings.pexels_api_key},
+                params={
+                    "query": query,
+                    "orientation": orientation,
+                    "size": "medium",
+                    # Over-fetch: the duration/aspect guards below discard candidates,
+                    # and we want a survivor rather than an empty result.
+                    "per_page": max(1, min(per_page * 5, 20)),
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        target_ratio = target_width / max(target_height, 1)
+        out: List[dict] = []
+        for video in data.get("videos", []):
+            duration = float(video.get("duration") or 0)
+            if not (_CLIP_MIN_DURATION_S <= duration <= _CLIP_MAX_DURATION_S):
+                continue
+            rendition = _pick_rendition(video.get("video_files") or [], target_width, target_height)
+            if rendition is None:
+                continue
+            # Pexels' `orientation` filter applies to the SOURCE asset, and its
+            # renditions don't always share that shape — re-check the one we picked,
+            # or a landscape clip gets cropped to a vertical sliver in the card.
+            ratio = rendition["width"] / max(rendition["height"], 1)
+            if abs(ratio - target_ratio) / target_ratio > 0.25:
+                continue
+            out.append({
+                "url": rendition["link"],
+                "width": rendition["width"],
+                "height": rendition["height"],
+                "fps": rendition.get("fps") or 30,
+                "duration": duration,
+                "photographer": (video.get("user") or {}).get("name"),
+            })
+            if len(out) >= per_page:
+                break
+        return out
 
 
 class RemoveBgService(BackgroundRemovalService):
@@ -207,9 +336,112 @@ class GeoapifyStaticMap:
             return resp.content
 
 
+class JamendoMusic(MusicGenerationService):
+    """Background music from the Jamendo API — the default real provider.
+
+    Jamendo's /tracks search maps almost 1:1 onto this ABC's (mood, genre, energy)
+    arguments, so the storyboard LLM's choices finally change what you hear: `mood` and
+    `genre` become `fuzzytags` (fuzzy OR matching over Jamendo's tag vocabulary), and
+    `energy` becomes `speed`. `vocalinstrumental=instrumental` is pinned on every query
+    — a lyric vocal fighting the narration is worse than no music at all.
+
+    Licensing: the free API tier is non-commercial and the catalogue is Creative
+    Commons. Commercially distributing a render would need a Jamendo Licensing
+    subscription — see LLM_service/assets/music/README.md.
+    """
+
+    # Our MusicEnergy vocabulary is a subset of Jamendo's `speed` (which also has
+    # verylow/veryhigh), so this is a straight pass-through with a safe default.
+    _SPEED_BY_ENERGY = {"low": "low", "medium": "medium", "high": "high"}
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    def _base_params(self) -> Dict[str, Any]:
+        return {
+            "client_id": self._settings.jamendo_client_id,
+            "format": "json",
+            "limit": 20,
+            # Popularity is a decent proxy for "produced well enough to sit under a
+            # brand video"; the catalogue is community-uploaded and uneven.
+            "order": "popularity_total",
+            "vocalinstrumental": "instrumental",
+            "audioformat": "mp32",
+        }
+
+    def _attempts(self, *, mood: str, genre: str, energy: str, seconds: int) -> List[Dict[str, Any]]:
+        """Progressively looser queries, tried in order until one returns tracks.
+
+        The tightest query (mood + genre + speed + a duration floor) can legitimately
+        match nothing in a 500k-track catalogue, and returning silence would be the
+        worst outcome — so each step drops the least important constraint. Mood is the
+        last thing to go because it dominates how the video feels, mirroring
+        BundledMusicLibrary._WEIGHTS."""
+        speed = self._SPEED_BY_ENERGY.get(energy, "medium")
+        floor = min(seconds, _MUSIC_MAX_TRACK_SECONDS)
+        tags = f"{mood}+{genre}"
+        return [
+            {"fuzzytags": tags, "speed": speed,
+             "durationbetween": f"{floor}_{_MUSIC_MAX_TRACK_SECONDS}"},
+            {"fuzzytags": tags, "speed": speed},   # drop the duration floor
+            {"fuzzytags": tags},                   # drop the speed filter
+            {"fuzzytags": mood},                   # mood alone — last resort
+        ]
+
+    async def generate(self, *, mood: str, genre: str, duration_seconds: float, energy: str) -> bytes:
+        import httpx  # lazy import
+
+        seconds = max(1, math.ceil(duration_seconds))
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            results: List[dict] = []
+            for extra in self._attempts(mood=mood, genre=genre, energy=energy, seconds=seconds):
+                resp = await client.get(_JAMENDO_TRACKS_URL, params={**self._base_params(), **extra})
+                resp.raise_for_status()
+                payload = resp.json()
+                # Jamendo signals application-level errors with HTTP 200 and a non-success
+                # status in the envelope, so raise_for_status() above is not enough.
+                status = (payload.get("headers") or {}).get("status")
+                if status != "success":
+                    raise RuntimeError(f"Jamendo search failed: {payload.get('headers')!r}")
+                results = payload.get("results") or []
+                if results:
+                    break
+
+            if not results:
+                raise RuntimeError(
+                    f"Jamendo returned no instrumental tracks for mood={mood!r} genre={genre!r} "
+                    f"energy={energy!r} even after relaxing the query"
+                )
+
+            # Random pick over the matches, for the same reason BundledMusicLibrary
+            # randomises its tie-break: repeated renders of one brief shouldn't always
+            # land on the identical track.
+            track = random.choice(results)
+            # `audiodownload` is the full-quality file but is withheld for some artists;
+            # `audio` is the always-present streaming URL and is fine to fetch directly.
+            url = track.get("audiodownload") if track.get("audiodownload_allowed") else None
+            url = url or track.get("audio")
+            if not url:
+                raise RuntimeError(f"Jamendo track {track.get('id')!r} exposed no audio URL")
+
+            async with client.stream("GET", url) as track_resp:
+                track_resp.raise_for_status()
+                chunks: List[bytes] = []
+                total = 0
+                async for chunk in track_resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > _MUSIC_MAX_BYTES:
+                        raise RuntimeError(f"Jamendo track exceeded {_MUSIC_MAX_BYTES} bytes")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+
+
 class BundledMusicLibrary(MusicGenerationService):
     """Background music from a local, pre-curated royalty-free library — the offline,
-    zero-cost, zero-key default (Soundraw's generation API is enterprise-gated).
+    zero-cost, zero-key FALLBACK behind JamendoMusic, used when no JAMENDO_CLIENT_ID is
+    configured (or the machine has no network). Note the shipped library is a single
+    track, so mood/genre/energy have no audible effect on this path — that variety is
+    what Jamendo provides.
 
     Reads `<music_dir>/manifest.json` — a list of tracks each tagged with `mood`,
     `genre`, and `energy` (the same vocab as video_schema's MusicMood/MusicGenre/

@@ -27,7 +27,9 @@ from LLM_service.core.video_schema import (
     OutroSlideSpec,
     PieChartSlideSpec,
     RenderableStoryboard,
+    MediaStatementSlideSpec,
     SLIDE_TYPES,
+    StatementSlideSpec,
     StoryboardSpec,
     aspect_for_platform,
     clamp_duration,
@@ -39,6 +41,8 @@ def test_slide_type_registry_matches_implemented_models():
         HookSlideSpec.model_fields["type"].default,
         CounterStatSlideSpec.model_fields["type"].default,
         CollageSlideSpec.model_fields["type"].default,
+        StatementSlideSpec.model_fields["type"].default,
+        MediaStatementSlideSpec.model_fields["type"].default,
         OutroSlideSpec.model_fields["type"].default,
         PieChartSlideSpec.model_fields["type"].default,
         LineChartSlideSpec.model_fields["type"].default,
@@ -630,3 +634,226 @@ def test_renderable_storyboard_round_trips_theme():
         width=1080, height=1920,
         slides=[{"type": "outro", "brandName": "X", "ctaLabel": "Go", "durationFrames": 90}],
     ).theme == "dark"
+
+
+# ── statement slides (the mosaic/per-word typographic language) ────────────
+
+def test_statement_variant_defaults_and_validates():
+    plain = StatementSlideSpec(text="Ship faster than the market moves")
+    assert plain.variant == "mosaic" and plain.kicker is None and plain.emphasisWords is None
+    styled = StatementSlideSpec(
+        text="Ship faster than the market moves",
+        kicker="BUILT FOR BUILDERS", emphasisWords=["faster"], variant="flat",
+    )
+    assert styled.variant == "flat" and styled.emphasisWords == ["faster"]
+    with pytest.raises(ValidationError):
+        StatementSlideSpec(text="Hi", variant="marquee")
+
+
+def test_statement_emphasis_words_are_capped():
+    # The renderer highlights colour only; more than a few emphasised words stops
+    # reading as emphasis at all.
+    StatementSlideSpec(text="a b c d e", emphasisWords=["a", "b", "c"])
+    with pytest.raises(ValidationError):
+        StatementSlideSpec(text="a b c d e", emphasisWords=["a", "b", "c", "d"])
+
+
+def test_hook_background_accepts_mosaic():
+    assert HookSlideSpec(headline="Hi", background="mosaic").background == "mosaic"
+
+
+def test_clamp_duration_has_a_default_for_statement():
+    assert clamp_duration("statement", None) == 105
+    assert clamp_duration("statement", 10) == 60
+    assert clamp_duration("statement", 9999) == 165
+
+
+def test_statement_is_a_template_fallback_target():
+    """`statement` must be reachable by the generated-slide fallback conversion: a
+    big typographic line is a far better home for an exhausted bespoke brief than
+    the deterministic hook card. `generated` must still be excluded."""
+    from pydantic import TypeAdapter
+    from LLM_service.core.video_schema import TemplateSlideSpec
+
+    adapter = TypeAdapter(TemplateSlideSpec)
+    slide = adapter.validate_python({"type": "statement", "text": "One clear idea, stated plainly"})
+    assert slide.type == "statement"
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"type": "generated", "description": "x", "data": {}})
+
+
+def test_fallback_maps_statement_without_assets():
+    """fallback.py's _render_without_assets ends in `raise ValueError`, and
+    fallback_slide_for swallows every exception — so a missing branch here would
+    silently degrade every converted statement slide to the hook card instead of
+    failing loudly."""
+    from LLM_service.workflow.video.fallback import _render_without_assets
+
+    rendered = _render_without_assets(
+        StatementSlideSpec(text="One clear idea", kicker="NOTE", emphasisWords=["clear"], variant="band"),
+        suggested_frames=None,
+    )
+    assert rendered.type == "statement"
+    assert rendered.variant == "band" and rendered.emphasisWords == ["clear"]
+    assert rendered.durationFrames == 105
+
+
+def test_statement_survives_asset_resolution_round_trip():
+    import asyncio
+    from pathlib import Path
+    import tempfile
+    from LLM_service.workflow.video.assets import resolve_storyboard_assets
+
+    storyboard = StoryboardSpec(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        platform="instagram_reels",
+        slides=[
+            {"type": "statement", "text": "Ship faster than the market moves",
+             "kicker": "BUILT FOR BUILDERS", "emphasisWords": ["faster"], "variant": "mosaic"},
+            {"type": "hook", "headline": "Hi", "background": "mosaic"},
+        ],
+    )
+    with tempfile.TemporaryDirectory() as d:
+        renderable = asyncio.run(resolve_storyboard_assets(storyboard, job_dir=Path(d) / "job"))
+    slides = renderable.model_dump()["slides"]
+    assert slides[0]["type"] == "statement"
+    assert slides[0]["text"] == "Ship faster than the market moves"
+    assert slides[0]["kicker"] == "BUILT FOR BUILDERS"
+    assert slides[0]["emphasisWords"] == ["faster"]
+    assert slides[0]["variant"] == "mosaic"
+    assert slides[0]["durationFrames"] == 105
+    assert slides[1]["background"] == "mosaic"
+
+
+# ── media_statement slides (stock footage) ───────────────────────────
+
+def test_media_statement_variant_defaults_and_validates():
+    plain = MediaStatementSlideSpec(text="Where the next thing starts")
+    assert plain.variant == "inset_card" and plain.mediaQuery is None
+    styled = MediaStatementSlideSpec(
+        text="Where the next thing starts", mediaQuery="city street night", variant="mosaic_reveal",
+    )
+    assert styled.variant == "mosaic_reveal" and styled.mediaQuery == "city street night"
+    with pytest.raises(ValidationError):
+        MediaStatementSlideSpec(text="Hi", variant="picture_in_picture")
+
+
+def test_clamp_duration_has_a_default_for_media_statement():
+    assert clamp_duration("media_statement", None) == 135
+    assert clamp_duration("media_statement", 10) == 90
+    assert clamp_duration("media_statement", 9999) == 210
+
+
+def test_media_statement_is_a_template_fallback_target():
+    from pydantic import TypeAdapter
+    from LLM_service.core.video_schema import TemplateSlideSpec
+
+    slide = TypeAdapter(TemplateSlideSpec).validate_python(
+        {"type": "media_statement", "text": "Where the next thing starts"}
+    )
+    assert slide.type == "media_statement"
+
+
+def test_fallback_maps_media_statement_without_assets():
+    """_render_without_assets ends in `raise ValueError`, swallowed upstream by
+    fallback_slide_for's broad except — a missing branch degrades silently."""
+    from LLM_service.workflow.video.fallback import _render_without_assets
+
+    rendered = _render_without_assets(
+        MediaStatementSlideSpec(text="Where the next thing starts", mediaQuery="city street night"),
+        suggested_frames=None,
+    )
+    assert rendered.type == "media_statement"
+    assert rendered.mediaLocalPath is None and rendered.mediaDurationFrames is None
+    assert rendered.durationFrames == 135
+
+
+def test_media_statement_degrades_when_the_clip_cannot_be_fetched():
+    """The default mock returns an undownloadable URL, so this exercises the real
+    fallback ladder end to end: search hit -> download fail -> localPath None -> the
+    renderer draws the mosaic alone. This is the production-likely path."""
+    import asyncio
+    from pathlib import Path
+    import tempfile
+    from LLM_service.workflow.video.assets import resolve_storyboard_assets
+
+    storyboard = StoryboardSpec(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        platform="instagram_reels",
+        slides=[
+            {"type": "media_statement", "text": "Where the next thing starts",
+             "kicker": "ON LOCATION", "emphasisWords": ["next"],
+             "mediaQuery": "city street night", "variant": "inset_card"},
+            {"type": "statement", "text": "One clear idea"},
+        ],
+    )
+    with tempfile.TemporaryDirectory() as d:
+        renderable = asyncio.run(resolve_storyboard_assets(storyboard, job_dir=Path(d) / "job"))
+    slide = renderable.model_dump()["slides"][0]
+    assert slide["type"] == "media_statement"
+    assert slide["mediaLocalPath"] is None and slide["mediaDurationFrames"] is None
+    assert slide["kicker"] == "ON LOCATION" and slide["emphasisWords"] == ["next"]
+    assert slide["variant"] == "inset_card" and slide["durationFrames"] == 135
+
+
+def test_resolve_clip_records_a_local_path_and_clip_length():
+    """The happy path: a downloadable clip lands in clips/ and carries its own frame
+    count, which the renderer needs to decide whether to <Loop> it."""
+    import asyncio
+    from pathlib import Path
+    import tempfile
+    from LLM_service.core.config import get_settings
+    from LLM_service.workflow.video import assets
+
+    async def fake_download(url):
+        return b"\x00fake mp4 bytes"
+
+    original = assets._download_clip
+    assets._download_clip = fake_download
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            clips_dir = Path(d) / "clips"
+            clip = asyncio.run(assets._resolve_clip(
+                "city street night", clips_dir=clips_dir, index=0,
+                width=1080, height=1920, settings=get_settings(),
+            ))
+            assert clip.localPath == "clips/0.mp4"
+            assert (clips_dir / "0.mp4").read_bytes() == b"\x00fake mp4 bytes"
+    finally:
+        assets._download_clip = original
+    # MockVideoSearch reports 12.0s; one frame of headroom keeps <Loop> off EOF.
+    assert clip.durationFrames == 12 * 30 - 1
+
+
+def test_resolve_clip_is_skipped_on_the_lambda_backend():
+    """Job-dir assets are served by the LOCAL render's --public-dir; the deployed
+    Lambda site bundle has no equivalent, so staticFile("clips/0.mp4") could never
+    resolve there. Downloading 40MB that can't be loaded is worse than degrading."""
+    import asyncio
+    import dataclasses
+    from pathlib import Path
+    import tempfile
+    from LLM_service.core.config import get_settings
+    from LLM_service.workflow.video import assets
+
+    # Settings is a frozen dataclass, not a pydantic model.
+    settings = dataclasses.replace(get_settings(), video_render_backend="lambda")
+    called = False
+
+    async def fail_download(url):
+        nonlocal called
+        called = True
+        return b"x"
+
+    original = assets._download_clip
+    assets._download_clip = fail_download
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            clip = asyncio.run(assets._resolve_clip(
+                "city street night", clips_dir=Path(d) / "clips", index=0,
+                width=1080, height=1920, settings=settings,
+            ))
+    finally:
+        assets._download_clip = original
+    assert clip.localPath is None and clip.durationFrames is None
+    assert not called, "no clip should be downloaded on the lambda backend"

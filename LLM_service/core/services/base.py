@@ -832,6 +832,41 @@ class ImageSearchService(ABC):
         ...
 
 
+class VideoSearchService(ABC):
+    """Stock-FOOTAGE search for `media_statement` slides — the moving-image sibling
+    of ImageSearchService. Same soft-fail contract: an empty result means "no clip
+    for this slide" (it degrades to the mosaic alone), never an exception.
+
+    Note this is stock-footage *search*, entirely distinct from VideoGenerationService,
+    which asks an AI model to synthesize a clip.
+    """
+
+    @abstractmethod
+    async def search(
+        self,
+        *,
+        query: str,
+        orientation: str = "portrait",
+        per_page: int = 1,
+        target_width: int = 1080,
+        target_height: int = 1920,
+    ) -> List[dict]:
+        """Return up to `per_page` candidate clips for `query`, each a dict with at
+        least {url, width, height, fps, duration, photographer}. `duration` is in
+        SECONDS (float).
+
+        `url` points at ONE already-chosen rendition, not a list of them: which of a
+        provider's encodings to download is provider knowledge (codec support,
+        rendition naming, size trade-offs), so it belongs behind this interface
+        rather than in every caller. `target_width`/`target_height` are the canvas
+        the clip will be composited into, so the impl can pick the least-upscale
+        rendition instead of the largest one available.
+
+        Empty list on no match.
+        """
+        ...
+
+
 # ── Background removal (Remove.bg) ───────────────────────────────────────────────
 
 class BackgroundRemovalService(ABC):

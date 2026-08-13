@@ -1,0 +1,59 @@
+{
+  "brandName": "STARLIGHT",
+  "theme": "light",
+  "primaryColor": "#f4f5fb",
+  "secondaryColor": "#4f46e5",
+  "accentColor": "#8b5cf6",
+  "backgroundStyle": "solid",
+  "transition": "none",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "slides": [
+    {
+      "type": "statement",
+      "kicker": "THE STARTUP SERIES",
+      "text": "Build AI agents on AWS",
+      "emphasisWords": ["agents"],
+      "variant": "mosaic",
+      "durationFrames": 105
+    },
+    {
+      "type": "statement",
+      "text": "Deciding between Bedrock, Claude Platform, or Direct API?",
+      "variant": "mosaic",
+      "durationFrames": 135
+    },
+    {
+      "type": "statement",
+      "text": "Every idea deserves a real shot",
+      "variant": "flat",
+      "durationFrames": 90
+    },
+    {
+      "type": "statement",
+      "kicker": "GET STARTED",
+      "text": "Follow our guide to find the right architecture",
+      "emphasisWords": ["right"],
+      "variant": "band",
+      "durationFrames": 120
+    },
+    {
+      "type": "hook",
+      "headline": "One language, every beat",
+      "subtext": "The mosaic as a hook background",
+      "kicker": "AND ON HOOKS",
+      "shape": "circle",
+      "variant": "poster",
+      "background": "mosaic",
+      "durationFrames": 90
+    },
+    {
+      "type": "outro",
+      "brandName": "STARLIGHT",
+      "ctaLabel": "Get Started",
+      "variant": "badge",
+      "durationFrames": 90
+    }
+  ]
+}

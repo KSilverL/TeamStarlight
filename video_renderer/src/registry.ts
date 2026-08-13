@@ -1,8 +1,10 @@
 // KEEP IN SYNC WITH: LLM_service/core/video_schema.py (the Slide discriminator
-// literals: "hook" | "counter_stat" | "collage" | "outro"). Every literal there
-// needs exactly one entry here, and vice versa. Python-side parity is checked by
-// LLM_service/tests/test_video_schema.py; there is no cross-language check, so
-// when adding a slide type, update both files in the same change.
+// literals: "hook" | "counter_stat" | "collage" | "statement" | "media_statement"
+// | "outro"). Every
+// literal there needs exactly one entry here, and vice versa. Parity IS checked
+// cross-language, by test_slide_registry_ts_covers_every_slide_type in
+// LLM_service/tests/test_contract_parity.py, which parses the object literal
+// below — keep it as one `key: Component,` per line.
 import React from "react";
 import { BarChartSlide } from "./slides/BarChartSlide";
 import { CollageSlide } from "./slides/CollageSlide";
@@ -13,7 +15,9 @@ import { LineChartSlide } from "./slides/LineChartSlide";
 import { MapSlide } from "./slides/MapSlide";
 import { NodeDiagramSlide } from "./slides/NodeDiagramSlide";
 import { OutroSlide } from "./slides/OutroSlide";
+import { MediaStatementSlide } from "./slides/MediaStatementSlide";
 import { PieChartSlide } from "./slides/PieChartSlide";
+import { StatementSlide } from "./slides/StatementSlide";
 import type { Slide } from "./types";
 
 // Each slide component's `slide` prop is narrowly typed to its own variant
@@ -35,6 +39,8 @@ export const SLIDE_REGISTRY: Record<Exclude<Slide["type"], "generated">, AnySlid
   hook: HookSlide,
   counter_stat: CounterStatSlide,
   collage: CollageSlide,
+  statement: StatementSlide,
+  media_statement: MediaStatementSlide,
   outro: OutroSlide,
   pie_chart: PieChartSlide,
   line_chart: LineChartSlide,

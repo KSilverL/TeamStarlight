@@ -40,6 +40,7 @@ from ..video_schema import StoryboardSpec
 from .base import (
     BackgroundRemovalService,
     ImageSearchService,
+    VideoSearchService,
     LLMService,
     MusicGenerationService,
     RealtimeEvent,
@@ -1598,6 +1599,34 @@ class MockImageSearch(ImageSearchService):
         ]
 
 
+class MockVideoSearch(VideoSearchService):
+    """Deterministic, offline stand-in for Pexels Videos: one placeholder clip
+    candidate per query (no network), so the asset-resolution pipeline and its tests
+    never need real credentials.
+
+    The URL is intentionally undownloadable, exactly like MockImageSearch's — that
+    makes the default mock run exercise _resolve_clip's real degradation ladder
+    (localPath stays None, the slide renders mosaic-only), which is the path most
+    likely to be hit in production."""
+
+    async def search(
+        self, *, query: str, orientation: str = "portrait", per_page: int = 1,
+        target_width: int = 1080, target_height: int = 1920,
+    ) -> List[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return [
+            {
+                "url": f"https://mock.pexels.local/video/{i}/{query.replace(' ', '-')}.mp4",
+                "width": target_width,
+                "height": target_height,
+                "fps": 30,
+                "duration": 12.0,
+                "photographer": "Mock Videographer",
+            }
+            for i in range(max(per_page, 0))
+        ]
+
+
 class MockLiveImageSearch(ImageSearchService):
     """Deterministic, offline stand-in for LiveImageSearch (core/services/web_search.py):
     a distinct URL host from MockImageSearch so the two sourcing paths (stock vs.
@@ -1647,14 +1676,13 @@ def _silent_mp3(duration_seconds: float) -> bytes:
 
 
 class MockMusicGeneration(MusicGenerationService):
-    """Offline stand-in for Soundraw: returns a real (silent) MP3 sized to
-    `duration_seconds`, so the music-resolution pipeline — including Remotion's
+    """Offline stand-in for the real music providers: returns a real (silent) MP3 sized
+    to `duration_seconds`, so the music-resolution pipeline — including Remotion's
     ffprobe inspection of the file — works end to end without real credentials
     or network access.
 
-    TODO: circle back and wire up a real SOUNDRAW_API_KEY (see SoundrawMusic in
-    media_assets.py) once its request/response contract is verified against a
-    live account — this mock only proves the pipeline plumbing, not real audio.
+    For actual audio set USE_MOCK_MUSIC_GENERATION=false; JamendoMusic (a free
+    JAMENDO_CLIENT_ID) is the real provider, with the bundled library behind it.
     """
 
     async def generate(self, *, mood: str, genre: str, duration_seconds: float, energy: str) -> bytes:

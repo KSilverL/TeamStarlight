@@ -3,7 +3,8 @@ Dynamic storyboard schema for the video-creation agent.
 
 Rather than picking between hardcoded templates, the LLM composes a `StoryboardSpec`
 — an ordered list of typed `slides`, each one drawn from a small, fixed registry of
-slide *types* (`hook`, `counter_stat`, `collage`, `outro`, plus the chart types
+slide *types* (`hook`, `counter_stat`, `collage`, `statement`, `media_statement`,
+`outro`, plus the chart types
 `pie_chart`, `line_chart`, `bar_chart`, `node_diagram`, `comparison_table`).
 This is a Pydantic discriminated union: the `type` field on each slide
 selects which model validates it (`Field(discriminator="type")`). Adding a new
@@ -56,6 +57,11 @@ DURATION_BUDGET: Dict[str, Tuple[int, int, int]] = {
     "hook": (90, 60, 150),
     "counter_stat": (150, 90, 240),
     "collage": (120, 90, 210),
+    # The reference this language came from runs ~120 frames/beat. A text-only
+    # statement lands shorter (3.5s) than a media beat, which needs its slow zoom
+    # room to breathe.
+    "statement": (105, 60, 165),
+    "media_statement": (135, 90, 210),
     "outro": (90, 60, 150),
     "pie_chart": (150, 90, 240),
     # line/bar maxes bumped to 300 so the step_reveal scrubber and race count-up
@@ -122,7 +128,7 @@ def aspect_for_platform(platform: str) -> Tuple[int, int]:
 # A background treatment applied behind a slide's content, drawn from the shared
 # design system (video_renderer/src/design/backdrops.tsx). Optional everywhere with
 # a "solid" default, so pre-variant props render identically.
-BackgroundStyle = Literal["solid", "gradient", "orbs", "grid"]
+BackgroundStyle = Literal["solid", "gradient", "orbs", "grid", "mosaic"]
 
 # Per-slide narration line the voiceover speaks WHILE this slide is on screen — the
 # unit that keeps the audio synced to the visuals (workflow/video/voiceover.py
@@ -155,7 +161,7 @@ class HookSlideSpec(BaseModel):
         "other — dynamic. Pick 'poster' for a punchy text-only open, 'split' when the image is strong.",
     )
     background: BackgroundStyle = Field(
-        "solid", description="Background treatment behind the content (solid/gradient/orbs/grid)"
+        "solid", description="Background treatment behind the content (solid/gradient/orbs/grid/mosaic)"
     )
     durationFrames: Optional[int] = Field(None, description="Suggested frames at 30fps; clamped server-side")
 
@@ -195,6 +201,68 @@ class CollageSlideSpec(BaseModel):
     )
     captions: Optional[List[str]] = Field(
         None, max_length=4, description="Optional per-image caption labels, same order as imageQueries"
+    )
+    durationFrames: Optional[int] = Field(None, description="Suggested frames at 30fps; clamped server-side")
+
+
+_EMPHASIS_DESC = (
+    "Up to 3 words FROM `text`, spelled exactly as they appear there, to render in the "
+    "accent colour — the words a narrator would lean on. Matching ignores case and "
+    "surrounding punctuation; a word that isn't in `text` is simply ignored. Omit for "
+    "an evenly-weighted line."
+)
+
+
+class StatementSlideSpec(BaseModel):
+    """One big typographic line over an animated pixel-mosaic field, each word
+    arriving and leaving on its own beat. The video's *idea* beat — a thesis, a
+    turn, a punchline — as opposed to the data beats the chart types carry."""
+
+    type: Literal["statement"] = "statement"
+    narration: Optional[str] = Field(None, description=_NARRATION_DESC)
+    text: str = Field(
+        description="The statement itself: 4-14 words, set very large and left-aligned. "
+        "Every word gets its own entrance, so make every word earn its place."
+    )
+    kicker: Optional[str] = Field(
+        None, description="Tiny ALL-CAPS eyebrow line above the statement, e.g. 'THE STARTUP SERIES' — optional"
+    )
+    emphasisWords: Optional[List[str]] = Field(None, max_length=3, description=_EMPHASIS_DESC)
+    variant: Literal["mosaic", "flat", "band"] = Field(
+        "mosaic",
+        description="Treatment. 'mosaic' (default): the full animated pixel field behind the "
+        "text. 'flat': plain background — a quieter beat between two loud ones. 'band': mosaic "
+        "across the top of the frame with the text below it.",
+    )
+    durationFrames: Optional[int] = Field(None, description="Suggested frames at 30fps; clamped server-side")
+
+
+class MediaStatementSlideSpec(BaseModel):
+    """The same typographic statement as `statement`, but over real stock FOOTAGE
+    rather than a mosaic field. The one slide type that consumes moving imagery."""
+
+    type: Literal["media_statement"] = "media_statement"
+    narration: Optional[str] = Field(None, description=_NARRATION_DESC)
+    text: str = Field(
+        description="The statement itself: 4-14 words, set large and left-aligned above "
+        "(or over) the footage. Every word gets its own entrance."
+    )
+    kicker: Optional[str] = Field(
+        None, description="Tiny ALL-CAPS eyebrow line above the statement — optional"
+    )
+    emphasisWords: Optional[List[str]] = Field(None, max_length=3, description=_EMPHASIS_DESC)
+    mediaQuery: Optional[str] = Field(
+        None,
+        description="2-4 word stock-FOOTAGE search keyword for the clip behind/below the "
+        "text, e.g. 'city street night' or 'team working office' — NEVER a URL, and never "
+        "just a restatement of `text`. Omit to fall back to the mosaic treatment.",
+    )
+    variant: Literal["inset_card", "full_bleed", "mosaic_reveal"] = Field(
+        "inset_card",
+        description="Treatment. 'inset_card' (default): footage in a rounded card that bleeds "
+        "off the bottom, text above it. 'full_bleed': footage fills the frame behind the text. "
+        "'mosaic_reveal': the pixel mosaic scatters away to reveal the footage then re-forms — "
+        "the most cinematic; use it at most once per storyboard.",
     )
     durationFrames: Optional[int] = Field(None, description="Suggested frames at 30fps; clamped server-side")
 
@@ -437,7 +505,8 @@ class GeneratedSlideSpec(BaseModel):
 
 SlideSpec = Annotated[
     Union[
-        HookSlideSpec, CounterStatSlideSpec, CollageSlideSpec, OutroSlideSpec,
+        HookSlideSpec, CounterStatSlideSpec, CollageSlideSpec, StatementSlideSpec,
+        MediaStatementSlideSpec, OutroSlideSpec,
         PieChartSlideSpec, LineChartSlideSpec, BarChartSlideSpec, NodeDiagramSlideSpec, ComparisonTableSlideSpec,
         MapSlideSpec, GeneratedSlideSpec,
     ],
@@ -451,7 +520,8 @@ SlideSpec = Annotated[
 # case anyone special-cases).
 TemplateSlideSpec = Annotated[
     Union[
-        HookSlideSpec, CounterStatSlideSpec, CollageSlideSpec, OutroSlideSpec,
+        HookSlideSpec, CounterStatSlideSpec, CollageSlideSpec, StatementSlideSpec,
+        MediaStatementSlideSpec, OutroSlideSpec,
         PieChartSlideSpec, LineChartSlideSpec, BarChartSlideSpec, NodeDiagramSlideSpec, ComparisonTableSlideSpec,
         MapSlideSpec,
     ],
@@ -462,7 +532,7 @@ TemplateSlideSpec = Annotated[
 # tests/test_video_schema.py against the actual model set, so it cannot drift
 # silently — see the module docstring for why this can't be checked cross-language.
 SLIDE_TYPES = frozenset({
-    "hook", "counter_stat", "collage", "outro",
+    "hook", "counter_stat", "collage", "statement", "media_statement", "outro",
     "pie_chart", "line_chart", "bar_chart", "node_diagram", "comparison_table",
     "map", "generated",
 })
@@ -492,8 +562,20 @@ class AudioSpec(BaseModel):
     StoryboardSpec (None → the legacy fixed-music, no-narration behavior), so any
     storyboard JSON persisted before this field existed still validates and renders
     unchanged. workflow/video/{music,voiceover}.py consume these; the resolved track
-    PATHS (not this spec) are what reach the renderer via RenderableStoryboard."""
+    PATHS (not this spec) are what reach the renderer via RenderableStoryboard.
 
+    Both tracks are independently suppressible by the LLM: `musicEnabled=False` drops
+    the backing music, and leaving every slide's `narration` (plus `narrationScript`)
+    null drops the voiceover. RenderVideoRequest's music_enabled/narration_enabled are
+    hard overrides layered on top of these — see workflow/video/jobs.py."""
+
+    musicEnabled: bool = Field(
+        True,
+        description="Whether the video has a backing music track at all. True (default) for "
+        "almost everything. Set false ONLY when the brief calls for it — a sombre or serious "
+        "subject, a spoken-word piece where music would distract, or an explicit request for "
+        "no music. When false, musicMood/musicGenre/musicEnergy are ignored.",
+    )
     musicMood: MusicMood = Field("inspiring", description="Emotional tone of the backing track")
     musicGenre: MusicGenre = Field("corporate", description="Musical style of the backing track")
     musicEnergy: MusicEnergy = Field("medium", description="Pace/intensity of the backing track")
@@ -595,6 +677,30 @@ class ResolvedImage(BaseModel):
     localPath: Optional[str] = None
 
 
+class ResolvedClip(BaseModel):
+    """One media_statement clip query after stock-footage resolution.
+
+    `localPath` is None when resolution failed (search miss, download failure, or the
+    Lambda backend) — the Remotion side then renders the mosaic alone, exactly as
+    ResolvedImage(localPath=None) degrades to a plain shape.
+
+    `durationFrames` is the CLIP's own length, not the slide's. The renderer needs it
+    to decide whether to wrap a short clip in <Loop>, and it cannot measure the file
+    itself: @remotion/media-utils isn't a dependency, and probing at render time
+    would mean IO inside a frame render.
+
+    Resolution-time only — it is NOT part of props.json. Following
+    RenderHookSlide.imageLocalPath's precedent (a single asset flattens; only
+    collage's LIST keeps a wrapper model), RenderMediaStatementSlide carries flat
+    mediaLocalPath + mediaDurationFrames, so types.ts needs no mirror of this."""
+
+    query: str
+    localPath: Optional[str] = None
+    durationFrames: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+
 class RenderHookSlide(BaseModel):
     type: Literal["hook"] = "hook"
     headline: str
@@ -622,6 +728,28 @@ class RenderCollageSlide(BaseModel):
     layout: Literal["grid", "scatter", "stack", "filmstrip", "polaroid"] = "grid"
     captions: Optional[List[str]] = None
     resolvedImages: List[ResolvedImage] = Field(default_factory=list)
+    durationFrames: int
+
+
+class RenderStatementSlide(BaseModel):
+    type: Literal["statement"] = "statement"
+    text: str
+    kicker: Optional[str] = None
+    emphasisWords: Optional[List[str]] = None
+    variant: Literal["mosaic", "flat", "band"] = "mosaic"
+    durationFrames: int
+
+
+class RenderMediaStatementSlide(BaseModel):
+    type: Literal["media_statement"] = "media_statement"
+    text: str
+    kicker: Optional[str] = None
+    emphasisWords: Optional[List[str]] = None
+    variant: Literal["inset_card", "full_bleed", "mosaic_reveal"] = "inset_card"
+    # Job-relative ("clips/0.mp4"), served via the render's --public-dir. None when
+    # the clip couldn't be resolved; the slide then renders mosaic-only.
+    mediaLocalPath: Optional[str] = None
+    mediaDurationFrames: Optional[int] = None
     durationFrames: int
 
 
@@ -723,7 +851,8 @@ class RenderGeneratedSlide(BaseModel):
 
 RenderSlide = Annotated[
     Union[
-        RenderHookSlide, RenderCounterStatSlide, RenderCollageSlide, RenderOutroSlide,
+        RenderHookSlide, RenderCounterStatSlide, RenderCollageSlide, RenderStatementSlide,
+        RenderMediaStatementSlide, RenderOutroSlide,
         RenderPieChartSlide, RenderLineChartSlide, RenderBarChartSlide, RenderNodeDiagramSlide,
         RenderComparisonTableSlide, RenderMapSlide, RenderGeneratedSlide,
     ],

@@ -137,6 +137,30 @@ export const scaleAway = (
   };
 };
 
+/**
+ * Slow continuous zoom (plus optional pan) across an element's whole life — the
+ * Ken Burns move, used both on stock footage and, at a much smaller amplitude
+ * (to: 1.035), to creep a text block toward the viewer over its slide.
+ *
+ * Returns a transform STRING rather than an EntranceStyle: it is meant to be
+ * concatenated with an entrance's own transform, not to replace it. Pan is in
+ * percent of the element's own box, so it behaves identically at any resolution.
+ *
+ * `Math.max(durationFrames, 1)` is not defensive padding — `interpolate` throws on
+ * a non-increasing input range, so a hand-written fixture with durationFrames: 0
+ * would hard-fail the whole render instead of rendering a still frame.
+ */
+export const kenBurns = (
+  frame: number,
+  durationFrames: number,
+  opts: { from?: number; to?: number; panX?: number; panY?: number } = {},
+): string => {
+  const t = interpolate(frame, [0, Math.max(durationFrames, 1)], [0, 1], clampBoth);
+  const from = opts.from ?? 1;
+  const scale = from + ((opts.to ?? 1.12) - from) * t;
+  return `scale(${scale}) translate(${(opts.panX ?? 0) * t}%, ${(opts.panY ?? 0) * t}%)`;
+};
+
 /** 0→1 progress between two frames, clamped — SVG draw-ons, sweeps, scrubbers. */
 export const progress = (frame: number, opts: { from?: number; to: number }): number =>
   interpolate(frame, [opts.from ?? 0, opts.to], [0, 1], clampBoth);

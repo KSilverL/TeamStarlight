@@ -339,9 +339,10 @@ Platform finalized (after `/review`) — enriched by the media_producer:
 > The draft text is HTML-escaped, so it is safe.
 > `video_storyboard` is a **`StoryboardSpec`** (`LLM_service/core/video_schema.py`): brand
 > identity + a 3-colour palette + an ordered list of 2–8 typed `slides` composed from a fixed
-> registry (`hook`, `counter_stat`, `collage`, `outro`, `pie_chart`, `line_chart`, `bar_chart`,
-> `node_diagram`, `comparison_table`). It is **data only** — image fields are stock-photo search
-> *keywords* (never URLs), and the final aspect ratio is derived server-side from `platform`. To
+> registry (`hook`, `counter_stat`, `collage`, `statement`, `media_statement`, `outro`,
+> `pie_chart`, `line_chart`, `bar_chart`, `node_diagram`, `comparison_table`). It is **data
+> only** — image/video fields are stock-search *keywords* (never URLs), and the final aspect
+> ratio is derived server-side from `platform`. To
 > get the actual MP4, trigger the render pipeline with
 > [`POST /tasks/{id}/render-video`](#video-render--post-taskstask_idrender-video--get-video-jobsjob_id)
 > and poll `/video-jobs/{job_id}`. Both artifacts appear only on the `final` event.
@@ -701,11 +702,18 @@ overrides:
 | `narration_text` | agent's per-slide narration | Override with your own single whole-video script (replaces the per-slide lines) |
 | `narration_voice` | agent-picked voice persona (Azure Dragon HD) | Override the voice with a provider voice id (e.g. `en-GB-RyanNeural`) |
 | `narration_enabled` | `true` | Set `false` for a music-only render with no narration |
+| `music_enabled` | `true` | Set `false` to suppress the backing track, overriding the agent's own `audio.musicEnabled` choice |
 
 ```json
-// request — silent-narration render
+// request — music-only render (no narration). The music mixes at -9dB rather than
+// the -18dB it sits at under a voiceover, so it still carries the video.
 { "platform": "instagram", "narration_enabled": false }
 ```
+
+Both tracks are also the storyboard agent's to decide: it drops the music by setting
+`audio.musicEnabled: false`, and drops the voice by leaving every slide's `narration`
+(and `audio.narrationScript`) null — so a brief like *"no music, just the voiceover"*
+needs no request flag at all. The two fields above are hard overrides on top of that.
 
 Errors: `404` if the task/platform has no finished draft yet; `409` if that platform's run did
 not request `"video"` (no storyboard to render).
