@@ -9,10 +9,13 @@ import type { RenderableStoryboard } from "./types";
 import { StoryboardBackdrop } from "./design/StoryboardBackdrop";
 import { TRANSITION_OVERLAP_FRAMES } from "./metadata";
 
-// -18dB ≈ 10^(-18/20) ≈ 0.13 linear gain (Remotion's `volume` is a linear
-// multiplier, not dB) — keeps headroom under a future voiceover track without
-// retuning later, matching CLAUDE.md's "-18dB under any voiceover" spec.
-const MUSIC_VOLUME = 0.13;
+// Remotion's `volume` is a linear multiplier, not dB: x = 10^(dB/20).
+// -18dB ≈ 0.13 — the bed sits under a voiceover, matching CLAUDE.md's
+// "-18dB under any voiceover" spec.
+const MUSIC_VOLUME_UNDER_VO = 0.13;
+// -9dB ≈ 0.35 — a music-only video has nothing to leave headroom for, and at
+// 0.13 it reads as near-silent. Music carries the video on its own here.
+const MUSIC_VOLUME_SOLO = 0.35;
 
 // The presentation for a storyboard-wide transition. `vertical` (9:16) pushes/wipes
 // along the tall axis; `horizontal` (16:9) along the wide axis — so motion always
@@ -53,13 +56,26 @@ export const StoryboardRenderer: React.FC<RenderableStoryboard> = ({
   // the fallback (caller-supplied script or a legacy storyboard), used only when there
   // are no per-slide paths.
   const hasSlideVoiceover = Boolean(voiceoverSlidePaths && voiceoverSlidePaths.length > 0);
+  // Deliberately NOT hasSlideVoiceover: that one asks "did Python resolve per-slide
+  // clips?" (so the global track is skipped), and an all-null array still answers yes.
+  // Picking the music level needs the different question "is any voice actually
+  // audible?" — a storyboard whose slides all have narration: null is a music-only
+  // video and should be mixed like one.
+  const hasAnyVoiceover =
+    Boolean(voiceoverLocalPath) || Boolean(voiceoverSlidePaths?.some(Boolean));
 
   return (
     <>
-      {musicLocalPath && <Audio src={staticFile(musicLocalPath)} volume={MUSIC_VOLUME} />}
-      {/* Full volume (Remotion default) — MUSIC_VOLUME above was chosen specifically
-          to leave headroom under a narration track, so no ducking logic is needed
-          here: the two tracks are just mixed as-is. */}
+      {/* The two tracks are mixed as-is with no per-frame ducking: the music level is
+          simply chosen up-front for the video it's in — quiet enough to sit under a
+          voiceover, or loud enough to carry a video that has none. */}
+      {musicLocalPath && (
+        <Audio
+          src={staticFile(musicLocalPath)}
+          volume={hasAnyVoiceover ? MUSIC_VOLUME_UNDER_VO : MUSIC_VOLUME_SOLO}
+        />
+      )}
+      {/* Voiceover plays at full volume (Remotion default). */}
       {!hasSlideVoiceover && voiceoverLocalPath && <Audio src={staticFile(voiceoverLocalPath)} />}
       {/* TransitionSeries with no <Transition> children is a plain hard-cut series,
           identical to the old <Series>; a <Transition> is interleaved between slides

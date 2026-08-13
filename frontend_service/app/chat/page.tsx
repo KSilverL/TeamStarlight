@@ -140,6 +140,9 @@ type VideoSlide =
 
 interface VideoStoryboard {
   brandName: string;
+  /** The storyboard's creative theme (StoryboardSpec.theme) — used as the byline in the
+   *  LinkedIn preview. Optional here because only that card reads it. */
+  theme?: string;
   primaryColor: string;
   secondaryColor: string;
   accentColor: string;
@@ -189,6 +192,35 @@ function localToday(): string {
   return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
 }
 
+/**
+ * A sidebar title for a campaign, out of its goal.
+ *
+ * A single post is named by the LLM service — `POST /tasks` returns a title and refines it over
+ * SSE. A campaign never touches that pipeline; it goes to `/plans` instead, which is why
+ * planning sessions showed a bare timestamp for ever. The goal is the right raw material: the
+ * classifier already extracts it as a short phrase in the user's own terms, so it needs
+ * tidying rather than generating.
+ *
+ * Same contract as `_clean_title` in LLM_service/api.py — strip wrapping quotes, collapse
+ * whitespace, clamp to 48 chars, empty in / empty out — plus a leading capital, because a goal
+ * reads as a fragment ("launch the subscription") and a title should not.
+ */
+function titleFromGoal(goal: string): string {
+  const cleaned = (goal ?? "")
+    .trim()
+    .replace(/^["'“”‘’]+|["'“”‘’]+$/g, "")
+    .split(/\s+/)
+    .join(" ")
+    .trim();
+  if (!cleaned) return "";
+
+  const clamped =
+    cleaned.length > 48
+      ? cleaned.slice(0, 48).replace(/[ ,.;:—-]+$/, "") + "…"
+      : cleaned;
+  return clamped.charAt(0).toUpperCase() + clamped.slice(1);
+}
+
 // ── Posting plans in chat ─────────────────────────────────────────────────────
 
 /** One dated slot on a campaign schedule. Strategy, never copy — the posts themselves are
@@ -216,6 +248,11 @@ interface Plan {
   items: PlanItem[];
 }
 
+/** How much deliberation each of a campaign's posts gets when it is written: the full agent
+ * roundtable, or straight to the writing. Chosen at confirm, because that is when the work
+ * is commissioned — see LLM_service/core/plan_schema.py. */
+type DraftMode = "roundtable" | "fast";
+
 /**
  * Where a campaign request has got to, across turns.
  *
@@ -239,7 +276,14 @@ interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
-  variant?: "status" | "draft" | "text-preview" | "html-preview" | "roundtable" | "plan-preview";
+  variant?:
+    | "status"
+    | "draft"
+    | "text-preview"
+    | "html-preview"
+    | "roundtable"
+    | "plan-preview"
+    | "social-post";
   platform?: Platform;
   draft?: DraftContent;
   html?: string;
@@ -265,6 +309,10 @@ interface Message {
   // of on Post Now. Absent whenever the user named no time, which is the common case.
   publishAt?: string;
   videoStoryboard?: VideoStoryboard;
+  // The storyboard's own gate (variant === "social-post"). Separate from `approval`, which
+  // gates the copy: on a text+video post the user signs off the two in sequence inside one card,
+  // and the storyboard can be sent back for changes after the copy is already approved.
+  storyboardApproval?: ApprovalStatus;
   // User-attached reference images (base64 data URLs) for image-to-video generation
   // (Higgsfield backend). Threaded from the compose box onto the storyboard message so
   // the render trigger can forward them; the free Remotion backend ignores them.
@@ -330,6 +378,10 @@ const CONTENT_TYPES: { id: ContentType; label: string }[] = [
   { id: "brand", label: "Brand Animation" },
 ];
 
+/** How many past sessions the sidebar shows before it needs asking. Enough to cover the last
+ *  day or two of work, few enough that the controls below stay on screen. */
+const SESSIONS_COLLAPSED_COUNT = 6;
+
 const INITIAL_MESSAGES: Message[] = [
   {
     id: "1",
@@ -351,6 +403,72 @@ const LEGACY_PLATFORM_IDS: Record<string, Platform> = { instagram: "facebook" };
 function platformLabel(id: string): string {
   return platformMap[LEGACY_PLATFORM_IDS[id] ?? id]?.label ?? id;
 }
+
+/** Platforms whose posts are reviewed as an in-feed mockup (SocialPostCard) rather than the
+ *  generic draft card — the ones we can actually publish to. */
+type MockupPlatform = "linkedin" | "facebook";
+
+const MOCKUP_PLATFORMS: readonly MockupPlatform[] = ["linkedin", "facebook"];
+
+function isMockupPlatform(id: string): id is MockupPlatform {
+  return (MOCKUP_PLATFORMS as readonly string[]).includes(id);
+}
+
+/**
+ * Per-platform chrome and posting rules for the post mockup.
+ *
+ * Class names are written out in full rather than composed from a hex value, because Tailwind
+ * scans this file as text — a `bg-[${color}]` built at runtime is a class that never gets
+ * generated.
+ */
+const POST_MOCKUP: Record<
+  MockupPlatform,
+  {
+    label: string;
+    /** The wordmark glyph in the preview strip and on the avatar. */
+    mark: string;
+    markClass: string;
+    buttonClass: string;
+    toggleActiveClass: string;
+    focusClass: string;
+    accentTextClass: string;
+    /** The line under the author name — each network shows something different there. */
+    byline: string;
+    /** The feed action row. Facebook has three; LinkedIn four. */
+    actions: string[];
+    /** Facebook publishes to Pages, so a Page must be picked before anything can go out. */
+    needsPages: boolean;
+    /** Graph captions a Page video from its own title/description fields. */
+    videoTitle: boolean;
+  }
+> = {
+  linkedin: {
+    label: "LinkedIn",
+    mark: "in",
+    markClass: "bg-[#0A66C2]",
+    buttonClass: "bg-[#0A66C2] hover:bg-[#0952A0]",
+    toggleActiveClass: "bg-[#0A66C2] text-white",
+    focusClass: "focus:border-[#0A66C2]",
+    accentTextClass: "text-[#0A66C2]",
+    byline: "Brand page",
+    actions: ["Like", "Comment", "Repost", "Send"],
+    needsPages: false,
+    videoTitle: false,
+  },
+  facebook: {
+    label: "Facebook",
+    mark: "f",
+    markClass: "bg-[#1877F2]",
+    buttonClass: "bg-[#1877F2] hover:bg-[#166FE0]",
+    toggleActiveClass: "bg-[#1877F2] text-white",
+    focusClass: "focus:border-[#1877F2]",
+    accentTextClass: "text-[#1877F2]",
+    byline: "Page",
+    actions: ["Like", "Comment", "Share"],
+    needsPages: true,
+    videoTitle: true,
+  },
+};
 
 // The Facebook Page id(s) the user picked in their Brand Profile. Facebook drafts
 // publish to these Pages via /api/meta/post; an empty list means Facebook isn't set up yet.
@@ -581,6 +699,10 @@ export default function ChatPage() {
   // "manual" pauses each roundtable table at round boundaries for a 4-way user prompt
   // (round_control); "auto" (default) never prompts — the backend's own default.
   const [roundtableMode, setRoundtableMode] = useState<"auto" | "manual">("auto");
+  // When on, every turn is a campaign: the classifier still reads the message for a goal and a
+  // date window, but its single_post verdict is overridden. Off, the classifier decides alone —
+  // which is how a terse "posts for the launch" ends up as one post about a launch.
+  const [planningMode, setPlanningMode] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
   // Up to 3 reference images the user attaches to the current turn (image-to-video).
@@ -605,6 +727,10 @@ export default function ChatPage() {
   // table_id -> the id of that table's RoundtableStage message, so later agent_utterance /
   // round_control events for the same table update the SAME card instead of spawning new ones.
   const roundtableMsgIdRef = useRef<Map<string, string>>(new Map());
+  // `${taskId}:${platform}` -> the id of that run's post-mockup message. A LinkedIn or Facebook
+  // post is reviewed as ONE evolving card (copy → storyboard → render → publish), so every
+  // later event for the same run patches that card instead of stacking another one.
+  const socialCardIdRef = useRef<Map<string, string>>(new Map());
 
   // Roundtable auto-play: when on, each persona's TTS clip plays automatically as it
   // arrives (agent_utterance_audio always lands after that persona's text turn, since
@@ -644,6 +770,24 @@ export default function ChatPage() {
   // ── Posting-plan path ───────────────────────────────────────────────────────
 
   /**
+   * What to do when the classifier can't be reached, which depends on whether the user asked.
+   *
+   * Left to itself, a failed classification falls through to the ordinary post path — the right
+   * call when the plan was only ever a guess we were making on the user's behalf. With planning
+   * mode on it is the wrong call twice over: they asked for a schedule, and quietly handing them
+   * a single post instead is the exact failure this toggle exists to prevent.
+   */
+  function classifyUnavailable(): boolean {
+    if (!planningMode) return false;
+    const message =
+      "I couldn't reach the planner, so I haven't built a posting plan. Try again in a moment — " +
+      "or switch Posting plan off in the sidebar and I'll write a single post instead.";
+    pushMessage({ role: "assistant", content: message });
+    if (sessionIdRef.current) persistMessage(sessionIdRef.current, "assistant", message);
+    return true;  // handled — do not fall through to the single-post path
+  }
+
+  /**
    * Handles one turn of a campaign request, and reports whether it took it.
    *
    * Returns false for an ordinary "write me a post" turn, which then flows on to `genWorkflow`
@@ -675,12 +819,15 @@ export default function ChatPage() {
           target_platforms: selectedPlatforms,
           known: campaignRef.current?.known,
           followups_asked: campaignRef.current?.followupsAsked ?? 0,
+          // The user asked for a plan outright. The call still happens — it is what reads the
+          // goal and the dates out of the sentence — but its verdict is no longer a vote.
+          force_plan: planningMode,
         }),
       });
       result = await res.json();
-      if (!res.ok || result.error) return false;  // fall back to the ordinary post path
+      if (!res.ok || result.error) return classifyUnavailable();
     } catch {
-      return false;  // classifying is an optimisation, never a reason to refuse the message
+      return classifyUnavailable();  // classifying is an optimisation, never a reason to refuse
     }
 
     if (result.intent !== "posting_plan") {
@@ -722,6 +869,13 @@ export default function ChatPage() {
    * ask, this falls straight through to building the plan.
    */
   async function startClarify(campaign: Record<string, string>) {
+    // Name the session here, the moment the campaign is settled — not after the plan is built.
+    // A campaign that reaches this point has a goal by definition (it is one of the planner's
+    // required fields), and naming it now means a schedule that fails to generate still leaves
+    // a session the user can recognise tomorrow.
+    const title = titleFromGoal(campaign.goal ?? "");
+    if (title) applySessionTitle(title, { provisional: false });
+
     pushMessage({ role: "assistant", content: "Working out the shape of this campaign…", variant: "status" });
 
     let data: Record<string, unknown> = {};
@@ -846,12 +1000,34 @@ export default function ChatPage() {
   const requestedPublishAtRef = useRef<string>("");
 
   const [pastSessions, setPastSessions] = useState<SessionSummary[]>([]);
+  // The sidebar shows the most recent few by default. The list is unbounded and grows for the
+  // life of the account, and pushing Platforms and Content Type off the screen costs more than
+  // a month-old session is worth — one click brings the rest back.
+  const [showAllSessions, setShowAllSessions] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [sessionTitle, setSessionTitle] = useState<string | null>(null);
   // Guards against later prompts in the same session overwriting the name —
   // the session is named once, from the first task's title.
   const sessionTitleRef = useRef<string | null>(null);
+  // True while the name is the placeholder POST /tasks derives from the topic, which the LLM's
+  // own shorter title (session_title, over SSE) is allowed to replace exactly once.
+  const titleIsProvisionalRef = useRef(false);
+
+  // Collapsed, the sidebar shows the newest few — but never hides the session being viewed,
+  // which would leave the list with nothing highlighted and the user unable to tell where
+  // they are. Sessions are sorted newest-first, so slicing keeps that order.
+  const visibleSessions = showAllSessions
+    ? pastSessions
+    : pastSessions.filter(
+        (s, i) => i < SESSIONS_COLLAPSED_COUNT || s.id === activeSessionId
+      );
+  const hiddenSessionCount = pastSessions.length - visibleSessions.length;
+  // Two reasons to show the control, and it needs both: something is hidden and can be
+  // revealed, or the list is expanded and can be put back. Testing only the first would take
+  // "Show less" away the moment it worked; testing only overflow would offer "Show 0 more" in
+  // the case where pinning the active session happens to make the whole list visible anyway.
+  const showSessionsToggle = showAllSessions || hiddenSessionCount > 0;
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -877,8 +1053,10 @@ export default function ChatPage() {
     if (loadingSessionId) return;
     setLoadingSessionId(session.id);
 	sessionTitleRef.current = session.title ?? null;
+	// A saved title is settled, not a placeholder — nothing in this session may rename it.
+	titleIsProvisionalRef.current = false;
 	setSessionTitle(session.title ?? null);
-	
+
     try {
       const token = localStorage.getItem("starlight_token");
       const res = await fetch(`/api/sessions/${session.id}/messages`, {
@@ -916,14 +1094,79 @@ export default function ChatPage() {
       setLoadingSessionId(null);
     }
   }
-  
-  function applySessionTitle(title: string) {
-    if (sessionTitleRef.current) return; // already named this session
+
+  /**
+   * Back to a blank chat, without a page reload.
+   *
+   * The inverse of `loadSession`, and it has to reset everything that one sets plus everything
+   * a run leaves behind — most importantly the live SSE stream, which would otherwise keep
+   * writing a dead session's roundtable into the new one. No backend call: a session is
+   * registered lazily by the first `handleSend`, so "new chat" is purely forgetting this one.
+   *
+   * The sidebar list is left alone deliberately. The session being left is still the user's,
+   * and it stays there to go back to.
+   */
+  function startNewChat() {
+    if (isLoading || loadingSessionId) return;
+
+    if (workflowEsRef.current) {
+      workflowEsRef.current.close();
+      workflowEsRef.current = null;
+    }
+
+    setMessages(INITIAL_MESSAGES);
+    setInput("");
+    setAttachments([]);
+    pendingRefsRef.current = [];
+
+    historyRef.current = [];
+    sessionIdRef.current = null;
+    setActiveSessionId(null);
+
+    setSessionTitle(null);
+    sessionTitleRef.current = null;
+    titleIsProvisionalRef.current = false;
+
+    campaignRef.current = null;
+    requestedPublishAtRef.current = "";
+
+    roundtableMsgIdRef.current.clear();
+    socialCardIdRef.current.clear();
+    streamingAssistantRef.current = null;
+
+    // Platforms, content types, roundtable and planning modes survive: those are how this user
+    // works, not part of the conversation they just closed.
+  }
+
+  /**
+   * Names the session — on screen and in the database.
+   *
+   * Two titles arrive for one session. `POST /tasks` answers immediately with a deterministic
+   * one derived from the topic, and the LLM's short version follows over SSE a moment later.
+   * The first is provisional precisely so the second can replace it; anything after that is
+   * ignored, because later prompts in the same session must not rename it.
+   *
+   * The PATCH is fire-and-forget. A session that fails to save its name still works — it just
+   * shows its date in the sidebar next time, which is exactly where this started.
+   */
+  function applySessionTitle(title: string, { provisional = true }: { provisional?: boolean } = {}) {
+    // Named already, and not by a placeholder this call is entitled to replace.
+    if (sessionTitleRef.current && !(titleIsProvisionalRef.current && !provisional)) return;
+
     sessionTitleRef.current = title;
+    titleIsProvisionalRef.current = provisional;
     setSessionTitle(title);
     setPastSessions((prev) =>
       prev.map((s) => (s.id === sessionIdRef.current ? { ...s, title } : s))
     );
+
+    if (sessionIdRef.current) {
+      fetch(`/api/sessions/${sessionIdRef.current}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ title }),
+      }).catch(() => {});
+    }
   }
 
   function formatDate(isoString: string) {
@@ -953,6 +1196,14 @@ export default function ChatPage() {
     );
   }
 
+  function togglePlanningMode() {
+    // Switching off abandons any half-gathered campaign. Left in place, a campaign that had
+    // asked for its dates would keep claiming turns after the user had visibly opted out of
+    // planning — the next message would answer a question they no longer wanted asked.
+    if (planningMode) campaignRef.current = null;
+    setPlanningMode(!planningMode);
+  }
+
   function readFileAsDataUrl(file: File): Promise<string> {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -980,22 +1231,60 @@ export default function ChatPage() {
     setAttachments((prev) => prev.filter((_, i) => i !== index));
   }
 
-  function handleApproval(messageId: string, approval: ApprovalStatus) {
+  /**
+   * Sends the user's verdict on a text draft to the human gate.
+   *
+   * @param editedText the copy as it stands in the card when Approve was clicked. When it
+   *   differs from what the agent wrote, the verdict becomes `approve_after_edit` and the gate
+   *   swaps the edited copy in as the approved draft — so media_producer storyboards from the
+   *   user's words, and the final post publishes them. Unchanged text sends a plain `approve`.
+   * @param reason free-text feedback on a rejection, threaded back to the creator for the
+   *   re-draft. Optional: rejecting without saying why still works.
+   */
+  function handleApproval(
+    messageId: string,
+    approval: ApprovalStatus,
+    editedText?: string,
+    reason?: string
+  ) {
     const msg = messages.find((m) => m.id === messageId);
     const platformLabel = platformMap[msg?.platform ?? ""]?.label ?? "platform";
 
+    const edited = editedText?.trim();
+    const wasEdited =
+      approval === "approved" && !!edited && edited !== (msg?.draft?.text ?? "").trim();
+
     setMessages((prev) =>
-      prev.map((m) => (m.id === messageId ? { ...m, approval } : m))
+      prev.map((m) =>
+        m.id === messageId
+          ? {
+              ...m,
+              approval,
+              // Keep the card (and everything downstream that reads it — the video caption, the
+              // post body) on the copy the user actually approved, not the draft they replaced.
+              ...(wasEdited ? { draft: { ...m.draft, text: edited! } } : {}),
+            }
+          : m
+      )
     );
 
     // For workflow drafts, submit the verdict to the human gate so the MAF
     // pipeline can continue (media_producer runs after approval, creator re-drafts after reject).
     if (msg?.workflowTaskId && msg.platform) {
-      const decision = approval === "approved" ? "approve" : "reject";
+      const decision =
+        approval !== "approved" ? "reject" : wasEdited ? "approve_after_edit" : "approve";
       fetch(`/api/tasks/${msg.workflowTaskId}/review`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ verdicts: { [msg.platform]: { decision } } }),
+        body: JSON.stringify({
+          verdicts: {
+            [msg.platform]: {
+              decision,
+              ...(wasEdited ? { edited_draft: edited } : {}),
+              ...(reason?.trim() ? { reason: reason.trim() } : {}),
+            },
+          },
+        }),
       }).catch(() => {
         // Non-fatal: the SSE stream will surface an error event if the review fails.
       });
@@ -1095,6 +1384,64 @@ export default function ChatPage() {
       return [...prev.slice(0, idx), full, ...prev.slice(idx)];
     });
     return id;
+  }
+
+  // ── In-feed post mockup — one growing card per (task, platform) ──────────────
+
+  /**
+   * Applies `patch` to a run's post-mockup card, creating it on first contact.
+   *
+   * The card is the post itself, not a step in it: the copy arrives first (draft_ready), the
+   * storyboard lands in its media slot afterwards (final), and the render replaces that — all
+   * in the same mockup, so the user is always looking at the thing they're about to publish.
+   * Keyed by task AND platform because one run can draft for several platforms at once, and
+   * each gets its own mockup in its own platform's chrome.
+   */
+  function upsertSocialCard(
+    taskId: string,
+    platform: MockupPlatform,
+    patch: (m: Message) => Partial<Message>
+  ) {
+    const key = `${taskId}:${platform}`;
+    setMessages((prev) => {
+      const existingId = socialCardIdRef.current.get(key);
+      if (existingId) {
+        return prev.map((m) => (m.id === existingId ? { ...m, ...patch(m) } : m));
+      }
+      const id = newId();
+      socialCardIdRef.current.set(key, id);
+      const base: Message = {
+        id,
+        role: "assistant",
+        content: `Here's how your ${POST_MOCKUP[platform].label} post is shaping up:`,
+        variant: "social-post",
+        platform,
+        workflowTaskId: taskId,
+        timestamp: new Date(),
+      };
+      return [...prev, { ...base, ...patch(base) }];
+    });
+  }
+
+  /** Signs off (or sends back) the storyboard stage. Purely local: by the time a storyboard
+   *  exists the workflow has already yielded its output, so there is no gate to answer —
+   *  approving it just unlocks the render. */
+  function setStoryboardApproval(messageId: string, approval: ApprovalStatus) {
+    setMessages((prev) =>
+      prev.map((m) => (m.id === messageId ? { ...m, storyboardApproval: approval } : m))
+    );
+  }
+
+  /** Swaps in a revised storyboard after the user asked for changes, leaving it pending so
+   *  they can look at the revision and either accept it or push back again. */
+  function patchSocialStoryboard(messageId: string, storyboard: VideoStoryboard) {
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === messageId
+          ? { ...m, videoStoryboard: storyboard, storyboardApproval: "pending" }
+          : m
+      )
+    );
   }
 
   // ── Roundtable stage helpers — one growing stage per table_id ────────────────
@@ -1208,6 +1555,10 @@ export default function ChatPage() {
     // Each call is a fresh task with its own tables — table_ids (== platform names) are
     // reused across runs, so a stale map entry would otherwise append onto a dead card.
     roundtableMsgIdRef.current.clear();
+    // Keyed by task id, so these can't collide across runs — cleared only to stop the map
+    // growing for the length of the session. Storyboard revisions patch by message id, so an
+    // earlier run's card stays fully interactive after this.
+    socialCardIdRef.current.clear();
 
     // 1. Start the MAF workflow task.
     let taskId: string;
@@ -1268,6 +1619,16 @@ export default function ChatPage() {
       const node = event.node as string;
       const status = event.status as string;
       const platform = event.platform as string | undefined;
+
+      // The LLM's own short title, generated off the hot path and arriving a beat after the
+      // run begins. It replaces the placeholder the POST /tasks response set, and saves.
+      if (type === "session_title") {
+        const title = event.title;
+        if (typeof title === "string" && title.trim()) {
+          applySessionTitle(title, { provisional: false });
+        }
+        return;
+      }
 
       if (type === "progress") {
         // Show each executor once per platform to avoid duplicate status lines.
@@ -1383,28 +1744,44 @@ export default function ChatPage() {
         // the copy, but they are being asked something else entirely — "this cannot ship, what do
         // you want to do" — and that is not a question to answer on their behalf.
         if (contentTypes.includes("text") || blocked) {
-          pushMessage({
-            role: "assistant",
-            content: blocked
-              ? `This ${platform} draft was blocked by the content-safety check — you decide what happens next:`
-              : `Here's your ${platform} draft — approve or request changes:`,
-            variant: "text-preview",
-            platform: platform as Platform,
+          const draftFields = {
             draft: { text: event.draft as string },
-            workflowTaskId: taskId,
             needsHumanIntervention: (event.needs_human_intervention as boolean) ?? false,
             blocked,
             blockReason,
             allowedDecisions,
-            approval: "pending",
+            approval: "pending" as ApprovalStatus,
             // When a video was also requested, the single publish is the native video post
-            // (caption = this copy) from the storyboard card below — so hide this card's own
-            // text/image post buttons to avoid a competing second post.
+            // (caption = this copy) — so no competing text-only post is offered.
             videoAlsoRequested: contentTypes.includes("video"),
             // Set only when this turn's request actually named a time; the card falls back to
             // Post Now otherwise.
             publishAt: requestedPublishAtRef.current || undefined,
-          });
+          };
+          if (isMockupPlatform(platform as string) && !blocked) {
+            // The publishable platforms review the whole post in one mockup card. Upsert rather
+            // than push so a re-draft after "Request changes" lands back in the SAME card as
+            // fresh pending copy, instead of leaving the rejected version sitting above it.
+            const mockup = platform as MockupPlatform;
+            upsertSocialCard(taskId, mockup, () => ({
+              content: `Here's how your ${POST_MOCKUP[mockup].label} post is shaping up — edit the copy if you like, then approve:`,
+              ...draftFields,
+            }));
+          } else {
+            // A blocked gate always lands here, mockup platform or not: only DraftCard offers the
+            // three decisions such a gate accepts. The mockup card's plain approve would be
+            // refused with a 400, leaving the run stuck at a gate with no way to resolve it.
+            pushMessage({
+              role: "assistant",
+              content: blocked
+                ? `This ${platform} draft was blocked by the content-safety check — you decide what happens next:`
+                : `Here's your ${platform} draft — approve or request changes:`,
+              variant: "text-preview",
+              platform: platform as Platform,
+              workflowTaskId: taskId,
+              ...draftFields,
+            });
+          }
           if (sessionIdRef.current) {
             persistMessage(sessionIdRef.current, "assistant", event.draft as string);
           }
@@ -1444,18 +1821,35 @@ export default function ChatPage() {
         // storyboard is data only at this point — rendering the MP4 is a separate,
         // explicitly-triggered job (see VideoStoryboardCard's "Render Video" button).
         if (event.video_storyboard && contentTypes.includes("video")) {
-          pushMessage({
-            role: "assistant",
-            content: `Brand video storyboard — ${platform}:`,
+          const storyboardFields = {
             videoStoryboard: event.video_storyboard as VideoStoryboard,
-            platform: platform as Platform,
-            workflowTaskId: taskId,
-            approval: "approved",
             referenceImages: pendingRefsRef.current.length ? pendingRefsRef.current : undefined,
-            // Carry the approved copy so the video card prefills its caption with it — a text+video
-            // task then publishes as one native video post with the generated copy as the caption.
-            draft: contentTypes.includes("text") ? { text: event.draft as string } : undefined,
-          });
+          };
+          if (isMockupPlatform(platform as string)) {
+            // Slot the storyboard into the media area of the card the copy is already in. A
+            // video-only run never hit the gate, so there may be no card yet — upsert creates
+            // one, carrying the storyboard straight to its own approval step.
+            upsertSocialCard(taskId, platform as MockupPlatform, () => ({
+              content: "Storyboard's ready — take a look before we render it:",
+              ...storyboardFields,
+              storyboardApproval: "pending",
+              // media_producer generates from the approved (possibly edited) copy, so `draft`
+              // here is the text the user signed off — the caption this publishes with.
+              draft: contentTypes.includes("text") ? { text: event.draft as string } : undefined,
+            }));
+          } else {
+            pushMessage({
+              role: "assistant",
+              content: `Brand video storyboard — ${platform}:`,
+              platform: platform as Platform,
+              workflowTaskId: taskId,
+              approval: "approved",
+              ...storyboardFields,
+              // Carry the approved copy so the video card prefills its caption with it — a text+video
+              // task then publishes as one native video post with the generated copy as the caption.
+              draft: contentTypes.includes("text") ? { text: event.draft as string } : undefined,
+            });
+          }
         }
       }
     };
@@ -1663,6 +2057,18 @@ export default function ChatPage() {
           <p className="text-xs text-[#9E9893] mt-0.5">AI Content Assistant</p>
         </div>
 
+        {/* Pinned above the scrolling list: starting over shouldn't require scrolling past
+            however many past sessions the user has. */}
+        <div className="px-5 pt-5 flex-shrink-0">
+          <button
+            onClick={startNewChat}
+            disabled={isLoading || loadingSessionId !== null}
+            className="w-full bg-[#FF4800] hover:bg-[#E03E00] disabled:opacity-50 text-white text-sm font-medium py-2.5 rounded-xl transition-colors"
+          >
+            + New chat
+          </button>
+        </div>
+
         <div className="flex-1 overflow-y-auto p-5 space-y-7">
           {/* Past Sessions */}
           {pastSessions.length > 0 && (
@@ -1671,7 +2077,7 @@ export default function ChatPage() {
                 Past Sessions
               </h3>
               <div className="space-y-1.5">
-                {pastSessions.map((s) => {
+                {visibleSessions.map((s) => {
                   const isActive = s.id === activeSessionId;
                   const isLoading = s.id === loadingSessionId;
                   return (
@@ -1697,6 +2103,32 @@ export default function ChatPage() {
                   );
                 })}
               </div>
+
+              {showSessionsToggle && (
+                <button
+                  onClick={() => setShowAllSessions((open) => !open)}
+                  aria-expanded={showAllSessions}
+                  className="flex items-center gap-1.5 w-full px-3 py-2 mt-1.5 rounded-lg text-[11px] font-medium text-[#9E9893] hover:text-[#1B1A17] hover:bg-[#F2EDE4] transition-colors"
+                >
+                  <svg
+                    width="10"
+                    height="10"
+                    viewBox="0 0 10 10"
+                    fill="none"
+                    aria-hidden="true"
+                    className={`transition-transform ${showAllSessions ? "rotate-180" : ""}`}
+                  >
+                    <path
+                      d="M2 3.5L5 6.5L8 3.5"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                  {showAllSessions ? "Show less" : `Show ${hiddenSessionCount} more`}
+                </button>
+              )}
             </div>
           )}
 
@@ -1797,6 +2229,39 @@ export default function ChatPage() {
             </p>
           </div>
 
+          {/* Planning mode */}
+          <div>
+            <h3 className="text-xs font-semibold text-[#9E9893] uppercase tracking-wider mb-3">
+              Planning
+            </h3>
+            <button
+              onClick={togglePlanningMode}
+              aria-pressed={planningMode}
+              className={`flex items-center justify-between w-full px-3 py-2 rounded-lg text-sm transition-colors border ${
+                planningMode
+                  ? "bg-[#FFF0EB] text-[#FF4800] border-[#FFCBB8]"
+                  : "text-[#6B6561] border-[#E8E3DA] hover:bg-[#F2EDE4]"
+              }`}
+            >
+              <span>Posting plan</span>
+              <span
+                className={`w-9 h-5 rounded-full relative transition-colors flex-shrink-0 ${
+                  planningMode ? "bg-[#FF4800]" : "bg-[#E8E3DA]"
+                }`}
+              >
+                <span
+                  className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+                    planningMode ? "translate-x-4" : "translate-x-0"
+                  }`}
+                />
+              </span>
+            </button>
+            <p className="text-[10px] text-[#BDB6AE] mt-1.5 leading-relaxed">
+              When on, your message becomes a dated schedule of posts across a period rather than
+              one post. Expect a question or two about the goal and the dates.
+            </p>
+          </div>
+
         </div>
       </aside>
 
@@ -1846,6 +2311,24 @@ export default function ChatPage() {
         {/* Messages */}
         <div className="flex-1 overflow-y-auto px-6 py-6 space-y-5">
           {messages.map((msg) => {
+            // Checked before the storyboard branch below, which keys off field presence rather
+            // than variant: once a storyboard lands in a mockup card's media area it would
+            // otherwise flip the whole post preview over to the bare storyboard card.
+            if (msg.variant === "social-post" && isMockupPlatform(msg.platform ?? "")) {
+              return (
+                <SocialPostCard
+                  key={msg.id}
+                  message={msg}
+                  platform={msg.platform as MockupPlatform}
+                  onApprove={(editedText) => handleApproval(msg.id, "approved", editedText)}
+                  onReject={(reason) => handleApproval(msg.id, "rejected", undefined, reason)}
+                  onStoryboardApprove={() => setStoryboardApproval(msg.id, "approved")}
+                  onStoryboardPatch={(storyboard) => patchSocialStoryboard(msg.id, storyboard)}
+                  formatTime={formatTime}
+                />
+              );
+            }
+
             // Workflow final event: storyboard delivered directly (no job polling
             // needed for this part) — actually rendering the MP4 is a separate,
             // explicitly-triggered job the card kicks off on demand.
@@ -2139,6 +2622,10 @@ function slideSummary(slide: VideoSlide): string {
  * triggered job: clicking "Render Video" posts {taskId, platform} to /api/video,
  * polls /api/video/[jobId] until done, then swaps the preview for a real
  * <video> player sourced from the finished download.
+ *
+ * Preview and download only — there are no publish controls here because the platforms this
+ * still serves (X, TikTok) have no posting integration. LinkedIn and Facebook storyboards go
+ * to SocialPostCard instead, which reviews and publishes the whole post as one piece.
  */
 function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) {
   const storyboard = message.videoStoryboard!;
@@ -2147,95 +2634,8 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
-  // Prefill the caption with the approved post copy when a text+video task threaded it on
-  // (message.draft); a video-only task has none, so it starts empty for the user to write.
-  const [caption, setCaption] = useState(() => message.draft?.text ?? "");
-  const [videoTitle, setVideoTitle] = useState("");
-  const [postStatus, setPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
-  const [postError, setPostError] = useState<string | null>(null);
   // Reference images carried from the compose box; the user can drop any before rendering.
   const [refs, setRefs] = useState<string[]>(message.referenceImages ?? []);
-
-  async function handlePostVideoToLinkedIn() {
-    if (!jobId || !caption.trim()) return;
-    const token = localStorage.getItem("starlight_token");
-    if (!token) {
-      setPostStatus("error");
-      setPostError("Log in, then connect LinkedIn from your Brand Profile before posting.");
-      return;
-    }
-    setPostStatus("posting");
-    setPostError(null);
-    try {
-      const res = await fetch("/api/linkedin/post-video", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ jobId, message: caption.trim() }),
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        setPostStatus("error");
-        setPostError(data.error ?? "Failed to post video to LinkedIn.");
-        return;
-      }
-      setPostStatus("posted");
-    } catch {
-      setPostStatus("error");
-      setPostError("Could not reach the backend.");
-    }
-  }
-
-  // Facebook storyboards publish the rendered MP4 to the connected Facebook Page.
-  // The proxy fetches the video bytes from the LLM service by jobId, so we only pass the id.
-  async function handlePostVideoToFacebook() {
-    if (!jobId || !caption.trim()) return;
-    const token = localStorage.getItem("starlight_token");
-    if (!token) {
-      setPostStatus("error");
-      setPostError("Log in, then connect Facebook from your Brand Profile before posting.");
-      return;
-    }
-    const pageIds = getSelectedPageIds();
-    if (pageIds.length === 0) {
-      setPostStatus("error");
-      setPostError("Connect Facebook and pick a Page in your Brand Profile first.");
-      return;
-    }
-    setPostStatus("posting");
-    setPostError(null);
-    try {
-      const res = await fetch("/api/meta/post-video", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          // Graph captions a Page video from `description` on the /{page-id}/videos edge —
-          // `message` is the /feed and /photos field and is silently dropped there. Send the
-          // caption as both so the one Java endpoint can serve whichever edge the mime picks.
-          jobId,
-          message: caption.trim(),
-          title: videoTitle.trim(),
-          description: caption.trim(),
-          pageIds,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        setPostStatus("error");
-        setPostError(data.error ?? "Failed to post video to Facebook.");
-        return;
-      }
-      setPostStatus("posted");
-    } catch {
-      setPostStatus("error");
-      setPostError("Could not reach the backend.");
-    }
-  }
 
   async function startRender() {
     if (!message.workflowTaskId || !message.platform) return;
@@ -2358,77 +2758,6 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
             >
               {renderState === "error" ? "Retry Render" : "Render Video"}
             </button>
-          </div>
-        )}
-
-        {renderState === "done" && message.platform === "linkedin" && (
-          <div className="px-4 pb-4 pt-1 border-t border-[#E8E3DA] space-y-2">
-            {postStatus === "posted" ? (
-              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
-                ✓ Posted to LinkedIn
-              </div>
-            ) : (
-              <>
-                <textarea
-                  value={caption}
-                  onChange={(e) => setCaption(e.target.value)}
-                  placeholder="Write a caption for this video…"
-                  rows={2}
-                  disabled={postStatus === "posting"}
-                  className="w-full bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-2 text-xs text-[#1B1A17] placeholder:text-[#9E9893] resize-none focus:outline-none focus:border-[#FF4800] disabled:opacity-60"
-                />
-                <button
-                  onClick={handlePostVideoToLinkedIn}
-                  disabled={postStatus === "posting" || !caption.trim()}
-                  className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-                >
-                  {postStatus === "posting" ? "Uploading & posting…" : "Post Video to LinkedIn"}
-                </button>
-              </>
-            )}
-            {postStatus === "error" && postError && (
-              <p className="text-xs text-red-600 text-center">{postError}</p>
-            )}
-          </div>
-        )}
-
-        {/* Facebook storyboards publish to the connected Facebook Page. */}
-        {renderState === "done" && message.platform === "facebook" && (
-          <div className="px-4 pb-4 pt-1 border-t border-[#E8E3DA] space-y-2">
-            {postStatus === "posted" ? (
-              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
-                ✓ Posted to Facebook
-              </div>
-            ) : (
-              <>
-                <input
-                  type="text"
-                  value={videoTitle}
-                  onChange={(e) => setVideoTitle(e.target.value)}
-                  placeholder="Video title (optional)"
-                  disabled={postStatus === "posting"}
-                  className="w-full bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-2 text-xs text-[#1B1A17] placeholder:text-[#9E9893] focus:outline-none focus:border-[#FF4800] disabled:opacity-60"
-                />
-                <textarea
-                  value={caption}
-                  onChange={(e) => setCaption(e.target.value)}
-                  placeholder="Write a caption for this video…"
-                  rows={2}
-                  disabled={postStatus === "posting"}
-                  className="w-full bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-2 text-xs text-[#1B1A17] placeholder:text-[#9E9893] resize-none focus:outline-none focus:border-[#FF4800] disabled:opacity-60"
-                />
-                <button
-                  onClick={handlePostVideoToFacebook}
-                  disabled={postStatus === "posting" || !caption.trim()}
-                  className="w-full bg-[#1877F2] hover:bg-[#166FE0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-                >
-                  {postStatus === "posting" ? "Uploading & posting…" : "Post Video to Facebook"}
-                </button>
-              </>
-            )}
-            {postStatus === "error" && postError && (
-              <p className="text-xs text-red-600 text-center">{postError}</p>
-            )}
           </div>
         )}
 
@@ -3051,6 +3380,7 @@ function PlanCard({
 }: PlanCardProps) {
   const [feedback, setFeedback] = useState("");
   const [busy, setBusy] = useState<"refining" | "confirming" | null>(null);
+  const [draftMode, setDraftMode] = useState<DraftMode>("roundtable");
 
   const isDraft = plan.status === "draft";
 
@@ -3088,7 +3418,8 @@ function PlanCard({
     try {
       const res = await fetch(`/api/plans/${plan.plan_id}/confirm`, {
         method: "POST",
-        headers: authHeaders(),
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ draft_mode: draftMode }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
@@ -3097,8 +3428,8 @@ function PlanCard({
       }
       onPlanChanged(data as Plan);
       onNotice(
-        `Confirmed — I'm writing all ${plan.items.length} posts now. They'll appear in your ` +
-        `review queue as they're ready, and nothing publishes until you approve it.`
+        `Confirmed — I'm writing your ${plan.items.length} posts now, one at a time. Follow ` +
+        `along in Posting Plans; nothing publishes until you approve it.`
       );
     } catch {
       onNotice("Could not reach the planning service.");
@@ -3186,6 +3517,41 @@ function PlanCard({
               </button>
             </div>
 
+            {/* The one thing worth deciding before committing: ten posts is the difference
+                between half a minute and half an hour of model work. */}
+            <div className="flex gap-1.5">
+              {(
+                [
+                  { id: "roundtable", label: "Roundtable", cost: "~3 min a post" },
+                  { id: "fast", label: "Fast", cost: "~20 sec a post" },
+                ] as const
+              ).map((option) => {
+                const active = draftMode === option.id;
+                return (
+                  <button
+                    key={option.id}
+                    onClick={() => setDraftMode(option.id)}
+                    disabled={busy !== null}
+                    aria-pressed={active}
+                    className={`flex-1 rounded-lg border px-2 py-1.5 text-left transition-colors disabled:opacity-50 ${
+                      active
+                        ? "border-[#FF4800] bg-[#FFF0EB]"
+                        : "border-[#E8E3DA] bg-white hover:border-[#C8C2BA]"
+                    }`}
+                  >
+                    <span className="block text-[11px] font-medium text-[#1B1A17]">
+                      {option.label}
+                    </span>
+                    <span
+                      className={`block text-[10px] ${active ? "text-[#FF4800]" : "text-[#9E9893]"}`}
+                    >
+                      {option.cost}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
             <button
               onClick={handleConfirm}
               disabled={busy !== null}
@@ -3196,7 +3562,8 @@ function PlanCard({
                 : `Confirm — write all ${plan.items.length} posts`}
             </button>
             <p className="text-[11px] text-[#9E9893] text-center leading-relaxed">
-              Every post is drafted for you to review. Nothing publishes until you approve it.
+              Written one at a time, in order, for you to review. Nothing publishes until you
+              approve it.
             </p>
           </div>
         ) : (
@@ -3204,8 +3571,14 @@ function PlanCard({
             <p className="text-xs text-green-700 font-medium mb-1">
               ✓ Confirmed — writing {plan.items.length} posts
             </p>
-            <Link href="/plans" className="text-xs text-[#FF4800] hover:underline">
-              Track them in Posting Plans →
+            {/* Named, so the link lands on THIS campaign. Without the id it opens on "No plan
+                selected" and the user has to find, among every plan they've ever made, the one
+                they were looking at a second ago. */}
+            <Link
+              href={`/plans?plan=${plan.plan_id}`}
+              className="text-xs text-[#FF4800] hover:underline"
+            >
+              Watch them being written →
             </Link>
           </div>
         )}
@@ -3306,6 +3679,16 @@ function BrandAnimationCard({
 
 // ── Draft Card ────────────────────────────────────────────────────────────────
 
+/**
+ * A generic platform draft: the copy, and approve/reject.
+ *
+ * Review only — there are no publish controls because the platforms this still serves
+ * (X, TikTok) have no posting integration; their copy is drafted here and posted by hand.
+ * LinkedIn and Facebook drafts go to SocialPostCard instead, which shows the post in that
+ * network's own chrome and carries it all the way through to publishing — with one exception:
+ * a gate the compliance screen blocked always lands here, whatever the platform, because this
+ * is the only card that offers the three decisions such a gate accepts.
+ */
 function DraftCard({
   message,
   onApprove,
@@ -3320,261 +3703,6 @@ function DraftCard({
   const platform = platformMap[message.platform!];
   const draft = message.draft!;
   const approval = message.approval;
-
-  // The moment the agent read out of the request, split into the two controls below. Absent or
-  // malformed leaves both blank, which is indistinguishable from a draft nobody timed.
-  const [agentDate, agentTime] = splitPublishAt(message.publishAt);
-
-  // "now" = post immediately, "schedule" = pick a date/time first. Opens on "schedule" when the
-  // user already said when they wanted this out — asking them to click Schedule and retype a
-  // time they just gave in the prompt is the whole gap this closes.
-  const [postMode, setPostMode] = useState<"now" | "schedule">(
-    agentDate ? "schedule" : "now"
-  );
-  const [postStatus, setPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
-  const [postError, setPostError] = useState<string | null>(null);
-  // Image posting is tracked separately from the text post so the two buttons don't clobber
-  // each other's status. The user attaches a real image file; it's uploaded as multipart.
-  const [imageFile, setImageFile] = useState<File | null>(null);
-  const [imagePostStatus, setImagePostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
-  const [imagePostError, setImagePostError] = useState<string | null>(null);
-
-  // The caption used for both text and image posts: the draft body plus any hashtags.
-  const captionText =
-    draft.hashtags && draft.hashtags.length > 0
-      ? `${draft.text}\n\n${draft.hashtags.join(" ")}`
-      : draft.text;
-
-  async function handlePostImageToLinkedIn() {
-    if (!imageFile) return;
-    const token = localStorage.getItem("starlight_token");
-    if (!token) {
-      setImagePostStatus("error");
-      setImagePostError("Log in, then connect LinkedIn from your Brand Profile before posting.");
-      return;
-    }
-    setImagePostStatus("posting");
-    setImagePostError(null);
-    try {
-      const form = new FormData();
-      form.append("image", imageFile);
-      form.append("message", captionText);
-      const res = await fetch("/api/linkedin/post-image", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-        body: form,
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        setImagePostStatus("error");
-        setImagePostError(data.error ?? "Failed to post image to LinkedIn.");
-        return;
-      }
-      setImagePostStatus("posted");
-    } catch {
-      setImagePostStatus("error");
-      setImagePostError("Could not reach the backend.");
-    }
-  }
-
-  // Scheduling fields — native date/time inputs give a built-in calendar UI. Seeded from the
-  // agent's reading of the request when there was one, and freely editable either way: this is
-  // a filled-in form, not a decision already taken.
-  const [scheduleDate, setScheduleDate] = useState(agentDate); // "2026-07-18"
-  const [scheduleTime, setScheduleTime] = useState(agentTime); // "10:00"
-  const [scheduleStatus, setScheduleStatus] = useState<"idle" | "scheduling" | "scheduled" | "error">("idle");
-  const [scheduleError, setScheduleError] = useState<string | null>(null);
-
-  function fullText() {
-    return draft.hashtags && draft.hashtags.length > 0
-      ? `${draft.text}\n\n${draft.hashtags.join(" ")}`
-      : draft.text;
-  }
-
-  async function handlePostToLinkedIn() {
-    const token = localStorage.getItem("starlight_token");
-    if (!token) {
-      setPostStatus("error");
-      setPostError(
-        "Log in, then connect LinkedIn from your Brand Profile before posting."
-      );
-      return;
-    }
-
-    setPostStatus("posting");
-    setPostError(null);
-
-    try {
-      const res = await fetch("/api/linkedin/post", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ message: fullText() }),
-      });
-
-      const data = await res.json();
-
-      if (!res.ok || data.error) {
-        setPostStatus("error");
-        setPostError(data.error ?? "Failed to post to LinkedIn.");
-        return;
-      }
-
-      setPostStatus("posted");
-    } catch {
-      setPostStatus("error");
-      setPostError("Could not reach the backend.");
-    }
-  }
-
-  /**
-   * Queues this draft for later instead of publishing it now.
-   *
-   * Goes through the shared scheduling API so the draft lands in the same persisted queue the
-   * content calendar reads — one place to see, edit and cancel it, and a schedule that survives
-   * a backend restart. The browser's timezone rides along so "10:00" means 10:00 where the user
-   * is, not in whatever zone the server runs in.
-   *
-   * @param platform the card's own platform; a card is only ever one of them, which is why the
-   *                 date/time state below can be shared between the two branches
-   * @param pageIds  Facebook Pages to publish to. Empty for LinkedIn, which has no equivalent —
-   *                 the backend ignores the field for it.
-   */
-  async function schedulePost(platform: "linkedin" | "facebook", pageIds: number[] = []) {
-    const label = platform === "facebook" ? "Facebook" : "LinkedIn";
-    const token = localStorage.getItem("starlight_token");
-    if (!token) {
-      setScheduleStatus("error");
-      setScheduleError(
-        `Log in, then connect ${label} from your Brand Profile before scheduling.`
-      );
-      return;
-    }
-    // Checked here as well as on the immediate-post path: a scheduled Facebook post needs a
-    // Page just as much, and finding that out when it comes due days later would be far worse
-    // than finding out now.
-    if (platform === "facebook" && pageIds.length === 0) {
-      setScheduleStatus("error");
-      setScheduleError("Connect Facebook and pick a Page in your Brand Profile first.");
-      return;
-    }
-    if (!scheduleDate || !scheduleTime) {
-      setScheduleStatus("error");
-      setScheduleError("Pick a date and time first.");
-      return;
-    }
-    setScheduleStatus("scheduling");
-    setScheduleError(null);
-
-    try {
-      const res = await fetch("/api/schedule/posts", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          platform,
-          message: fullText(),
-          date: scheduleDate,
-          time: scheduleTime,
-          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-          page_ids: pageIds,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        setScheduleStatus("error");
-        setScheduleError(data.error ?? "Failed to schedule the post.");
-        return;
-      }
-      setScheduleStatus("scheduled");
-    } catch {
-      setScheduleStatus("error");
-      setScheduleError("Could not reach the backend.");
-    }
-  }
-  
-  // Facebook drafts publish to a connected Facebook Page (see the Brand Profile
-  // "Facebook Page" card). These reuse the same status states as the LinkedIn handlers — a
-  // given card is only ever one platform, so they never run against each other.
-  async function handlePostTextToFacebook() {
-    const token = localStorage.getItem("starlight_token");
-    if (!token) {
-      setPostStatus("error");
-      setPostError("Log in, then connect Facebook from your Brand Profile before posting.");
-      return;
-    }
-    const pageIds = getSelectedPageIds();
-    if (pageIds.length === 0) {
-      setPostStatus("error");
-      setPostError("Connect Facebook and pick a Page in your Brand Profile first.");
-      return;
-    }
-    setPostStatus("posting");
-    setPostError(null);
-    try {
-      const form = new FormData();
-      form.append("message", captionText);
-      for (const id of pageIds) form.append("pageId", String(id));
-      const res = await fetch("/api/meta/post", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-        body: form,
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        setPostStatus("error");
-        setPostError(data.error ?? "Failed to post to Facebook.");
-        return;
-      }
-      setPostStatus("posted");
-    } catch {
-      setPostStatus("error");
-      setPostError("Could not reach the backend.");
-    }
-  }
-
-  async function handlePostImageToFacebook() {
-    if (!imageFile) return;
-    const token = localStorage.getItem("starlight_token");
-    if (!token) {
-      setImagePostStatus("error");
-      setImagePostError("Log in, then connect Facebook from your Brand Profile before posting.");
-      return;
-    }
-    const pageIds = getSelectedPageIds();
-    if (pageIds.length === 0) {
-      setImagePostStatus("error");
-      setImagePostError("Connect Facebook and pick a Page in your Brand Profile first.");
-      return;
-    }
-    setImagePostStatus("posting");
-    setImagePostError(null);
-    try {
-      const form = new FormData();
-      form.append("image", imageFile);
-      form.append("message", captionText);
-      for (const id of pageIds) form.append("pageId", String(id));
-      const res = await fetch("/api/meta/post", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-        body: form,
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        setImagePostStatus("error");
-        setImagePostError(data.error ?? "Failed to post image to Facebook.");
-        return;
-      }
-      setImagePostStatus("posted");
-    } catch {
-      setImagePostStatus("error");
-      setImagePostError("Could not reach the backend.");
-    }
-  }
 
   return (
     <div className="w-full max-w-lg">
@@ -3716,256 +3844,11 @@ function DraftCard({
           </div>
         )}
 
-        {/* A text+video task publishes as a single native video post (caption = this copy) from
-            the storyboard card below, so this card offers no competing text/image post — just a note. */}
-        {approval === "approved" && message.platform === "linkedin" && message.videoAlsoRequested && (
+        {approval === "approved" && (
           <div className="px-4 pb-4">
             <div className="rounded-lg bg-[#F8F5EE] border border-[#E8E3DA] px-3 py-2 text-xs text-[#6B6561]">
-              This copy will be published as the caption of your video post below — render and
-              post it there to publish once.
-            </div>
-          </div>
-        )}
-
-        {/* Post / Schedule (LinkedIn only, once approved) */}
-        {approval === "approved" && message.platform === "linkedin" && !message.videoAlsoRequested && (
-          <div className="px-4 pb-4 space-y-3">
-            {postStatus === "posted" ? (
-              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
-                ✓ Posted to LinkedIn
-              </div>
-            ) : scheduleStatus === "scheduled" ? (
-              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
-                ✓ Scheduled for {scheduleDate} at {scheduleTime}
-              </div>
-            ) : (
-              <>
-                {/* Mode toggle */}
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => setPostMode("now")}
-                    className={`flex-1 text-sm font-medium py-1.5 rounded-lg transition-colors ${
-                      postMode === "now"
-                        ? "bg-[#0A66C2] text-white"
-                        : "bg-[#F2EDE4] text-[#6B6561] border border-[#E8E3DA]"
-                    }`}
-                  >
-                    Post Now
-                  </button>
-                  <button
-                    onClick={() => setPostMode("schedule")}
-                    className={`flex-1 text-sm font-medium py-1.5 rounded-lg transition-colors ${
-                      postMode === "schedule"
-                        ? "bg-[#0A66C2] text-white"
-                        : "bg-[#F2EDE4] text-[#6B6561] border border-[#E8E3DA]"
-                    }`}
-                  >
-                    Schedule
-                  </button>
-                </div>
-
-                {postMode === "now" ? (
-                  <button
-                    onClick={handlePostToLinkedIn}
-                    disabled={postStatus === "posting"}
-                    className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-                  >
-                    {postStatus === "posting" ? "Posting…" : "Post to LinkedIn"}
-                  </button>
-                ) : (
-                  <div className="space-y-2">
-                    {/* Say where the pre-filled time came from. Without this the controls just
-                        arrive populated, and a user who didn't notice would publish on a day
-                        they never confirmed. */}
-                    {agentDate && (
-                      <p className="text-xs text-[#6B6561] bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-2.5 py-1.5 leading-relaxed">
-                        Timed from your request — adjust it here if that&apos;s not what you meant.
-                      </p>
-                    )}
-                    <div className="flex gap-2">
-                      <input
-                        type="date"
-                        value={scheduleDate}
-                        onChange={(e) => setScheduleDate(e.target.value)}
-                        className="flex-1 bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-1.5 text-sm text-[#1B1A17] focus:outline-none focus:border-[#0A66C2]"
-                      />
-                      <input
-                        type="time"
-                        value={scheduleTime}
-                        onChange={(e) => setScheduleTime(e.target.value)}
-                        className="flex-1 bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-1.5 text-sm text-[#1B1A17] focus:outline-none focus:border-[#0A66C2]"
-                      />
-                    </div>
-                    <button
-                      onClick={() => schedulePost("linkedin")}
-                      disabled={scheduleStatus === "scheduling"}
-                      className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-                    >
-                      {scheduleStatus === "scheduling" ? "Scheduling…" : "Schedule Post"}
-                    </button>
-                  </div>
-                )}
-
-                {postStatus === "error" && postError && (
-                  <p className="text-xs text-red-600 text-center">{postError}</p>
-                )}
-                {scheduleStatus === "error" && scheduleError && (
-                  <p className="text-xs text-red-600 text-center">{scheduleError}</p>
-                )}
-              </>
-            )}
-
-            {/* Optional: attach an image and publish it with this caption as an image post. */}
-            <div className="mt-3 pt-3 border-t border-[#E8E3DA]">
-              {imagePostStatus === "posted" ? (
-                <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
-                  ✓ Image posted to LinkedIn
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  <input
-                    type="file"
-                    accept="image/*"
-                    onChange={(e) => {
-                      setImageFile(e.target.files?.[0] ?? null);
-                      setImagePostStatus("idle");
-                      setImagePostError(null);
-                    }}
-                    className="block w-full text-xs text-[#6B6561] file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border file:border-[#E8E3DA] file:bg-[#F2EDE4] file:text-[#1B1A17] file:text-xs file:font-medium hover:file:bg-[#E8E3DA]"
-                  />
-                  <button
-                    onClick={handlePostImageToLinkedIn}
-                    disabled={!imageFile || imagePostStatus === "posting"}
-                    className="w-full bg-[#0A66C2] hover:bg-[#0952A0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-                  >
-                    {imagePostStatus === "posting" ? "Uploading & posting…" : "Post Image to LinkedIn"}
-                  </button>
-                </div>
-              )}
-              {imagePostStatus === "error" && imagePostError && (
-                <p className="text-xs text-red-600 mt-2 text-center">{imagePostError}</p>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* Facebook drafts publish to the connected Facebook Page (Brand Profile). */}
-        {approval === "approved" && message.platform === "facebook" && (
-          <div className="px-4 pb-4 space-y-3">
-            {postStatus === "posted" ? (
-              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
-                ✓ Posted to Facebook
-              </div>
-            ) : scheduleStatus === "scheduled" ? (
-              <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
-                ✓ Scheduled for {scheduleDate} at {scheduleTime}
-              </div>
-            ) : (
-              <>
-                {/* Same now/schedule choice LinkedIn drafts get. Facebook holds the schedule
-                    itself once the time is far enough out, so a scheduled post here survives
-                    this service being down at publish time. */}
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => setPostMode("now")}
-                    className={`flex-1 text-sm font-medium py-1.5 rounded-lg transition-colors ${
-                      postMode === "now"
-                        ? "bg-[#1877F2] text-white"
-                        : "bg-[#F2EDE4] text-[#6B6561] border border-[#E8E3DA]"
-                    }`}
-                  >
-                    Post Now
-                  </button>
-                  <button
-                    onClick={() => setPostMode("schedule")}
-                    className={`flex-1 text-sm font-medium py-1.5 rounded-lg transition-colors ${
-                      postMode === "schedule"
-                        ? "bg-[#1877F2] text-white"
-                        : "bg-[#F2EDE4] text-[#6B6561] border border-[#E8E3DA]"
-                    }`}
-                  >
-                    Schedule
-                  </button>
-                </div>
-
-                {postMode === "now" ? (
-                  <button
-                    onClick={handlePostTextToFacebook}
-                    disabled={postStatus === "posting"}
-                    className="w-full bg-[#1877F2] hover:bg-[#166FE0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-                  >
-                    {postStatus === "posting" ? "Posting…" : "Post to Facebook"}
-                  </button>
-                ) : (
-                  <div className="space-y-2">
-                    {agentDate && (
-                      <p className="text-xs text-[#6B6561] bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-2.5 py-1.5 leading-relaxed">
-                        Timed from your request — adjust it here if that&apos;s not what you meant.
-                      </p>
-                    )}
-                    <div className="flex gap-2">
-                      <input
-                        type="date"
-                        value={scheduleDate}
-                        onChange={(e) => setScheduleDate(e.target.value)}
-                        className="flex-1 bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-1.5 text-sm text-[#1B1A17] focus:outline-none focus:border-[#1877F2]"
-                      />
-                      <input
-                        type="time"
-                        value={scheduleTime}
-                        onChange={(e) => setScheduleTime(e.target.value)}
-                        className="flex-1 bg-[#F8F5EE] border border-[#E8E3DA] rounded-lg px-3 py-1.5 text-sm text-[#1B1A17] focus:outline-none focus:border-[#1877F2]"
-                      />
-                    </div>
-                    <button
-                      onClick={() => schedulePost("facebook", getSelectedPageIds())}
-                      disabled={scheduleStatus === "scheduling"}
-                      className="w-full bg-[#1877F2] hover:bg-[#166FE0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-                    >
-                      {scheduleStatus === "scheduling" ? "Scheduling…" : "Schedule Post"}
-                    </button>
-                  </div>
-                )}
-
-                {postStatus === "error" && postError && (
-                  <p className="text-xs text-red-600 text-center">{postError}</p>
-                )}
-                {scheduleStatus === "error" && scheduleError && (
-                  <p className="text-xs text-red-600 text-center">{scheduleError}</p>
-                )}
-              </>
-            )}
-
-            {/* Optional: attach an image and publish it with this caption as a photo post. */}
-            <div className="mt-3 pt-3 border-t border-[#E8E3DA]">
-              {imagePostStatus === "posted" ? (
-                <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
-                  ✓ Image posted to Facebook
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  <input
-                    type="file"
-                    accept="image/*"
-                    onChange={(e) => {
-                      setImageFile(e.target.files?.[0] ?? null);
-                      setImagePostStatus("idle");
-                      setImagePostError(null);
-                    }}
-                    className="block w-full text-xs text-[#6B6561] file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border file:border-[#E8E3DA] file:bg-[#F2EDE4] file:text-[#1B1A17] file:text-xs file:font-medium hover:file:bg-[#E8E3DA]"
-                  />
-                  <button
-                    onClick={handlePostImageToFacebook}
-                    disabled={!imageFile || imagePostStatus === "posting"}
-                    className="w-full bg-[#1877F2] hover:bg-[#166FE0] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-                  >
-                    {imagePostStatus === "posting" ? "Uploading & posting…" : "Post Image to Facebook"}
-                  </button>
-                </div>
-              )}
-              {imagePostStatus === "error" && imagePostError && (
-                <p className="text-xs text-red-600 mt-2 text-center">{imagePostError}</p>
-              )}
+              Approved — {platform.label} isn&apos;t connected for publishing, so copy this across
+              when you&apos;re ready to post.
             </div>
           </div>
         )}
@@ -3973,6 +3856,837 @@ function DraftCard({
         <p className="text-xs text-[#9E9893] px-4 pb-3">
           {formatTime(message.timestamp)}
         </p>
+      </div>
+    </div>
+  );
+}
+
+// ── LinkedIn Post Card ────────────────────────────────────────────────────────
+
+interface SocialPostCardProps {
+  message: Message;
+  platform: MockupPlatform;
+  /** Approve the copy. Receives the text as it stands in the editor, which may differ from
+   *  what the agent wrote — the caller turns that into an `approve_after_edit` verdict. */
+  onApprove: (editedText: string) => void;
+  onReject: (reason: string) => void;
+  onStoryboardApprove: () => void;
+  onStoryboardPatch: (storyboard: VideoStoryboard) => void;
+  formatTime: (d: Date) => string;
+}
+
+/** The publish moment as a feed post would show it: "now", "2h", "3d". */
+function relativePostAge(at: Date): string {
+  const mins = Math.max(0, Math.floor((Date.now() - at.getTime()) / 60000));
+  if (mins < 1) return "now";
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
+}
+
+/**
+ * One post, reviewed in place from first draft to publish, in its own platform's chrome.
+ *
+ * The card IS the post: the copy sits where the copy will sit, the media (a storyboard, then the
+ * rendered MP4, or an attached photo) sits where the media will sit, and each stage's controls
+ * hang off the bottom of the same mockup. That replaces a read-only draft card and a separate,
+ * ungated storyboard card whose relationship to each other — one post, not two — was never visible.
+ *
+ * Four stages, driven by the message rather than local state so an SSE re-draft lands correctly:
+ *   A. copy       `approval === "pending"`             — editable, Approve / Request changes
+ *   B. storyboard `storyboardApproval === "pending"`   — Approve / Request changes (regenerates)
+ *   C. render     storyboard approved                  — Render video
+ *   D. publish    render done                          — Post, or Post now / Schedule (text only)
+ *
+ * LinkedIn and Facebook differ only in chrome and in how they publish (POST_MOCKUP + the
+ * handlers below); everything about the review itself is shared.
+ *
+ * **Scheduling is offered on text-only posts.** Media — video or photo — is post-now only,
+ * because the scheduler is text-only (`scheduled_post` carries no media column and the sweeper
+ * calls only the text endpoints), so a scheduled media post would be a promise nothing
+ * downstream could keep. Attaching a photo therefore drops the card back to Post now.
+ */
+function SocialPostCard({
+  message,
+  platform,
+  onApprove,
+  onReject,
+  onStoryboardApprove,
+  onStoryboardPatch,
+  formatTime,
+}: SocialPostCardProps) {
+  const ui = POST_MOCKUP[platform];
+  const draftText = message.draft?.text ?? "";
+  const hashtags = message.draft?.hashtags ?? [];
+  const approval = message.approval;
+  const storyboard = message.videoStoryboard;
+  const storyboardApproval = message.storyboardApproval;
+  // Video is part of this post either because the run asked for one, or because a storyboard has
+  // already landed (a video-only run never sets the flag).
+  const hasVideo = !!message.videoAlsoRequested || !!storyboard;
+
+  // The copy editor is uncontrolled and read on submit: there is no save step, so nothing about
+  // editing can gate the pipeline. `key` remounts it with fresh text when the agent re-drafts.
+  const textRef = useRef<HTMLTextAreaElement>(null);
+
+  const [rejectOpen, setRejectOpen] = useState(false);
+  const [rejectText, setRejectText] = useState("");
+
+  // Storyboard revision.
+  const [sbFeedbackOpen, setSbFeedbackOpen] = useState(false);
+  const [sbFeedback, setSbFeedback] = useState("");
+  const [sbStatus, setSbStatus] = useState<"idle" | "revising" | "error">("idle");
+  const [sbError, setSbError] = useState<string | null>(null);
+
+  // Render — same contract as VideoStoryboardCard: start a job, then poll it.
+  const [renderState, setRenderState] = useState<"idle" | "pending" | "done" | "error">("idle");
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [renderError, setRenderError] = useState<string | null>(null);
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+
+  // Reference images (image-to-video) are DERIVED from the message, not copied into state at
+  // mount: this card is created when the copy arrives and the images only land with the later
+  // storyboard patch, so a `useState(message.referenceImages)` would freeze an empty list and
+  // silently drop them. Removals are tracked instead of the list itself.
+  const [droppedRefs, setDroppedRefs] = useState<string[]>([]);
+  const refs = (message.referenceImages ?? []).filter((r) => !droppedRefs.includes(r));
+
+  // An optional photo on a text post. File plus its preview URL are one piece of state so the
+  // preview can never be left pointing at a file that has been swapped out.
+  const [image, setImage] = useState<{ file: File; url: string } | null>(null);
+
+  // What actually went out, kept so the card still shows the post after publishing — on a
+  // video-only run the body lives in the (now unmounted) caption box and would otherwise vanish.
+  const [postedText, setPostedText] = useState<string | null>(null);
+
+  // Graph captions a Page video from the /videos edge's own title/description fields, so
+  // Facebook gets a title box; LinkedIn's video post takes the caption alone.
+  const [videoTitle, setVideoTitle] = useState("");
+
+  // Publishing.
+  const [postStatus, setPostStatus] = useState<"idle" | "posting" | "posted" | "error">("idle");
+  const [postError, setPostError] = useState<string | null>(null);
+
+  // Scheduling (text-only posts). Seeded from the moment the agent read out of the request, so
+  // "post this Friday at 10" opens on Schedule with Friday 10:00 already filled in.
+  const [agentDate, agentTime] = splitPublishAt(message.publishAt);
+  const [postMode, setPostMode] = useState<"now" | "schedule">(agentDate ? "schedule" : "now");
+  const [scheduleDate, setScheduleDate] = useState(agentDate);
+  const [scheduleTime, setScheduleTime] = useState(agentTime);
+  const [scheduleStatus, setScheduleStatus] =
+    useState<"idle" | "scheduling" | "scheduled" | "error">("idle");
+  const [scheduleError, setScheduleError] = useState<string | null>(null);
+
+  // Release the previous preview URL whenever the pick changes, and the last one on unmount.
+  // Cleanup only — no setState, so this never cascades a render.
+  useEffect(() => {
+    const url = image?.url;
+    return () => {
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [image]);
+
+  // A video-only run drafts no copy, so there is nothing to approve and nothing to caption the
+  // post with — the body doubles as the caption box until the post goes out.
+  const captionEntry = !draftText.trim() && postStatus !== "posted";
+  const bodyEditable = approval === "pending" || captionEntry;
+  // Anything in the media well makes this post-now only (see the class comment).
+  const mediaAttached = hasVideo || !!image;
+
+  /** The copy as it will actually publish: body plus hashtags. Reads the editor while it is
+   *  open, so an in-progress edit (or a caption typed on a video-only run) is what publishes. */
+  function captionText() {
+    const live = textRef.current?.value;
+    const body = live !== undefined && live !== null ? live : draftText;
+    return hashtags.length > 0 ? `${body}\n\n${hashtags.join(" ")}` : body;
+  }
+
+  function autoGrow(el: HTMLTextAreaElement) {
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }
+
+  function pickImage(file: File | null) {
+    setImage(file ? { file, url: URL.createObjectURL(file) } : null);
+    // A photo can't be scheduled, so don't leave the user staring at a date picker that would
+    // quietly publish without it.
+    if (file) setPostMode("now");
+    setPostStatus("idle");
+    setPostError(null);
+  }
+
+  /** The auth token plus, for Facebook, the Pages to publish to — or an error explaining what
+   *  the user still has to connect. Checked before every publish and before scheduling: finding
+   *  out a Page was missing when the post came due days later would be far worse. */
+  function publishCredentials(
+    action: "posting" | "scheduling"
+  ): { token: string; pageIds: number[] } | { error: string } {
+    const token = localStorage.getItem("starlight_token");
+    if (!token) {
+      return {
+        error: `Log in, then connect ${ui.label} from your Brand Profile before ${action}.`,
+      };
+    }
+    if (!ui.needsPages) return { token, pageIds: [] };
+    const pageIds = getSelectedPageIds();
+    if (pageIds.length === 0) {
+      return { error: "Connect Facebook and pick a Page in your Brand Profile first." };
+    }
+    return { token, pageIds };
+  }
+
+  async function reviseStoryboard() {
+    if (!message.workflowTaskId || !message.platform || !sbFeedback.trim()) return;
+    setSbStatus("revising");
+    setSbError(null);
+    try {
+      const res = await fetch("/api/storyboard", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          taskId: message.workflowTaskId,
+          platform: message.platform,
+          feedback: sbFeedback.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error || !data.storyboard) {
+        setSbStatus("error");
+        setSbError(data.error ?? "Could not revise the storyboard.");
+        return;
+      }
+      onStoryboardPatch(data.storyboard as VideoStoryboard);
+      setSbStatus("idle");
+      setSbFeedback("");
+      setSbFeedbackOpen(false);
+    } catch {
+      setSbStatus("error");
+      setSbError("Could not reach the backend.");
+    }
+  }
+
+  async function startRender() {
+    if (!message.workflowTaskId || !message.platform) return;
+    setRenderState("pending");
+    setRenderError(null);
+    setElapsed(0);
+    try {
+      const res = await fetch("/api/video", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          taskId: message.workflowTaskId,
+          platform: message.platform,
+          ...(refs.length > 0 ? { referenceImages: refs } : {}),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setRenderState("error");
+        setRenderError(data.error ?? "Could not start the render.");
+        return;
+      }
+      setJobId(data.jobId as string);
+    } catch {
+      setRenderState("error");
+      setRenderError("Could not reach the video backend.");
+    }
+  }
+
+  useEffect(() => {
+    if (renderState !== "pending" || !jobId) return;
+
+    // The render is a Remotion CLI subprocess (asset fetch + headless Chromium) — tens of
+    // seconds, so poll on a 3s cadence rather than anything tighter.
+    const poll = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/video/${jobId}`);
+        const data = await res.json();
+        if (data.status === "done") {
+          setDownloadUrl(data.downloadUrl as string);
+          setRenderState("done");
+        } else if (data.status === "error") {
+          setRenderState("error");
+          setRenderError(data.error ?? "Render failed.");
+        }
+      } catch {
+        // transient network error — keep polling
+      }
+    }, 3000);
+
+    const tick = setInterval(() => setElapsed((s) => s + 1), 1000);
+    return () => {
+      clearInterval(poll);
+      clearInterval(tick);
+    };
+  }, [renderState, jobId]);
+
+  /**
+   * Publishes the post as it stands: video if one was rendered, else photo if one is attached,
+   * else plain text. One button, because from the user's side there is only ever one post here.
+   */
+  async function handlePost() {
+    const creds = publishCredentials("posting");
+    if ("error" in creds) {
+      setPostStatus("error");
+      setPostError(creds.error);
+      return;
+    }
+    const { token, pageIds } = creds;
+
+    // Read once: the editor is the source of truth while it's open, and both platforms reject an
+    // empty post anyway — better to say so here than round-trip for the same answer.
+    const body = captionText();
+    if (!body.trim()) {
+      setPostStatus("error");
+      setPostError("Write a caption for this post first.");
+      return;
+    }
+
+    setPostStatus("posting");
+    setPostError(null);
+    try {
+      const auth = { Authorization: `Bearer ${token}` };
+      const json = { "Content-Type": "application/json", ...auth };
+      let res: Response;
+
+      if (hasVideo) {
+        // A text+video post publishes ONCE, as a native video post with this copy as the caption.
+        res =
+          platform === "facebook"
+            ? await fetch("/api/meta/post-video", {
+                method: "POST",
+                headers: json,
+                body: JSON.stringify({
+                  jobId,
+                  // Graph captions a Page video from `description` on the /videos edge and from
+                  // `message` on /feed, so send the caption as both and let the one endpoint use
+                  // whichever edge the media type picks.
+                  message: body,
+                  title: videoTitle.trim(),
+                  description: body,
+                  pageIds,
+                }),
+              })
+            : await fetch("/api/linkedin/post-video", {
+                method: "POST",
+                headers: json,
+                body: JSON.stringify({ jobId, message: body }),
+              });
+      } else if (image) {
+        const form = new FormData();
+        form.append("image", image.file);
+        form.append("message", body);
+        if (platform === "facebook") for (const id of pageIds) form.append("pageId", String(id));
+        res = await fetch(platform === "facebook" ? "/api/meta/post" : "/api/linkedin/post-image", {
+          method: "POST",
+          headers: auth,
+          body: form,
+        });
+      } else if (platform === "facebook") {
+        // Java's /meta/post is @ModelAttribute multipart, so even the text-only post goes as a form.
+        const form = new FormData();
+        form.append("message", body);
+        for (const id of pageIds) form.append("pageId", String(id));
+        res = await fetch("/api/meta/post", { method: "POST", headers: auth, body: form });
+      } else {
+        res = await fetch("/api/linkedin/post", {
+          method: "POST",
+          headers: json,
+          body: JSON.stringify({ message: body }),
+        });
+      }
+
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setPostStatus("error");
+        setPostError(data.error ?? `Failed to post to ${ui.label}.`);
+        return;
+      }
+      setPostedText(body);
+      setPostStatus("posted");
+    } catch {
+      setPostStatus("error");
+      setPostError("Could not reach the backend.");
+    }
+  }
+
+  /**
+   * Queues a text-only post instead of publishing it now.
+   *
+   * Goes through the shared scheduling API so it lands in the same persisted queue the content
+   * calendar reads — one place to see, edit and cancel it, and a schedule that survives a backend
+   * restart. The browser's timezone rides along so "10:00" means 10:00 where the user is, not in
+   * whatever zone the server runs in.
+   */
+  async function handleSchedule() {
+    const creds = publishCredentials("scheduling");
+    if ("error" in creds) {
+      setScheduleStatus("error");
+      setScheduleError(creds.error);
+      return;
+    }
+    if (!scheduleDate || !scheduleTime) {
+      setScheduleStatus("error");
+      setScheduleError("Pick a date and time first.");
+      return;
+    }
+    setScheduleStatus("scheduling");
+    setScheduleError(null);
+    try {
+      const res = await fetch("/api/schedule/posts", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${creds.token}`,
+        },
+        body: JSON.stringify({
+          platform,
+          message: captionText(),
+          date: scheduleDate,
+          time: scheduleTime,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          page_ids: creds.pageIds,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setScheduleStatus("error");
+        setScheduleError(data.error ?? "Failed to schedule the post.");
+        return;
+      }
+      setScheduleStatus("scheduled");
+    } catch {
+      setScheduleStatus("error");
+      setScheduleError("Could not reach the backend.");
+    }
+  }
+
+  // The storyboard names the brand, so the mockup's author row can too once one exists.
+  const brandName = storyboard?.brandName?.trim() || "Your brand";
+  const initial = brandName.charAt(0).toUpperCase();
+
+  const stageLabel =
+    postStatus === "posted"
+      ? "Published"
+      : scheduleStatus === "scheduled"
+        ? "Scheduled"
+        : approval === "pending"
+          ? "Copy — needs your approval"
+          : approval === "rejected"
+            ? "Rewriting the copy…"
+            : storyboardApproval === "pending"
+              ? "Storyboard — needs your approval"
+              : renderState === "done"
+                ? "Ready to publish"
+                : hasVideo && !storyboard
+                  ? "Building the storyboard…"
+                  : "Ready to post";
+
+  return (
+    <div className="w-full max-w-lg">
+      <p className="text-sm text-[#6B6561] mb-2">{message.content}</p>
+
+      <div className="bg-white border border-[#E8E3DA] rounded-2xl overflow-hidden shadow-sm">
+        {/* Preview strip — this is a composition mockup, never a live post. */}
+        <div className="flex items-center justify-between px-4 py-2 bg-[#F8F5EE] border-b border-[#E8E3DA]">
+          <span className="flex items-center gap-1.5 text-xs font-semibold text-[#6B6561]">
+            <span
+              className={`w-4 h-4 rounded-sm ${ui.markClass} text-white text-[10px] font-bold flex items-center justify-center`}
+            >
+              {ui.mark}
+            </span>
+            {ui.label} preview
+          </span>
+          <span className="text-[10px] font-medium text-[#6B6561] bg-white border border-[#E8E3DA] px-2 py-0.5 rounded-full">
+            {stageLabel}
+          </span>
+        </div>
+
+        {/* Author row */}
+        <div className="flex items-center gap-3 px-4 pt-4">
+          <div
+            className={`w-12 h-12 rounded-full ${ui.markClass} text-white text-lg font-semibold flex items-center justify-center shrink-0`}
+          >
+            {initial}
+          </div>
+          <div className="min-w-0">
+            <div className="text-sm font-semibold text-[#1B1A17] truncate">{brandName}</div>
+            <div className="text-xs text-[#6B6561] truncate">{storyboard?.theme || ui.byline}</div>
+            <div className="flex items-center gap-1 text-xs text-[#9E9893]">
+              {relativePostAge(message.timestamp)} ·
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                <path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm7 9h-3a15 15 0 0 0-1.1-5.2A8 8 0 0 1 19 11ZM12 4c.9 1.3 1.7 3.6 1.9 7h-3.8C10.3 7.6 11.1 5.3 12 4ZM9.1 5.8A15 15 0 0 0 8 11H5a8 8 0 0 1 4.1-5.2ZM5 13h3a15 15 0 0 0 1.1 5.2A8 8 0 0 1 5 13Zm7 7c-.9-1.3-1.7-3.6-1.9-7h3.8c-.2 3.4-1 5.7-1.9 7Zm2.9-1.8A15 15 0 0 0 16 13h3a8 8 0 0 1-4.1 5.2Z" />
+              </svg>
+            </div>
+          </div>
+        </div>
+
+        {/* Post body — editable while the copy is still up for approval. */}
+        <div className="px-4 pt-3">
+          {message.needsHumanIntervention && approval === "pending" && (
+            <div className="mb-3 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-xs text-amber-700">
+              The AI reviewer flagged this draft after multiple attempts — your direct input is needed.
+            </div>
+          )}
+
+          {bodyEditable ? (
+            <textarea
+              // Callback ref so the box is already sized to the draft on mount — `rows` alone
+              // would scroll a long post until the first keystroke grew it.
+              ref={(el) => {
+                textRef.current = el;
+                if (el) autoGrow(el);
+              }}
+              key={draftText}
+              defaultValue={draftText}
+              onInput={(e) => autoGrow(e.currentTarget)}
+              rows={3}
+              aria-label="Post copy"
+              placeholder={captionEntry ? "Write the caption for this post…" : undefined}
+              className={`w-full bg-transparent text-sm text-[#1B1A17] leading-relaxed resize-none rounded-lg px-2 py-1 -mx-2 border border-transparent placeholder:text-[#9E9893] hover:border-[#E8E3DA] focus:bg-[#F8F5EE] ${ui.focusClass} focus:outline-none transition-colors`}
+            />
+          ) : (
+            (draftText || postedText) && (
+              <p className="text-sm text-[#1B1A17] whitespace-pre-wrap leading-relaxed">
+                {draftText || postedText}
+              </p>
+            )
+          )}
+
+          {hashtags.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mt-2">
+              {hashtags.map((tag) => (
+                <span key={tag} className={`text-xs ${ui.accentTextClass} font-medium`}>
+                  {tag}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Media well — video once rendered, else the storyboard standing in for it, else the
+            attached photo. */}
+        {(storyboard || image || renderState !== "idle") && (
+          <div className="mt-3 bg-[#F8F5EE] border-y border-[#E8E3DA] p-3">
+            {renderState === "done" && downloadUrl ? (
+              <video src={downloadUrl} controls className="w-full rounded-lg bg-black" />
+            ) : storyboard ? (
+              <StoryboardPreview storyboard={storyboard} />
+            ) : image ? (
+              <div className="relative">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={image.url} alt="Attached photo" className="w-full rounded-lg" />
+                <button
+                  onClick={() => pickImage(null)}
+                  aria-label="Remove photo"
+                  disabled={postStatus === "posting"}
+                  className="absolute top-2 right-2 w-6 h-6 rounded-full bg-[#1B1A17]/80 text-white text-xs flex items-center justify-center hover:bg-[#FF4800] disabled:opacity-50 transition-colors"
+                >
+                  ×
+                </button>
+              </div>
+            ) : null}
+
+            {renderState === "pending" && (
+              <div className="flex flex-col items-center justify-center gap-2 text-[#9E9893] py-4">
+                <svg className="animate-spin" width={28} height={28} viewBox="0 0 24 24" fill="none">
+                  <circle cx="12" cy="12" r="10" stroke="#E8E3DA" strokeWidth="3" />
+                  <path d="M12 2a10 10 0 0 1 10 10" stroke="#FF4800" strokeWidth="3" strokeLinecap="round" />
+                </svg>
+                <p className="text-xs font-medium text-center">Rendering video… {elapsed}s elapsed</p>
+              </div>
+            )}
+
+            {renderState === "error" && (
+              <p className="text-xs text-red-600 text-center mt-3">{renderError}</p>
+            )}
+          </div>
+        )}
+
+        {/* Engagement bar — deliberately count-free: this post doesn't exist yet, and inventing
+            reactions for it would be inventing data. */}
+        <div className="flex items-center justify-around px-2 py-1.5 mt-1 border-t border-[#E8E3DA] text-[#9E9893]">
+          {ui.actions.map((action) => (
+            <span key={action} className="flex-1 text-center text-xs font-medium py-1.5 select-none">
+              {action}
+            </span>
+          ))}
+        </div>
+
+        {/* ── Review controls ─────────────────────────────────────────────────── */}
+        <div className="bg-[#F8F5EE] border-t border-[#E8E3DA] px-4 py-3 space-y-2">
+          {/* Stage A — the copy */}
+          {approval === "pending" && (
+            <>
+              <p className="text-[11px] text-[#9E9893]">
+                Edit the copy above if you want — your changes go through with the approval.
+              </p>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => onApprove(textRef.current?.value ?? draftText)}
+                  className="flex-1 bg-green-600 hover:bg-green-500 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                >
+                  Approve copy
+                </button>
+                <button
+                  onClick={() => setRejectOpen((open) => !open)}
+                  className="flex-1 bg-white hover:bg-[#E8E3DA] text-[#1B1A17] text-sm font-medium py-2 rounded-lg transition-colors border border-[#E8E3DA]"
+                >
+                  Request changes
+                </button>
+              </div>
+              {rejectOpen && (
+                <div className="space-y-2 pt-1">
+                  <textarea
+                    value={rejectText}
+                    onChange={(e) => setRejectText(e.target.value)}
+                    placeholder="What should change? (optional)"
+                    rows={2}
+                    className={`w-full bg-white border border-[#E8E3DA] rounded-lg px-3 py-2 text-xs text-[#1B1A17] placeholder:text-[#9E9893] resize-none focus:outline-none ${ui.focusClass}`}
+                  />
+                  <button
+                    onClick={() => onReject(rejectText)}
+                    className="w-full bg-[#1B1A17] hover:bg-black text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                  >
+                    Send back for a rewrite
+                  </button>
+                </div>
+              )}
+            </>
+          )}
+
+          {approval === "rejected" && (
+            <p className="text-xs text-[#6B6561]">
+              Sent back — the new draft will land in this same post.
+            </p>
+          )}
+
+          {/* Between approving the copy and the storyboard arriving. */}
+          {approval === "approved" && hasVideo && !storyboard && (
+            <p className="text-xs text-[#6B6561]">
+              Copy approved. Building the video storyboard from it…
+            </p>
+          )}
+
+          {/* Stage B — the storyboard */}
+          {storyboard && storyboardApproval === "pending" && (
+            <>
+              <div className="flex gap-2">
+                <button
+                  onClick={onStoryboardApprove}
+                  disabled={sbStatus === "revising"}
+                  className="flex-1 bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                >
+                  Approve storyboard
+                </button>
+                <button
+                  onClick={() => setSbFeedbackOpen((open) => !open)}
+                  disabled={sbStatus === "revising"}
+                  className="flex-1 bg-white hover:bg-[#E8E3DA] disabled:opacity-50 text-[#1B1A17] text-sm font-medium py-2 rounded-lg transition-colors border border-[#E8E3DA]"
+                >
+                  Request changes
+                </button>
+              </div>
+              {sbFeedbackOpen && (
+                <div className="space-y-2 pt-1">
+                  <textarea
+                    value={sbFeedback}
+                    onChange={(e) => setSbFeedback(e.target.value)}
+                    placeholder="What should change? e.g. 'open on the stat, drop the pie chart'"
+                    rows={2}
+                    disabled={sbStatus === "revising"}
+                    className={`w-full bg-white border border-[#E8E3DA] rounded-lg px-3 py-2 text-xs text-[#1B1A17] placeholder:text-[#9E9893] resize-none focus:outline-none ${ui.focusClass} disabled:opacity-60`}
+                  />
+                  <button
+                    onClick={reviseStoryboard}
+                    disabled={sbStatus === "revising" || !sbFeedback.trim()}
+                    className="w-full bg-[#FF4800] hover:bg-[#E03E00] disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                  >
+                    {sbStatus === "revising" ? "Reworking the storyboard…" : "Rework storyboard"}
+                  </button>
+                  <p className="text-[11px] text-[#9E9893]">
+                    Only the storyboard changes — your approved copy stays as it is.
+                  </p>
+                </div>
+              )}
+              {sbStatus === "error" && sbError && <p className="text-xs text-red-600">{sbError}</p>}
+            </>
+          )}
+
+          {/* Stage C — render */}
+          {storyboard &&
+            storyboardApproval === "approved" &&
+            (renderState === "idle" || renderState === "error") && (
+              <>
+                {refs.length > 0 && (
+                  <div className="mb-1">
+                    <p className="text-[10px] text-[#9E9893] mb-1.5">
+                      Reference image{refs.length !== 1 ? "s" : ""} — the video is generated from these:
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      {refs.map((src, i) => (
+                        <div key={i} className="relative">
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img
+                            src={src}
+                            alt={`reference ${i + 1}`}
+                            className="w-12 h-12 object-cover rounded-md border border-[#E8E3DA]"
+                          />
+                          <button
+                            onClick={() => setDroppedRefs((prev) => [...prev, src])}
+                            aria-label={`Remove reference ${i + 1}`}
+                            className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-[#1B1A17] text-white text-[10px] flex items-center justify-center shadow hover:bg-[#FF4800] transition-colors"
+                          >
+                            ×
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                <button
+                  onClick={startRender}
+                  className="w-full bg-[#FF4800] hover:bg-[#E03E00] text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                >
+                  {renderState === "error" ? "Retry render" : "Render video"}
+                </button>
+              </>
+            )}
+
+          {/* Stage D — publish */}
+          {postStatus === "posted" ? (
+            <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+              ✓ Posted to {ui.label}
+            </div>
+          ) : scheduleStatus === "scheduled" ? (
+            <div className="text-center py-2 rounded-xl text-sm font-medium bg-green-50 text-green-700 border border-green-200">
+              ✓ Scheduled for {scheduleDate} at {scheduleTime}
+            </div>
+          ) : (
+            <>
+              {/* Video: one publish, now. The scheduler is text-only, so there is nothing
+                  honest to offer here beyond posting it. */}
+              {hasVideo && renderState === "done" && (
+                <>
+                  {ui.videoTitle && (
+                    <input
+                      type="text"
+                      value={videoTitle}
+                      onChange={(e) => setVideoTitle(e.target.value)}
+                      placeholder="Video title (optional)"
+                      disabled={postStatus === "posting"}
+                      className={`w-full bg-white border border-[#E8E3DA] rounded-lg px-3 py-2 text-xs text-[#1B1A17] placeholder:text-[#9E9893] focus:outline-none ${ui.focusClass} disabled:opacity-60`}
+                    />
+                  )}
+                  <button
+                    onClick={handlePost}
+                    disabled={postStatus === "posting"}
+                    className={`w-full ${ui.buttonClass} disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors`}
+                  >
+                    {postStatus === "posting" ? "Uploading & posting…" : `Post to ${ui.label}`}
+                  </button>
+                </>
+              )}
+
+              {/* Text post: optionally with a photo, published now or queued for a future date. */}
+              {!hasVideo && approval === "approved" && (
+                <>
+                  {!mediaAttached && (
+                    <div className="flex gap-1 p-1 bg-white border border-[#E8E3DA] rounded-lg">
+                      {(["now", "schedule"] as const).map((mode) => (
+                        <button
+                          key={mode}
+                          onClick={() => setPostMode(mode)}
+                          className={`flex-1 text-xs font-medium py-1.5 rounded-md transition-colors ${
+                            postMode === mode
+                              ? ui.toggleActiveClass
+                              : "text-[#6B6561] hover:bg-[#F8F5EE]"
+                          }`}
+                        >
+                          {mode === "now" ? "Post now" : "Schedule"}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {postMode === "now" || mediaAttached ? (
+                    <>
+                      <label className="block">
+                        <span className="sr-only">Attach a photo</span>
+                        <input
+                          type="file"
+                          accept="image/*"
+                          onChange={(e) => pickImage(e.target.files?.[0] ?? null)}
+                          disabled={postStatus === "posting"}
+                          className="w-full text-xs text-[#6B6561] file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border file:border-[#E8E3DA] file:bg-white file:text-xs file:font-medium file:text-[#1B1A17] hover:file:bg-[#E8E3DA] disabled:opacity-60"
+                        />
+                      </label>
+                      {image && (
+                        <p className="text-[11px] text-[#9E9893]">
+                          Photo posts publish immediately — scheduling carries text only.
+                        </p>
+                      )}
+                      <button
+                        onClick={handlePost}
+                        disabled={postStatus === "posting"}
+                        className={`w-full ${ui.buttonClass} disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors`}
+                      >
+                        {postStatus === "posting"
+                          ? image
+                            ? "Uploading & posting…"
+                            : "Posting…"
+                          : `Post to ${ui.label}`}
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      {agentDate && (
+                        <p className="text-[11px] text-[#9E9893]">
+                          Timed from your request — adjust it here if that&apos;s not what you meant.
+                        </p>
+                      )}
+                      <div className="flex gap-2">
+                        <input
+                          type="date"
+                          value={scheduleDate}
+                          onChange={(e) => setScheduleDate(e.target.value)}
+                          aria-label="Publish date"
+                          className={`flex-1 bg-white border border-[#E8E3DA] rounded-lg px-2 py-1.5 text-xs text-[#1B1A17] focus:outline-none ${ui.focusClass}`}
+                        />
+                        <input
+                          type="time"
+                          value={scheduleTime}
+                          onChange={(e) => setScheduleTime(e.target.value)}
+                          aria-label="Publish time"
+                          className={`flex-1 bg-white border border-[#E8E3DA] rounded-lg px-2 py-1.5 text-xs text-[#1B1A17] focus:outline-none ${ui.focusClass}`}
+                        />
+                      </div>
+                      <button
+                        onClick={handleSchedule}
+                        disabled={scheduleStatus === "scheduling"}
+                        className={`w-full ${ui.buttonClass} disabled:opacity-50 text-white text-sm font-medium py-2 rounded-lg transition-colors`}
+                      >
+                        {scheduleStatus === "scheduling" ? "Scheduling…" : "Schedule post"}
+                      </button>
+                    </>
+                  )}
+                </>
+              )}
+
+              {postStatus === "error" && postError && (
+                <p className="text-xs text-red-600 text-center">{postError}</p>
+              )}
+              {scheduleStatus === "error" && scheduleError && (
+                <p className="text-xs text-red-600 text-center">{scheduleError}</p>
+              )}
+            </>
+          )}
+        </div>
+
+        <p className="text-xs text-[#9E9893] px-4 pb-3 pt-2">{formatTime(message.timestamp)}</p>
       </div>
     </div>
   );

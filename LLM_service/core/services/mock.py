@@ -20,7 +20,7 @@ import html as _html
 import re
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import AsyncIterator, Dict, List, Optional
+from typing import AsyncIterator, Callable, Dict, List, Optional
 
 from agent_framework import (
     BaseChatClient,
@@ -41,6 +41,7 @@ from ..video_schema import StoryboardSpec
 from .base import (
     BackgroundRemovalService,
     ImageSearchService,
+    VideoSearchService,
     LLMService,
     MusicGenerationService,
     RealtimeEvent,
@@ -192,6 +193,16 @@ _PLATFORM_TAGS: Dict[str, str] = {
     "linkedin": "#Leadership", "instagram": "#instagood",
     "x": "#news", "tiktok": "#fyp #foryou", "facebook": "",
 }
+
+
+def _word_chunks(text: str) -> List[str]:
+    """Split `text` into word-sized slices that concatenate back to it exactly.
+
+    Whitespace rides with the word that follows it, so joining the slices is a plain
+    `"".join` with no reconstruction rules — the same contract a real token stream has,
+    which is the point: the offline path must be indistinguishable to every consumer.
+    """
+    return re.findall(r"\s*\S+|\s+", text)
 
 
 def _enforce_char_limit(post: str, limit: Optional[int]) -> str:
@@ -858,6 +869,7 @@ class MockLLM(LLMService):
         history: Optional[List[dict]] = None,
         feedback: str = "",
         prior_draft: str = "",
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> str:
         await asyncio.sleep(_MOCK_LATENCY)
         tone = tone_hint or "on-brand"
@@ -895,6 +907,13 @@ class MockLLM(LLMService):
         # observable (production reworks the copy against it). Empty on the first pass.
         if feedback:
             post += f"\n\nReworked to address: {feedback}"
+        if on_delta is not None:
+            # Hand the finished post back a word at a time, so an offline run drives the
+            # same streaming code path as production — the frontend's delta accumulation
+            # and the executor's coalescing are then exercised by the whole mocked suite,
+            # not only by a live Azure deployment nobody runs in CI.
+            for chunk in _word_chunks(post):
+                on_delta(chunk)
         return post
 
     async def render_html_card(
@@ -1625,6 +1644,34 @@ class MockImageSearch(ImageSearchService):
         ]
 
 
+class MockVideoSearch(VideoSearchService):
+    """Deterministic, offline stand-in for Pexels Videos: one placeholder clip
+    candidate per query (no network), so the asset-resolution pipeline and its tests
+    never need real credentials.
+
+    The URL is intentionally undownloadable, exactly like MockImageSearch's — that
+    makes the default mock run exercise _resolve_clip's real degradation ladder
+    (localPath stays None, the slide renders mosaic-only), which is the path most
+    likely to be hit in production."""
+
+    async def search(
+        self, *, query: str, orientation: str = "portrait", per_page: int = 1,
+        target_width: int = 1080, target_height: int = 1920,
+    ) -> List[dict]:
+        await asyncio.sleep(_MOCK_LATENCY)
+        return [
+            {
+                "url": f"https://mock.pexels.local/video/{i}/{query.replace(' ', '-')}.mp4",
+                "width": target_width,
+                "height": target_height,
+                "fps": 30,
+                "duration": 12.0,
+                "photographer": "Mock Videographer",
+            }
+            for i in range(max(per_page, 0))
+        ]
+
+
 class MockLiveImageSearch(ImageSearchService):
     """Deterministic, offline stand-in for LiveImageSearch (core/services/web_search.py):
     a distinct URL host from MockImageSearch so the two sourcing paths (stock vs.
@@ -1674,14 +1721,13 @@ def _silent_mp3(duration_seconds: float) -> bytes:
 
 
 class MockMusicGeneration(MusicGenerationService):
-    """Offline stand-in for Soundraw: returns a real (silent) MP3 sized to
-    `duration_seconds`, so the music-resolution pipeline — including Remotion's
+    """Offline stand-in for the real music providers: returns a real (silent) MP3 sized
+    to `duration_seconds`, so the music-resolution pipeline — including Remotion's
     ffprobe inspection of the file — works end to end without real credentials
     or network access.
 
-    TODO: circle back and wire up a real SOUNDRAW_API_KEY (see SoundrawMusic in
-    media_assets.py) once its request/response contract is verified against a
-    live account — this mock only proves the pipeline plumbing, not real audio.
+    For actual audio set USE_MOCK_MUSIC_GENERATION=false; JamendoMusic (a free
+    JAMENDO_CLIENT_ID) is the real provider, with the bundled library behind it.
     """
 
     async def generate(self, *, mood: str, genre: str, duration_seconds: float, energy: str) -> bytes:

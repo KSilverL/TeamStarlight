@@ -28,6 +28,13 @@ import jakarta.annotation.PreDestroy;
  *
  * <p><b>The approval gate is untouched.</b> Each slot still stops at the human gate exactly as
  * before; this changes when the drafting happens, not whether a person signs it off.
+ *
+ * <p><b>One slot at a time.</b> Each slot's run is waited out before the next begins, so a
+ * campaign is written in the order the user reads it: post one, then post two. Starting them
+ * all at once finished no sooner in practice — the model calls queue behind each other anyway
+ * — and it left the plan page with several slots half-written and nothing to say about any of
+ * them. Sequential drafting means there is always exactly one live slot to point at, which is
+ * the difference between a progress indicator and a spinner.
  */
 @Service
 public class PlanCampaignDrafter {
@@ -38,16 +45,32 @@ public class PlanCampaignDrafter {
     private PlanService planService;
 
     /**
-     * How long to wait between starting one slot's draft and the next.
+     * A breather between one slot finishing and the next starting.
      *
-     * <p>The LLM service starts each run in the background and returns immediately, so without
-     * a pause here confirming a fifteen-slot campaign would fire fifteen concurrent workflow
-     * runs within milliseconds — a burst of model calls that invites rate limiting and makes
-     * every draft slower than doing them in turn. Staggering the starts spreads the same work
-     * out; it costs nothing, because nobody can review a draft that hasn't been written yet.
+     * <p>Short now that slots are drafted in turn rather than fired off together: the wait for
+     * the previous slot is what spaces the model calls out, so this only exists to give the
+     * frontend a beat in which the finished slot is visibly finished before the next one takes
+     * over as the live one.
      */
-    @Value("${app.plans.draft-stagger-ms:5000}")
+    @Value("${app.plans.draft-stagger-ms:1000}")
     private long staggerMs;
+
+    /** How often to ask whether the slot being drafted has finished. */
+    @Value("${app.plans.draft-poll-interval-ms:3000}")
+    private long pollIntervalMs;
+
+    /**
+     * How long to wait for one slot before giving up on it and moving to the next.
+     *
+     * <p>A campaign must not be held hostage by a single wedged run. Fifteen minutes is well
+     * past a slow roundtable (a handful of minutes, even with every persona taking its turn)
+     * but short enough that a stuck slot costs the rest of the campaign one delay rather than
+     * the whole evening. Nothing is lost when it trips: the slot keeps whatever status it
+     * reached, and {@link PlanScheduler}'s daily sweep still picks up anything left
+     * {@code planned}.
+     */
+    @Value("${app.plans.draft-wait-timeout-ms:900000}")
+    private long waitTimeoutMs;
 
     /**
      * Single-threaded on purpose: one campaign drafts at a time, its slots staggered. Kept off
@@ -98,8 +121,9 @@ public class PlanCampaignDrafter {
         int started = 0;
         for (Map<String, Object> item : pending) {
             String itemId = String.valueOf(item.get("item_id"));
+            String taskId = null;
             try {
-                planService.executePlanItem(planId, itemId, null);
+                taskId = taskIdOf(planService.executePlanItem(planId, itemId, null));
                 started++;
                 log.info("[PlanCampaignDrafter] Plan {} item {} drafting ({}/{})",
                         planId, itemId, started, pending.size());
@@ -111,23 +135,87 @@ public class PlanCampaignDrafter {
                         planId, itemId, e.getMessage());
             }
 
-            if (!sleepBetweenItems()) {
+            // Wait this slot out before commissioning the next. A slot that never started
+            // has nothing to wait for, so the campaign moves straight on to the one after.
+            if (taskId != null && !awaitDraft(planId, itemId, taskId)) {
+                log.warn("[PlanCampaignDrafter] Plan {}: interrupted after {} slot(s); the daily "
+                        + "job will pick up the rest", planId, started);
+                return;
+            }
+
+            if (!sleep(staggerMs)) {
                 log.warn("[PlanCampaignDrafter] Plan {}: interrupted after {} slot(s); the daily "
                         + "job will pick up the rest", planId, started);
                 return;
             }
         }
 
-        log.info("[PlanCampaignDrafter] Plan {}: {} of {} slot(s) drafting", planId, started, pending.size());
+        log.info("[PlanCampaignDrafter] Plan {}: {} of {} slot(s) drafted", planId, started, pending.size());
+    }
+
+    /** The task id the LLM service assigned to a slot's run, or null if it reported none. */
+    @SuppressWarnings("unchecked")
+    private static String taskIdOf(Map<String, Object> executeResponse) {
+        if (executeResponse == null) {
+            return null;
+        }
+        Object task = executeResponse.get("task");
+        if (!(task instanceof Map)) {
+            return null;
+        }
+        Object taskId = ((Map<String, Object>) task).get("task_id");
+        return taskId == null ? null : String.valueOf(taskId);
+    }
+
+    /**
+     * Blocks until a slot's run stops running, or the wait times out.
+     *
+     * <p>"Stops running" means the copy exists — the run has reached its human gate
+     * ({@code awaiting_review}), finished, or failed. It deliberately does NOT mean the user
+     * has approved anything: waiting on a person would stall the campaign the moment they
+     * closed the tab, and the whole point of drafting on confirm is that the review can happen
+     * whenever they like.
+     *
+     * <p>A task the service cannot describe is treated as finished rather than retried — the
+     * campaign moving on is always better than it stopping, and the daily sweep is the net.
+     *
+     * @return false if the wait was interrupted (shutdown), meaning we should stop entirely.
+     */
+    private boolean awaitDraft(String planId, String itemId, String taskId) {
+        long deadline = System.currentTimeMillis() + waitTimeoutMs;
+
+        while (System.currentTimeMillis() < deadline) {
+            if (!sleep(pollIntervalMs)) {
+                return false;
+            }
+            String status;
+            try {
+                Map<String, Object> task = planService.getTask(taskId);
+                status = task == null ? null : String.valueOf(task.get("status"));
+            } catch (Exception e) {
+                log.info("[PlanCampaignDrafter] Plan {} item {}: task {} unreadable ({}); moving on",
+                        planId, itemId, taskId, e.getMessage());
+                return true;
+            }
+            if (!"running".equals(status)) {
+                log.info("[PlanCampaignDrafter] Plan {} item {} settled as {}",
+                        planId, itemId, status);
+                return true;
+            }
+        }
+
+        log.warn("[PlanCampaignDrafter] Plan {} item {}: still running after {}ms; starting the "
+                + "next slot anyway", planId, itemId, waitTimeoutMs);
+        return true;
     }
 
     /** @return false if the wait was interrupted (shutdown), meaning we should stop. */
-    private boolean sleepBetweenItems() {
-        if (staggerMs <= 0) {
+    private boolean sleep(long millis) {
+        if (millis <= 0) {
             return true;
         }
         try {
-            Thread.sleep(staggerMs);
+            Thread.sleep(millis);
             return true;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();

@@ -1,14 +1,19 @@
 """
-Music resolution: generates a Soundraw background-music track sized to a render's
-exact duration and writes it into the job directory — mirrors `assets.py`'s
-degrade-gracefully shape (a failure here never aborts the render, the video just
-comes out silent).
+Music resolution: sources a background track sized to a render's exact duration and
+writes it into the job directory — mirrors `assets.py`'s degrade-gracefully shape (a
+failure here never aborts the render, the video just comes out silent).
 
-Mood/genre/energy are now agent-selected: the storyboard LLM authors them on
+Which provider actually serves the track is `factory.get_music_generation()`'s call —
+Jamendo's API by default, a bundled local library offline. Either way the bytes land in
+`job_dir/music.mp3` and Remotion only ever sees the job-relative path.
+
+Mood/genre/energy are agent-selected: the storyboard LLM authors them on
 `StoryboardSpec.audio` and `jobs.py` passes them through here. The constants below
 remain the fallback for a storyboard with no `audio` block (e.g. one persisted before
-the field existed). This still runs entirely server-side, after the storyboard has
-already been approved — same trust boundary as image resolution.
+the field existed). Whether music is resolved AT ALL is decided upstream in `jobs.py`
+(`music_enabled` / `audio.musicEnabled`) — reaching this function means music is wanted.
+This still runs entirely server-side, after the storyboard has already been approved —
+same trust boundary as image resolution.
 """
 
 from __future__ import annotations

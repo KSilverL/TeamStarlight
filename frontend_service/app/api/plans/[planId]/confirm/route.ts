@@ -8,11 +8,19 @@ export async function POST(
 ) {
   const { planId } = await params;
   const authHeader = request.headers.get("Authorization");
+  // Optional body, carrying `draft_mode`. A confirm sent without one is still valid —
+  // the plan keeps whatever mode it already has — so an unparseable body degrades to
+  // an empty one rather than failing the confirm.
+  const body = await request.json().catch(() => ({}));
 
   try {
     const upstream = await fetch(`${BACKEND_URL}/plans/${planId}/confirm`, {
       method: "POST",
-      headers: { ...(authHeader ? { Authorization: authHeader } : {}) },
+      headers: {
+        "Content-Type": "application/json",
+        ...(authHeader ? { Authorization: authHeader } : {}),
+      },
+      body: JSON.stringify(body),
     });
 
     const data = await upstream.json().catch(() => ({}));

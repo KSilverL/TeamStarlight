@@ -339,9 +339,10 @@ Platform finalized (after `/review`) — enriched by the media_producer:
 > The draft text is HTML-escaped, so it is safe.
 > `video_storyboard` is a **`StoryboardSpec`** (`LLM_service/core/video_schema.py`): brand
 > identity + a 3-colour palette + an ordered list of 2–8 typed `slides` composed from a fixed
-> registry (`hook`, `counter_stat`, `collage`, `outro`, `pie_chart`, `line_chart`, `bar_chart`,
-> `node_diagram`, `comparison_table`). It is **data only** — image fields are stock-photo search
-> *keywords* (never URLs), and the final aspect ratio is derived server-side from `platform`. To
+> registry (`hook`, `counter_stat`, `collage`, `statement`, `media_statement`, `outro`,
+> `pie_chart`, `line_chart`, `bar_chart`, `node_diagram`, `comparison_table`). It is **data
+> only** — image/video fields are stock-search *keywords* (never URLs), and the final aspect
+> ratio is derived server-side from `platform`. To
 > get the actual MP4, trigger the render pipeline with
 > [`POST /tasks/{id}/render-video`](#video-render--post-taskstask_idrender-video--get-video-jobsjob_id)
 > and poll `/video-jobs/{job_id}`. Both artifacts appear only on the `final` event.
@@ -701,14 +702,44 @@ overrides:
 | `narration_text` | agent's per-slide narration | Override with your own single whole-video script (replaces the per-slide lines) |
 | `narration_voice` | agent-picked voice persona (Azure Dragon HD) | Override the voice with a provider voice id (e.g. `en-GB-RyanNeural`) |
 | `narration_enabled` | `true` | Set `false` for a music-only render with no narration |
+| `music_enabled` | `true` | Set `false` to suppress the backing track, overriding the agent's own `audio.musicEnabled` choice |
 
 ```json
-// request — silent-narration render
+// request — music-only render (no narration). The music mixes at -9dB rather than
+// the -18dB it sits at under a voiceover, so it still carries the video.
 { "platform": "instagram", "narration_enabled": false }
 ```
 
+Both tracks are also the storyboard agent's to decide: it drops the music by setting
+`audio.musicEnabled: false`, and drops the voice by leaving every slide's `narration`
+(and `audio.narrationScript`) null — so a brief like *"no music, just the voiceover"*
+needs no request flag at all. The two fields above are hard overrides on top of that.
+
 Errors: `404` if the task/platform has no finished draft yet; `409` if that platform's run did
 not request `"video"` (no storyboard to render).
+
+### `POST /tasks/{task_id}/regenerate-storyboard` — rework the storyboard first
+
+The storyboard is produced **after** the human gate (`media_producer`), so by the time a user
+sees it the workflow has already yielded its output and there is no verdict left to send. This
+reworks that storyboard in place from free-text feedback — without re-drafting the copy the user
+already approved, which a gate reject would do.
+
+```json
+// request
+{ "platform": "linkedin", "feedback": "open on the stat and drop the collage" }
+```
+```json
+// response (200) — the revised spec, already stored against the task
+{ "video_storyboard": { "brandName": "…", "slides": [ … ] } }
+```
+
+The revision **replaces** the stored `video_storyboard`, so a subsequent `/render-video` renders
+the revision — and calling this again revises the newest storyboard, not the original. Repeatable
+as many times as the user wants.
+
+Errors: `400` on blank `feedback`; `404` if the task/platform has no finished draft yet; `409` if
+that platform's run produced no storyboard.
 
 ### `GET /video-jobs/{job_id}` — poll the render job
 
@@ -978,8 +1009,8 @@ just a task. Practical rules:
 | Code | When |
 |---|---|
 | `400` | Missing/invalid fields (no `topic`, empty `target_platforms`, unknown/empty `content_types`, bad `decision`, `approve_after_edit` without `edited_draft`, `/say` or `/raise-hand` without `table_id`/`text`, `/roundtable` with no resolvable `platform`, an unknown `roundtable_mode` or `/round-control` `action`; `/plans` or `/plans/clarify` without `goal`/platforms/valid dates, `/plans/{id}/refine` without `feedback` or a non-blank `answers`, `/plans/due` without a `date`, a PATCH with unknown item fields or a status other than `skipped`/`planned`) |
-| `404` | Unknown `task_id`, `session_id`, `plan_id`/`item_id`, or video `job_id`; `/render-video` for a platform with no finished draft; `/download` when the rendered file is missing on disk |
-| `409` | Task not awaiting review, `task_id` already exists, brief not complete, `/confirm-learning` before the task is `completed`, `/render-video` on a platform whose run produced no storyboard, `/download` before the job is `done`; `/plans/{id}/confirm` or `/plans/{id}/refine` on a non-draft plan, `/execute` on a non-active plan or a non-`planned` item (double-execute guard) |
+| `404` | Unknown `task_id`, `session_id`, `plan_id`/`item_id`, or video `job_id`; `/render-video` or `/regenerate-storyboard` for a platform with no finished draft; `/download` when the rendered file is missing on disk |
+| `409` | Task not awaiting review, `task_id` already exists, brief not complete, `/confirm-learning` before the task is `completed`, `/render-video` or `/regenerate-storyboard` on a platform whose run produced no storyboard, `/download` before the job is `done`; `/plans/{id}/confirm` or `/plans/{id}/refine` on a non-draft plan, `/execute` on a non-active plan or a non-`planned` item (double-execute guard) |
 | `422` | FastAPI request-body validation (malformed JSON / wrong field types); standard FastAPI `detail` payload |
 | `500` | Unexpected error on a **synchronous** call (e.g. `POST /review`). A failure during a **background** run (`POST /tasks` / `/roundtable[s]`, which already returned `running`) is **not** a `500` — the task goes `status: "error"` (with an `error` message) and the SSE stream closes on a `workflow`/`error` event. |
 
@@ -1025,6 +1056,7 @@ record Output(String platform, String draft, String decision, String comment,
               List<String> content_types,
               String html_card, Map<String,Object> video_storyboard) {}  // media present only if requested
 record RenderVideo(String platform) {}                        // POST /tasks/{id}/render-video
+record RegenerateStoryboard(String platform, String feedback) {}  // POST /tasks/{id}/regenerate-storyboard
 record TaskSnapshot(String task_id, String status, String title, List<Pending> pending,
                     List<Output> outputs, List<Map<String,Object>> proposed_rules,
                     String error) {}   // title: history-sidebar label; error: present only when status == "error"
@@ -1095,6 +1127,8 @@ public class NewsroomClient {
     public Map<String,Object> raiseHand(String id, String table) throws Exception { return post("/tasks/" + id + "/raise-hand", new RaiseHand(table), Map.class); }
     public Map<String,Object> say(String id, Say s)              throws Exception { return post("/tasks/" + id + "/say", s, Map.class); }
     // Video render: trigger the MP4 for a finished platform's storyboard, then poll the job.
+    // Rework the storyboard first if the user wants changes — the approved copy is untouched.
+    public Map<String,Object> regenerateStoryboard(String id, String platform, String feedback) throws Exception { return post("/tasks/" + id + "/regenerate-storyboard", new RegenerateStoryboard(platform, feedback), Map.class); }
     public Map<String,Object> renderVideo(String id, String platform) throws Exception { return post("/tasks/" + id + "/render-video", new RenderVideo(platform), Map.class); }
     public Map<String,Object> videoJob(String jobId)             throws Exception { return get("/video-jobs/" + jobId, Map.class); }
 

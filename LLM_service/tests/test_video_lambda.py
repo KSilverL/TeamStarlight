@@ -17,7 +17,12 @@ from __future__ import annotations
 import pytest
 
 from LLM_service.core.config import Settings
-from LLM_service.core.video_schema import RenderableStoryboard, RenderGeneratedSlide, RenderHookSlide
+from LLM_service.core.video_schema import (
+    RenderableStoryboard,
+    RenderGeneratedSlide,
+    RenderHookSlide,
+    RenderMediaStatementSlide,
+)
 from LLM_service.workflow.video import lambda_render, render
 from LLM_service.workflow.video.render import RenderError
 
@@ -47,6 +52,115 @@ def _generated_storyboard() -> RenderableStoryboard:
         width=1080, height=1920,
         slides=[RenderGeneratedSlide(componentName="Generated_job1_0", data={}, durationFrames=100)],
     )
+
+
+# ── render.py: the render subprocess timeout ───────────────────────────
+
+def _storyboard_of(*durations, transition: str = "none") -> RenderableStoryboard:
+    return RenderableStoryboard(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        width=1080, height=1920, transition=transition,
+        slides=[RenderHookSlide(headline="Hi", durationFrames=d) for d in durations],
+    )
+
+
+def test_render_timeout_scales_with_frame_count():
+    """A long storyboard must get proportionally longer to render in. The flat 240s
+    this replaced left a full-length storyboard barely any headroom, so ordinary
+    run-to-run variance started reading as a hung process."""
+    short = render.render_timeout_for(_storyboard_of(90, 90))
+    long = render.render_timeout_for(_storyboard_of(*([300] * 8)))
+    assert long > short
+    # 2400 frames * 0.35 + 120 fixed
+    assert long == pytest.approx(120.0 + 0.35 * 2400)
+
+
+def test_render_timeout_never_drops_below_the_historical_default():
+    """Short storyboards must not come out of this change with a TIGHTER budget than
+    the flat 240s they had before it."""
+    assert render.render_timeout_for(_storyboard_of(60)) == 240.0
+    assert render.render_timeout_for(_storyboard_of(90, 90)) == 240.0
+
+
+def test_render_timeout_discounts_transition_overlap():
+    """Transitions overlap slides, so the storyboard renders FEWER frames than the
+    slide durations sum to — the budget follows the frames actually rendered
+    (renderable_total_frames), not the nominal total."""
+    durations = [300] * 8
+    assert render.render_timeout_for(_storyboard_of(*durations, transition="fade")) < (
+        render.render_timeout_for(_storyboard_of(*durations, transition="none"))
+    )
+
+
+async def test_render_storyboard_derives_its_own_timeout(tmp_path, monkeypatch):
+    """render_storyboard is called with no timeout_s in production (jobs.py), so the
+    derived value has to actually reach the subprocess runner."""
+    seen = {}
+
+    async def fake_render_local(renderable, *, job_dir, settings, entry_point, composition_id, timeout_s):
+        seen["timeout_s"] = timeout_s
+        return tmp_path / "output.mp4"
+
+    monkeypatch.setattr(render, "_render_local", fake_render_local)
+    storyboard = _storyboard_of(*([300] * 8))
+    await render.render_storyboard(storyboard, job_dir=tmp_path, settings=Settings())
+    assert seen["timeout_s"] == render.render_timeout_for(storyboard)
+    assert seen["timeout_s"] > 240.0
+
+
+async def test_render_storyboard_honours_an_explicit_timeout(tmp_path, monkeypatch):
+    seen = {}
+
+    async def fake_render_local(renderable, *, job_dir, settings, entry_point, composition_id, timeout_s):
+        seen["timeout_s"] = timeout_s
+        return tmp_path / "output.mp4"
+
+    monkeypatch.setattr(render, "_render_local", fake_render_local)
+    await render.render_storyboard(
+        _storyboard_of(*([300] * 8)), job_dir=tmp_path, settings=Settings(), timeout_s=7.0,
+    )
+    assert seen["timeout_s"] == 7.0
+
+
+# ── render.py: worker concurrency ─────────────────────────────────────
+
+def _clip_storyboard(media_local_path="clips/0.mp4") -> RenderableStoryboard:
+    return RenderableStoryboard(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        width=1080, height=1920,
+        slides=[RenderMediaStatementSlide(
+            text="Hi", mediaLocalPath=media_local_path, durationFrames=150,
+        )],
+    )
+
+
+def test_concurrency_is_capped_for_storyboards_carrying_video():
+    """Each Remotion worker is a Chromium tab holding a decoded frame; a slide
+    playing stock footage holds a decoded VIDEO frame too. At Remotion's default
+    (~half the cores) that exhausted a small host and aborted the render outright
+    with "No frame found at position N" — which looks like a corrupt input, not a
+    resource limit."""
+    assert render._resolve_concurrency(_clip_storyboard(), Settings()) == 3
+
+
+def test_concurrency_is_left_alone_without_video():
+    """Storyboards with no footage were never the problem — don't halve their
+    throughput for a risk they don't carry."""
+    assert render._resolve_concurrency(_no_generated_storyboard(), Settings()) is None
+
+
+def test_concurrency_is_left_alone_when_the_clip_failed_to_resolve():
+    """A media_statement whose clip missed degrades to the mosaic and decodes no
+    video, so it needs no cap."""
+    assert render._resolve_concurrency(_clip_storyboard(media_local_path=None), Settings()) is None
+
+
+def test_explicit_concurrency_setting_overrides_the_cap():
+    """A host with more (or less) headroom must be able to override without a code
+    change."""
+    settings = Settings(video_render_concurrency=8)
+    assert render._resolve_concurrency(_clip_storyboard(), settings) == 8
+    assert render._resolve_concurrency(_no_generated_storyboard(), settings) == 8
 
 
 # ── render.py: local vs lambda dispatch ───────────────────────────────────────

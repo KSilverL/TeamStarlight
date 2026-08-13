@@ -212,7 +212,18 @@ intent stays `posting_plan`. Drop `known` to end the conversation.
 | `known` | object | No | The `campaign` from the previous response |
 | `history` | object[] | No | Prior `{role, content}` turns |
 | `followups_asked` | int | No | From the previous response; at the cap (2) the gaps get filled rather than asked about |
+| `force_plan` | bool | No | The user asked for a plan **outright** — a UI control, not an inference. Defaults `false` |
 | `business_id` / `user_id` | string | No | Ride onto the finished brief |
+
+> **`force_plan` overrules the verdict, it does not skip the call.** Reading intent out of a
+> sentence is guesswork, and it is wrong often enough to matter — *"posts for the launch"* is a
+> campaign to a human and a single post to a model. The chat's **Posting plan** toggle is the
+> user settling it, so `intent` comes back `posting_plan` whatever the message looks like alone.
+> The classification still runs, because it is also what extracts the goal and the window.
+>
+> A message the classifier read as a one-off carries neither, so a forced campaign usually
+> starts empty and asks its clarifying questions — same machinery, same cap, same guaranteed
+> termination as a campaign the classifier chose itself.
 
 > **`today` is required and this is the point of it.** The service has no clock — `/plans/due`
 > takes the date as an argument for the same reason. "Next month" is only resolvable against a

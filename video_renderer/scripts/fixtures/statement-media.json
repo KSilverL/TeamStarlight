@@ -1,0 +1,54 @@
+{
+  "brandName": "STARLIGHT",
+  "theme": "light",
+  "primaryColor": "#f4f5fb",
+  "secondaryColor": "#4f46e5",
+  "accentColor": "#8b5cf6",
+  "backgroundStyle": "solid",
+  "transition": "none",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "slides": [
+    {
+      "type": "media_statement",
+      "kicker": "THE STARTUP SERIES",
+      "text": "Deciding between Bedrock, Claude Platform, or Direct API?",
+      "emphasisWords": [
+        "Bedrock"
+      ],
+      "variant": "inset_card",
+      "mediaLocalPath": "clips/stock.mp4",
+      "mediaDurationFrames": 593,
+      "durationFrames": 150
+    },
+    {
+      "type": "media_statement",
+      "text": "Match your AI platform to your startup's needs",
+      "emphasisWords": [
+        "Match"
+      ],
+      "variant": "full_bleed",
+      "mediaLocalPath": "clips/stock.mp4",
+      "mediaDurationFrames": 593,
+      "durationFrames": 135
+    },
+    {
+      "type": "media_statement",
+      "text": "Follow our guide to find the right architecture",
+      "emphasisWords": [
+        "right"
+      ],
+      "variant": "mosaic_reveal",
+      "mediaLocalPath": "clips/stock.mp4",
+      "mediaDurationFrames": 593,
+      "durationFrames": 165
+    },
+    {
+      "type": "media_statement",
+      "text": "No clip resolved, so this degrades to the mosaic",
+      "variant": "inset_card",
+      "durationFrames": 120
+    }
+  ]
+}

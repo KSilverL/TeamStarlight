@@ -25,6 +25,7 @@ from ...core.config import Settings, get_settings
 from ...core.services import factory
 from ...core.services.media_assets import GeoapifyGeocoder, GeoapifyStaticMap, basemap_style
 from ...core.video_schema import (
+    FPS,
     GeneratedSlideSpec,
     MapPin,
     MapSlideSpec,
@@ -36,9 +37,12 @@ from ...core.video_schema import (
     RenderHookSlide,
     RenderLineChartSlide,
     RenderMapSlide,
+    RenderMediaStatementSlide,
     RenderNodeDiagramSlide,
     RenderOutroSlide,
     RenderPieChartSlide,
+    RenderStatementSlide,
+    ResolvedClip,
     ResolvedImage,
     StoryboardSpec,
     aspect_for_platform,
@@ -99,6 +103,86 @@ async def _resolve_image(query: str, *, images_dir: Path, index: int) -> Resolve
     path = images_dir / f"{index}.png"
     path.write_bytes(cutout)
     return ResolvedImage(query=query, localPath=f"{images_dir.name}/{path.name}")
+
+
+# A stock mp4 is 10-100x the size of a stock photo, so the image path's "buffer
+# resp.content whole with a 15s timeout" is not reusable here.
+_CLIP_MAX_BYTES = 40 * 1024 * 1024
+
+
+async def _download_clip(url: str) -> Optional[bytes]:
+    """Fetch clip bytes, streamed with a hard size cap.
+
+    Deliberately separate from `_download`: 15 seconds isn't enough for a video, and
+    buffering `resp.content` with no ceiling invites a 200MB download into memory if
+    a rendition guard upstream ever slips. None on any failure — a clip that won't
+    download degrades the slide, it never aborts the render."""
+    try:
+        import httpx  # lazy import, matches the rest of core/services/*
+
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            async with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                chunks: List[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > _CLIP_MAX_BYTES:
+                        return None
+                    chunks.append(chunk)
+                return b"".join(chunks)
+    except Exception:
+        return None
+
+
+async def _resolve_clip(
+    query: str, *, clips_dir: Path, index: int, width: int, height: int, settings: Settings,
+) -> ResolvedClip:
+    """Resolve one stock-footage query to a local mp4 — `_resolve_image`'s twin, with
+    the same fallback ladder: a search miss or download failure leaves `localPath`
+    None and the Remotion side renders the mosaic alone rather than a gap.
+
+    Skipped outright on the Lambda backend, like `_resolve_map_basemap`: job-dir
+    assets reach the renderer via the local render's --public-dir, and the deployed
+    Lambda site bundle has no equivalent, so `staticFile("clips/0.mp4")` could never
+    resolve there. Downloading 40MB that Chromium-on-Lambda cannot load is strictly
+    worse than degrading up front.
+
+    No background removal, unlike the image path — a cut-out has no video analogue,
+    and the footage is meant to read as a full frame anyway."""
+    if settings.video_render_backend == "lambda":
+        return ResolvedClip(query=query, localPath=None)
+
+    # Derived from the already-resolved canvas rather than guessed: this is what
+    # stops a 16:9 clip being cropped to a vertical sliver inside a 9:16 card.
+    orientation = "portrait" if height > width else "landscape" if width > height else "square"
+    try:
+        results = await factory.get_video_search().search(
+            query=query, orientation=orientation, per_page=1,
+            target_width=width, target_height=height,
+        )
+    except Exception:
+        results = []
+    if not results or not results[0].get("url"):
+        return ResolvedClip(query=query, localPath=None)
+
+    raw = await _download_clip(results[0]["url"])
+    if raw is None:
+        return ResolvedClip(query=query, localPath=None)
+
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    path = clips_dir / f"{index}.mp4"
+    path.write_bytes(raw)
+    # One frame of headroom: <Loop> must never ask the decoder for a frame past EOF.
+    duration_s = float(results[0].get("duration") or 0)
+    frames = max(1, int(duration_s * FPS) - 1) if duration_s > 0 else None
+    return ResolvedClip(
+        query=query,
+        localPath=f"{clips_dir.name}/{path.name}",
+        durationFrames=frames,
+        width=results[0].get("width"),
+        height=results[0].get("height"),
+    )
 
 
 def _mercator_y(lat: float) -> float:
@@ -266,9 +350,30 @@ async def resolve_storyboard_assets(
             for q in slide.imageQueries:
                 image_jobs.append((i, q))
 
-    resolved = await asyncio.gather(
-        *(_resolve_image(q, images_dir=images_dir, index=n) for n, (_, q) in enumerate(image_jobs)),
-        return_exceptions=True,
+    # media_statement clips resolve in the SAME wave as the images (nested gathers,
+    # not one flat list — the two result types differ, and the isinstance guard below
+    # that catches a bug in the resolution code itself needs one type to check).
+    clip_jobs: List[Tuple[int, str]] = [
+        (i, s.mediaQuery)
+        for i, s in enumerate(storyboard.slides)
+        if s.type == "media_statement" and s.mediaQuery
+    ]
+
+    resolved, resolved_clips = await asyncio.gather(
+        asyncio.gather(
+            *(_resolve_image(q, images_dir=images_dir, index=n) for n, (_, q) in enumerate(image_jobs)),
+            return_exceptions=True,
+        ),
+        asyncio.gather(
+            *(
+                _resolve_clip(
+                    q, clips_dir=job_dir / "clips", index=n,
+                    width=width, height=height, settings=settings,
+                )
+                for n, (_, q) in enumerate(clip_jobs)
+            ),
+            return_exceptions=True,
+        ),
     )
     # A bare exception here (vs. a graceful ResolvedImage(localPath=None)) means a
     # bug in the resolution code itself, not an expected asset failure — still must
@@ -277,6 +382,12 @@ async def resolve_storyboard_assets(
     for (slide_index, query), result in zip(image_jobs, resolved):
         image = result if isinstance(result, ResolvedImage) else ResolvedImage(query=query, localPath=None)
         by_slide.setdefault(slide_index, []).append(image)
+
+    clips_by_slide: Dict[int, ResolvedClip] = {}
+    for (slide_index, query), result in zip(clip_jobs, resolved_clips):
+        clips_by_slide[slide_index] = (
+            result if isinstance(result, ResolvedClip) else ResolvedClip(query=query, localPath=None)
+        )
 
     render_slides = []
     for i, slide in enumerate(storyboard.slides):
@@ -299,6 +410,20 @@ async def resolve_storyboard_assets(
             render_slides.append(RenderCollageSlide(
                 headline=slide.headline, layout=slide.layout, captions=slide.captions,
                 resolvedImages=by_slide.get(i, []), durationFrames=duration,
+            ))
+        elif slide.type == "statement":
+            render_slides.append(RenderStatementSlide(
+                text=slide.text, kicker=slide.kicker, emphasisWords=slide.emphasisWords,
+                variant=slide.variant, durationFrames=duration,
+            ))
+        elif slide.type == "media_statement":
+            clip = clips_by_slide.get(i)
+            render_slides.append(RenderMediaStatementSlide(
+                text=slide.text, kicker=slide.kicker, emphasisWords=slide.emphasisWords,
+                variant=slide.variant,
+                mediaLocalPath=clip.localPath if clip else None,
+                mediaDurationFrames=clip.durationFrames if clip else None,
+                durationFrames=duration,
             ))
         elif slide.type == "outro":
             render_slides.append(RenderOutroSlide(

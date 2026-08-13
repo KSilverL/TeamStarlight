@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { countUp, fadeIn, progress, riseSoft, stagger } from "../animations";
+import { countUp, fadeIn, kenBurns, progress, riseSoft, stagger } from "../animations";
+
+const scaleOf = (transform: string): number => Number(/scale\(([-\d.]+)\)/.exec(transform)![1]);
 
 const FPS = 30;
 
@@ -64,5 +66,37 @@ describe("riseSoft", () => {
     const end = riseSoft(30);
     expect(end.opacity).toBe(1);
     expect(end.transform).toBe("translateY(0px)");
+  });
+});
+
+describe("kenBurns", () => {
+  it("starts at `from` and ends at `to`", () => {
+    expect(kenBurns(0, 90, { from: 1, to: 1.12 })).toBe("scale(1) translate(0%, 0%)");
+    expect(scaleOf(kenBurns(90, 90, { from: 1, to: 1.12 }))).toBeCloseTo(1.12);
+  });
+
+  it("clamps past the duration", () => {
+    expect(kenBurns(999, 90)).toBe(kenBurns(90, 90));
+  });
+
+  it("is monotone in scale across the ramp", () => {
+    let prev = -Infinity;
+    for (let f = 0; f <= 90; f++) {
+      const s = scaleOf(kenBurns(f, 90));
+      expect(s).toBeGreaterThanOrEqual(prev);
+      prev = s;
+    }
+  });
+
+  it("applies pan as a percentage of the element", () => {
+    expect(kenBurns(60, 60, { from: 1, to: 1, panX: 10, panY: -4 })).toBe(
+      "scale(1) translate(10%, -4%)",
+    );
+  });
+
+  it("does not throw on a zero-length slide", () => {
+    // interpolate() throws on a non-increasing range — a fixture with
+    // durationFrames: 0 would otherwise hard-fail the whole render.
+    expect(() => kenBurns(0, 0)).not.toThrow();
   });
 });

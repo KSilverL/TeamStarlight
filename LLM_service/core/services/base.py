@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import AsyncIterator, List, Optional
+from typing import AsyncIterator, Callable, List, Optional
 
 from ..skill_schema import SkillCandidate, SkillRule, UserSkillDoc
 from ..trend_schema import Trend
@@ -285,6 +285,7 @@ class LLMService(ABC):
         history: Optional[List[dict]] = None,
         feedback: str = "",
         prior_draft: str = "",
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> str:
         """Return ready-to-publish, platform-native post copy (a real post the user
         can copy-paste — hook, body, CTA, hashtags/emojis — not an outline),
@@ -306,7 +307,13 @@ class LLMService(ABC):
         {role, content} messages, supplied by the caller (the backend looks it up by
         conversation id and assembles the payload — this service stays stateless): an
         impl folds it in as prior turns so a follow-up like "make it punchier" continues
-        the thread. None/empty means a fresh, single-turn generation."""
+        the thread. None/empty means a fresh, single-turn generation.
+
+        `on_delta`, when given, is called with successive slices of the copy AS IT IS
+        WRITTEN — the concatenation of every call equals the returned string. This is the
+        one method that streams, because it is the one whose output a person sits and
+        waits for. It is advisory: an impl that cannot stream may call it once with the
+        whole text, or not at all, and the return value is authoritative either way."""
         ...
 
     @abstractmethod
@@ -869,6 +876,41 @@ class ImageSearchService(ABC):
     async def search(self, *, query: str, per_page: int = 1) -> List[dict]:
         """Return up to `per_page` candidate images for `query`, each a dict with at
         least {url, photographer, width, height}. Empty list on no match."""
+        ...
+
+
+class VideoSearchService(ABC):
+    """Stock-FOOTAGE search for `media_statement` slides — the moving-image sibling
+    of ImageSearchService. Same soft-fail contract: an empty result means "no clip
+    for this slide" (it degrades to the mosaic alone), never an exception.
+
+    Note this is stock-footage *search*, entirely distinct from VideoGenerationService,
+    which asks an AI model to synthesize a clip.
+    """
+
+    @abstractmethod
+    async def search(
+        self,
+        *,
+        query: str,
+        orientation: str = "portrait",
+        per_page: int = 1,
+        target_width: int = 1080,
+        target_height: int = 1920,
+    ) -> List[dict]:
+        """Return up to `per_page` candidate clips for `query`, each a dict with at
+        least {url, width, height, fps, duration, photographer}. `duration` is in
+        SECONDS (float).
+
+        `url` points at ONE already-chosen rendition, not a list of them: which of a
+        provider's encodings to download is provider knowledge (codec support,
+        rendition naming, size trade-offs), so it belongs behind this interface
+        rather than in every caller. `target_width`/`target_height` are the canvas
+        the clip will be composited into, so the impl can pick the least-upscale
+        rendition instead of the largest one available.
+
+        Empty list on no match.
+        """
         ...
 
 

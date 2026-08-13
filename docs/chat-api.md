@@ -41,6 +41,7 @@ Frontend receives updated session state
 - [A1. Create Session](#a1-create-session)
 - [A2. Get Session](#a2-get-session)
 - [A3. List Sessions](#a3-list-sessions)
+- [A4. Rename Session](#a4-rename-session)
 
 **B - Chat Messaging (Frontend → Backend)**
 - [B1. Send Message / Submit Brief](#b1-send-message--submit-brief)
@@ -260,6 +261,7 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
     "updatedAt": null,
     "status": "running",
     "phase": null,
+    "title": "Ethiopia Harvest Launch",
     "targetPlatforms": ["instagram", "linkedin"],
     "contentTopics": null
   }
@@ -267,6 +269,72 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
 ```
 
 Returns an empty array `[]` if no sessions exist or the token is missing/invalid.
+
+`title` is `null` until the session has been named (see A4) — the sidebar falls back to the
+creation timestamp for those.
+
+---
+
+### A4. Rename Session
+
+**Description**  
+Sets a session's title, which is what the history sidebar shows in place of a timestamp. The
+title itself is produced by the LLM service and handed to the client on the `POST /tasks`
+response and the `session_title` SSE event — see [session-title-api.md](./session-title-api.md).
+This is where the client writes it down so it survives a reload.
+
+**Endpoint**  
+`/api/sessions/{id}`
+
+**Base URL**  
+`http://localhost:8081`
+
+**Method**  
+`PATCH`
+
+**Headers**
+
+| Header          | Required | Description                         |
+|-----------------|----------|-------------------------------------|
+| `Authorization` | Yes      | `Bearer <token>` from `POST /login` |
+| `Content-Type`  | Yes      | `application/json`                  |
+
+**Body Parameters**
+
+| Field   | Type   | Required | Description                                        |
+|---------|--------|----------|----------------------------------------------------|
+| `title` | string | Yes      | The session's name. Blank or absent is a no-op     |
+
+**Example Request**
+
+```http
+PATCH /api/sessions/intake-a1b2c3d4e5f6 HTTP/1.1
+Host: localhost:8081
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+Content-Type: application/json
+
+{ "title": "Ethiopia Harvest Launch" }
+```
+
+**Example Successful Response** — `200 OK`
+
+```json
+{ "updated": true }
+```
+
+`{"updated": false}` comes back when the title was blank: nothing is written, because an empty
+title would erase a good one.
+
+**Errors**
+
+| Status | When                                                      |
+|--------|-----------------------------------------------------------|
+| `401`  | Missing or invalid token                                   |
+| `403`  | The session belongs to another business                    |
+| `404`  | No session with that id                                    |
+
+> Unlike the other endpoints in this section, this one **enforces ownership**. A title is the
+> one part of a session another account could otherwise rewrite by guessing an id.
 
 ---
 

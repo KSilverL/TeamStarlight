@@ -50,6 +50,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Stre
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .core.config import get_settings, load_dotenv
+from .core.emitter import emitter_bound
 from .core.events import (
     DONE,
     ERROR,
@@ -83,6 +84,7 @@ from .workflow.roundtable.context import build_persona_context
 from .workflow.roundtable.personas import render_brand_profile, render_user_skills
 from .workflow.video.jobs import get_render_job, start_render_job
 from .core.plan_schema import (
+    DRAFT_MODES,
     PlanClarification,
     PlanItem,
     PostingPlan,
@@ -222,6 +224,20 @@ def _brief_from_inputs(inputs: dict) -> Brief:
     )
 
 
+def _valid_draft_mode(raw) -> str:
+    """Validate a plan's draft_mode ('roundtable' | 'fast'), 400 on anything else."""
+    mode = str(raw or "roundtable").strip().lower()
+    if mode not in DRAFT_MODES:
+        raise ApiError(400, f"'draft_mode' must be one of {', '.join(DRAFT_MODES)}")
+    return mode
+
+
+def _draft_mode_from_inputs(inputs: dict) -> str:
+    """The deliberation mode a new plan's slots will be written with. Omitted → the
+    roundtable, so a caller that has never heard of this field gets what it always got."""
+    return _valid_draft_mode(inputs.get("draft_mode"))
+
+
 def _compliance_payload(request) -> dict:
     """The additive compliance fields for one pending gate (`HumanReviewRequest`).
 
@@ -275,13 +291,15 @@ def _reject_disallowed_on_blocked_gate(pending: dict, verdict: dict, platform: s
 
 
 def _roundtable_mode_from_inputs(inputs: dict) -> str:
-    """Pop + validate the per-request step-mode switch. "auto" (the default) never prompts —
+    """Pop + validate the per-request roundtable switch. "auto" (the default) never prompts —
     today's hands-off flow; "manual" pauses every table at each round boundary for the user's
-    4-way choice (next / speak / enough / auto) via POST /tasks/{id}/round-control. Popped so
-    the remaining inputs stay a pure brief."""
+    4-way choice (next / speak / enough / auto) via POST /tasks/{id}/round-control; "off"
+    skips the discussion entirely and runs the original dispatcher → strategist → creator
+    path, for a caller that has chosen speed over deliberation (a campaign's fast mode).
+    Popped so the remaining inputs stay a pure brief."""
     mode = str(inputs.pop("roundtable_mode", None) or "auto").strip().lower()
-    if mode not in ("auto", "manual"):
-        raise ApiError(400, "'roundtable_mode' must be 'auto' or 'manual'")
+    if mode not in ("auto", "manual", "off"):
+        raise ApiError(400, "'roundtable_mode' must be 'auto', 'manual' or 'off'")
     return mode
 
 
@@ -856,6 +874,17 @@ class WorkflowService:
     # ── Drive one run segment (start or resume) until the next pause / end ─────
 
     async def _drive(self, task: _Task, *, message=None, responses=None) -> dict:
+        """Drain the workflow with this task's publisher bound as the ambient event sink.
+
+        The binding is what lets the creator stream copy as it writes (see core/emitter.py):
+        `_translate` only ever sees whole messages, so a draft that takes half a minute to
+        write has nothing to report until it is finished. Bound here rather than in `start`
+        because a resume (`review` → a rejected platform re-drafts) goes through this same
+        method and must stream too."""
+        with emitter_bound(lambda ev: self._publish(task, ev)):
+            return await self._drain(task, message=message, responses=responses)
+
+    async def _drain(self, task: _Task, *, message=None, responses=None) -> dict:
         # Answered gates stop being pending the moment we resume with their response — before
         # the stream even starts, not after it drains (see below for why "after" is wrong).
         if responses:
@@ -1035,7 +1064,9 @@ class WorkflowService:
             raise ApiError(409, f"task_id already exists: {task_id}")
         rt_mode = _roundtable_mode_from_inputs(inputs)  # 400 on a bad value, before any spawn
         brief = _brief_from_inputs(inputs)  # validates synchronously (HTTP 400) before any spawn
-        roundtable = get_settings().roundtable_enabled
+        # The setting is the deployment's ceiling; "off" is one caller declining it for this
+        # run. Neither can turn the roundtable ON where the other has ruled it out.
+        roundtable = get_settings().roundtable_enabled and rt_mode != "off"
         text_requested = "text" in brief.content_types
         # A CALLER-supplied hook (the CLI menu) owns the terminal, so tables must run one at a
         # time; the service's own step-mode hook (below) is per-table (SSE + /round-control),
@@ -1404,6 +1435,52 @@ class WorkflowService:
         trigger only needs {task_id, platform} — never a full storyboard round-trip."""
         return self._require(task_id).outputs.get(platform)
 
+    async def regenerate_storyboard(self, task_id: str, platform: str, feedback: str) -> dict:
+        """Re-generate one platform's video storyboard from the user's feedback, leaving the
+        approved copy alone.
+
+        The storyboard is produced after the human gate (media_producer), so by the time the
+        user sees it the workflow has already yielded its output and there is no gate left to
+        send a verdict to. Without this, disliking a storyboard meant re-running the whole
+        task — regenerating new copy the user had already approved just to get different slides.
+
+        The revision replaces `video_storyboard` on the stored FinalDraft, which is what
+        VideoService.start reads (`get_final_draft`) — so the next render picks up the revision
+        with no extra plumbing, and iterating twice compares against the newest storyboard
+        rather than the original.
+        """
+        feedback = (feedback or "").strip()
+        if not feedback:
+            raise ApiError(400, "'feedback' is required — say what should change about the storyboard")
+
+        task = self._require(task_id)
+        final = task.outputs.get(platform)
+        if final is None:
+            raise ApiError(404, f"no finished draft for platform '{platform}' on task {task_id}")
+        previous = final.get("video_storyboard")
+        if not previous:
+            raise ApiError(409, f"platform '{platform}' has no video storyboard yet")
+
+        raw = await factory.get_llm().generate_video_storyboard(
+            topic=task.brief.topic,
+            # A media-only run has no text deliverable, so the FinalDraft's draft is blank —
+            # fall back to the topic rather than asking the LLM to re-storyboard nothing.
+            draft=final.get("draft") or task.brief.topic,
+            tone_hint=task.brief.tone_hint,
+            platform=platform,
+            skill=load_skill("brand_video_storyboard"),
+            direction=feedback,
+            # Framed as a follow-up turn (what we produced, what the user wants changed) so the
+            # revision edits that storyboard rather than starting over from the brief.
+            history=[
+                {"role": "assistant", "content": json.dumps(previous)},
+                {"role": "user", "content": feedback},
+            ],
+        )
+        final["video_storyboard"] = StoryboardSpec(**raw).model_dump()
+        task.outputs[platform] = final
+        return {"video_storyboard": final["video_storyboard"]}
+
     def buffered_events(self, task_id: str) -> list[dict]:
         """Non-blocking snapshot of the event log so far (the SSE replay
         buffer). Unlike `events()`, this never waits for future events."""
@@ -1593,7 +1670,7 @@ class IntakeService:
         self, *, message: str, today: str, target_platforms: Optional[list] = None,
         known: Optional[dict] = None, history: Optional[list] = None,
         followups_asked: int = 0, business_id: Optional[str] = None,
-        user_id: Optional[str] = None,
+        user_id: Optional[str] = None, force_plan: bool = False,
     ) -> dict:
         """Route one chat turn: one post now, or a campaign across a date range?
 
@@ -1601,7 +1678,11 @@ class IntakeService:
         posts for next month" produced one post *about* planning LinkedIn posts. A
         `single_post` answer means the caller carries on to `POST /tasks` exactly as before;
         `posting_plan` means it keeps turning this until `complete`, then takes the result to
-        `/plans/clarify` and `POST /plans`."""
+        `/plans/clarify` and `POST /plans`.
+
+        `force_plan` skips the fork: the caller's user has asked for a plan explicitly (the
+        chat's Posting plan toggle), so the turn is a campaign whatever the sentence looks
+        like on its own."""
         if not (message or "").strip():
             raise ApiError(400, "missing required field: message")
 
@@ -1621,6 +1702,7 @@ class IntakeService:
             followups_asked=followups_asked,
             business_id=business_id,
             user_id=user_id,
+            force_plan=force_plan,
         )
 
     def _require(self, session_id: str) -> IntakeSession:
@@ -1747,7 +1829,8 @@ class VideoService:
     async def start(
         self, task_id: str, platform: str, *,
         narration_text: Optional[str] = None, narration_voice: Optional[str] = None,
-        narration_enabled: bool = True, reference_images: Optional[list[str]] = None,
+        narration_enabled: bool = True, music_enabled: bool = True,
+        reference_images: Optional[list[str]] = None,
     ) -> dict:
         draft = self._workflow.get_final_draft(task_id, platform)
         if draft is None:
@@ -1758,7 +1841,7 @@ class VideoService:
         doc = await start_render_job(
             task_id=task_id, platform=platform, storyboard=StoryboardSpec(**storyboard),
             narration_text=narration_text, narration_voice=narration_voice,
-            narration_enabled=narration_enabled,
+            narration_enabled=narration_enabled, music_enabled=music_enabled,
             reference_images=_decode_reference_images(reference_images),
         )
         return {"job_id": doc["id"], "status": doc["status"]}
@@ -2017,6 +2100,7 @@ class PlanService:
             start_date=start_date,
             end_date=end_date,
             status="draft",
+            draft_mode=_draft_mode_from_inputs(inputs),
             strategy_summary=spec.strategy_summary,
             recommended_cadence=spec.recommended_cadence,
             follow_up_questions=list(spec.follow_up_questions),
@@ -2086,10 +2170,18 @@ class PlanService:
             business_id=business_id, user_id=user_id, status=status)
         return {"plans": plans}
 
-    async def confirm(self, plan_id: str) -> dict:
+    async def confirm(self, plan_id: str, *, draft_mode: Optional[str] = None) -> dict:
+        """Activate a draft plan, which is what releases its slots to be written.
+
+        `draft_mode` is accepted here and not only at creation because confirming is the
+        moment the choice becomes real: until then the plan is a schedule the user is
+        still editing, and how much deliberation each slot gets is a decision about work
+        that has not started. Omitted → whatever the plan already carries."""
         plan = await self._require(plan_id)
         if plan.get("status") != "draft":
             raise ApiError(409, f"plan {plan_id} is not a draft (status={plan.get('status')})")
+        if draft_mode is not None:
+            plan["draft_mode"] = _valid_draft_mode(draft_mode)
         plan["status"] = "active"
         await self._save(plan)
         return plan
@@ -2164,6 +2256,10 @@ class PlanService:
             "user_id": plan.get("user_id"),
             "content_types": list(item.get("content_types") or ["text"]),
         }
+        # The campaign's deliberation setting, applied per slot. A plan stored before
+        # draft_mode existed reads as "roundtable" and behaves exactly as it did.
+        if plan.get("draft_mode") == "fast":
+            inputs["roundtable_mode"] = "off"
         # WorkflowService.start 409s on a duplicate task_id, so a double-execute that
         # raced past the item-status guard still cannot start a second run.
         snapshot = await self._workflow.start(inputs, task_id=task_id, background=True)
@@ -2349,6 +2445,10 @@ class ClassifyRequest(BaseModel):
         "cap the conversation fills the gaps itself rather than interrogating further.")
     business_id: Optional[str] = None
     user_id: Optional[str] = None
+    force_plan: bool = Field(
+        False, description="The user asked for a posting plan outright (a UI control, not an "
+        "inference). Overrides a `single_post` verdict — the classification still runs, since "
+        "it is what extracts the goal and the date window from the message.")
 
 
 class IntakeStartRequest(BaseModel):
@@ -2425,10 +2525,27 @@ class RenderVideoRequest(BaseModel):
         True, description="Whether to render narration at all. True (default) uses the "
         "agent's script (or narration_text override); false suppresses narration entirely."
     )
+    music_enabled: bool = Field(
+        True, description="Whether to render backing music at all. True (default) defers to "
+        "the storyboard LLM's own choice (audio.musicEnabled); false suppresses music "
+        "entirely, overriding the agent. Set both this and narration_enabled false for a "
+        "fully silent render."
+    )
     reference_images: Optional[list[str]] = Field(
         None, description="1-3 user-attached reference images as base64 data URLs "
         "(or raw base64), passed to the Higgsfield backend for image-to-video. "
         "Ignored by the Remotion (local/lambda) backends."
+    )
+
+
+class RegenerateStoryboardRequest(BaseModel):
+    """Revise one platform's storyboard in place — POST /tasks/{task_id}/regenerate-storyboard.
+    Only the storyboard is re-generated; the approved copy is untouched."""
+
+    platform: str = Field(..., description="Which finished platform draft's storyboard to revise")
+    feedback: str = Field(
+        ..., description="What should change about the storyboard, in the user's own words "
+        "(e.g. 'drop the pie chart and open on the stat instead')."
     )
 
 
@@ -2454,6 +2571,20 @@ class CreatePlanRequest(BaseModel):
     answers: Optional[dict[str, str]] = Field(
         None, description="Answers to the follow_up_questions from a prior POST /plans/clarify, "
         "keyed by the question — so the very first draft is already tailored to them.")
+    draft_mode: Optional[str] = Field(
+        None, description="How much deliberation each slot's copy gets: 'roundtable' (the "
+        "default — the full agent discussion per slot, minutes each) or 'fast' (straight to "
+        "the strategist/creator, seconds each). Changeable again at confirm time.")
+
+
+class ConfirmPlanRequest(BaseModel):
+    """Activate a draft plan — POST /plans/{plan_id}/confirm. The body is optional; it
+    exists so the user can settle how their campaign gets written at the moment they
+    commit to it, rather than back when the schedule was first generated."""
+    model_config = ConfigDict(extra="allow")
+
+    draft_mode: Optional[str] = Field(
+        None, description="'roundtable' or 'fast'. Omitted → keep what the plan carries.")
 
 
 class ClarifyPlanRequest(BaseModel):
@@ -2724,9 +2855,21 @@ async def render_video(request: Request, task_id: str, body: RenderVideoRequest)
     return await _video(request).start(
         task_id, body.platform,
         narration_text=body.narration_text, narration_voice=body.narration_voice,
-        narration_enabled=body.narration_enabled,
+        narration_enabled=body.narration_enabled, music_enabled=body.music_enabled,
         reference_images=body.reference_images,
     )
+
+
+@tasks_router.post(
+    "/{task_id}/regenerate-storyboard",
+    summary="Revise one platform's video storyboard from user feedback",
+)
+async def regenerate_storyboard(
+    request: Request, task_id: str, body: RegenerateStoryboardRequest
+) -> dict:
+    """Returns the revised `video_storyboard` and stores it against the task, so a later
+    `/render-video` renders the revision. The approved copy is never re-generated."""
+    return await _workflow(request).regenerate_storyboard(task_id, body.platform, body.feedback)
 
 
 @intake_router.post("", summary="Open an intake conversation (voice or text)")
@@ -2753,6 +2896,7 @@ async def intake_classify(request: Request, body: ClassifyRequest) -> dict:
         followups_asked=body.followups_asked,
         business_id=body.business_id,
         user_id=body.user_id,
+        force_plan=body.force_plan,
     )
 
 
@@ -2929,8 +3073,11 @@ async def refine_plan(request: Request, plan_id: str, body: RefinePlanRequest) -
 
 
 @plans_router.post("/{plan_id}/confirm", summary="Activate a draft plan")
-async def confirm_plan(request: Request, plan_id: str) -> dict:
-    return await _plans(request).confirm(plan_id)
+async def confirm_plan(
+    request: Request, plan_id: str, body: Optional[ConfirmPlanRequest] = None
+) -> dict:
+    return await _plans(request).confirm(
+        plan_id, draft_mode=(body.draft_mode if body else None))
 
 
 @plans_router.patch("/{plan_id}/items/{item_id}", summary="Edit or skip one plan item")
