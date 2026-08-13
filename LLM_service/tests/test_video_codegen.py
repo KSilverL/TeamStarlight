@@ -913,3 +913,158 @@ def test_with_repair_hint_appends_only_when_matched():
     hinted = codegen._with_repair_hint("error TS2749: 'Foo' refers to a value")
     assert hinted.startswith("error TS2749") and "Repair hint:" in hinted
     assert codegen._with_repair_hint("novel failure") == "novel failure"
+
+
+# ── The Node toolchain seams themselves (tsc / remotion still) ───────────────
+# Every test above patches `_run_typecheck` / `_run_preview_render`, so the actual
+# subprocess invocations — the argv, the per-job tsconfig scoping, and the
+# timeout/failure handling that keeps a broken generation from hanging a render —
+# only ran when a real Node toolchain was installed. Faking
+# asyncio.create_subprocess_exec drives them offline.
+
+class _FakeProc:
+    def __init__(self, *, returncode=0, stdout=b"", stderr=b"", hang=False, output=None):
+        self.returncode = returncode
+        self._stdout, self._stderr = stdout, stderr
+        self._hang, self._output = hang, output
+        self.killed = False
+
+    async def communicate(self):
+        import asyncio as _asyncio
+
+        if self._hang:
+            await _asyncio.Event().wait()
+        if self._output is not None:
+            self._output.write_bytes(b"png")
+        return self._stdout, self._stderr
+
+    def kill(self):
+        self.killed = True
+
+    async def wait(self):
+        return self.returncode
+
+
+def _spawn(monkeypatch, proc_factory):
+    """Patch subprocess spawning; return the list argv/kwargs are recorded into."""
+    import asyncio as _asyncio
+
+    calls: list = []
+
+    async def fake_exec(*argv, **kwargs):
+        calls.append((argv, kwargs))
+        return proc_factory(argv)
+
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", fake_exec)
+    return calls
+
+
+async def test_typecheck_is_scoped_to_this_jobs_tsconfig(tmp_path, monkeypatch):
+    settings = Settings(video_renderer_dir=str(tmp_path))
+    calls = _spawn(monkeypatch, lambda argv: _FakeProc(returncode=0))
+
+    ok, detail = await codegen._run_typecheck(settings, job_id="job-1")
+
+    assert (ok, detail) == (True, "")
+    argv, kwargs = calls[0]
+    assert argv[1:4] == ("tsc", "--noEmit", "-p")
+    # A per-job tsconfig, never the whole project — a stale sibling job can't
+    # poison this job's typecheck.
+    assert argv[4] == "src/generated/job-1/tsconfig.json"
+    assert kwargs["cwd"] == str(tmp_path)
+    written = json.loads((tmp_path / "src/generated/job-1/tsconfig.json").read_text())
+    assert written["extends"] == "../../../tsconfig.json"
+    assert "./**/*.tsx" in written["include"]
+
+
+async def test_typecheck_surfaces_stdout_and_stderr_on_failure(tmp_path, monkeypatch):
+    """tsc reports errors on STDOUT, so both streams are fed back to the repair loop."""
+    settings = Settings(video_renderer_dir=str(tmp_path))
+    _spawn(monkeypatch, lambda argv: _FakeProc(
+        returncode=2, stdout=b"src/x.tsx(3,5): error TS2339: no 'foo'", stderr=b"warn"))
+
+    ok, detail = await codegen._run_typecheck(settings, job_id="job-1")
+    assert ok is False
+    assert "TS2339" in detail and "warn" in detail
+
+
+async def test_typecheck_timeout_kills_tsc(tmp_path, monkeypatch):
+    settings = Settings(video_renderer_dir=str(tmp_path))
+    hung = _FakeProc(hang=True)
+    _spawn(monkeypatch, lambda argv: hung)
+
+    ok, detail = await codegen._run_typecheck(settings, job_id="job-1", timeout_s=0.01)
+    assert ok is False and "timed out" in detail
+    assert hung.killed is True
+
+
+async def test_preview_render_invokes_remotion_still_at_half_scale(tmp_path, monkeypatch):
+    settings = Settings(video_renderer_dir=str(tmp_path))
+    entry = tmp_path / "src" / "generated" / "job-1" / "preview.tsx"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("//", encoding="utf-8")
+    out = tmp_path / "still.png"
+    calls = _spawn(monkeypatch, lambda argv: _FakeProc(output=out))
+
+    ok, detail = await codegen._run_preview_render(
+        settings, entry_path=entry, output_path=out, frame=12)
+
+    assert (ok, detail) == (True, "")
+    argv, _ = calls[0]
+    assert argv[1:3] == ("remotion", "still")
+    assert argv[3] == "src/generated/job-1/preview.tsx"
+    assert str(out) in argv and "--frame=12" in argv and "--scale=0.5" in argv
+
+
+async def test_preview_render_passes_props_and_public_dir_for_map_qa(tmp_path, monkeypatch):
+    """map_qa.py renders the SHARED composition, so it needs the job's props/assets."""
+    settings = Settings(video_renderer_dir=str(tmp_path))
+    entry = tmp_path / "src" / "index.tsx"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("//", encoding="utf-8")
+    out = tmp_path / "still.png"
+    props = tmp_path / "props.json"
+    props.write_text("{}", encoding="utf-8")
+    job_dir = tmp_path / "job-1"
+    job_dir.mkdir()
+    calls = _spawn(monkeypatch, lambda argv: _FakeProc(output=out))
+
+    await codegen._run_preview_render(
+        settings, entry_path=entry, output_path=out, composition_id="StoryboardVideo",
+        props_path=props, public_dir=job_dir)
+
+    argv, _ = calls[0]
+    assert "StoryboardVideo" in argv
+    assert f"--props={props}" in argv
+    assert f"--public-dir={job_dir.resolve().as_posix()}" in argv
+
+
+async def test_preview_render_reports_a_crash_and_a_silent_success(tmp_path, monkeypatch):
+    settings = Settings(video_renderer_dir=str(tmp_path))
+    entry = tmp_path / "src" / "preview.tsx"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("//", encoding="utf-8")
+    out = tmp_path / "still.png"
+
+    _spawn(monkeypatch, lambda argv: _FakeProc(
+        returncode=1, stderr=b"Error: interpolate() inputRange must be increasing"))
+    ok, detail = await codegen._run_preview_render(settings, entry_path=entry, output_path=out)
+    assert ok is False and "inputRange" in detail  # a runtime error a typecheck can't catch
+
+    _spawn(monkeypatch, lambda argv: _FakeProc(returncode=0, output=None))
+    ok, detail = await codegen._run_preview_render(settings, entry_path=entry, output_path=out)
+    assert ok is False and "produced no output file" in detail
+
+
+async def test_preview_render_timeout_kills_the_renderer(tmp_path, monkeypatch):
+    settings = Settings(video_renderer_dir=str(tmp_path))
+    entry = tmp_path / "src" / "preview.tsx"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("//", encoding="utf-8")
+    hung = _FakeProc(hang=True)
+    _spawn(monkeypatch, lambda argv: hung)
+
+    ok, detail = await codegen._run_preview_render(
+        settings, entry_path=entry, output_path=tmp_path / "still.png", timeout_s=0.01)
+    assert ok is False and "timed out" in detail
+    assert hung.killed is True

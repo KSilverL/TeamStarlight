@@ -1,6 +1,9 @@
 import { NextRequest } from "next/server";
 
-const LLM_URL = process.env.LLM_SERVICE_URL ?? "http://localhost:8080";
+// Routed through the Java backend, which is where identity is VERIFIABLE (it holds the JWT
+// signing key) and therefore where the brand a run reads and writes gets decided. Talking to the
+// Python service directly would mean `business_id` is whatever the caller typed.
+const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:8081";
 
 export async function POST(
   request: NextRequest,
@@ -17,9 +20,15 @@ export async function POST(
   }
 
   try {
-    const upstream = await fetch(`${LLM_URL}/tasks/${taskId}/say`, {
+    const upstream = await fetch(`${BACKEND_URL}/tasks/${taskId}/say`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        // See the note in ../route.ts: the backend checks task ownership on this call.
+        ...(request.headers.get("Authorization")
+          ? { Authorization: request.headers.get("Authorization") as string }
+          : {}),
+      },
       body: JSON.stringify(body),
     });
     const data = await upstream.json();

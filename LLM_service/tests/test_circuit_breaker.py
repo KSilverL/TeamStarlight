@@ -44,17 +44,29 @@ async def test_repeated_rejection_trips_breaker_to_human(workflow, make_brief):
 
 async def test_breaker_pauses_with_pending_request(workflow, make_brief):
     """The circuit-broken draft still lands at the RequestPort (paused, awaiting a
-    human), not silently dropped."""
+    human), not silently dropped — and the human's way out of it is to fix the copy,
+    not to wave it through."""
     result = await workflow.run(make_brief(topic="unsafe cure", platforms=("twitter",)))
 
     assert result.get_final_state() == WorkflowRunState.IDLE_WITH_PENDING_REQUESTS
     reqs = result.get_request_info_events()
     assert len(reqs) == 1 and reqs[0].data.needs_human_intervention is True
 
-    # A human can still override and approve the flagged draft → it completes.
-    final = await workflow.run(
+    # A plain human approve does NOT override the safety block: the compliance_gate
+    # re-screens the approved bytes and bounces them back to the gate (see
+    # test_compliance_gate.py). Nothing is published.
+    blocked = await workflow.run(
         responses={reqs[0].request_id: HumanVerdict(decision="approve")}
     )
+    assert blocked.get_final_state() == WorkflowRunState.IDLE_WITH_PENDING_REQUESTS
+    assert blocked.get_outputs() == []
+
+    # Editing the copy into something clean is the way out — it completes, and the
+    # circuit-breaker provenance survives to the output.
+    final = await workflow.run(responses={
+        blocked.get_request_info_events()[0].request_id: HumanVerdict(
+            decision="approve_after_edit", edited_draft="a clean, compliant rewrite"),
+    })
     assert final.get_final_state() == WorkflowRunState.IDLE
     out = final.get_outputs()
     assert len(out) == 1

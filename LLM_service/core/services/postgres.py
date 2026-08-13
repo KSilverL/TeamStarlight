@@ -14,10 +14,12 @@ shaping logic without a database.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import ssl as _ssl
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import AsyncIterator, List, Optional
 
 from agent_framework import CheckpointStorage, WorkflowCheckpoint
 
@@ -96,6 +98,29 @@ def _trends_ddl(table: str) -> str:
     )
 
 
+def _channel(task_id: str) -> str:
+    """The LISTEN/NOTIFY channel for one task.
+
+    Hashed rather than interpolated: a channel name is a PostgreSQL identifier, capped at
+    63 bytes and case-folded unless quoted, while a task_id is a caller-supplied string
+    (the backend's session id) with none of those guarantees. A hash makes the mapping
+    total and injection-proof.
+    """
+    return "llm_task_" + hashlib.sha1(task_id.encode("utf-8")).hexdigest()[:24]
+
+
+def _leases_ddl(table: str) -> str:
+    # Expiring cross-replica locks. `expires_at` rather than a held-open lock because the
+    # holder is a process that can be killed mid-run: a session-scoped
+    # pg_try_advisory_lock would also be wrong here, since asyncpg hands out a DIFFERENT
+    # pooled connection per call, so the lock would not survive to the release.
+    return (
+        f"CREATE TABLE IF NOT EXISTS {table} ("
+        f"name TEXT PRIMARY KEY, owner TEXT NOT NULL, "
+        f"expires_at TIMESTAMPTZ NOT NULL)"
+    )
+
+
 def _posting_plans_ddl(table: str) -> str:
     # One row per posting plan (core.plan_schema.PostingPlan), whole doc in JSONB.
     # business_id/user_id/status are pulled out as plain columns (kept in sync on
@@ -129,6 +154,7 @@ class PostgresStore(StoreService):
                 await conn.execute(_video_jobs_ddl(s.postgres_video_jobs_table))
                 await conn.execute(_trends_ddl(s.postgres_trends_table))
                 await conn.execute(_posting_plans_ddl(s.postgres_posting_plans_table))
+                await conn.execute(_leases_ddl(s.postgres_leases_table))
         return self._pool_obj
 
     async def _read(self, table: str, key: str) -> Optional[dict]:
@@ -203,6 +229,77 @@ class PostgresStore(StoreService):
 
     async def load_checkpoint(self, *, task_id: str) -> Optional[dict]:
         return await self._read(self._settings.postgres_checkpoints_table, task_id)
+
+    # ── Cross-replica coordination ────────────────────────────────────────────
+
+    async def try_acquire_lease(self, *, name: str, owner: str, ttl_seconds: float) -> bool:
+        """One statement, so the winner is decided by the database rather than by a
+        read-then-write that two replicas can both pass.
+
+        The conflict clause updates ONLY when the row has expired or we already own it.
+        `RETURNING` reports rows actually written, so a live lease held by someone else
+        filters the UPDATE out and comes back EMPTY — that absence is the "you lost" signal.
+        One statement, so there is no window between deciding and taking it.
+        """
+        pool = await self._pool()
+        table = self._settings.postgres_leases_table
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"INSERT INTO {table} (name, owner, expires_at) "
+                f"VALUES ($1, $2, now() + make_interval(secs => $3)) "
+                f"ON CONFLICT (name) DO UPDATE "
+                f"  SET owner = EXCLUDED.owner, expires_at = EXCLUDED.expires_at "
+                f"  WHERE {table}.expires_at < now() OR {table}.owner = EXCLUDED.owner "
+                f"RETURNING owner",
+                name, owner, float(ttl_seconds),
+            )
+        # No row at all means the ON CONFLICT matched but the WHERE filtered the update
+        # out — i.e. a live lease held by someone else.
+        return bool(row) and row["owner"] == owner
+
+    async def release_lease(self, *, name: str, owner: str) -> None:
+        """`AND owner = $2` is the whole point: if our lease expired and another replica
+        took over, this deletes nothing rather than yanking the lock out from under it."""
+        pool = await self._pool()
+        table = self._settings.postgres_leases_table
+        async with pool.acquire() as conn:
+            await conn.execute(
+                f"DELETE FROM {table} WHERE name = $1 AND owner = $2", name, owner)
+
+    async def notify_task(self, *, task_id: str, seq: int) -> None:
+        """NOTIFY carrying only the high-water `seq`.
+
+        Deliberately not the event: NOTIFY payloads are capped (8000 bytes) and a `final`
+        event with an embedded HTML brand card sails past that. The durable log is the
+        source of truth; this only says "there is something new to read"."""
+        pool = await self._pool()
+        async with pool.acquire() as conn:
+            # The channel name is an identifier, so it cannot be parameterised — hence
+            # quote_ident, and `pg_notify` rather than raw NOTIFY (which takes no params).
+            await conn.execute("SELECT pg_notify($1, $2)", _channel(task_id), str(int(seq)))
+
+    async def watch_task(self, *, task_id: str) -> AsyncIterator[int]:
+        """LISTEN on a dedicated connection, yielding each announced `seq`.
+
+        Dedicated (not pooled) because LISTEN is connection-scoped: handing the connection
+        back to the pool between notifications would silently stop the subscription. The
+        connection is closed in the `finally`, which is what unsubscribes."""
+        import asyncpg  # lazy import, like _pool()
+
+        s = self._settings
+        queue: asyncio.Queue = asyncio.Queue()
+        conn = await asyncpg.connect(dsn=s.postgres_dsn, **_connect_kwargs(s))
+        try:
+            def _on_notify(_conn, _pid, _channel, payload) -> None:
+                try:
+                    queue.put_nowait(int(payload))
+                except (TypeError, ValueError):
+                    pass  # a malformed hint costs latency, never correctness
+            await conn.add_listener(_channel(task_id), _on_notify)
+            while True:
+                yield await queue.get()
+        finally:
+            await conn.close()
 
     async def create_video_job(self, *, job_id: str, task_id: str, platform: str, storyboard: dict) -> dict:
         now = datetime.now(timezone.utc).isoformat()

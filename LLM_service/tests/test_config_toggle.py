@@ -303,3 +303,143 @@ def test_resolved_video_renderer_dir_is_absolute_with_absolute_override(tmp_path
 def test_resolved_video_renderer_dir_is_absolute_by_default():
     from LLM_service.core.config import Settings
     assert Settings().resolved_video_renderer_dir.is_absolute()
+
+
+# ── Render-pipeline service getters (the credentialed asset vendors) ──────────
+# Same mock-vs-production boundary as the four core contracts above, for the
+# services that only ever run with a paid API key: Pexels, Remove.bg, Soundraw,
+# Azure Speech and Higgsfield. Selecting one without its key must raise a clear
+# RuntimeError, never silently fall back to mock (which would mean a "successful"
+# run that quietly produced mock assets).
+
+_ASSET_GETTERS = [
+    # (getter, toggle var, credential env, production class, the name in the error)
+    ("get_image_search", "USE_MOCK_IMAGE_SEARCH", {"PEXELS_API_KEY": "pex"},
+     "PexelsImageSearch", "Pexels"),
+    ("get_background_removal", "USE_MOCK_BACKGROUND_REMOVAL", {"REMOVEBG_API_KEY": "rmbg"},
+     "RemoveBgService", "Remove.bg"),
+    ("get_music_generation", "USE_MOCK_MUSIC_GENERATION", {"SOUNDRAW_API_KEY": "snd"},
+     "SoundrawMusic", "Background music"),
+    # Azure Speech TTS is shared with the roundtable persona readback, so it reads the
+    # ROUNDTABLE_TTS_* pair — NOT AZURE_SPEECH_*, which no longer exists.
+    ("get_voiceover_generation", "USE_MOCK_VOICEOVER",
+     {"ROUNDTABLE_TTS_KEY": "sp", "ROUNDTABLE_TTS_REGION": "westeurope"},
+     "AzureSpeechVoiceover", "Azure Speech"),
+    ("get_video_generation", "USE_MOCK_VIDEO_GENERATION",
+     {"HIGGSFIELD_API_KEY": "hf", "HIGGSFIELD_API_SECRET": "hf-secret"},
+     "HiggsfieldVideoGeneration", "Higgsfield"),
+]
+
+
+@pytest.fixture
+def asset_env(monkeypatch, tmp_path):
+    """Clear every render-pipeline toggle + key, then let a test set what it needs.
+
+    Music is the one two-tier getter: the bundled royalty-free library wins over
+    Soundraw whenever it is populated, and LLM_service/assets/music/ IS populated in
+    this repo — so leaving MUSIC_LIBRARY_DIR at its default would make every
+    `SOUNDRAW_API_KEY` case in the table resolve to BundledMusicLibrary instead. Point
+    it at an empty directory so the table means what it says (toggle + key → that
+    vendor); the library-first precedence gets its own test below.
+    """
+    for getter, toggle, creds, _cls, _name in _ASSET_GETTERS:
+        monkeypatch.delenv(toggle, raising=False)
+        for key in creds:
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "no-music"))
+    reset_settings()
+    reset_services()
+    yield monkeypatch
+    reset_settings()
+    reset_services()
+
+
+@pytest.mark.parametrize("getter, toggle, creds, cls, name", _ASSET_GETTERS)
+def test_asset_service_defaults_to_mock(asset_env, getter, toggle, creds, cls, name):
+    from LLM_service.core.services import factory
+
+    assert type(getattr(factory, getter)()).__name__.startswith("Mock")
+
+
+@pytest.mark.parametrize("getter, toggle, creds, cls, name", _ASSET_GETTERS)
+def test_asset_service_resolves_production_impl_with_credentials(
+        asset_env, getter, toggle, creds, cls, name):
+    from LLM_service.core.services import factory
+
+    asset_env.setenv(toggle, "false")
+    for key, value in creds.items():
+        asset_env.setenv(key, value)
+    reset_settings()
+    reset_services()
+    assert type(getattr(factory, getter)()).__name__ == cls
+
+
+@pytest.mark.parametrize("getter, toggle, creds, cls, name", _ASSET_GETTERS)
+def test_asset_service_without_credentials_raises(asset_env, getter, toggle, creds, cls, name):
+    from LLM_service.core.services import factory
+
+    asset_env.setenv(toggle, "false")  # production requested, no key set
+    reset_settings()
+    reset_services()
+    with pytest.raises(RuntimeError, match=name):
+        getattr(factory, getter)()
+
+
+def test_asset_services_follow_the_global_mock_switch(asset_env):
+    """USE_MOCK=false flips the asset vendors too — with their keys present."""
+    from LLM_service.core.services import factory
+
+    asset_env.setenv("USE_MOCK", "false")
+    for _getter, _toggle, creds, _cls, _name in _ASSET_GETTERS:
+        for key, value in creds.items():
+            asset_env.setenv(key, value)
+    reset_settings()
+    reset_services()
+    for getter, _toggle, _creds, cls, _name in _ASSET_GETTERS:
+        assert type(getattr(factory, getter)()).__name__ == cls
+
+
+# ── Music: the bundled library outranks Soundraw ──────────────────────────────
+# The only asset getter with two production tiers. Soundraw's generation API is
+# enterprise-gated, so a populated local royalty-free library is the zero-key,
+# zero-cost default and is preferred even when a Soundraw key IS present. The
+# generic table above deliberately points MUSIC_LIBRARY_DIR at an empty directory,
+# which is exactly the case these two pin down.
+
+def _write_music_library(tmp_path):
+    """A minimal populated library: manifest.json with one tagged track."""
+    lib = tmp_path / "music"
+    lib.mkdir()
+    (lib / "manifest.json").write_text(
+        '{"tracks": [{"file": "chill.mp3", "mood": "calm",'
+        ' "genre": "ambient", "energy": "low"}]}',
+        encoding="utf-8",
+    )
+    return lib
+
+
+def test_populated_music_library_wins_over_soundraw(asset_env, tmp_path):
+    from LLM_service.core.services import factory
+
+    asset_env.setenv("USE_MOCK_MUSIC_GENERATION", "false")
+    asset_env.setenv("MUSIC_LIBRARY_DIR", str(_write_music_library(tmp_path)))
+    asset_env.setenv("SOUNDRAW_API_KEY", "snd")   # present, and still not chosen
+    reset_settings()
+    reset_services()
+    assert type(factory.get_music_generation()).__name__ == "BundledMusicLibrary"
+
+
+def test_music_library_with_no_tracks_falls_through_to_soundraw(asset_env, tmp_path):
+    """A manifest that parses but lists nothing reads as 'no library', not as an error."""
+    from LLM_service.core.services import factory
+
+    lib = tmp_path / "empty-music"
+    lib.mkdir()
+    (lib / "manifest.json").write_text('{"tracks": []}', encoding="utf-8")
+
+    asset_env.setenv("USE_MOCK_MUSIC_GENERATION", "false")
+    asset_env.setenv("MUSIC_LIBRARY_DIR", str(lib))
+    asset_env.setenv("SOUNDRAW_API_KEY", "snd")
+    reset_settings()
+    reset_services()
+    assert type(factory.get_music_generation()).__name__ == "SoundrawMusic"

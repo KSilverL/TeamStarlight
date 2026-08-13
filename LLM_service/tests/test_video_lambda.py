@@ -206,3 +206,90 @@ async def test_render_on_lambda_requires_region(tmp_path):
             composition_id="StoryboardVideo", props_path=tmp_path / "props.json",
             settings=settings, timeout_s=30.0,
         )
+
+
+# ── The remaining AWS-side failure modes ─────────────────────────────────────
+# A Lambda render burns real AWS spend, so every way the Node bridge can fail
+# must surface as a RenderError the job row can report — never a hang, and never
+# a "success" that returns nothing renderable.
+
+async def test_run_node_script_kills_a_hung_script_on_timeout(monkeypatch):
+    import asyncio
+
+    killed = {}
+
+    class _Hung:
+        returncode = None
+
+        async def communicate(self):
+            await asyncio.Event().wait()  # never resolves
+
+        def kill(self):
+            killed["yes"] = True
+
+        async def wait(self):
+            return -9
+
+    async def fake_exec(*args, **kwargs):
+        return _Hung()
+
+    monkeypatch.setattr(lambda_render.asyncio, "create_subprocess_exec", fake_exec)
+    with pytest.raises(RenderError, match="timed out after 0s"):
+        await lambda_render._run_node_script(
+            Settings(), "scripts/fake.mjs", [], timeout_s=0.01)
+    assert killed == {"yes": True}  # no orphaned node process
+
+
+async def test_run_node_script_reports_a_zero_exit_with_empty_stdout(monkeypatch):
+    """Exit 0 but nothing printed: the bridge produced no result to act on."""
+    async def fake_exec(*args, **kwargs):
+        return await _fake_subprocess(0, b"   \n", b"warning: nothing to do")
+
+    monkeypatch.setattr(lambda_render.asyncio, "create_subprocess_exec", fake_exec)
+    with pytest.raises(RenderError, match="produced no output"):
+        await lambda_render._run_node_script(Settings(), "scripts/fake.mjs", [], timeout_s=5.0)
+
+
+async def test_serve_url_for_raises_when_the_deploy_returns_no_serve_url(monkeypatch):
+    async def fake_run_node_script(settings, script, args, *, timeout_s):
+        return {"status": "done"}  # deployed, but nothing to render against
+
+    monkeypatch.setattr(lambda_render, "_run_node_script", fake_run_node_script)
+    with pytest.raises(RenderError, match="did not return a serveUrl"):
+        await lambda_render._serve_url_for(
+            _generated_storyboard(), job_id="job1",
+            entry_point="src/generated/job1/entry.tsx", settings=_lambda_settings())
+
+
+async def test_render_on_lambda_raises_when_the_render_returns_no_url(tmp_path, monkeypatch):
+    async def fake_run_node_script(settings, script, args, *, timeout_s):
+        return {"status": "done"}
+
+    monkeypatch.setattr(lambda_render, "_run_node_script", fake_run_node_script)
+    props_path = tmp_path / "props.json"
+    props_path.write_text("{}")
+    with pytest.raises(RenderError, match="did not return a url"):
+        await lambda_render.render_on_lambda(
+            _no_generated_storyboard(), job_id="job1", entry_point="src/index.tsx",
+            composition_id="StoryboardVideo", props_path=props_path,
+            settings=_lambda_settings(), timeout_s=30.0)
+
+
+async def test_render_on_lambda_passes_the_output_bucket_when_configured(tmp_path, monkeypatch):
+    captured: dict = {}
+
+    async def fake_run_node_script(settings, script, args, *, timeout_s):
+        captured["args"] = args
+        return {"status": "done", "url": "https://bucket.s3.amazonaws.com/out.mp4"}
+
+    monkeypatch.setattr(lambda_render, "_run_node_script", fake_run_node_script)
+    props_path = tmp_path / "props.json"
+    props_path.write_text("{}")
+
+    await lambda_render.render_on_lambda(
+        _no_generated_storyboard(), job_id="job1", entry_point="src/index.tsx",
+        composition_id="StoryboardVideo", props_path=props_path,
+        settings=_lambda_settings(remotion_lambda_output_bucket="my-renders"), timeout_s=30.0)
+
+    assert "--output-bucket" in captured["args"]
+    assert captured["args"][captured["args"].index("--output-bucket") + 1] == "my-renders"

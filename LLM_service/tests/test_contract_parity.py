@@ -273,7 +273,8 @@ async def test_voiceover_synthesize_parity():
     m = await mock.MockVoiceover().synthesize(text=text, voice=voice)
 
     # Azure impl: fake the HTTP layer via a stub client so no network/credentials.
-    az = azure.AzureSpeechVoiceover(Settings(azure_speech_key="k", azure_speech_region="eastus"))
+    az = azure.AzureSpeechVoiceover(
+        Settings(roundtable_tts_key="k", roundtable_tts_region="eastus"))
 
     class _Resp:
         content = b"\xff\xfb\x10\xc0" * 500

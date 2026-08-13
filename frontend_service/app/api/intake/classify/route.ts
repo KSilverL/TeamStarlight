@@ -3,7 +3,10 @@ import { NextRequest } from "next/server";
 // Goes straight to the LLM service, like /api/tasks and unlike /api/plans/*. Classifying is a
 // read-only judgement about a sentence — it stores nothing and needs no business scope, and the
 // business_id that actually matters is stamped by Java from the JWT when the plan is created.
-const LLM_URL = process.env.LLM_SERVICE_URL ?? "http://localhost:8080";
+// Routed through the Java backend, which is where identity is VERIFIABLE (it holds the JWT
+// signing key) and therefore where the brand a run reads and writes gets decided. Talking to the
+// Python service directly would mean `business_id` is whatever the caller typed.
+const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:8081";
 
 // Routes one chat turn: is this asking for one post, or a campaign across a date range?
 //
@@ -20,7 +23,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const upstream = await fetch(`${LLM_URL}/intake/classify`, {
+    const upstream = await fetch(`${BACKEND_URL}/intake/classify`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),

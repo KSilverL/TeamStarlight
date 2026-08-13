@@ -89,8 +89,19 @@ public class ApiDTOS {
 		String roundtableMode;
 	}
 	
+	/**
+	 * One gate waiting on a verdict.
+	 *
+	 * The last three fields appear ONLY when the LLM service's post-approval compliance screen
+	 * blocked the copy and re-opened this gate; they are absent on an ordinary gate (so `blocked`
+	 * deserializes to false, which is the correct reading). Ignoring them is not an option for any
+	 * caller that submits verdicts: a blocked gate refuses a plain `approve` outright — the only
+	 * decisions it accepts are the ones named in `allowed_decisions`
+	 * (`approve_after_edit` / `reject` / `discard`).
+	 */
 	public record Pending(String request_id, String platform, String draft, String comment,
-            boolean needs_human_intervention) {}
+            boolean needs_human_intervention,
+            boolean blocked, String block_reason, List<String> allowed_decisions) {}
 	
 	public record Output(String platform, String draft, String decision, String comment,
             boolean needs_human_intervention, List<Map<String,Object>> proposed_rules,

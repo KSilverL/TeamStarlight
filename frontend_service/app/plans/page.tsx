@@ -914,7 +914,12 @@ function ItemDraftPreview({
   }
 
   function watchTask(id: string) {
-    const es = new EventSource(`/api/tasks/${id}/events`);
+    // EventSource cannot set headers, so the token rides as a query parameter — the backend
+    // accepts it there for exactly this case. Without it, the stream for a run this business
+    // owns is refused and the card never leaves "generating".
+    const token = localStorage.getItem("starlight_token");
+    const query = token ? `?access_token=${encodeURIComponent(token)}` : "";
+    const es = new EventSource(`/api/tasks/${id}/events${query}`);
     let lastSeq = -1;
 
     es.onmessage = (e) => {
@@ -967,8 +972,10 @@ function ItemDraftPreview({
     setIsReviewing(true);
     try {
       const res = await fetch(`/api/tasks/${taskId}/review`, {
+        // The token is required, not optional: a run started by this business is refused to
+        // anyone else, and an unauthenticated request counts as anyone else.
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ verdicts }),
       });
       if (!res.ok) {
