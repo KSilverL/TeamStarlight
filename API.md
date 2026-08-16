@@ -13,7 +13,8 @@ Integration guide for the content-generation service (`LLM_service/api.py`).
                                       │  (optional roundtable discussion streams here too)
                                       │  (pauses at the review gate)
                               POST /tasks/{id}/review  ← approve / reject / edit
-                                      │
+                                      │  ↺ a blocked approval re-opens the gate (blocked:true)
+                                      │    → edit it / regenerate / discard
                               GET /tasks/{id}  ← final outputs
                                       │
                               POST /tasks/{id}/confirm-learning  ← opt in to learning (optional)
@@ -32,7 +33,11 @@ Integration guide for the content-generation service (`LLM_service/api.py`).
    (a roundtable + drafting can take minutes). The service drafts content per platform, pauses for
    human review, then finalizes.
 3. **Progress** streams over **SSE** (`GET /tasks/{id}/events`) — open it right after `POST /tasks`
-   to catch the gate. Review resumes over REST (`POST /review`, synchronous).
+   to catch the gate. Review resumes over REST (`POST /review`, synchronous). What you approve is
+   screened by Content Safety one last time; a block **re-opens the gate** for that platform with
+   `blocked: true` instead of finalizing it
+   ([details](#approval-is-not-the-last-word-on-compliance)) — so treat `awaiting_review` as a loop,
+   and never auto-approve unconditionally.
 4. **Optional extras:** with `ROUNDTABLE_ENABLED` the run opens with a multi-persona discussion you can join ([Roundtable](#roundtable-optional)); after completion, `POST /tasks/{id}/confirm-learning` makes the service learn from the run.
 5. **Posting plans** — `POST /plans/clarify` first asks a few tailoring questions, then `POST /plans` turns a campaign goal into a dated posting *schedule* (topics + timing + rationale, no copy) that the user can `POST …/refine` until happy; the backend's daily cron then asks `GET /plans/due?date=<today>` and `POST …/execute`s each due item into an ordinary run, so the planned content is drafted **on the planned day** and waits at the gate ([Posting plans](#posting-plans--post-plans--the-daily-dueexecute-loop)).
 
@@ -54,6 +59,44 @@ Built on **FastAPI** (ASGI, served by uvicorn). The Python LLM service is consum
 - All request/response bodies: `application/json; charset=utf-8`
 - SSE endpoint: `text/event-stream`
 - Errors: `{ "error": "message" }` with the appropriate HTTP status code. (Body-shape errors caught by FastAPI's own validation return `422` with its standard detail payload; the service's domain validation returns `400` in the `{ "error": … }` shape.)
+
+### Deploying more than one instance
+
+**No routing rules — with one prerequisite.** Any replica can serve any `/tasks/{id}/*` call,
+including the ones that steer a run. A `POST /review` landing on a replica that never saw the
+task rebuilds the workflow from its stored checkpoint and carries on; the SSE stream you have
+open on a *different* replica keeps delivering while that happens. You do **not** need sticky
+sessions, consistent hashing, or a task-id-aware ingress.
+
+> **Prerequisite: every replica must share one store** (`USE_MOCK_STORE=false`, the same
+> `POSTGRES_DSN`/`DATABASE_URL`). That store holds the task mirror, the workflow checkpoints and
+> the lock that coordinates the handover. With the in-memory mock store each process is an
+> island and you are back to routing by `task_id`.
+>
+> Nothing else to configure. `TASK_RESUME_LEASE_SECONDS` and `TASK_TAIL_POLL_SECONDS` have
+> working defaults, and the `service_leases` table is created automatically on first connect.
+
+This also covers **restarts and rolling deploys**: a run paused at the gate before the restart is
+picked up by whatever replica the next verdict reaches. Previously every in-flight approval was
+stranded by a deploy, which is what made this worth changing.
+
+What is still worth knowing:
+
+- **`seq` continues across the hop.** A client resuming with `Last-Event-ID` is never stranded,
+  wherever it reconnects. Anything proxying `/events` must forward that header.
+- **A follower trails slightly.** A stream attached to a replica that isn't driving the run is
+  fed from the durable log, so it lags the driver by up to a second or two. Ordering and
+  de-duplication are unaffected (`seq` is authoritative).
+- **`409` is now rare and specific**, not the normal cross-replica answer. You get it when there
+  is genuinely nothing to resume — the run already finished, it never had a checkpoint (a
+  standalone `POST /roundtable` task is an event sink with no workflow), or another replica is
+  mid-resume for that same run. **The last one is retryable**: wait a moment and repeat the call.
+- **Not shared across replicas** (all soft): a roundtable's raise-hand and step-mode prompts are
+  answered by the replica running that discussion; `agent_utterance_audio` clips are not mirrored,
+  so a rebuilt task replays its discussion silently; and a locally rendered MP4 is downloadable
+  only from the replica that rendered it.
+- A run interrupted mid-flight (killed between supersteps, with no gate open to resume from)
+  reports `status: "error"` rather than a `running` that will never finish.
 
 ---
 
@@ -262,13 +305,23 @@ run to reach `awaiting_review` (the review gate) — or `completed` for a **medi
 
 Subscribe once and watch the entire run. The stream replays all events so far, continues live, and **closes when the task completes**.
 
-Each line: `data: <json>\n\n`. Two envelope-wide details:
+Each frame: `id: <seq>\ndata: <json>\n\n`. Three envelope-wide details:
 
-- Every event carries a **`seq`** — a stable, monotonic per-task index. Because a reconnect
-  **replays the whole buffer**, key your side effects off `seq` (skip anything you've already
-  handled) instead of reacting to every delivery.
+- Every event carries a **`seq`** — a stable, monotonic per-task index — both inside the JSON and
+  as the frame's `id:`. Key your side effects off `seq` (skip anything you've already handled)
+  instead of reacting to every delivery.
+- **Resuming a dropped connection.** A reconnect replays from wherever you tell it to:
+  - a browser `EventSource` does this **for you** — it remembers the last `id:` it saw and sends
+    it back as the `Last-Event-ID` header, and the service replays only what came after;
+  - a non-browser client can pass `?from_seq=<seq>` explicitly;
+  - omit both (a first connect) and you get the **full** replay, as before.
+
+  ⚠️ **If you proxy this endpoint, forward the `Last-Event-ID` request header.** Dropping it
+  doesn't fail — it silently disables resume, and every reconnect replays the whole run again.
+  A malformed marker also degrades to a full replay rather than an error.
 - After 15 s of inactivity the server emits an SSE comment line (`: keep-alive`) — invisible to
-  `EventSource`, but keeps idle proxies/browsers from timing the connection out.
+  `EventSource`, but keeps idle proxies/browsers from timing the connection out. Keep-alives
+  carry no `id:`, so they never move your resume marker.
 
 Switch on `type`:
 
@@ -354,10 +407,21 @@ Platform finalized (after `/review`) — enriched by the media_producer:
 | Service starts generating | `dispatcher`, `strategist`, `creator` (roundtable mode skips `dispatcher`/`strategist`) | `null` |
 | Per-platform review | `reviewer` | set |
 | Gate — waiting for you | `human_gate` (`interrupted`) + `draft_ready` result per platform | set |
-| After `/review` | `human_gate` + `final` result per platform | set |
+| After `/review` | `human_gate`, `compliance_gate` + `final` result per platform (or a `discarded` result on a `discard` verdict) | set |
 | All done | `workflow` (`done`) | `null` |
 
 Rejected platforms re-run — their events repeat for the next round.
+
+> **`compliance_gate`** is the final content-safety screen, run on the copy you approved
+> (your `edited_draft` included) before anything is produced. It normally passes and you
+> just see its two `running`/`done` progress events. If it **blocks**, that platform does
+> not finalize: the gate re-opens with a fresh `draft_ready` + `human_gate` `interrupted`
+> pair — the `draft_ready` carrying `blocked: true` + `block_reason` + `allowed_decisions` —
+> and the task goes back to `awaiting_review`. Full contract, plus the auto-approve loop
+> warning and a UI recipe, under
+> [Approval is not the last word on compliance](#approval-is-not-the-last-word-on-compliance).
+> Its progress events carry `phase: "review"`, like `reviewer` and `human_gate`, so a
+> phase-driven UI needs no change.
 
 > **Media-only runs** (`content_types` without `"text"`) skip the `creator` / `reviewer` /
 > `human_gate` events entirely: after any roundtable discussion you get a `final` result per
@@ -386,15 +450,90 @@ Resume the paused run. You can address one or more pending platforms at a time; 
 
 | `decision` | Effect | Relevant field |
 |---|---|---|
-| `approve` | Platform finalized | — |
+| `approve` | Platform finalized (after the compliance screen below) | — |
 | `approve_after_edit` | Finalized with your text (the edit is recorded for later learning) | `edited_draft` (required) |
 | `reject` | Platform **reworks against your `reason`** and returns to `awaiting_review` | `reason` (optional, but steers the rework) |
+| `discard` | Platform is **abandoned** — no output, no retry; the run settles without it | `reason` (optional, recorded) |
 
 On `reject`, the `reason` is not just logged — it is threaded into the re-draft (together with the
 rejected copy), so the regenerated post reworks to address that specific feedback rather than
 blindly rerolling. Send a concrete `reason` ("too formal, add a customer stat") to steer the rework.
 
-**Response:** updated task snapshot. All platforms resolved → `status: "completed"`.
+**Response:** updated task snapshot. All platforms resolved → `status: "completed"`; a platform
+bounced by the compliance screen (below) leaves the task `awaiting_review` with that platform
+pending.
+
+#### Approval is not the last word on compliance
+
+Whatever you approve — your `edited_draft` included — is screened by Content Safety one final
+time before anything is produced. If it is blocked, that platform is **not** finalized: it comes
+straight back as a **pending gate for the same platform**, carrying three additional fields:
+
+```jsonc
+{
+  "request_id": "…", "platform": "linkedin",
+  "draft": "…the copy that was blocked…",
+  "comment": "compliance block: this content is NOT compliant and cannot be published as written (…). Please revise the copy and approve again, or reject it to have a new version drafted.",
+  "needs_human_intervention": true,
+
+  "blocked": true,                              // ← the discriminator
+  "block_reason": "hate_speech severity 4",     // ← raw reason, for your own copy / i18n
+  "allowed_decisions": ["approve_after_edit", "reject", "discard"]   // ← the three options
+}
+```
+
+| Field | Use it for |
+|---|---|
+| `blocked` | Telling a compliance block apart from an ordinary gate. **Absent means false** — never sent as `false`. |
+| `block_reason` | The raw Content Safety reason, so you can write your own message (or localize) instead of showing `comment` verbatim. |
+| `allowed_decisions` | Which buttons to render. `approve` is deliberately missing: re-sending the same copy is screened again and blocked again. |
+
+The same three fields appear on the `draft_ready` SSE event for that platform, so whichever
+surface you already watch, you get the signal there.
+
+**Offer the user exactly three options** — the values in `allowed_decisions`, in that order:
+
+| Option | Verdict to send | What happens |
+|---|---|---|
+| **Edit it myself** | `{"decision": "approve_after_edit", "edited_draft": "…"}` | Your text is screened again on the way through. Clean → it ships. Still blocked → the gate re-opens with the new reason. |
+| **Regenerate** | `{"decision": "reject"}` | The creator drafts a **new** version. **You do not need to send a `reason`** — the block reason is handed to the creator automatically ("the previous copy was blocked by content safety (…) — rewrite it so it cannot trip that again"). Add a `reason` only to steer it further; it rides along. The new draft goes through the reviewer and comes back to the gate as an ordinary pending (no `blocked` key). |
+| **Discard** | `{"decision": "discard"}` | The platform is abandoned. No output, no retry — it appears in the snapshot's `discarded` and emits a `discarded` result event, and the run settles without it. |
+
+A compliance block is not something an approval can wave through — that is the point of the
+control. Re-sending a plain `approve` unchanged is simply blocked again.
+
+> **Additive by construction.** These three keys are **absent** from every payload unless a block
+> actually happened, so everything you parse today is byte-identical and no existing client
+> changes. Standard JSON-client hygiene applies: ignore fields you don't know. (Jackson 3 /
+> Spring Boot 4 ignores unknown properties by default; TypeScript does inherently.)
+
+**⚠️ If you auto-approve gates anywhere, bound the loop.** "Approve everything until the task
+leaves `awaiting_review`" never terminates against a blocked draft — it is the one integration
+that genuinely breaks. Either stop when `blocked` is true, or never auto-approve the same
+platform twice:
+
+```java
+Set<String> approvedOnce = new HashSet<>();
+while ("awaiting_review".equals(task.status)) {
+    Map<String, Verdict> verdicts = new HashMap<>();
+    for (Pending p : task.pending) {
+        if (Boolean.TRUE.equals(p.blocked())) return task;  // needs a human decision; hand it over
+        if (!approvedOnce.add(p.platform())) return task;   // belt-and-braces if you skip `blocked`
+        verdicts.put(p.platform(), new Verdict("approve", null, null));
+    }
+    task = agentServ.reviewTask(taskId, new ReviewRequest(verdicts));
+}
+```
+
+**UI recipe.** On `draft_ready`, key the draft card by `platform` and let a new event for the same
+platform **supersede** the previous card rather than appending a second one. When `blocked` is
+true, style it as a block (not the amber "reviewer flagged this" notice), show your message built
+from `block_reason`, and render one button per entry in `allowed_decisions`. Don't report
+"approved / queued for publishing" until the `final` event actually lands for that platform — and
+settle the card on a `discarded` event too, since a discarded platform never produces a `final`.
+
+> Full standalone guide for this feature, with sequence diagrams and copy-paste client code:
+> **[docs/COMPLIANCE_GATE_API.md](docs/COMPLIANCE_GATE_API.md)**.
 
 Learning no longer happens automatically on `approve_after_edit`. Once the task is `completed`,
 call **`POST /tasks/{id}/confirm-learning`** (below) to opt in — it distils both brand-voice rules
@@ -465,6 +604,7 @@ Returned by `POST /tasks`, `POST /tasks/{id}/review`, and this endpoint:
 - `pending` — drafts waiting for your verdict. Drive your review UI off this list.
 - `outputs` — finalized drafts.
 - `proposed_rules` — the brand rules `/confirm-learning` wrote (snapshot; empty until you confirm).
+- `discarded` — **present only if** some platform got a `discard` verdict: `[{"platform": "linkedin", "reason": "…"}]`. A discarded platform produces no `outputs` entry, so this is what explains its absence. Absent on an ordinary run.
 - `title` — a short human-readable label for this session, for your **history sidebar**. Present from the very first `running` snapshot (a deterministic topic-derived title, zero latency), then **upgraded in place** to a polished cheap-tier LLM title that also arrives as a one-off [`session_title` SSE event](#the-sse-event-stream) — the upgrade runs concurrently and never delays the run.
 
 **`status` values:**
@@ -512,6 +652,34 @@ data: {"type":"result","status":"discussion_consensus","table_id":"linkedin","no
 - `discussion_consensus` — one per table, after its last utterance. `strategy` is the
   platform→angle map fed downstream to the creator; `converged: false` means the table hit its
   round cap rather than reaching agreement.
+
+#### Turn audio (`agent_utterance_audio`)
+
+Each persona turn is also read aloud. Synthesis runs in the background, so the clip arrives as a
+**separate, later** event — match it back to the turn by `speaker` + `round_index`:
+
+```
+data: {"type":"agent_utterance_audio","table_id":"linkedin","speaker":"brand_voice","agent_id":"brand_voice",
+       "round_index":2,"audio_url":"/tasks/sess-1a2b/audio/linkedin/brand_voice/2",
+       "phase":"discuss","status":"done","ts":...}
+```
+
+- `audio_url` is a **reference, not the bytes** — a service-relative path. Fetch it (lazily, e.g.
+  when the user presses play) from **`GET /tasks/{task_id}/audio/{table_id}/{speaker}/{round_index}`**,
+  which returns `audio/mpeg`. If you proxy the service, mirror this path the way you mirror the
+  others; the event's value is the upstream path, so prefixing your own mount point is enough.
+- **`404` is normal** and simply means "no audio for that turn": never synthesized (the human
+  seat is not read back), synthesis failed, or the clip aged out of the server's bounded cache.
+  Treat it as no-audio, not an error. Clips are not durable — a run recovered after a restart
+  replays its discussion **silently**, with the turns intact.
+- Not every turn gets one, and the event may never arrive. Render the turn on `agent_utterance`;
+  attach audio only if and when this follows.
+
+> **Changed:** this event used to inline the mp3 as base64 in an `audio_b64` field. That put
+> megabytes into an event log that is replayed on reconnect, and let a large audio frame delay
+> latency-sensitive events (like a step-mode `round_control` prompt) behind it on the same
+> connection. A client still reading `audio_b64` finds nothing and plays no audio — it does not
+> break otherwise.
 
 ### `POST /tasks/{task_id}/raise-hand` — reserve the next turn on a table
 
@@ -978,8 +1146,8 @@ just a task. Practical rules:
 | Code | When |
 |---|---|
 | `400` | Missing/invalid fields (no `topic`, empty `target_platforms`, unknown/empty `content_types`, bad `decision`, `approve_after_edit` without `edited_draft`, `/say` or `/raise-hand` without `table_id`/`text`, `/roundtable` with no resolvable `platform`, an unknown `roundtable_mode` or `/round-control` `action`; `/plans` or `/plans/clarify` without `goal`/platforms/valid dates, `/plans/{id}/refine` without `feedback` or a non-blank `answers`, `/plans/due` without a `date`, a PATCH with unknown item fields or a status other than `skipped`/`planned`) |
-| `404` | Unknown `task_id`, `session_id`, `plan_id`/`item_id`, or video `job_id`; `/render-video` for a platform with no finished draft; `/download` when the rendered file is missing on disk |
-| `409` | Task not awaiting review, `task_id` already exists, brief not complete, `/confirm-learning` before the task is `completed`, `/render-video` on a platform whose run produced no storyboard, `/download` before the job is `done`; `/plans/{id}/confirm` or `/plans/{id}/refine` on a non-draft plan, `/execute` on a non-active plan or a non-`planned` item (double-execute guard) |
+| `404` | Unknown `task_id`, `session_id`, `plan_id`/`item_id`, or video `job_id`; `/render-video` for a platform with no finished draft; `/download` when the rendered file is missing on disk; `/tasks/{id}/audio/…` for a turn with no clip (never synthesized, or aged out — treat as "no audio", not an error) |
+| `409` | Task not awaiting review, `task_id` already exists, brief not complete, `/confirm-learning` before the task is `completed`, `/render-video` on a platform whose run produced no storyboard, `/download` before the job is `done`; `/plans/{id}/confirm` or `/plans/{id}/refine` on a non-draft plan, `/execute` on a non-active plan or a non-`planned` item (double-execute guard); `/review` or `/round-control` on a run that cannot be resumed — already finished, or it never had a workflow checkpoint (a standalone `POST /roundtable` task) — and, **retryably**, while another replica is mid-resume for that same run (see [Deploying more than one instance](#deploying-more-than-one-instance)) |
 | `422` | FastAPI request-body validation (malformed JSON / wrong field types); standard FastAPI `detail` payload |
 | `500` | Unexpected error on a **synchronous** call (e.g. `POST /review`). A failure during a **background** run (`POST /tasks` / `/roundtable[s]`, which already returned `running`) is **not** a `500` — the task goes `status: "error"` (with an `error` message) and the SSE stream closes on a `workflow`/`error` event. |
 

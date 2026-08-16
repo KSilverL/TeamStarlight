@@ -105,9 +105,12 @@ services:
       - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
       - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
       - AZURE_OPENAI_CHAT_DEPLOYMENT=${AZURE_OPENAI_CHAT_DEPLOYMENT}
+      # Voiceover TTS reads the SHARED Azure Speech credential — the ROUNDTABLE_TTS_* pair
+      # further down, not AZURE_SPEECH_KEY/_REGION. Those two used to be passed here and
+      # were read by nothing: a stack configured with only them got a voiceover service
+      # that built fine and then synthesized against https://None.tts.speech.microsoft.com,
+      # which degrades to "no narration" silently. Removed so the wiring can't lie again.
       - USE_MOCK_VOICEOVER=${USE_MOCK_VOICEOVER}
-      - AZURE_SPEECH_KEY=${AZURE_SPEECH_KEY}
-      - AZURE_SPEECH_REGION=${AZURE_SPEECH_REGION}
       - VOICEOVER_DEFAULT_VOICE=${VOICEOVER_DEFAULT_VOICE}
       - USE_MOCK_MUSIC_GENERATION=${USE_MOCK_MUSIC_GENERATION}
       # Web search (Bing grounding via Azure AI Foundry agents). FOUNDRY_PROJECT_ENDPOINT
