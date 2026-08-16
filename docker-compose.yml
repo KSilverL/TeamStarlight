@@ -36,22 +36,24 @@ services:
       - "8081:8081"
     environment:
       - LLM_SERVICE_BASE_URL=http://llm:8080
-      # Database: whatever application.properties / the environment already says — i.e. the same
-      # cluster this backend has always used. It is deliberately NOT redirected here.
+      # Database. application.properties no longer carries a hardcoded fallback, so these three
+      # are REQUIRED — `:?` makes compose refuse to start with a named variable instead of
+      # passing "" (an unset root-.env var substitutes to the empty string, not to nothing, and
+      # an empty JDBC URL fails at boot with a far less obvious message).
       #
-      # An earlier version of this file defaulted it to the local `database` service, meaning to be
-      # safe. It was the opposite: the LLM service's own DATABASE_URL still pointed at the shared
-      # cluster, so half the world was fresh and half was production. A fresh backend database
-      # restarts its business-id sequence at 1, and those ids then collided with the real plans and
-      # brand profiles the LLM service still held for businesses 1 and 2 — a test account
-      # inherited a stranger's campaigns, and the real accounts could no longer log in.
+      # Point these at the SAME cluster the `llm` service's DATABASE_URL below uses. An earlier
+      # version of this file redirected the backend to a local `database` service, meaning to be
+      # safe. It was the opposite: the LLM service still pointed at the shared cluster, so half
+      # the world was fresh and half was production. A fresh backend database restarts its
+      # business-id sequence at 1, and those ids collided with the real plans and brand profiles
+      # the LLM service still held for businesses 1 and 2 — a test account inherited a stranger's
+      # campaigns, and the real accounts could no longer log in.
       #
       # The rule this encodes: the backend's database and the LLM service's store are ONE world.
       # Move them together or not at all. `docker-compose.mock.yml` moves both.
-      #
-      # Nothing is listed here on purpose — an empty `SPRING_DATASOURCE_URL=` would not mean
-      # "unset", it would override application.properties with an empty string and fail startup.
-      # To point a deployed stack elsewhere, set the three SPRING_DATASOURCE_* vars in your `.env`.
+      - DB_URL=${DB_URL:?set DB_URL in .env (jdbc:postgresql://host:5432/db?sslmode=require)}
+      - DB_USERNAME=${DB_USERNAME:?set DB_USERNAME in .env}
+      - DB_PASSWORD=${DB_PASSWORD:?set DB_PASSWORD in .env}
       # Signs the JWTs whose subject decides which brand a run reads and writes — see
       # BriefIdentity / TaskAccess. The dev default keeps `docker compose up` working out of the
       # box; set a real secret anywhere the stack is reachable by anyone else.
@@ -60,8 +62,18 @@ services:
       # no explanation, because the signature no longer verifies. Override it in `.env` for any
       # deployment; changing it is a deliberate act of logging everyone out.
       - JWT_SECRET=${JWT_SECRET:-starlight-default-secret-change-in-production}
-      # Supabase credentials — override here or in a .env file if needed.
-      # Defaults are already baked into application.properties.
+      # Outbound mail (missed-post notifications). Host/port default in application.properties;
+      # only the credentials need supplying, and a blank pair only fails when a mail is sent.
+      - SPRING_MAIL_HOST=${SPRING_MAIL_HOST:-smtp.gmail.com}
+      - SPRING_MAIL_PORT=${SPRING_MAIL_PORT:-587}
+      - SPRING_MAIL_USERNAME=${SPRING_MAIL_USERNAME:-}
+      - SPRING_MAIL_PASSWORD=${SPRING_MAIL_PASSWORD:-}
+      # Instagram publishing + the blob container its videos are staged in. All optional —
+      # leave blank and every other surface still works; only Instagram posting fails.
+      - INSTAGRAM_ACCOUNT_ID=${INSTAGRAM_ACCOUNT_ID:-}
+      - INSTAGRAM_ACCOUNT_TOKEN=${INSTAGRAM_ACCOUNT_TOKEN:-}
+      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING:-}
+      - AZURE_STORAGE_CONTAINER_NAME=${AZURE_STORAGE_CONTAINER_NAME:-instagramcontent}
       # LinkedIn/Meta OAuth — must match the redirect URI registered on the respective Developer
       # app, and where to send the browser back to after the OAuth round-trip.
       - LINKEDIN_REDIRECT_URI=${LINKEDIN_REDIRECT_URI:-http://localhost:8081/linkedin/callback}
@@ -79,7 +91,7 @@ services:
     build:
       context: .
       dockerfile: LLM_service/Dockerfile
-    # ⚠️ SECURITY: this service has NO authentication of its own. It trusts `business_id` /
+    # SECURITY: this service has NO authentication of its own. It trusts `business_id` /
     # `user_id` in the request body, and those select which brand's voice profile a run reads and
     # writes — so anything that can reach this port can read and poison any tenant's data. It is
     # safe only because the backend in front of it derives those from a verified token.
@@ -140,7 +152,14 @@ services:
       - GEOAPIFY_API_KEY=${GEOAPIFY_API_KEY}
       - GEOAPIFY_MAP_STYLE=${GEOAPIFY_MAP_STYLE}
 
-      - USE_MOCK_SAFETY=false
+      # Content safety (the reviewer's first call). These three move TOGETHER: get_safety()
+      # raises when USE_MOCK_SAFETY is false and the credentials are absent, and that raise
+      # lands in the reviewer — the node every text run passes through on its way to the human
+      # gate. Hardcoding `false` here while never forwarding AZURE_CONTENTSAFETY_* meant the
+      # .env's USE_MOCK_SAFETY=true was ignored and no run could ever reach the gate.
+      - USE_MOCK_SAFETY=${USE_MOCK_SAFETY:-false}
+      - AZURE_CONTENTSAFETY_ENDPOINT=${AZURE_CONTENTSAFETY_ENDPOINT}
+      - AZURE_CONTENTSAFETY_KEY=${AZURE_CONTENTSAFETY_KEY}
 
       # Voice
       - USE_MOCK_VOICE=${USE_MOCK_VOICE}

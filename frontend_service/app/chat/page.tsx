@@ -2818,9 +2818,11 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
     setError(null);
     setElapsed(0);
     try {
+      // authHeaders() is required, not optional: /tasks/{id}/render-video is one of the
+      // TaskAccess-guarded routes, so an unauthenticated render of an OWNED run is 403.
       const res = await fetch("/api/video", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({
           taskId: message.workflowTaskId,
           platform: message.platform,
@@ -4426,9 +4428,11 @@ function SocialPostCard({
     setRenderError(null);
     setElapsed(0);
     try {
+      // See the sibling startRender above — the render route is TaskAccess-guarded, so the
+      // token has to travel with it or an owned run 403s for its own owner.
       const res = await fetch("/api/video", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({
           taskId: message.workflowTaskId,
           platform: message.platform,
