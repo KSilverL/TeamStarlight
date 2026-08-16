@@ -110,7 +110,11 @@ def build_roundtable(
         workflow = MagenticBuilder(
             participants=agents,
             manager=manager,
-            max_round_count=rounds + 2,  # builder backstop; the custom manager converges first
+            # Inert: MagenticBuilder IGNORES max_round_count when `manager=` is pre-built (it
+            # reads `manager.max_round_count`, which MockRoundtableManager leaves unset). The
+            # mock manager converges off its own `_max_rounds` — kept only as documentation of
+            # the intended ceiling.
+            max_round_count=rounds + 2,
             checkpoint_storage=InMemoryCheckpointStorage(),
         ).build()
     else:

@@ -53,6 +53,28 @@ def _item(answer, reason: str = "deterministic roundtable manager") -> MagenticP
     return MagenticProgressLedgerItem(reason=reason, answer=answer)
 
 
+def _converged_ledger(
+    magentic_context: MagenticContext,
+    user_name: Optional[str],
+    *,
+    reason: str,
+    instruction: str,
+) -> MagenticProgressLedger:
+    """A SATISFIED progress ledger. The orchestrator reads `is_request_satisfied` first and
+    routes straight to `prepare_final_answer`, which re-reads the whole `chat_history` and
+    writes the real consensus — so this is how a table converges without the manager's own
+    LLM ledger call. `next_speaker` is never dispatched on this branch (the orchestrator
+    completes instead), but it must still name a real participant, and never the user seat."""
+    agents = [n for n in magentic_context.participant_descriptions if n != user_name]
+    return MagenticProgressLedger(
+        is_request_satisfied=_item(True, reason),
+        is_in_loop=_item(False),
+        is_progress_being_made=_item(True),
+        next_speaker=_item(agents[0] if agents else (user_name or "")),
+        instruction_or_question=_item(instruction),
+    )
+
+
 def _user_floor_ledger(user_name: str, platform: str, round_index: int) -> MagenticProgressLedger:
     """A progress ledger that hands this round's mic to the user seat (never satisfied — the
     discussion continues after the user speaks, when the NEXT round returns to persona selection)."""
@@ -267,7 +289,11 @@ class InteractiveMagenticManager(StandardMagenticManager):
     the user did not ask to give.
 
     Because MagenticBuilder ignores its own `max_round_count` when given a pre-built `manager=`,
-    the round cap is set here on the manager (the orchestrator reads `manager.max_round_count`)."""
+    the round cap is set here on the manager (the orchestrator reads `manager.max_round_count`).
+    The cap is enforced by THIS class, not the framework: at the cap `create_progress_ledger`
+    returns a satisfied ledger so the table converges through `prepare_final_answer` (a real
+    synthesis of the whole transcript) instead of the orchestrator's consensus-less termination
+    sentinel. See `__init__` for why `max_round_count` is handed to the framework with headroom."""
 
     def __init__(
         self,
@@ -280,7 +306,18 @@ class InteractiveMagenticManager(StandardMagenticManager):
         before_round: Optional[BeforeRound] = None,
         max_round_count: Optional[int] = None,
     ) -> None:
-        super().__init__(agent, max_round_count=max_round_count)
+        # The framework's own round cap is a BACKSTOP, not the working limit. The orchestrator
+        # enforces it in `_check_within_limits_or_complete`, which emits a hardcoded
+        # "Workflow terminated due to reaching maximum round count." sentinel with NO LLM call
+        # and no consensus. `create_progress_ledger` converges one round before that instead
+        # (see the round-cap branch below), so hand the framework +2 of headroom and keep the
+        # real cap here. MockRoundtableManager has always worked this way — it leaves
+        # `max_round_count` unset entirely and converges off its own `_max_rounds`.
+        super().__init__(
+            agent,
+            max_round_count=None if max_round_count is None else max_round_count + 2,
+        )
+        self._max_rounds = max_round_count
         self._platform = platform
         self._task_id = task_id
         self._store = store
@@ -342,20 +379,39 @@ class InteractiveMagenticManager(StandardMagenticManager):
         return replace(magentic_context, participant_descriptions=filtered)
 
     async def create_progress_ledger(self, magentic_context: MagenticContext) -> MagenticProgressLedger:
-        if self._before_round is not None:
-            await self._before_round(self._platform, magentic_context.round_count)
+        round_count = magentic_context.round_count
+        past_cap = self._max_rounds is not None and round_count > self._max_rounds
+        # Skip the per-round prompt once the cap is reached: this round converges whatever the
+        # user answers, so asking would only risk a ROUNDTABLE_CONTROL_TIMEOUT wait for an
+        # answer that cannot change anything. (MockRoundtableManager guards its hook the same way.)
+        if self._before_round is not None and not past_cap:
+            await self._before_round(self._platform, round_count)
         # Step mode's "ENOUGH": converge now. A satisfied ledger routes the orchestrator to
         # prepare_final_answer, which synthesizes the consensus from the partial transcript —
         # no LLM ledger call is needed (or wanted) for a decision the user already made.
         if finish_requested(self._task_id, self._platform):
-            agents = [n for n in magentic_context.participant_descriptions if n != self._user]
-            return MagenticProgressLedger(
-                is_request_satisfied=_item(True, "the user ended the discussion (enough)"),
-                is_in_loop=_item(False),
-                is_progress_being_made=_item(True),
-                next_speaker=_item(agents[0] if agents else (self._user or "")),
-                instruction_or_question=_item(
+            return _converged_ledger(
+                magentic_context, self._user,
+                reason="the user ended the discussion (enough)",
+                instruction=(
                     f"The user ended the {self._platform} discussion; synthesize the consensus now."),
+            )
+        # Round cap: converge through that SAME satisfied path rather than letting the
+        # orchestrator's limit check fire. That check emits its termination sentinel without
+        # ever calling the LLM, so the table would hand downstream whatever
+        # `runner._resolve_consensus` could salvage — the last persona's single line (personas
+        # speak ONE point per turn by charter), not a synthesis of the debate. Converging here
+        # spends one `prepare_final_answer` call to read the full transcript and write the real
+        # consensus; `max_round_count` is +2 above so the framework's cap stays unreachable
+        # behind this branch. Costs no persona turn: rounds 1..max_rounds still speak, and this
+        # fires on the ledger call that previously hit the sentinel.
+        if past_cap:
+            return _converged_ledger(
+                magentic_context, self._user,
+                reason=f"the {self._platform} table reached its {self._max_rounds}-round cap",
+                instruction=(
+                    f"The {self._platform} discussion reached its round limit; synthesize the "
+                    "consensus from everything that was said."),
             )
         # Raise-hand path: the user holds the floor this round → force the mic to the user seat.
         if await self._user_pending():

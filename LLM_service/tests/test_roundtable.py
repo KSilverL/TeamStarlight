@@ -1082,3 +1082,93 @@ async def test_llm_manager_converges_on_enough_without_consulting_the_llm():
 
     assert ledger.is_request_satisfied.answer is True
     assert ledger.next_speaker.answer != USER_SEAT_NAME   # synthesis never lands on the user seat
+
+
+# ── The round cap converges through a real synthesis, not the framework's sentinel ──
+# The orchestrator's own `_check_within_limits_or_complete` terminates with a hardcoded
+# "Workflow terminated due to reaching maximum round count." string and NO LLM call, which
+# would leave runner._resolve_consensus salvaging one persona's last line as the strategy.
+# The production manager therefore converges itself one round earlier.
+
+
+async def test_llm_manager_converges_at_the_round_cap_instead_of_the_sentinel():
+    """At the cap the manager returns a SATISFIED ledger — the orchestrator routes that to
+    prepare_final_answer, which reads the whole transcript and writes a real consensus. No
+    progress-ledger LLM call is spent on a round whose outcome is already decided."""
+    from LLM_service.workflow.roundtable.user_seat import USER_SEAT_NAME
+
+    mgr = _interactive_manager("t-llm-cap")   # max_rounds=6
+
+    async def fail_complete(messages):
+        raise AssertionError("the ledger LLM must not be consulted once the cap is reached")
+
+    mgr._complete = fail_complete
+
+    ctx = _context_with_user()
+    ctx.round_count = 7  # the round that previously tripped the orchestrator's limit check
+    ledger = await mgr.create_progress_ledger(ctx)
+
+    assert ledger.is_request_satisfied.answer is True
+    assert "cap" in ledger.is_request_satisfied.reason
+    assert ledger.next_speaker.answer != USER_SEAT_NAME
+
+
+async def test_framework_round_cap_sits_above_the_managers_own():
+    """The framework's cap is a backstop only: it must be strictly higher than the working cap,
+    or the consensus-less sentinel would fire before the manager could converge."""
+    mgr = _interactive_manager("t-llm-backstop")   # max_rounds=6
+
+    assert mgr._max_rounds == 6
+    assert mgr.max_round_count > mgr._max_rounds
+
+
+async def test_below_the_cap_the_llm_still_selects_the_speaker():
+    """The cap branch must not short-circuit an ordinary round — under the cap the moderator's
+    LLM progress ledger still runs and picks the next speaker."""
+    mgr = _interactive_manager("t-llm-under-cap")   # max_rounds=6
+    calls: list = []
+
+    async def fake_complete(messages):
+        calls.append(messages)
+        from agent_framework import Message
+        return Message("assistant", [_ledger_json(BRAND_VOICE)])
+
+    mgr._complete = fake_complete
+
+    ctx = _context_with_user()
+    ctx.round_count = 6  # the LAST round that should still speak
+    ledger = await mgr.create_progress_ledger(ctx)
+
+    assert len(calls) == 1
+    assert ledger.is_request_satisfied.answer is False
+    assert ledger.next_speaker.answer == BRAND_VOICE
+
+
+async def test_round_cap_skips_the_step_mode_prompt():
+    """The per-round prompt is pointless at the cap (the round converges whatever the user
+    answers) — asking would only risk a ROUNDTABLE_CONTROL_TIMEOUT wait for a dead answer."""
+    prompted: list = []
+
+    async def before_round(table_id: str, round_index: int) -> None:
+        prompted.append(round_index)
+
+    from LLM_service.workflow.roundtable.manager import build_interactive_manager
+    from LLM_service.workflow.roundtable.user_seat import USER_SEAT_NAME
+
+    mgr = build_interactive_manager(
+        factory.get_chat_client(agent_name="moderator"),
+        platform=PLATFORM, max_rounds=6, task_id="t-llm-cap-hook",
+        store=factory.get_store(), user_name=USER_SEAT_NAME,
+        before_round=before_round,
+    )
+
+    async def fail_complete(messages):
+        raise AssertionError("no LLM call expected on the converging round")
+
+    mgr._complete = fail_complete
+
+    ctx = _context_with_user()
+    ctx.round_count = 7
+    await mgr.create_progress_ledger(ctx)
+
+    assert prompted == []
