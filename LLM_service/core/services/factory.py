@@ -22,6 +22,7 @@ from . import azure, higgsfield, media_assets, mock, postgres, web_search
 from .base import (
     BackgroundRemovalService,
     ImageSearchService,
+    VideoSearchService,
     LLMService,
     MusicGenerationService,
     RealtimeVoiceService,
@@ -41,6 +42,7 @@ __all__ = [
     "get_realtime_voice",
     "get_chat_client",
     "get_image_search",
+    "get_video_search",
     "get_live_image_search",
     "get_background_removal",
     "get_music_generation",
@@ -184,6 +186,19 @@ def get_image_search() -> ImageSearchService:
     return _cached("image_search", build)
 
 
+def get_video_search() -> VideoSearchService:
+    """Stock FOOTAGE for media_statement slides. Distinct from get_video_generation
+    (which synthesizes a clip with an AI model); this one searches a stock library.
+    Shares PEXELS_API_KEY with get_image_search — no separate credential."""
+    def build() -> VideoSearchService:
+        s = get_settings()
+        if s.mock_video_search():
+            return mock.MockVideoSearch()
+        _require(s.has_pexels, "Pexels video", "PEXELS_API_KEY", "USE_MOCK_VIDEO_SEARCH=true")
+        return media_assets.PexelsVideoSearch(s)
+    return _cached("video_search", build)
+
+
 def get_background_removal() -> BackgroundRemovalService:
     def build() -> BackgroundRemovalService:
         s = get_settings()
@@ -199,12 +214,17 @@ def get_music_generation() -> MusicGenerationService:
         s = get_settings()
         if s.mock_music_generation():
             return mock.MockMusicGeneration()
-        # Prefer the local royalty-free library (offline, no key) when it's populated;
-        # Soundraw is the generative fallback and is enterprise-gated.
+        # Jamendo first: it's the only provider where the agent's mood/genre/energy
+        # actually varies the track. The local library is the offline/no-key fallback
+        # (one track, so mood has no audible effect there), and Soundraw — generative,
+        # enterprise-gated — is last.
+        if s.has_jamendo:
+            return media_assets.JamendoMusic(s)
         if s.has_music_library:
             return media_assets.BundledMusicLibrary(s)
         _require(s.has_soundraw, "Background music",
-                 "a populated MUSIC_LIBRARY_DIR/manifest.json (see assets/music/README.md), "
+                 "JAMENDO_CLIENT_ID (free, from devportal.jamendo.com), a populated "
+                 "MUSIC_LIBRARY_DIR/manifest.json (see assets/music/README.md), "
                  "or SOUNDRAW_API_KEY", "USE_MOCK_MUSIC_GENERATION=true")
         return media_assets.SoundrawMusic(s)
     return _cached("music_generation", build)

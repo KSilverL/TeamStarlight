@@ -61,6 +61,7 @@ class CampaignConversation:
         followups_asked: int = 0,
         business_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        force_plan: bool = False,
     ) -> dict:
         """Returns {intent, complete, campaign, question, assistant_message, followups_asked,
         publish_at}.
@@ -71,6 +72,10 @@ class CampaignConversation:
         beyond the verdict itself: the moment the user asked the post to go out at, if they
         named one. It is a proposal for the caller's schedule controls, not an instruction —
         nothing is queued until the user confirms it.
+
+        `force_plan` is the user having said so themselves — a UI control, not a guess. The
+        classification still runs, because it is what reads the goal and the window out of the
+        sentence; only its verdict is overridden.
         """
         raw = await factory.get_llm().classify_request(
             message=message, today=today, platforms=platforms,
@@ -88,8 +93,13 @@ class CampaignConversation:
         # settle nothing at all ("I want a posting plan" → we ask for the goal), and judging
         # only on settled fields would let that conversation fall apart on its second turn,
         # which is exactly when it is most fragile.
+        #
+        # `force_plan` joins them because it is the same statement made louder: the user has
+        # told us outright this is a campaign, and a model reading "posts for the launch" as a
+        # single post is exactly the mistake the control exists to overrule.
         resumed = (
-            followups_asked > 0
+            force_plan
+            or followups_asked > 0
             or any((known or {}).get(field) for field in REQUIRED_FIELDS)
         )
 

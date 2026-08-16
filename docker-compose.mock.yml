@@ -1,0 +1,69 @@
+# Credential-free overlay: runs the whole stack with every external vendor mocked.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.mock.yml up --build
+#
+# For functional testing — clicking through the app to see that the wiring works — where paying
+# Azure/Pexels/Remove.bg for deterministic-enough output would be waste. Output is canned and
+# instant; anything about model QUALITY has to be judged on the real stack.
+#
+# Every var is listed explicitly rather than relying on USE_MOCK=true alone, because a per-service
+# toggle BEATS the global one (core/config.py) — and the base compose file sets several of them to
+# `false` outright. Leaving any one out would send that vendor a real, unauthenticated request.
+#
+# It also moves the BACKEND's database, and that pairing is not optional. The backend's account
+# table and the LLM service's store are one world: business ids are issued by the former and used
+# as keys by the latter. Point one at a fresh database and leave the other on the shared cluster
+# and the id sequences collide — a brand-new test account is handed id 2, and inherits every plan
+# and brand profile the LLM service still holds for "business 2". Both move here, together.
+services:
+  # An isolated database for this overlay, so mock runs never touch real accounts.
+  database:
+    image: postgres:17
+    environment:
+      - POSTGRES_DB=business
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - mockdb:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d business"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    environment:
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://database:5432/business
+      - SPRING_DATASOURCE_USERNAME=postgres
+      - SPRING_DATASOURCE_PASSWORD=password
+    depends_on:
+      llm:
+        condition: service_started
+      # Wait until Postgres actually accepts connections — Spring fails its JPA bootstrap
+      # outright if it is still starting up.
+      database:
+        condition: service_healthy
+
+  llm:
+    environment:
+      - USE_MOCK=true
+      - USE_MOCK_LLM=true
+      - USE_MOCK_SAFETY=true
+      - USE_MOCK_STORE=true
+      - USE_MOCK_VOICE=true
+      - USE_MOCK_IMAGE_SEARCH=true
+      - USE_MOCK_BACKGROUND_REMOVAL=true
+      - USE_MOCK_MUSIC_GENERATION=true
+      - USE_MOCK_VOICEOVER=true
+      - USE_MOCK_WEB_SEARCH=true
+      - USE_MOCK_VIDEO_GENERATION=true
+      # The mock store keeps brand profiles and learned rules in memory, so they reset with the
+      # container. That is the point of this overlay — no shared state to corrupt — but it does
+      # mean the learning loop cannot be demonstrated across restarts here.
+      - LLM_SERVICE_IGNORE_DOTENV=1
+      # Off by default; flip to true to exercise the multi-persona discussion (mock personas are
+      # scripted and deterministic, so this stays free).
+      - ROUNDTABLE_ENABLED=${ROUNDTABLE_ENABLED:-false}
+
+volumes:
+  mockdb:

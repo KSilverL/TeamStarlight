@@ -128,6 +128,14 @@ public class Session {
 		this.user = b;
 	}
 
+	// Ignored for the same reason the field is: sessions are returned straight to the browser
+	// by GET /api/sessions, and Business carries the account's password. Read server-side only,
+	// to check that a caller owns the session they're editing.
+	@JsonIgnore
+	public Business getUser() {
+		return user;
+	}
+
 	public boolean isComplete() {
 		return complete;
 	}

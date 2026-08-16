@@ -112,7 +112,15 @@ services:
       # which degrades to "no narration" silently. Removed so the wiring can't lie again.
       - USE_MOCK_VOICEOVER=${USE_MOCK_VOICEOVER}
       - VOICEOVER_DEFAULT_VOICE=${VOICEOVER_DEFAULT_VOICE}
+      # Backing music. JAMENDO_CLIENT_ID is the real provider; leave it blank and the
+      # bundled single-track library in the image takes over (see core/config.py).
+      # NOTE: do not re-add a hardcoded USE_MOCK_MUSIC_GENERATION further down this
+      # list — compose takes the LAST value for a duplicated key, and a stray `=true`
+      # below silently made every containerised render a silent MP3.
       - USE_MOCK_MUSIC_GENERATION=${USE_MOCK_MUSIC_GENERATION}
+      - JAMENDO_CLIENT_ID=${JAMENDO_CLIENT_ID}
+      - SOUNDRAW_API_KEY=${SOUNDRAW_API_KEY}
+      - USE_MOCK_VIDEO_SEARCH=${USE_MOCK_VIDEO_SEARCH}
       # Web search (Bing grounding via Azure AI Foundry agents). FOUNDRY_PROJECT_ENDPOINT
       # must be set here too — get_web_search() raises without it once USE_MOCK_WEB_SEARCH
       # is false, since it's the endpoint the WEB_SEARCH_AGENT_* names below resolve against.
@@ -135,7 +143,6 @@ services:
       - GEOAPIFY_API_KEY=${GEOAPIFY_API_KEY}
       - GEOAPIFY_MAP_STYLE=${GEOAPIFY_MAP_STYLE}
 
-      - USE_MOCK_MUSIC_GENERATION=true
       - USE_MOCK_SAFETY=false
 
       # Voice

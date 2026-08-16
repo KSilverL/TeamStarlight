@@ -25,6 +25,7 @@ from LLM_service.api import (
     WorkflowService,
     create_app,
 )
+from LLM_service.core.config import reset_settings
 from LLM_service.core.plan_schema import (
     PlanItem,
     PlanItemSpec,
@@ -417,6 +418,53 @@ async def test_series_recap_reaches_second_item_brief():
     assert "Campaign goal:" in brief.user_intent
     assert first_topic in brief.user_intent  # the series recap names what already went out
     assert plan["items"][1]["platforms"] == brief.target_platforms
+
+
+async def test_draft_mode_defaults_to_the_roundtable_and_survives_the_round_trip():
+    """A plan stored before this field existed, or created by a caller that has never
+    heard of it, must read back as the deliberated mode it was actually written with."""
+    svc = _service()
+    plan = await svc.create(dict(_CREATE))
+    assert plan["draft_mode"] == "roundtable"
+    assert (await svc.get(plan["plan_id"]))["draft_mode"] == "roundtable"
+
+    fast = await svc.create({**_CREATE, "draft_mode": "fast"})
+    assert (await svc.get(fast["plan_id"]))["draft_mode"] == "fast"
+
+    with pytest.raises(ApiError) as exc:
+        await svc.create({**_CREATE, "draft_mode": "leisurely"})
+    assert exc.value.status == 400
+
+
+async def test_confirming_settles_how_the_campaign_gets_written(monkeypatch):
+    """The choice rides on confirm because that is when the work is commissioned — and it
+    has to reach the runs it commissions, not just sit in the stored document.
+
+    Asserted with the roundtable switched ON, since "fast" is only observable as the
+    absence of something that would otherwise have happened."""
+    monkeypatch.setenv("ROUNDTABLE_ENABLED", "true")
+    reset_settings()
+    svc = _service()
+
+    async def _first_slot_of(draft_mode: str):
+        plan = await svc.create({**_CREATE, "draft_mode": draft_mode})
+        pid = plan["plan_id"]
+        assert (await svc.confirm(pid, draft_mode=draft_mode))["draft_mode"] == draft_mode
+        res = await svc.execute(pid, "item-1")
+        task_id = res["task"]["task_id"]
+        await _await_task_status(svc._workflow, task_id, "awaiting_review")
+        return svc._workflow._tasks[task_id]
+
+    # No table ever sat, so there is no discussion for the learning loop to distil.
+    assert (await _first_slot_of("fast")).roundtable_transcript == []
+    # The deliberated mode still holds its discussion, on the same deployment.
+    assert (await _first_slot_of("roundtable")).roundtable_transcript
+
+
+async def test_confirming_without_a_mode_leaves_the_plans_own_choice_alone():
+    svc = _service()
+    plan = await svc.create({**_CREATE, "draft_mode": "fast"})
+    assert (await svc.confirm(plan["plan_id"]))["draft_mode"] == "fast"
 
 
 async def test_reconcile_degrades_when_task_registry_is_gone():

@@ -11,6 +11,8 @@ approve_after_edit). Fully mocked / offline.
 
 from __future__ import annotations
 
+import pytest
+
 from LLM_service.api import MediaService
 from LLM_service.core.config import get_settings
 from LLM_service.core.services.azure import AzureLLM
@@ -105,7 +107,7 @@ async def test_write_copy_threads_history_into_the_prompt():
     captured: dict = {}
     llm = AzureLLM(get_settings())
 
-    async def _complete(messages):
+    async def _complete(messages, **_kwargs):
         captured["messages"] = messages
         return "continued copy"
 
@@ -203,3 +205,84 @@ async def test_media_only_video_only_produces_just_the_video_spec(make_brief):
     out = snap["outputs"][0]
     assert out["draft"] == "" and out["html_card"] is None
     assert out["video_storyboard"] and len(out["video_storyboard"]["slides"]) >= 2
+
+
+# ── E. Storyboard revision: reworking the video without re-writing the copy ────
+# The storyboard is produced AFTER the human gate, so by the time the user sees it the
+# workflow has already yielded — there is no verdict left to send. These cover the
+# separate revision path that reworks the storyboard in place instead.
+
+async def test_regenerate_storyboard_replaces_the_stored_spec_and_threads_feedback(make_brief):
+    """The user's feedback reaches the generator (the mock echoes `direction` into the hook
+    narration) and the revision REPLACES the stored spec — so the next render, which reads the
+    storyboard back off the task, renders the revision rather than the original."""
+    from LLM_service.api import WorkflowService
+
+    svc = WorkflowService()
+    await svc.start(
+        make_brief(platforms=("linkedin",), content_types=["video"]).model_dump(),
+        task_id="revise-1",
+    )
+    original = svc.get_final_draft("revise-1", "linkedin")["video_storyboard"]
+
+    feedback = "open on the stat and drop the collage"
+    revised = (await svc.regenerate_storyboard("revise-1", "linkedin", feedback))["video_storyboard"]
+
+    # A real, well-formed storyboard came back — not a passthrough of the old one.
+    assert StoryboardSpec(**revised)
+    hook = next(s for s in revised["slides"] if s["type"] == "hook")
+    assert feedback in (hook["narration"] or "")
+    assert revised != original
+
+    # And it is what the task now holds, which is what VideoService.start renders from.
+    assert svc.get_final_draft("revise-1", "linkedin")["video_storyboard"] == revised
+
+
+async def test_regenerate_storyboard_leaves_the_approved_copy_alone(make_brief):
+    """The whole point of this path over a gate reject: copy the user already signed off —
+    including their own edits — survives a storyboard rework untouched."""
+    from LLM_service.api import WorkflowService
+
+    svc = WorkflowService()
+    await svc.start(
+        make_brief(platforms=("linkedin",), content_types=["text", "video"]).model_dump(),
+        task_id="revise-2",
+    )
+    edited = "The copy exactly as the user rewrote it."
+    await svc.review("revise-2", {
+        "linkedin": {"decision": "approve_after_edit", "edited_draft": edited}})
+    assert svc.get_final_draft("revise-2", "linkedin")["draft"] == edited
+
+    await svc.regenerate_storyboard("revise-2", "linkedin", "make it faster")
+    assert svc.get_final_draft("revise-2", "linkedin")["draft"] == edited
+
+
+async def test_regenerate_storyboard_rejects_what_it_cannot_revise(make_brief):
+    """Blank feedback (nothing to act on), an unknown task, and a platform whose draft carries
+    no storyboard each fail with their own status rather than silently re-rolling the dice."""
+    from LLM_service.api import ApiError, WorkflowService
+
+    svc = WorkflowService()
+    await svc.start(
+        make_brief(platforms=("linkedin",), content_types=["text"]).model_dump(),
+        task_id="revise-3",
+    )
+
+    with pytest.raises(ApiError) as blank:
+        await svc.regenerate_storyboard("revise-3", "linkedin", "   ")
+    assert blank.value.status == 400
+
+    with pytest.raises(ApiError) as unknown:
+        await svc.regenerate_storyboard("no-such-task", "linkedin", "make it faster")
+    assert unknown.value.status == 404
+
+    # The task exists and is awaiting review, so no platform has reached the output node yet.
+    with pytest.raises(ApiError) as unfinished:
+        await svc.regenerate_storyboard("revise-3", "linkedin", "make it faster")
+    assert unfinished.value.status == 404
+
+    # Text-only: the draft finishes, but it carries no storyboard to revise.
+    await svc.review("revise-3", {"linkedin": {"decision": "approve"}})
+    with pytest.raises(ApiError) as no_storyboard:
+        await svc.regenerate_storyboard("revise-3", "linkedin", "make it faster")
+    assert no_storyboard.value.status == 409

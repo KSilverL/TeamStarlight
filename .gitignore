@@ -24,6 +24,10 @@ LLM_service/.video_jobs/
 video_renderer/node_modules/
 video_renderer/out/
 video_renderer/.remotion/
+
+# No need to upload videos to the repo.
+*.mp*
+
 # Evaluation sweep outputs (raw run records + reports) — regenerate with
 # `python -m evaluation.run_eval`; never checked in.
 evaluation/results/

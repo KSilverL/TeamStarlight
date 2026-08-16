@@ -17,13 +17,25 @@ Its prompt is built from three layers:
 """
 
 import asyncio
+import time
 
 from agent_framework import Executor, WorkflowContext, handler
 
+from ...core.emitter import emit
+from ...core.events import draft_delta_event
 from ...core.services import factory
 from ...core.skill_schema import UserSkillDoc
 from ...skills import load_skill
 from ..messages import Brief, CreativeStrategy, Draft, ReviewOutcome
+
+# Copy arrives from the model in fragments far smaller than anything worth its own SSE
+# frame. Every published event is kept in the task's buffer for the lifetime of the run
+# and replayed in full to each reconnecting client, so a 3000-character post streamed
+# raw would mean hundreds of frames replayed on every page load. Batch until one of
+# these thresholds trips: enough characters to be worth sending, or long enough that a
+# slow model would otherwise look stalled.
+_DELTA_FLUSH_CHARS = 60
+_DELTA_FLUSH_SECONDS = 0.15
 
 
 def _user_skill_block(doc: UserSkillDoc, platform: str) -> str:
@@ -39,6 +51,42 @@ def _user_skill_block(doc: UserSkillDoc, platform: str) -> str:
     if must_avoid:
         sections.append("MUST AVOID:\n" + "\n".join(f"- {t}" for t in must_avoid))
     return "\n".join(sections)
+
+
+class _DeltaBatcher:
+    """Coalesces the model's fragments into `draft_delta` events for one platform.
+
+    Stateful per draft, so a multi-platform fan-out interleaves cleanly: each batcher
+    keeps its own buffer and each event names its platform, letting the frontend run one
+    lane per platform exactly as it does for every other per-platform event.
+    """
+
+    def __init__(self, platform: str, attempt: int) -> None:
+        self._platform = platform
+        self._attempt = attempt
+        self._buffer: list[str] = []
+        self._chars = 0
+        self._last_flush = time.monotonic()
+
+    def feed(self, chunk: str) -> None:
+        self._buffer.append(chunk)
+        self._chars += len(chunk)
+        now = time.monotonic()
+        if self._chars >= _DELTA_FLUSH_CHARS or now - self._last_flush >= _DELTA_FLUSH_SECONDS:
+            self.flush()
+
+    def flush(self) -> None:
+        """Emit whatever is buffered. Called on the thresholds above and once more when
+        the draft completes — without that final flush the tail of every post (up to a
+        batch's worth) would only appear when `draft_ready` overwrote the accumulation,
+        which reads on screen as the last line arriving late."""
+        if not self._buffer:
+            return
+        text = "".join(self._buffer)
+        self._buffer.clear()
+        self._chars = 0
+        self._last_flush = time.monotonic()
+        emit(draft_delta_event(platform=self._platform, text=text, attempt=self._attempt))
 
 
 async def _draft_one(
@@ -68,6 +116,9 @@ async def _draft_one(
         if doc:
             user_skills = _user_skill_block(doc, platform)
 
+    # Stream the copy as it is written. `emit` is a no-op unless a run bound a sink
+    # (core/emitter.py), so an executor exercised on its own still just returns a Draft.
+    batcher = _DeltaBatcher(platform, attempt)
     text = await factory.get_llm().write_copy(
         topic=brief.topic,
         platform=platform,
@@ -82,7 +133,9 @@ async def _draft_one(
         user_skills=user_skills,     # per-user layer: this user's learned rules
         feedback=feedback,           # rework layer: why the prior draft was rejected
         prior_draft=prior_draft,     # rework layer: the rejected copy to fix
+        on_delta=batcher.feed,       # live layer: publish the copy as it lands
     )
+    batcher.flush()
     return Draft(platform=platform, text=text, attempt=attempt, brief=brief, strategy=strategy)
 
 

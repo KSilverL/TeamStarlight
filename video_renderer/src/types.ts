@@ -19,7 +19,7 @@ export interface StatItem {
 }
 
 // Per-slide background treatment; mirrors video_schema.BackgroundStyle.
-export type BackgroundStyle = "solid" | "gradient" | "orbs" | "grid";
+export type BackgroundStyle = "solid" | "gradient" | "orbs" | "grid" | "mosaic";
 
 export interface HookSlide {
   type: "hook";
@@ -56,6 +56,36 @@ export interface CollageSlide {
   layout: "grid" | "scatter" | "stack" | "filmstrip" | "polaroid";
   captions?: string[];
   resolvedImages: ResolvedImage[];
+  durationFrames: number;
+}
+
+// A big typographic line over the animated pixel mosaic, each word animating
+// independently (design/components.tsx WordReveal). Kept FLAT — no nested object
+// literals — because test_contract_parity.py's _ts_field_union scrapes this
+// interface with a regex that stops at the first `}`.
+export interface StatementSlide {
+  type: "statement";
+  text: string;
+  kicker?: string;
+  emphasisWords?: string[];
+  variant?: "mosaic" | "flat" | "band";
+  durationFrames: number;
+}
+
+// The same statement, over real stock footage. mediaLocalPath is job-relative
+// ("clips/0.mp4"), served via --public-dir; absent when the clip couldn't be
+// resolved, and the component then degrades to the mosaic-only treatment.
+// mediaDurationFrames is the CLIP's own length (not the slide's) — the renderer
+// needs it to decide whether to wrap a short clip in <Loop>, and cannot measure the
+// file itself. Kept FLAT for test_contract_parity.py's regex, as above.
+export interface MediaStatementSlide {
+  type: "media_statement";
+  text: string;
+  kicker?: string;
+  emphasisWords?: string[];
+  variant?: "inset_card" | "full_bleed" | "mosaic_reveal";
+  mediaLocalPath?: string;
+  mediaDurationFrames?: number;
   durationFrames: number;
 }
 
@@ -188,6 +218,8 @@ export type Slide =
   | HookSlide
   | CounterStatSlide
   | CollageSlide
+  | StatementSlide
+  | MediaStatementSlide
   | OutroSlide
   | PieChartSlide
   | LineChartSlide

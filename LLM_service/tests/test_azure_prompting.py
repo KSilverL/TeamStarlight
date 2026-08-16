@@ -38,11 +38,13 @@ class RecordingLLM:
         # call, and the codegen entry points swallow exceptions as a soft degrade — so
         # the drift surfaces as an empty/default result, not as an obvious signature error.
         async def _complete(messages, *, model=None, temperature=None, max_tokens=None,
-                            reasoning_effort=None, verbosity=None, max_retries=None):
+                            reasoning_effort=None, verbosity=None, max_retries=None,
+                            on_delta=None):
             self.calls.append({
                 "messages": messages, "model": model, "temperature": temperature,
                 "max_tokens": max_tokens, "reasoning_effort": reasoning_effort,
                 "verbosity": verbosity, "max_retries": max_retries,
+                "on_delta": on_delta,
             })
             return self._replies.pop(0) if len(self._replies) > 1 else self._replies[0]
 

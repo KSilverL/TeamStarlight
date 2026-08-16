@@ -99,11 +99,15 @@ public class PlanController {
     @PostMapping("/{planId}/confirm")
     public ResponseEntity<?> confirmPlan(
             @PathVariable String planId,
+            @RequestBody(required = false) Map<String, Object> body,
             @RequestHeader(value = "Authorization", required = false) String authHeader) {
         int businessId = requireBusinessId(authHeader);
         requireOwnedPlan(planId, businessId); // 403s before we let the confirm through
 
-        Map<String, Object> confirmed = planService.confirmPlan(planId);
+        // The body is optional and carries only `draft_mode` today — how much deliberation
+        // each slot gets. It rides on confirm rather than on create because this is the
+        // point where the work is actually commissioned.
+        Map<String, Object> confirmed = planService.confirmPlan(planId, body);
         planCampaignDrafter.draftAll(planId);
 
         return ResponseEntity.ok(confirmed);

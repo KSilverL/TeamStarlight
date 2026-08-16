@@ -136,6 +136,9 @@ class Settings:
     use_mock_store: Optional[bool] = None
     use_mock_voice: Optional[bool] = None
     use_mock_image_search: Optional[bool] = None
+    # Stock-FOOTAGE search (Pexels Videos) for media_statement slides. Not the
+    # same thing as use_mock_video_generation, which fakes AI clip SYNTHESIS.
+    use_mock_video_search: Optional[bool] = None
     use_mock_background_removal: Optional[bool] = None
     use_mock_music_generation: Optional[bool] = None
     use_mock_web_search: Optional[bool] = None
@@ -294,12 +297,15 @@ class Settings:
     geoapify_map_style: Optional[str] = None
 
     # ── Background music ────────────────────────────────────────────────────────
-    # Soundraw is a generative option but is enterprise-gated; the default real
-    # provider is a local, curated royalty-free library (media_assets.BundledMusicLibrary):
-    # zero key, zero cost, offline. `music_library_dir` overrides where its tracks +
-    # manifest.json live (default: LLM_service/assets/music/). The bundled library is
-    # used when USE_MOCK_MUSIC_GENERATION=false and the library has ≥1 tagged track;
-    # Soundraw is only reached if no library is populated.
+    # Provider order (see services/factory.get_music_generation): Jamendo first — a free
+    # API key from devportal.jamendo.com over ~500k Creative-Commons tracks, and the only
+    # provider where the agent's mood/genre/energy actually changes what you hear. Behind
+    # it, a local curated library (media_assets.BundledMusicLibrary) keeps offline and
+    # no-key machines working; `music_library_dir` overrides where its tracks +
+    # manifest.json live (default: LLM_service/assets/music/), and it is used when the
+    # library has ≥1 tagged track. Soundraw is a generative option but enterprise-gated,
+    # so it is only reached when neither of the above is available.
+    jamendo_client_id: Optional[str] = None
     music_library_dir: Optional[str] = None
     soundraw_api_key: Optional[str] = None
 
@@ -362,6 +368,11 @@ class Settings:
     # user reference images for image-to-video), written to job_dir/output.mp4. This is
     # the intended fee-paying-tier product; the free tier stays on "local"/"lambda".
     video_render_backend: str = "local"
+    # Headless-Chromium workers for a LOCAL render. None -> Remotion's own default
+    # (~half the logical cores), except that render.py caps storyboards containing
+    # stock footage, whose decoded video frames are what exhaust a small host.
+    # Set this to override on a machine with more (or less) memory headroom.
+    video_render_concurrency: Optional[int] = None
     # ── Remotion Lambda (workflow/video/lambda_render.py) ───────────────────────
     # Required when video_render_backend == "lambda". These name resources YOU
     # deploy yourself first via the Remotion Lambda CLI (`npx remotion lambda
@@ -477,6 +488,9 @@ class Settings:
     def mock_image_search(self) -> bool:
         return self.use_mock if self.use_mock_image_search is None else self.use_mock_image_search
 
+    def mock_video_search(self) -> bool:
+        return self.use_mock if self.use_mock_video_search is None else self.use_mock_video_search
+
     def mock_background_removal(self) -> bool:
         return self.use_mock if self.use_mock_background_removal is None else self.use_mock_background_removal
 
@@ -520,6 +534,10 @@ class Settings:
     @property
     def has_geoapify(self) -> bool:
         return bool(self.geoapify_api_key)
+
+    @property
+    def has_jamendo(self) -> bool:
+        return bool(self.jamendo_client_id)
 
     @property
     def has_soundraw(self) -> bool:
@@ -593,6 +611,7 @@ class Settings:
             f"[llm={tag(self.mock_llm())} safety={tag(self.mock_safety())} "
             f"store={tag(self.mock_store())} voice={tag(self.mock_voice())} "
             f"image_search={tag(self.mock_image_search())} "
+            f"video_search={tag(self.mock_video_search())} "
             f"background_removal={tag(self.mock_background_removal())} "
             f"music_generation={tag(self.mock_music_generation())} "
             f"web_search={tag(self.mock_web_search())} "
@@ -612,6 +631,7 @@ def _load() -> Settings:
         use_mock_store=_env_bool("USE_MOCK_STORE"),
         use_mock_voice=_env_bool("USE_MOCK_VOICE"),
         use_mock_image_search=_env_bool("USE_MOCK_IMAGE_SEARCH"),
+        use_mock_video_search=_env_bool("USE_MOCK_VIDEO_SEARCH"),
         use_mock_background_removal=_env_bool("USE_MOCK_BACKGROUND_REMOVAL"),
         use_mock_music_generation=_env_bool("USE_MOCK_MUSIC_GENERATION"),
         use_mock_web_search=_env_bool("USE_MOCK_WEB_SEARCH"),
@@ -677,6 +697,7 @@ def _load() -> Settings:
         removebg_api_key=os.getenv("REMOVEBG_API_KEY"),
         geoapify_api_key=os.getenv("GEOAPIFY_API_KEY"),
         geoapify_map_style=os.getenv("GEOAPIFY_MAP_STYLE") or None,
+        jamendo_client_id=os.getenv("JAMENDO_CLIENT_ID"),
         music_library_dir=os.getenv("MUSIC_LIBRARY_DIR"),
         soundraw_api_key=os.getenv("SOUNDRAW_API_KEY"),
         # Shared Azure Speech credential — used by BOTH the roundtable persona TTS
@@ -697,6 +718,7 @@ def _load() -> Settings:
         video_renderer_dir=os.getenv("VIDEO_RENDERER_DIR"),
         video_jobs_dir=os.getenv("VIDEO_JOBS_DIR", ".video_jobs"),
         video_render_backend=os.getenv("VIDEO_RENDER_BACKEND", "local").strip().lower(),
+        video_render_concurrency=_env_int("VIDEO_RENDER_CONCURRENCY", 0) or None,
         aws_region=os.getenv("AWS_REGION"),
         remotion_lambda_function_name=os.getenv("REMOTION_LAMBDA_FUNCTION_NAME"),
         remotion_lambda_serve_url=os.getenv("REMOTION_LAMBDA_SERVE_URL"),

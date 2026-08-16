@@ -120,6 +120,18 @@ Content-Type: application/json
 }
 ```
 
+**Example Unsuccessful Response — Already signed in** — `409 Conflict`
+
+```json
+{
+  "error": "Already signed in. Log out first."
+}
+```
+
+Returned when the request carries a valid `Authorization: Bearer <token>`. Creating a second
+account from inside an existing session would leave the caller signed in as neither the account
+they had nor the one they just made. See [A2. Login](#a2-login) for the full reasoning.
+
 **Example Unsuccessful Response — Missing required field** — `400 Bad Request`
 
 ```json
@@ -191,6 +203,23 @@ The token is a 7-day HMAC-SHA256 JWT. Its subject claim is the `businessId` (int
   "error": "Invalid email or password"
 }
 ```
+
+**Example Unsuccessful Response — Already signed in** — `409 Conflict`
+
+```json
+{
+  "error": "Already signed in. Log out first."
+}
+```
+
+Sent when the request carries an `Authorization: Bearer <token>` header holding a **valid**
+token. The client keeps exactly one token, so a second login would silently replace the first
+— quietly changing which business every later request is scoped to. Logging out has to be a
+deliberate act rather than a side effect of submitting a form.
+
+An expired or malformed token reads as no session at all (the same `-1` every other endpoint
+sees), so it never stands between someone and a fresh login. `POST /signIn` returns the same
+409 for the same reason.
 
 ---
 

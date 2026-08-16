@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: teamstarlight
+Version: 0.1.0
+Requires-Python: >=3.12
+Requires-Dist: fastapi>=0.139.0
+Requires-Dist: pydantic>=2.13.4
+Provides-Extra: evaluation
+Requires-Dist: agent-framework-core==1.9.0; extra == "evaluation"
+Requires-Dist: agent-framework-orchestrations==1.0.0; extra == "evaluation"
+Requires-Dist: httpx>=0.28.1; extra == "evaluation"
+Requires-Dist: pytest>=8.0.0; extra == "evaluation"
+Requires-Dist: pytest-asyncio>=0.23.0; extra == "evaluation"
+Requires-Dist: typing-extensions>=4.15.0; extra == "evaluation"
+Requires-Dist: uvicorn[standard]>=0.30.0; extra == "evaluation"
