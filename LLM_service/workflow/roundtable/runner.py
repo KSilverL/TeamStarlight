@@ -137,6 +137,12 @@ MODERATOR_SPEAKER = "moderator"
 # its round/reset cap before the manager declares consensus — see agent_framework_orchestrations
 # `_check_within_limits_or_complete`. Treat it as "no real consensus" and recover from the
 # transcript instead, so a capped discussion still hands the creator a usable strategy.
+#
+# BACKSTOP ONLY on the normal paths: both managers now converge themselves AT the cap (a
+# satisfied ledger → `prepare_final_answer`, a real synthesis of the whole transcript), and the
+# framework's own cap is set above theirs, so this sentinel should no longer be reachable by
+# running out of rounds. It stays because the salvage is also what covers an empty/absent
+# `output` event, and because a framework upgrade could reintroduce the path.
 _TERMINATION_SENTINEL = "Workflow terminated due to reaching maximum"
 
 
