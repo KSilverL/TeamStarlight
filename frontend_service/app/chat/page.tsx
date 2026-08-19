@@ -1347,17 +1347,19 @@ export default function ChatPage() {
       });
     }
 
+    // An approval needs no follow-up line: the card already shows the approved state, and
+    // the run's own progress events say what happens next. Only a rejection posts one, so
+    // the user knows a re-draft is on the way rather than nothing at all.
+    if (approval !== "rejected") return;
+
     setTimeout(() => {
       setMessages((prev) => [
         ...prev,
         {
           id: Date.now().toString(),
           role: "assistant",
-          content:
-            approval === "approved"
-              ? `✓ ${platformLabel} content approved and queued for publishing.`
-              : `Noted. Regenerating ${platformLabel} content with your feedback in mind...`,
-          variant: approval === "rejected" ? "status" : undefined,
+          content: `Noted. Regenerating ${platformLabel} content with your feedback in mind...`,
+          variant: "status",
           timestamp: new Date(),
         },
       ]);
