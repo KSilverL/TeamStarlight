@@ -32,6 +32,7 @@ from ...core.video_schema import (
     RenderableStoryboard,
     RenderBarChartSlide,
     RenderCollageSlide,
+    RenderColdOpenSlide,
     RenderComparisonTableSlide,
     RenderCounterStatSlide,
     RenderHookSlide,
@@ -350,14 +351,16 @@ async def resolve_storyboard_assets(
             for q in slide.imageQueries:
                 image_jobs.append((i, q))
 
-    # media_statement clips resolve in the SAME wave as the images (nested gathers,
+    # Stock-footage clips resolve in the SAME wave as the images (nested gathers,
     # not one flat list — the two result types differ, and the isinstance guard below
     # that catches a bug in the resolution code itself needs one type to check).
     clip_jobs: List[Tuple[int, str]] = [
         (i, s.mediaQuery)
         for i, s in enumerate(storyboard.slides)
-        if s.type == "media_statement" and s.mediaQuery
+        if s.type in ("media_statement", "cold_open") and s.mediaQuery
     ]
+    # Both footage-consuming types take exactly one clip, so clips_by_slide stays a
+    # plain {slide_index: ResolvedClip}: no structural change for the second type.
 
     resolved, resolved_clips = await asyncio.gather(
         asyncio.gather(
@@ -421,6 +424,15 @@ async def resolve_storyboard_assets(
             render_slides.append(RenderMediaStatementSlide(
                 text=slide.text, kicker=slide.kicker, emphasisWords=slide.emphasisWords,
                 variant=slide.variant,
+                mediaLocalPath=clip.localPath if clip else None,
+                mediaDurationFrames=clip.durationFrames if clip else None,
+                durationFrames=duration,
+            ))
+        elif slide.type == "cold_open":
+            clip = clips_by_slide.get(i)
+            render_slides.append(RenderColdOpenSlide(
+                headline=slide.headline, kicker=slide.kicker, subtext=slide.subtext,
+                emphasisWords=slide.emphasisWords, variant=slide.variant,
                 mediaLocalPath=clip.localPath if clip else None,
                 mediaDurationFrames=clip.durationFrames if clip else None,
                 durationFrames=duration,
@@ -495,6 +507,12 @@ async def resolve_storyboard_assets(
                 primary_color=storyboard.primaryColor, secondary_color=storyboard.secondaryColor,
                 accent_color=storyboard.accentColor, settings=settings, budget=codegen_budget,
             ))
+        else:
+            # Unreachable while this chain covers SLIDE_TYPES, which is exactly the point:
+            # without it, adding a slide type and forgetting this chain DROPS the slide from
+            # the storyboard, giving a silently shorter video with nothing logged anywhere.
+            # Mirrors the closing raise in fallback.py::_render_without_assets.
+            raise ValueError(f"unmapped slide type in asset resolution: {slide.type}")
 
     return RenderableStoryboard(
         brandName=storyboard.brandName,

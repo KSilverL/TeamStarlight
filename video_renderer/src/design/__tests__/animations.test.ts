@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { countUp, fadeIn, kenBurns, progress, riseSoft, stagger } from "../animations";
+import { countUp, fadeIn, filmGrade, kenBurns, progress, riseSoft, stagger } from "../animations";
 
 const scaleOf = (transform: string): number => Number(/scale\(([-\d.]+)\)/.exec(transform)![1]);
 
@@ -98,5 +98,37 @@ describe("kenBurns", () => {
     // interpolate() throws on a non-increasing range — a fixture with
     // durationFrames: 0 would otherwise hard-fail the whole render.
     expect(() => kenBurns(0, 0)).not.toThrow();
+  });
+});
+
+describe("filmGrade", () => {
+  const NEUTRAL = "saturate(1) contrast(1) brightness(1)";
+
+  it("starts at the given grade and resolves to neutral", () => {
+    const opts = { frames: 20, saturate: 0.25, contrast: 1.25, brightness: 0.6 };
+    expect(filmGrade(0, opts)).toBe("saturate(0.25) contrast(1.25) brightness(0.6)");
+    expect(filmGrade(20, opts)).toBe(NEUTRAL);
+  });
+
+  it("clamps before the delay and past the end", () => {
+    const opts = { delay: 10, frames: 10, saturate: 2 };
+    expect(filmGrade(0, opts)).toBe(filmGrade(10, opts));
+    expect(filmGrade(999, opts)).toBe(NEUTRAL);
+  });
+
+  it("is a neutral no-op with no options", () => {
+    // Every channel already at 1 must stay exactly 1 at every frame, so a caller can
+    // pass a grade for one channel without accidentally animating the others.
+    expect(filmGrade(0)).toBe(NEUTRAL);
+    expect(filmGrade(7)).toBe(NEUTRAL);
+  });
+
+  it("moves monotonically toward neutral", () => {
+    let prev = 0;
+    for (let f = 0; f <= 30; f += 5) {
+      const sat = Number(/saturate\(([-\d.]+)\)/.exec(filmGrade(f, { frames: 30, saturate: 0 }))![1]);
+      expect(sat).toBeGreaterThanOrEqual(prev);
+      prev = sat;
+    }
   });
 });

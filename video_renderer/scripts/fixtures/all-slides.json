@@ -9,6 +9,17 @@
   "fps": 30,
   "slides": [
     {
+      "type": "cold_open",
+      "kicker": "SUMMER 2026",
+      "headline": "Where the light gets in",
+      "subtext": "A film about mornings",
+      "emphasisWords": [
+        "light"
+      ],
+      "variant": "title_card",
+      "durationFrames": 150
+    },
+    {
       "type": "hook",
       "headline": "The future is bright",
       "subtext": "and it starts today",

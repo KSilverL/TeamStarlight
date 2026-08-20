@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from LLM_service.core.video_schema import (
     AudioSpec,
     BarChartSlideSpec,
+    ColdOpenSlideSpec,
     CollageSlideSpec,
     ComparisonTableSlideSpec,
     CounterStatSlideSpec,
@@ -38,6 +39,7 @@ from LLM_service.core.video_schema import (
 
 def test_slide_type_registry_matches_implemented_models():
     discriminators = {
+        ColdOpenSlideSpec.model_fields["type"].default,
         HookSlideSpec.model_fields["type"].default,
         CounterStatSlideSpec.model_fields["type"].default,
         CollageSlideSpec.model_fields["type"].default,
@@ -857,3 +859,106 @@ def test_resolve_clip_is_skipped_on_the_lambda_backend():
         assets._download_clip = original
     assert clip.localPath is None and clip.durationFrames is None
     assert not called, "no clip should be downloaded on the lambda backend"
+
+# ── cold_open slides (the cinematic opener) ──────────────────────────────
+
+
+def test_cold_open_variant_defaults_and_validates():
+    plain = ColdOpenSlideSpec(headline="Where the light gets in")
+    assert plain.variant == "title_card" and plain.mediaQuery is None
+    assert plain.kicker is None and plain.subtext is None
+    styled = ColdOpenSlideSpec(
+        headline="Where the light gets in", mediaQuery="coastal cliffs sunrise",
+        variant="horizon", kicker="SUMMER 2026", emphasisWords=["light"],
+    )
+    assert styled.variant == "horizon" and styled.mediaQuery == "coastal cliffs sunrise"
+    with pytest.raises(ValidationError):
+        ColdOpenSlideSpec(headline="Hi", variant="picture_in_picture")
+
+
+def test_cold_open_caps_emphasis_at_two_words():
+    """Tighter than statement/media_statement's 3: on a 2-6 word title, three accent
+    words is just a coloured title."""
+    assert ColdOpenSlideSpec(headline="One two three four", emphasisWords=["One", "two"])
+    with pytest.raises(ValidationError):
+        ColdOpenSlideSpec(headline="One two three four", emphasisWords=["One", "two", "three"])
+
+
+def test_clamp_duration_has_a_default_for_cold_open():
+    assert clamp_duration("cold_open", None) == 150
+    assert clamp_duration("cold_open", 10) == 105
+    assert clamp_duration("cold_open", 9999) == 240
+
+
+def test_cold_open_is_not_a_template_fallback_target():
+    """Deliberately excluded from TemplateSlideSpec: a converted `generated` slide is by
+    definition mid-video, and cold_open's title never exits, which reads as a bug
+    anywhere but slide 1. Pinned so it can't drift back in with a bulk union edit."""
+    from pydantic import TypeAdapter
+    from LLM_service.core.video_schema import TemplateSlideSpec
+
+    with pytest.raises(ValidationError):
+        TypeAdapter(TemplateSlideSpec).validate_python(
+            {"type": "cold_open", "headline": "Where the light gets in"}
+        )
+
+
+def test_cold_open_degrades_when_the_clip_cannot_be_fetched():
+    """The default mock returns an undownloadable URL, so this walks the real ladder end
+    to end: search hit -> download fail -> mediaLocalPath None -> the renderer draws the
+    mosaic-only opener. The production-likely path, and the one that proves cold_open is
+    wired into assets.py's clip wave rather than only into the schema."""
+    import asyncio
+    from pathlib import Path
+    import tempfile
+    from LLM_service.workflow.video.assets import resolve_storyboard_assets
+
+    storyboard = StoryboardSpec(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        platform="instagram_reels",
+        slides=[
+            {"type": "cold_open", "headline": "Where the light gets in",
+             "kicker": "SUMMER 2026", "subtext": "A film about mornings",
+             "emphasisWords": ["light"], "mediaQuery": "coastal cliffs sunrise",
+             "variant": "trailer"},
+            {"type": "outro", "brandName": "X", "ctaLabel": "Watch Now"},
+        ],
+    )
+    with tempfile.TemporaryDirectory() as d:
+        renderable = asyncio.run(resolve_storyboard_assets(storyboard, job_dir=Path(d) / "job"))
+    slide = renderable.model_dump()["slides"][0]
+    assert slide["type"] == "cold_open"
+    assert slide["mediaLocalPath"] is None and slide["mediaDurationFrames"] is None
+    assert slide["kicker"] == "SUMMER 2026" and slide["subtext"] == "A film about mornings"
+    assert slide["emphasisWords"] == ["light"]
+    assert slide["variant"] == "trailer" and slide["durationFrames"] == 150
+
+
+def test_asset_resolution_rejects_an_unmapped_slide_type():
+    """assets.py's spec->render chain used to fall through silently, DROPPING a slide type
+    it didn't know about: a shorter video with nothing logged. The closing `raise` makes
+    the next missed slide type loud, so assert it is actually there."""
+    import asyncio
+    import inspect
+    from pathlib import Path
+    import tempfile
+    from LLM_service.workflow.video import assets
+
+    assert "unmapped slide type" in inspect.getsource(assets.resolve_storyboard_assets)
+
+    storyboard = StoryboardSpec(
+        brandName="X", primaryColor="#000", secondaryColor="#111", accentColor="#222",
+        platform="instagram_reels",
+        slides=[
+            {"type": "statement", "text": "One clear idea"},
+            {"type": "outro", "brandName": "X", "ctaLabel": "Watch Now"},
+        ],
+    )
+    # Plant a type the chain cannot map. The discriminated union blocks this at
+    # construction, but plain assignment doesn't re-validate, which is exactly the
+    # shape of the bug: a type that is legal upstream and unknown here.
+    storyboard.slides[0].type = "not_a_slide_type"  # type: ignore[assignment]
+    with tempfile.TemporaryDirectory() as d:
+        with pytest.raises(ValueError, match="unmapped slide type"):
+            asyncio.run(assets.resolve_storyboard_assets(storyboard, job_dir=Path(d) / "job"))
+

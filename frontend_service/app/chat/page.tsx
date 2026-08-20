@@ -43,6 +43,15 @@ interface VideoStat {
 // bespoke Remotion scene the codegen agent authors from scratch when none of the
 // fixed types fit (workflow/video/codegen.py). The agent decides which slides,
 // order, and length fit the brief, never a hardcoded template count.
+interface ColdOpenSlide {
+  type: "cold_open";
+  headline: string;
+  subtext?: string | null;
+  kicker?: string | null;
+  mediaQuery?: string | null;
+  variant?: "title_card" | "trailer" | "horizon";
+  durationFrames?: number | null;
+}
 interface HookSlide {
   type: "hook";
   headline: string;
@@ -127,6 +136,7 @@ interface GeneratedSlide {
   durationFrames?: number | null;
 }
 type VideoSlide =
+  | ColdOpenSlide
   | HookSlide
   | CounterStatSlide
   | CollageSlide
@@ -2755,6 +2765,7 @@ interface VideoStoryboardCardProps {
 }
 
 const SLIDE_ICON: Record<VideoSlide["type"], string> = {
+  cold_open: "🎥",
   hook: "🎬",
   counter_stat: "🔢",
   collage: "🖼️",
@@ -2769,6 +2780,8 @@ const SLIDE_ICON: Record<VideoSlide["type"], string> = {
 
 function slideSummary(slide: VideoSlide): string {
   switch (slide.type) {
+    case "cold_open":
+      return slide.headline;
     case "hook":
       return slide.headline;
     case "counter_stat":

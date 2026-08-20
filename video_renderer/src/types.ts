@@ -89,6 +89,25 @@ export interface MediaStatementSlide {
   durationFrames: number;
 }
 
+// The video's cinematic opening title: an establishing footage shot behind a title
+// lockup, framed by a letterbox matte cut out of the live pixel-mosaic field. Where
+// media_statement is a mid-video beat, this is slide 1 - its title never exits.
+// mediaLocalPath/mediaDurationFrames carry the same contract as media_statement's:
+// job-relative path, absent when the clip could not be resolved, and the component
+// then degrades to a mosaic-only treatment. Kept FLAT for test_contract_parity.py's
+// regex, as above.
+export interface ColdOpenSlide {
+  type: "cold_open";
+  headline: string;
+  kicker?: string;
+  subtext?: string;
+  emphasisWords?: string[];
+  variant?: "title_card" | "trailer" | "horizon";
+  mediaLocalPath?: string;
+  mediaDurationFrames?: number;
+  durationFrames: number;
+}
+
 export interface OutroSlide {
   type: "outro";
   brandName: string;
@@ -215,6 +234,7 @@ export interface GeneratedSlide {
 }
 
 export type Slide =
+  | ColdOpenSlide
   | HookSlide
   | CounterStatSlide
   | CollageSlide

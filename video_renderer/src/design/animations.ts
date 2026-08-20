@@ -161,6 +161,46 @@ export const kenBurns = (
   return `scale(${scale}) translate(${(opts.panX ?? 0) * t}%, ${(opts.panY ?? 0) * t}%)`;
 };
 
+/**
+ * Colour-grade ramp: a CSS `filter` string that starts at the given saturate/
+ * contrast/brightness and resolves to NEUTRAL (1, 1, 1) over `frames`.
+ *
+ * The destination is always neutral and never a parameter, which is the whole point:
+ * footage that arrives graded and settles into its true look reads as an ARRIVAL,
+ * where footage that is simply on screen at full brightness reads as a continuation.
+ * That is most of what separates ColdOpenSlide's opening shot from
+ * MediaStatementSlide's mid-video one.
+ *
+ * Returns a string rather than an EntranceStyle, like kenBurns, so it composes at the
+ * call site. Put it on a DIFFERENT element than the Ken Burns transform: `filter`
+ * makes its element a containing block and a new stacking context, and stacking that
+ * on the same node as a scale() inside an overflow:hidden box is what gets Chromium
+ * re-rasterising at the wrong size.
+ */
+export const filmGrade = (
+  frame: number,
+  opts: {
+    delay?: number;
+    frames?: number;
+    saturate?: number;
+    contrast?: number;
+    brightness?: number;
+  } = {},
+): string => {
+  const t = interpolate(
+    frame - (opts.delay ?? 0),
+    [0, opts.frames ?? 30],
+    [0, 1],
+    clampBoth,
+  );
+  const to = (from: number) => from + (1 - from) * t;
+  return (
+    `saturate(${to(opts.saturate ?? 1)}) ` +
+    `contrast(${to(opts.contrast ?? 1)}) ` +
+    `brightness(${to(opts.brightness ?? 1)})`
+  );
+};
+
 /** 0→1 progress between two frames, clamped — SVG draw-ons, sweeps, scrubbers. */
 export const progress = (frame: number, opts: { from?: number; to: number }): number =>
   interpolate(frame, [opts.from ?? 0, opts.to], [0, 1], clampBoth);

@@ -3,8 +3,8 @@ Dynamic storyboard schema for the video-creation agent.
 
 Rather than picking between hardcoded templates, the LLM composes a `StoryboardSpec`
 — an ordered list of typed `slides`, each one drawn from a small, fixed registry of
-slide *types* (`hook`, `counter_stat`, `collage`, `statement`, `media_statement`,
-`outro`, plus the chart types
+slide *types* (`cold_open`, `hook`, `counter_stat`, `collage`, `statement`,
+`media_statement`, `outro`, plus the chart types
 `pie_chart`, `line_chart`, `bar_chart`, `node_diagram`, `comparison_table`).
 This is a Pydantic discriminated union: the `type` field on each slide
 selects which model validates it (`Field(discriminator="type")`). Adding a new
@@ -62,6 +62,12 @@ DURATION_BUDGET: Dict[str, Tuple[int, int, int]] = {
     # room to breathe.
     "statement": (105, 60, 165),
     "media_statement": (135, 90, 210),
+    # The opener carries the whole video's first impression alone, so it gets the most
+    # generous budget of the text types: its shot has to establish before the title lands
+    # (~f34), and the settle zoom only reads over 4s+. The 240 ceiling is set by clip
+    # supply, not taste - media_assets._CLIP_MIN_DURATION_S is 4s, so a worst-case clip
+    # stretches to ~0.49x, which still reads as slow motion; past that it starts to stutter.
+    "cold_open": (150, 105, 240),
     "outro": (90, 60, 150),
     "pie_chart": (150, 90, 240),
     # line/bar maxes bumped to 300 so the step_reveal scrubber and race count-up
@@ -263,6 +269,73 @@ class MediaStatementSlideSpec(BaseModel):
         "off the bottom, text above it. 'full_bleed': footage fills the frame behind the text. "
         "'mosaic_reveal': the pixel mosaic scatters away to reveal the footage then re-forms — "
         "the most cinematic; use it at most once per storyboard.",
+    )
+    durationFrames: Optional[int] = Field(None, description="Suggested frames at 30fps; clamped server-side")
+
+
+# `cold_open` has a `headline`, not a `text`, so it cannot share _EMPHASIS_DESC - that
+# string names the field explicitly and would point the LLM at one that doesn't exist
+# here. The cap is 2 rather than 3 as well: on a 2-6 word title, three accent words is
+# just a coloured title.
+_COLD_OPEN_EMPHASIS_DESC = (
+    "1-2 words FROM `headline`, spelled exactly as they appear there, to render in the "
+    "accent colour. On a title this short, emphasising more than two words emphasises "
+    "nothing. Matching ignores case and surrounding punctuation; a word that isn't in "
+    "`headline` is simply ignored. Omit for an evenly-weighted title."
+)
+
+
+class ColdOpenSlideSpec(BaseModel):
+    """The video's cinematic opening title: an establishing stock-FOOTAGE shot behind a
+    title lockup, framed by a letterbox matte cut out of the animated pixel-mosaic field.
+    The opener equivalent of `media_statement` - where `hook` is a card, this is a title
+    sequence.
+
+    Deliberately NOT configurable the way `hook` is: no `background`, no `shape`, no
+    scrim/zoom knobs. Each variant's backdrop IS its choreography, and the component owns
+    legibility over arbitrary footage. That configurability is a large part of why `hook`
+    reads as a template rather than as direction."""
+
+    type: Literal["cold_open"] = "cold_open"
+    narration: Optional[str] = Field(None, description=_NARRATION_DESC)
+    headline: str = Field(
+        description="The opening title: 2-6 words, set very large. This is a TITLE, not a "
+        "sentence - a film title or a magazine cover line, not a claim with a verb and a "
+        "full stop. Every word gets its own entrance and the title then stays on screen for "
+        "the rest of the slide, so cut anything that isn't load-bearing."
+    )
+    kicker: Optional[str] = Field(
+        None,
+        description="Tiny ALL-CAPS line above the title - the title-sequence slate: a date, "
+        "a season, a series name, or a place ('SUMMER 2026', 'DUBLIN', 'EPISODE ONE', "
+        "'INTRODUCING'). 1-3 words. Omit it rather than pad it.",
+    )
+    subtext: Optional[str] = Field(
+        None,
+        description="One short line under the title - a subtitle, date, place or promise, "
+        "2-7 words. Omit it unless it says something the title cannot: kicker + title + "
+        "subtext is three stacked text elements, which is one too many for most openers.",
+    )
+    emphasisWords: Optional[List[str]] = Field(
+        None, max_length=2, description=_COLD_OPEN_EMPHASIS_DESC
+    )
+    mediaQuery: Optional[str] = Field(
+        None,
+        description="2-4 word stock-FOOTAGE search keyword for the opening shot. Pick an "
+        "ESTABLISHING image - a place, a texture, a wide view, people in motion ('coastal "
+        "cliffs sunrise', 'city street night', 'workshop hands making'). Prefer slow, wide, "
+        "atmospheric footage over busy close-ups: this shot plays under a title for several "
+        "seconds with a slow zoom on it. NEVER a URL, and never a restatement of `headline`. "
+        "Omit and the slide opens on the mosaic field alone.",
+    )
+    variant: Literal["title_card", "trailer", "horizon"] = Field(
+        "title_card",
+        description="Cinematic treatment. 'title_card' (default): the matte irises open on a "
+        "cold, dim shot that blooms into colour while the title lands centred in the lower "
+        "third - elegant, the safe choice. 'trailer': a hard cut on a flash frame, the matte "
+        "slams shut, and the title snaps in bottom-left off an accent slate - kinetic and "
+        "loud. 'horizon': footage across the top under an angled horizon line with the title "
+        "below on the live mosaic field - the brand-forward, documentary open.",
     )
     durationFrames: Optional[int] = Field(None, description="Suggested frames at 30fps; clamped server-side")
 
@@ -505,7 +578,7 @@ class GeneratedSlideSpec(BaseModel):
 
 SlideSpec = Annotated[
     Union[
-        HookSlideSpec, CounterStatSlideSpec, CollageSlideSpec, StatementSlideSpec,
+        ColdOpenSlideSpec, HookSlideSpec, CounterStatSlideSpec, CollageSlideSpec, StatementSlideSpec,
         MediaStatementSlideSpec, OutroSlideSpec,
         PieChartSlideSpec, LineChartSlideSpec, BarChartSlideSpec, NodeDiagramSlideSpec, ComparisonTableSlideSpec,
         MapSlideSpec, GeneratedSlideSpec,
@@ -518,6 +591,12 @@ SlideSpec = Annotated[
 # union's JSON Schema (so it never even sees the `generated` type) and its answer is
 # validated against it (so echoing `generated` back is a schema violation, not a
 # case anyone special-cases).
+#
+# `cold_open` is deliberately excluded too, and is the only OTHER exclusion: it is an
+# OPENER whose title never exits (see ColdOpenSlideSpec), which looks like a bug anywhere
+# but slide 1 - and a converted `generated` slide is by definition mid-video. Leaving it
+# out also keeps this schema, the heaviest prompt in the pipeline, from growing.
+# test_video_schema.py pins the exclusion so it cannot drift back in.
 TemplateSlideSpec = Annotated[
     Union[
         HookSlideSpec, CounterStatSlideSpec, CollageSlideSpec, StatementSlideSpec,
@@ -532,7 +611,7 @@ TemplateSlideSpec = Annotated[
 # tests/test_video_schema.py against the actual model set, so it cannot drift
 # silently — see the module docstring for why this can't be checked cross-language.
 SLIDE_TYPES = frozenset({
-    "hook", "counter_stat", "collage", "statement", "media_statement", "outro",
+    "cold_open", "hook", "counter_stat", "collage", "statement", "media_statement", "outro",
     "pie_chart", "line_chart", "bar_chart", "node_diagram", "comparison_table",
     "map", "generated",
 })
@@ -753,6 +832,22 @@ class RenderMediaStatementSlide(BaseModel):
     durationFrames: int
 
 
+class RenderColdOpenSlide(BaseModel):
+    type: Literal["cold_open"] = "cold_open"
+    headline: str
+    kicker: Optional[str] = None
+    subtext: Optional[str] = None
+    emphasisWords: Optional[List[str]] = None
+    variant: Literal["title_card", "trailer", "horizon"] = "title_card"
+    # MUST stay named `mediaLocalPath`: render.py::_resolve_concurrency duck-types this
+    # exact attribute across every slide to cap Remotion workers at 3 when a storyboard
+    # carries footage. Renaming it silently loses that OOM protection, whose symptom is an
+    # intermittent 'No frame found at position N' rather than anything that points here.
+    mediaLocalPath: Optional[str] = None
+    mediaDurationFrames: Optional[int] = None
+    durationFrames: int
+
+
 class RenderOutroSlide(BaseModel):
     type: Literal["outro"] = "outro"
     brandName: str
@@ -851,8 +946,8 @@ class RenderGeneratedSlide(BaseModel):
 
 RenderSlide = Annotated[
     Union[
-        RenderHookSlide, RenderCounterStatSlide, RenderCollageSlide, RenderStatementSlide,
-        RenderMediaStatementSlide, RenderOutroSlide,
+        RenderColdOpenSlide, RenderHookSlide, RenderCounterStatSlide, RenderCollageSlide,
+        RenderStatementSlide, RenderMediaStatementSlide, RenderOutroSlide,
         RenderPieChartSlide, RenderLineChartSlide, RenderBarChartSlide, RenderNodeDiagramSlide,
         RenderComparisonTableSlide, RenderMapSlide, RenderGeneratedSlide,
     ],
