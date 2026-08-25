@@ -85,6 +85,46 @@ public class CrossPlatformController {
     }
 
     //////////////////////////////////////////////////////// LINKEDIN METHODS ////////////////////////////////////////////////////////
+    @PostMapping("/linkedin/addCompCreds")
+    public ResponseEntity<?> linkedCompCreds(
+            @RequestBody LinkedInCredsReqDTO requestDTO,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+
+        int businessId = requireBusinessId(authHeader);
+        crossPlatformService.saveLinkedInCredentials(businessId, requestDTO);
+        return ResponseEntity.ok("LinkedIn company credentials added successfully.");
+    }
+    
+    /**
+     * Schedules a LinkedIn text post.
+     *
+     * <p>Kept as an alias for the browser code that already calls it; the schedule itself now
+     * lives in the {@code scheduled_post} table and is published by the sweeper, so — unlike
+     * the in-memory timer this replaced — it survives a restart and can be listed, edited and
+     * cancelled through {@code /schedule/posts}. The row id is returned so callers can do that.
+     */
+    @PostMapping("/linkedin/schedule-post")
+    public ResponseEntity<?> linkedInSchedulePost(
+            @RequestBody LinkedInPostReqDTO requestDTO,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+
+        int businessId = requireBusinessId(authHeader);
+
+        ScheduledPost post = scheduledPostService.create(businessId, new ScheduledPostReqDTO(
+                "linkedin",
+                requestDTO.scheduledTime() == null ? null : requestDTO.scheduledTime().toString(),
+                null,
+                requestDTO.message(),
+                List.of(),
+                List.of()
+        ));
+
+        return ResponseEntity.ok(Map.of(
+                "status", "scheduled",
+                "id", String.valueOf(post.getId()),
+                "scheduled_at", post.getScheduledAt().toString()));
+    }
+
     @PostMapping("/linkedin/auth")
     public void linkedInAuth(
             HttpServletResponse response,
@@ -161,46 +201,6 @@ public class CrossPlatformController {
             return ResponseEntity.status(e.getStatusCode())
                     .body(Map.of("error", e.getReason() == null ? "Could not load Facebook Pages." : e.getReason()));
         }
-    }
-
-    @PostMapping("/linkedin/addCompCreds")
-    public ResponseEntity<?> linkedCompCreds(
-            @RequestBody LinkedInCredsReqDTO requestDTO,
-            @RequestHeader(value = "Authorization", required = false) String authHeader) {
-
-        int businessId = requireBusinessId(authHeader);
-        crossPlatformService.saveLinkedInCredentials(businessId, requestDTO);
-        return ResponseEntity.ok("LinkedIn company credentials added successfully.");
-    }
-    
-    /**
-     * Schedules a LinkedIn text post.
-     *
-     * <p>Kept as an alias for the browser code that already calls it; the schedule itself now
-     * lives in the {@code scheduled_post} table and is published by the sweeper, so — unlike
-     * the in-memory timer this replaced — it survives a restart and can be listed, edited and
-     * cancelled through {@code /schedule/posts}. The row id is returned so callers can do that.
-     */
-    @PostMapping("/linkedin/schedule-post")
-    public ResponseEntity<?> linkedInSchedulePost(
-            @RequestBody LinkedInPostReqDTO requestDTO,
-            @RequestHeader(value = "Authorization", required = false) String authHeader) {
-
-        int businessId = requireBusinessId(authHeader);
-
-        ScheduledPost post = scheduledPostService.create(businessId, new ScheduledPostReqDTO(
-                "linkedin",
-                requestDTO.scheduledTime() == null ? null : requestDTO.scheduledTime().toString(),
-                null,
-                requestDTO.message(),
-                List.of(),
-                List.of()
-        ));
-
-        return ResponseEntity.ok(Map.of(
-                "status", "scheduled",
-                "id", String.valueOf(post.getId()),
-                "scheduled_at", post.getScheduledAt().toString()));
     }
 
     @PostMapping("/meta/auth")

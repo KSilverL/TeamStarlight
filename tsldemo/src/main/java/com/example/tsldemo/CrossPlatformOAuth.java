@@ -18,8 +18,10 @@ public class CrossPlatformOAuth {
 	@GeneratedValue(strategy = GenerationType.IDENTITY)
 	@JsonProperty("id")
     private Long id;
+    @ManyToOne
+    @JoinColumn(name = "businessId", referencedColumnName = "id", nullable = false)
     @JsonProperty("businessId")
-    private Long businessId;
+    private Business businessId;
     @JsonProperty("urn")
     private String urn;
     @JsonProperty("clientId")
