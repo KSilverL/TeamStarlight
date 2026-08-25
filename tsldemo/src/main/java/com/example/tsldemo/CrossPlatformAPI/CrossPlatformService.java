@@ -32,9 +32,8 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.server.ResponseStatusException;
 
+import com.example.tsldemo.Business;
 import com.example.tsldemo.CrossPlatformOAuth;
-import com.example.tsldemo.Message;
-import com.example.tsldemo.Session;
 import com.example.tsldemo.DTOs.Request.CrossPlatPostReqDTO;
 import com.example.tsldemo.DTOs.Request.GlobalCrossPlatform.GlobalCredsReqDTO;
 import com.example.tsldemo.DTOs.Request.LinkedInCredsReqDTO;
@@ -57,7 +56,7 @@ import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaTokenDetails;
 import com.example.tsldemo.DTOs.ResponseReceived.Meta.MetaUserInfoDTO;
 import com.example.tsldemo.DTOs.ResponseToFrontEnd.GlobalCredListRespDTO;
 import com.example.tsldemo.ENUMS.PlatformEnum;
-import com.example.tsldemo.SessionAPI.SessionService;
+import com.example.tsldemo.SignInAPI.BusinessRepository;
 
 import jakarta.servlet.http.HttpServletResponse;
 
@@ -119,7 +118,8 @@ public class CrossPlatformService {
     @Autowired
     private CrossPlatformRepository crossPlatformRepository;
     
-    @Autowired SessionService sessionServ;
+    @Autowired
+    private BusinessRepository businessRepository;
 
 	private final RestClient restClient;
 
@@ -149,7 +149,7 @@ public class CrossPlatformService {
         List<CrossPlatformOAuth> crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatformIn(businessId, platforms);
         for (CrossPlatformOAuth cred : crossPlatformOAuth) {
             GlobalCredListRespDTO globalCredentials = new GlobalCredListRespDTO();
-            globalCredentials.setBusinessId(cred.getBusinessId());
+            globalCredentials.setBusinessId(cred.getId());
             globalCredentials.setClientId(cred.getClientId());
             globalCredentials.setClientSecret(cred.getClientSecret());
             globalCredentials.setPageIdArray(cred.getPageIdArray());
@@ -165,7 +165,8 @@ public class CrossPlatformService {
 
         for (GlobalCredsReqDTO cred : creds) {
             CrossPlatformOAuth crossPlatformOAuth = new CrossPlatformOAuth();
-            crossPlatformOAuth.setBusinessId(cred.businessId());
+            Business business = checkBusinessExist(cred.businessId());
+            crossPlatformOAuth.setBusinessId(business);
             crossPlatformOAuth.setClientId(cred.clientId());
             crossPlatformOAuth.setClientSecret(cred.clientSecret());
             crossPlatformOAuth.setPlatform(cred.platform());
@@ -637,7 +638,8 @@ public class CrossPlatformService {
         CrossPlatformOAuth crossPlatformOAuth = crossPlatformRepository.findByBusinessIdAndPlatform(businessId, PlatformEnum.LINKEDIN);
         if (crossPlatformOAuth == null) {
             crossPlatformOAuth = new CrossPlatformOAuth();
-            crossPlatformOAuth.setBusinessId((long) businessId);
+            Business business = checkBusinessExist(Long.valueOf(businessId));
+            crossPlatformOAuth.setBusinessId(business);
             crossPlatformOAuth.setPlatform(PlatformEnum.LINKEDIN);
         }
 
@@ -1184,4 +1186,11 @@ public class CrossPlatformService {
         return index < tokens.size() ? tokens.get(index) : tokens.get(0);
     }
 
+    public Business checkBusinessExist(Long businessId) {
+        Business business = businessRepository.findById(businessId);
+        if (business == null) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Business not found with ID: " + businessId);
+        }
+        return business;
+    }
 }

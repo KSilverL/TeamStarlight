@@ -6,4 +6,6 @@ import com.example.tsldemo.Business;
 
 public interface BusinessRepository extends JpaRepository<Business, Integer>{
 	Business findByEmail(String email);
+
+	Business findById(Long id);
 }
