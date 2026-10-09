@@ -679,7 +679,10 @@ target either a local subprocess or Remotion Lambda.
    catalogue is now: `hook`, `counter_stat`, `collage`, `outro`, `pie_chart`, `line_chart`,
    `bar_chart`, `node_diagram`, `comparison_table`, **`map`** (pin/journey slides),
    **`statement`** and **`media_statement`** (big per-word typographic beats over an animated
-   pixel mosaic / stock footage, new), and
+   pixel mosaic / stock footage, new), **`cold_open`** (the cinematic opening title: an
+   establishing stock-footage shot with a slow zoom, framed by a letterbox matte cut out of
+   the mosaic field, under a word-by-word title that never exits — the richer alternative to
+   `hook`, and the only type pinned to slide 1, new), and
    **`generated`** (an open-ended, LLM-authored scene, new — see step 2b). Most template slide
    types also now accept a per-slide `variant` (e.g. poster/split hooks, orbit/ticker stats,
    donut/exploded pie), and the storyboard as a whole can carry a shared `backdrop`/`transition`.

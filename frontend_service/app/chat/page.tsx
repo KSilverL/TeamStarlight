@@ -43,6 +43,15 @@ interface VideoStat {
 // bespoke Remotion scene the codegen agent authors from scratch when none of the
 // fixed types fit (workflow/video/codegen.py). The agent decides which slides,
 // order, and length fit the brief, never a hardcoded template count.
+interface ColdOpenSlide {
+  type: "cold_open";
+  headline: string;
+  subtext?: string | null;
+  kicker?: string | null;
+  mediaQuery?: string | null;
+  variant?: "title_card" | "trailer" | "horizon";
+  durationFrames?: number | null;
+}
 interface HookSlide {
   type: "hook";
   headline: string;
@@ -127,6 +136,7 @@ interface GeneratedSlide {
   durationFrames?: number | null;
 }
 type VideoSlide =
+  | ColdOpenSlide
   | HookSlide
   | CounterStatSlide
   | CollageSlide
@@ -272,6 +282,44 @@ interface CampaignState {
   questions: string[];
 }
 
+/**
+ * The learning opt-in card's lifecycle.
+ *
+ * `saving` exists to disable both buttons the instant one is clicked: POST
+ * /tasks/{id}/confirm-learning is NOT idempotent — a second call distils the same conversation
+ * again and appends the rules a second time — so the card must be a one-shot.
+ */
+type LearningState = "asking" | "saving" | "saved" | "declined" | "error";
+
+/** One brand-voice rule written into the Brand_Voice_Profile (`kind` is must_do | must_avoid). */
+interface BrandRule {
+  kind: string;
+  rule: string;
+  rationale?: string;
+}
+
+/** One learned per-user writing preference, with the turn/edit it was traced back to. */
+interface LearnedPreference {
+  skill: string;
+  evidence?: string;
+}
+
+/**
+ * POST /tasks/{id}/confirm-learning. The two channels are independent and best-effort, so
+ * `brand_rules: []` alongside a populated `preference_summary` (or the reverse, or both empty)
+ * are all ordinary outcomes rather than errors — see workflow/learning/archivist.py.
+ */
+interface ConfirmLearningResponse {
+  learned?: boolean;
+  brand_rules?: BrandRule[];
+  preference_summary?: {
+    // Parallel arrays: learned_skills[i] was inferred from evidence[i].
+    learned_skills?: string[];
+    evidence?: string[];
+  } | null;
+  error?: string;
+}
+
 interface Message {
   id: string;
   role: "user" | "assistant";
@@ -283,7 +331,8 @@ interface Message {
     | "html-preview"
     | "roundtable"
     | "plan-preview"
-    | "social-post";
+    | "social-post"
+    | "learning";
   platform?: Platform;
   draft?: DraftContent;
   html?: string;
@@ -329,6 +378,17 @@ interface Message {
   // The draft campaign schedule (variant === "plan-preview"). Grows in place: refining
   // replaces it, confirming flips its status, so the card is always the plan's current truth.
   plan?: Plan;
+  // The learning opt-in card (variant === "learning"), offered once a run settles.
+  // `workflowTaskId` above is the task the confirmation applies to. The card is the ONLY
+  // place a user sees what was learned — the service exposes no read endpoint for stored
+  // skills, only this call's response.
+  learningState?: LearningState;
+  learnedRules?: BrandRule[];
+  learnedPreferences?: LearnedPreference[];
+  learningError?: string;
+  // The answer the failed attempt was carrying, so "Try again" re-sends THAT rather than
+  // assuming yes — a retry must never turn the user's "not this time" into a confirmation.
+  learningChoice?: boolean;
   // Set on voice turns (native speech-to-speech) once the clip is fully assembled —
   // an object URL for a WAV blob built client-side from the raw PCM16 the session
   // streamed, so the turn's audio can be replayed/downloaded from its bubble.
@@ -499,7 +559,9 @@ const NODE_LABELS: Record<string, string> = {
   scout: "Scouting content strategy…",
   creator: "Writing platform copy…",
   reviewer: "Running safety & brand review…",
-  archivist: "Learning from your edits…",
+  // No `archivist` entry: learning stopped being an in-graph executor when it moved to an
+  // opt-in service step (workflow/builder.py), so it emits no progress event. The learning
+  // card pushed when the run settles is what reports it now.
   media_producer: "Generating brand assets…",
 };
 
@@ -731,6 +793,11 @@ export default function ChatPage() {
   // post is reviewed as ONE evolving card (copy → storyboard → render → publish), so every
   // later event for the same run patches that card instead of stacking another one.
   const socialCardIdRef = useRef<Map<string, string>>(new Map());
+  // Task ids already offered a learning card. The stream's own `seq` dedupe covers an
+  // EventSource reconnect replaying the terminal event, but not a second `genWorkflow` on the
+  // same task — and confirm-learning is not idempotent, so a duplicate card could train the
+  // profile twice off one conversation. Never cleared per run: it must outlive the stream.
+  const learningAskedRef = useRef<Set<string>>(new Set());
 
   // Roundtable auto-play: when on, each persona's TTS clip plays automatically as it
   // arrives (agent_utterance_audio always lands after that persona's text turn, since
@@ -1290,17 +1357,19 @@ export default function ChatPage() {
       });
     }
 
+    // An approval needs no follow-up line: the card already shows the approved state, and
+    // the run's own progress events say what happens next. Only a rejection posts one, so
+    // the user knows a re-draft is on the way rather than nothing at all.
+    if (approval !== "rejected") return;
+
     setTimeout(() => {
       setMessages((prev) => [
         ...prev,
         {
           id: Date.now().toString(),
           role: "assistant",
-          content:
-            approval === "approved"
-              ? `✓ ${platformLabel} content approved and queued for publishing.`
-              : `Noted. Regenerating ${platformLabel} content with your feedback in mind...`,
-          variant: approval === "rejected" ? "status" : undefined,
+          content: `Noted. Regenerating ${platformLabel} content with your feedback in mind...`,
+          variant: "status",
           timestamp: new Date(),
         },
       ]);
@@ -1373,6 +1442,111 @@ export default function ChatPage() {
         ? `Regenerating ${platformLabel} copy, avoiding what was flagged…`
         : `Dropped ${platformLabel} from this run.`;
     pushMessage({ role: "assistant", content: note, variant: "status" });
+  }
+
+  // ── Learning opt-in ─────────────────────────────────────────────────────────
+
+  /**
+   * Offer to learn from a run that just settled.
+   *
+   * Called on the terminal `workflow`/`done` progress event, which the service publishes at
+   * exactly the moment it marks the task complete — the same flag confirm-learning gates on
+   * (it answers 409 before that point). A failed run publishes `workflow`/`error` instead and
+   * so is never offered, which is what we want: there is nothing worth learning from a crash.
+   *
+   * Two guards, both load-bearing:
+   *  - signed out → no card. Both learning channels key off the `business_id` / `user_id` the
+   *    backend stamps onto the brief from the token, so an anonymous run has nothing to learn
+   *    FOR; offering it would promise something that cannot happen.
+   *  - once per task → the endpoint is not idempotent (a second confirm distils and appends the
+   *    same rules again), so the offer itself has to be single-shot, not just its buttons.
+   */
+  function maybeAskToLearn(taskId: string) {
+    if (!Object.keys(authHeaders()).length) return;
+    if (learningAskedRef.current.has(taskId)) return;
+    learningAskedRef.current.add(taskId);
+
+    // Deliberately NOT persisted (no persistMessage call): this is a live control, not
+    // transcript. Replaying it out of session history would hand the user a button for a task
+    // that has since been learned from — or evicted — and clicking it could double-train.
+    pushMessage({
+      role: "assistant",
+      content: "Want me to learn from this one?",
+      variant: "learning",
+      workflowTaskId: taskId,
+      learningState: "asking",
+    });
+  }
+
+  /**
+   * Answer the learning prompt.
+   *
+   * `learn: false` still posts rather than short-circuiting in the browser: `learn` is a
+   * parameter of the endpoint's contract, not something you express by staying silent, and one
+   * code path beats two. The service simply records the decline and writes nothing.
+   */
+  async function handleConfirmLearning(messageId: string, learn: boolean) {
+    const msg = messages.find((m) => m.id === messageId);
+    const taskId = msg?.workflowTaskId;
+    if (!taskId) return;
+
+    // Flip BEFORE awaiting, so the first click disables both buttons — see LearningState.
+    patchLearningCard(messageId, {
+      learningState: "saving",
+      learningError: undefined,
+      learningChoice: learn,
+    });
+
+    let res: Response;
+    let data: ConfirmLearningResponse;
+    try {
+      res = await fetch(`/api/tasks/${taskId}/confirm-learning`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ learn }),
+      });
+      data = (await res.json().catch(() => ({}))) as ConfirmLearningResponse;
+    } catch {
+      patchLearningCard(messageId, {
+        learningState: "error",
+        learningError: "Could not reach the backend.",
+      });
+      return;
+    }
+
+    if (!res.ok || data.error) {
+      patchLearningCard(messageId, {
+        learningState: "error",
+        // 409 is the one status with a meaning worth translating: the run is not finished, so
+        // there is nothing to learn from yet. Anything else surfaces as the backend phrased it.
+        learningError:
+          res.status === 409
+            ? "This run isn't finished yet — there's nothing to learn from so far."
+            : data.error ?? `The backend refused that (${res.status}).`,
+      });
+      return;
+    }
+
+    if (!data.learned) {
+      patchLearningCard(messageId, { learningState: "declined" });
+      return;
+    }
+
+    // Zip the parallel arrays the service returns; `evidence` is best-effort and can be shorter.
+    const summary = data.preference_summary;
+    patchLearningCard(messageId, {
+      learningState: "saved",
+      learnedRules: data.brand_rules ?? [],
+      learnedPreferences: (summary?.learned_skills ?? []).map((skill, i) => ({
+        skill,
+        evidence: summary?.evidence?.[i],
+      })),
+    });
+  }
+
+  /** Swaps a learning card's state in place, so the prompt becomes its own result. */
+  function patchLearningCard(messageId: string, patch: Partial<Message>) {
+    setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, ...patch } : m)));
   }
 
   function pushMessage(msg: Omit<Message, "id" | "timestamp">, insertBeforeId?: string): string {
@@ -1656,6 +1830,8 @@ export default function ChatPage() {
         if (node === "workflow" && status === "done") {
           es.close();
           workflowEsRef.current = null;
+          // The run is complete, which is precisely when confirm-learning stops answering 409.
+          maybeAskToLearn(taskId);
         }
       }
 
@@ -2395,6 +2571,17 @@ export default function ChatPage() {
               );
             }
 
+            if (msg.variant === "learning") {
+              return (
+                <LearningCard
+                  key={msg.id}
+                  message={msg}
+                  onDecide={(learn) => handleConfirmLearning(msg.id, learn)}
+                  formatTime={formatTime}
+                />
+              );
+            }
+
             if (msg.variant === "status") {
               return (
                 <div
@@ -2578,6 +2765,7 @@ interface VideoStoryboardCardProps {
 }
 
 const SLIDE_ICON: Record<VideoSlide["type"], string> = {
+  cold_open: "🎥",
   hook: "🎬",
   counter_stat: "🔢",
   collage: "🖼️",
@@ -2592,6 +2780,8 @@ const SLIDE_ICON: Record<VideoSlide["type"], string> = {
 
 function slideSummary(slide: VideoSlide): string {
   switch (slide.type) {
+    case "cold_open":
+      return slide.headline;
     case "hook":
       return slide.headline;
     case "counter_stat":
@@ -2643,9 +2833,11 @@ function VideoStoryboardCard({ message, formatTime }: VideoStoryboardCardProps) 
     setError(null);
     setElapsed(0);
     try {
+      // authHeaders() is required, not optional: /tasks/{id}/render-video is one of the
+      // TaskAccess-guarded routes, so an unauthenticated render of an OWNED run is 403.
       const res = await fetch("/api/video", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({
           taskId: message.workflowTaskId,
           platform: message.platform,
@@ -3589,6 +3781,184 @@ function PlanCard({
   );
 }
 
+// ── Learning Card ─────────────────────────────────────────────────────────────
+
+interface LearningCardProps {
+  message: Message;
+  onDecide: (learn: boolean) => void;
+  formatTime: (d: Date) => string;
+}
+
+/** One learned item: the rule itself, with the edit or turn it was traced back to beneath. */
+function LearnedItem({
+  text,
+  note,
+  tone,
+}: {
+  text: string;
+  note?: string;
+  tone: "positive" | "negative";
+}) {
+  const badge =
+    tone === "negative"
+      ? "bg-amber-50 text-amber-800 border-amber-200"
+      : "bg-green-50 text-green-700 border-green-200";
+  return (
+    <li className="flex gap-2.5">
+      <span
+        className={`text-xs px-2.5 py-1 rounded-full font-medium border flex-shrink-0 h-fit ${badge}`}
+      >
+        {tone === "negative" ? "avoid" : "do"}
+      </span>
+      <div className="min-w-0">
+        <p className="text-sm text-[#1B1A17] leading-snug">{text}</p>
+        {note && <p className="text-xs text-[#9E9893] mt-0.5 leading-snug">{note}</p>}
+      </div>
+    </li>
+  );
+}
+
+/**
+ * The learning opt-in, and then its receipt.
+ *
+ * The card becomes its own result rather than being replaced by a new message, so the answer
+ * stays attached to the question. Showing exactly what was written matters more here than it
+ * would elsewhere: the service has no endpoint for reading stored skills back, so this response
+ * is the only view a user ever gets of what the system now knows about them.
+ */
+function LearningCard({ message, onDecide, formatTime }: LearningCardProps) {
+  const state = message.learningState ?? "asking";
+  const rules = message.learnedRules ?? [];
+  const prefs = message.learnedPreferences ?? [];
+  // `learned: true` with both channels empty is an ordinary outcome — nothing in this
+  // conversation was distinct enough to distil, or learning is switched off service-side.
+  // It is not a failure, and saying "saved 0 rules" would read like one.
+  const learnedNothing = state === "saved" && !rules.length && !prefs.length;
+
+  return (
+    <div className="w-full max-w-md">
+      <div className="bg-white border border-[#E8E3DA] rounded-2xl p-5 shadow-sm">
+        <div className="flex items-start gap-3">
+          <span className="text-lg leading-none flex-shrink-0" aria-hidden="true">
+            🧠
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-semibold text-[#1B1A17]">
+              {state === "saved" && !learnedNothing
+                ? "Here's what I picked up"
+                : "Learn from this conversation?"}
+            </p>
+
+            {state === "asking" && (
+              <>
+                <p className="text-xs text-[#6B6561] mt-1 leading-relaxed">
+                  I can study the edits you made and how you talked about this post, then apply
+                  what I learn to future drafts. Nothing is saved unless you say so.
+                </p>
+                <div className="flex gap-2 mt-4">
+                  <button
+                    onClick={() => onDecide(true)}
+                    className="bg-[#FF4800] hover:bg-[#E03E00] text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors shadow-sm"
+                  >
+                    Yes, learn from it
+                  </button>
+                  <button
+                    onClick={() => onDecide(false)}
+                    className="border border-[#E8E3DA] text-[#6B6561] hover:bg-[#F2EDE4] hover:text-[#1B1A17] text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+                  >
+                    Not this time
+                  </button>
+                </div>
+              </>
+            )}
+
+            {state === "saving" && (
+              <div className="flex items-center gap-2 mt-2 text-sm text-[#9E9893] italic">
+                <span className="w-1.5 h-1.5 rounded-full bg-[#FF4800] animate-pulse flex-shrink-0" />
+                Working out what to keep…
+              </div>
+            )}
+
+            {state === "declined" && (
+              <p className="text-xs text-[#6B6561] mt-1 leading-relaxed">
+                Nothing was saved — this conversation won&apos;t change how I write.
+              </p>
+            )}
+
+            {learnedNothing && (
+              <p className="text-xs text-[#6B6561] mt-1 leading-relaxed">
+                Nothing new this time — I didn&apos;t find a preference here I don&apos;t
+                already know about.
+              </p>
+            )}
+
+            {state === "saved" && !learnedNothing && (
+              <div className="mt-3 space-y-4">
+                {rules.length > 0 && (
+                  <div>
+                    <p className="text-xs font-semibold text-[#6B6561] uppercase tracking-wide mb-2">
+                      Added to your brand voice
+                    </p>
+                    <ul className="space-y-2">
+                      {rules.map((r, i) => (
+                        <LearnedItem
+                          key={`rule-${i}`}
+                          text={r.rule}
+                          note={r.rationale}
+                          tone={r.kind === "must_avoid" ? "negative" : "positive"}
+                        />
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {prefs.length > 0 && (
+                  <div>
+                    <p className="text-xs font-semibold text-[#6B6561] uppercase tracking-wide mb-2">
+                      Learned about how you write
+                    </p>
+                    <ul className="space-y-2">
+                      {prefs.map((p, i) => (
+                        <LearnedItem
+                          key={`pref-${i}`}
+                          text={p.skill}
+                          note={p.evidence}
+                          tone="positive"
+                        />
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                <p className="text-[11px] text-[#C8C2BA] leading-relaxed">
+                  I&apos;ll take these into account the next time I write for you.
+                </p>
+              </div>
+            )}
+
+            {state === "error" && (
+              <div className="mt-2">
+                <p className="bg-red-50 border border-red-200 text-red-700 text-xs px-3 py-2 rounded-lg leading-relaxed">
+                  {message.learningError ?? "Something went wrong."}
+                </p>
+                {/* Safe to offer: a call that failed wrote nothing, so retrying can't
+                    double-count. Only a SUCCESSFUL confirm must never be repeated. Re-sends
+                    the original answer — a failed decline retries as a decline. */}
+                <button
+                  onClick={() => onDecide(message.learningChoice ?? true)}
+                  className="mt-2 border border-[#E8E3DA] text-[#6B6561] hover:bg-[#F2EDE4] hover:text-[#1B1A17] text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+                >
+                  Try again
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <p className="text-[10px] text-[#C8C2BA] mt-1">{formatTime(message.timestamp)}</p>
+    </div>
+  );
+}
+
 // ── Brand Animation Card ──────────────────────────────────────────────────────
 
 interface BrandAnimationCardProps {
@@ -4073,9 +4443,11 @@ function SocialPostCard({
     setRenderError(null);
     setElapsed(0);
     try {
+      // See the sibling startRender above — the render route is TaskAccess-guarded, so the
+      // token has to travel with it or an owned run 403s for its own owner.
       const res = await fetch("/api/video", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({
           taskId: message.workflowTaskId,
           platform: message.platform,

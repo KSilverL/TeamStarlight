@@ -25,6 +25,12 @@ export const SHAPE_CLIP = {
   diagonalCutTop: "polygon(0 0, 100% 0, 100% 12%, 0 24%)",
   /** Chevron/arrow pointing right — process steps. */
   chevron: "polygon(0 0, 88% 0, 100% 50%, 88% 100%, 0 100%, 8% 50%)",
+  /**
+   * Angled BOTTOM edge, sloping down to the left. The media/type seam on
+   * ColdOpenSlide's `horizon` variant. Complement of diagonalCut (which slopes the
+   * TOP edge), and deliberately the same 12% slope so the two read as one system.
+   */
+  horizonCut: "polygon(0 0, 100% 0, 100% 88%, 0 100%)",
 } as const;
 
 export type ClipName = keyof typeof SHAPE_CLIP;

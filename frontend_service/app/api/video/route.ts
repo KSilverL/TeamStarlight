@@ -26,9 +26,16 @@ export async function POST(request: NextRequest) {
   }
 
   try {
+    // Forward the caller's token: /tasks/{id}/render-video is TaskAccess-guarded, and a run
+    // started while logged in is OWNED — so dropping the header here 403s the owner out of
+    // rendering their own video. Every other /tasks/* proxy route relays it for the same reason.
+    const auth = request.headers.get("Authorization");
     const upstream = await fetch(`${BACKEND_URL}/tasks/${taskId}/render-video`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(auth ? { Authorization: auth } : {}),
+      },
       body: JSON.stringify({
         platform,
         ...(referenceImages.length > 0 ? { reference_images: referenceImages } : {}),

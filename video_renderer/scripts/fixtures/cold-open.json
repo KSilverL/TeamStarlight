@@ -1,0 +1,60 @@
+{
+  "brandName": "STARLIGHT",
+  "theme": "dark",
+  "primaryColor": "#0d1117",
+  "secondaryColor": "#2d4ed8",
+  "accentColor": "#f5c84c",
+  "backgroundStyle": "solid",
+  "transition": "none",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "slides": [
+    {
+      "type": "cold_open",
+      "kicker": "SUMMER 2026",
+      "headline": "Where the light gets in",
+      "subtext": "A film about mornings",
+      "emphasisWords": [
+        "light"
+      ],
+      "variant": "title_card",
+      "mediaLocalPath": "clips/stock.mp4",
+      "mediaDurationFrames": 419,
+      "durationFrames": 150
+    },
+    {
+      "type": "cold_open",
+      "kicker": "NOW SHOWING",
+      "headline": "Nothing stays still",
+      "emphasisWords": [
+        "Nothing"
+      ],
+      "variant": "trailer",
+      "mediaLocalPath": "clips/stock.mp4",
+      "mediaDurationFrames": 419,
+      "durationFrames": 150
+    },
+    {
+      "type": "cold_open",
+      "kicker": "DUBLIN",
+      "headline": "The city before it wakes",
+      "subtext": "Six weeks on the north quays",
+      "emphasisWords": [
+        "wakes"
+      ],
+      "variant": "horizon",
+      "mediaLocalPath": "clips/stock.mp4",
+      "mediaDurationFrames": 419,
+      "durationFrames": 165
+    },
+    {
+      "type": "cold_open",
+      "kicker": "NO CLIP RESOLVED",
+      "headline": "The mosaic ident stands in",
+      "subtext": "Renders with no assets at all",
+      "variant": "title_card",
+      "durationFrames": 150
+    }
+  ]
+}

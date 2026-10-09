@@ -1,6 +1,6 @@
 // KEEP IN SYNC WITH: LLM_service/core/video_schema.py (the Slide discriminator
-// literals: "hook" | "counter_stat" | "collage" | "statement" | "media_statement"
-// | "outro"). Every
+// literals: "cold_open" | "hook" | "counter_stat" | "collage" | "statement"
+// | "media_statement" | "outro"). Every
 // literal there needs exactly one entry here, and vice versa. Parity IS checked
 // cross-language, by test_slide_registry_ts_covers_every_slide_type in
 // LLM_service/tests/test_contract_parity.py, which parses the object literal
@@ -8,6 +8,7 @@
 import React from "react";
 import { BarChartSlide } from "./slides/BarChartSlide";
 import { CollageSlide } from "./slides/CollageSlide";
+import { ColdOpenSlide } from "./slides/ColdOpenSlide";
 import { ComparisonTableSlide } from "./slides/ComparisonTableSlide";
 import { CounterStatSlide } from "./slides/CounterStatSlide";
 import { HookSlide } from "./slides/HookSlide";
@@ -36,6 +37,7 @@ type AnySlideComponent = React.FC<{
 // "generated" is intentionally absent here: it has no hand-written component.
 // resolveSlideComponent() below resolves it instead, from GENERATED_REGISTRY.
 export const SLIDE_REGISTRY: Record<Exclude<Slide["type"], "generated">, AnySlideComponent> = {
+  cold_open: ColdOpenSlide,
   hook: HookSlide,
   counter_stat: CounterStatSlide,
   collage: CollageSlide,

@@ -30,8 +30,27 @@ enumerates them via the `type` discriminator. Never invent a new slide type.
 
 ## The slide registry
 
-- **`hook`** — the scroll-stopping opening line, optionally with a cut-out image on
-  a geometric shape behind it. Almost always the first slide. Optional `kicker` is a
+- **`cold_open`** — the video's CINEMATIC OPENING TITLE, and the default way to start:
+  a real stock-footage establishing shot with a slow zoom, framed by a letterbox matte
+  cut out of the animated pixel-mosaic field, under a title that arrives word by word
+  and then stays. Reach for it whenever a place, a texture, or people in motion can set
+  the scene. `headline` is a 2-6 word TITLE, not a sentence — a film title or a magazine
+  cover line. `mediaQuery` is a 2-4 word stock-FOOTAGE search for an *establishing* shot:
+  wide, slow, atmospheric ('coastal cliffs sunrise', 'city street night'), never a busy
+  close-up. Optional `kicker` is the title slate ('SUMMER 2026', 'DUBLIN', 'EPISODE ONE');
+  optional `subtext` a short subtitle under the title — use one or the other, rarely both.
+  Pick a `variant`: *title_card* (default — the matte irises open on a cold, dim shot that
+  blooms into colour while the title lands centred in the lower third; elegant, the safe
+  choice), *trailer* (a hard cut on a flash frame, the matte slams shut, and the title
+  snaps in bottom-left off an accent slate — kinetic and loud), or *horizon* (footage
+  across the top under an angled horizon line with the title below on the live mosaic —
+  brand-forward and documentary). Omit `mediaQuery` and it opens on the mosaic alone.
+  **Use it at slide 1 and nowhere else** — its title never exits, which is right for an
+  opening and looks like a bug in the middle of a video.
+- **`hook`** — the quieter, text-first opening card: a headline with an optional cut-out
+  image on a geometric shape behind it. Use it when the brief has no scene worth showing,
+  or when a bold typographic open suits the brand better than footage — otherwise prefer
+  `cold_open`. Optional `kicker` is a
   tiny ALL-CAPS eyebrow above the headline ('NOW LIVE', 'INTRODUCING'). Pick a
   `variant`: *spotlight* (default — image on a shape, headline below), *poster* (no
   image, giant headline over a gradient — bold and typographic; great for a text-only
@@ -144,7 +163,9 @@ enumerates them via the `type` discriminator. Never invent a new slide type.
 
 ## Ordering conventions
 
-- Start with `hook` (it's the reason someone keeps watching).
+- Start with `cold_open` (it's the reason someone keeps watching). Use `hook` instead
+  when the open is text-only or deliberately quiet. Either way, the first slide is one
+  of those two — and `cold_open` never appears anywhere but first.
 - End with `outro` (it's the only slide with a CTA).
 - A `statement` works best as a *pivot* between two other slides — a beat you'd
   pause on. Don't place two `statement` slides back to back.
@@ -161,10 +182,13 @@ description longer than a few words. A later step resolves these to real cut-out
 images; you only choose what to search for. Omit `imageQuery`/leave it null for a
 text-only hook slide if no image fits.
 
-`media_statement.mediaQuery` works the same way but searches stock FOOTAGE rather
-than photos (e.g. `"city street night"`, `"team working office"`). Describe the
-scene you want to see moving — don't just restate the slide's `text`. Omit it and
-the slide falls back to the mosaic treatment.
+`media_statement.mediaQuery` and `cold_open.mediaQuery` work the same way but search
+stock FOOTAGE rather than photos (e.g. `"city street night"`, `"team working office"`).
+Describe the scene you want to see moving — don't just restate the slide's own words.
+Omit it and the slide falls back to the mosaic treatment. The difference between the two:
+`media_statement` wants a scene to sit BEHIND an idea, while `cold_open` wants a scene to
+OPEN ON — wider, slower, more establishing, since it plays under a title for several
+seconds with a slow zoom on it.
 
 ## Chart/data fields are illustrative, not looked up
 
@@ -221,6 +245,8 @@ consistent with any real figures mentioned in the brief; don't contradict them.
 ## Copy rules
 
 - `brandName`: 1-2 words, ALL CAPS.
+- `cold_open.headline`: 2-6 words, a TITLE rather than a sentence — no verb and full
+  stop needed. `cold_open.kicker`: 1-3 words, ALL CAPS.
 - `hook.headline`: 3-7 words, the scroll-stopping opening line.
 - `counter_stat.stats`: each item has a short `value`, a `label`, and a single-symbol
   `icon` (e.g. ★ ◆ ▲ ● ■ ✦).

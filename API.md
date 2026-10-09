@@ -339,7 +339,8 @@ Platform finalized (after `/review`) — enriched by the media_producer:
 > The draft text is HTML-escaped, so it is safe.
 > `video_storyboard` is a **`StoryboardSpec`** (`LLM_service/core/video_schema.py`): brand
 > identity + a 3-colour palette + an ordered list of 2–8 typed `slides` composed from a fixed
-> registry (`hook`, `counter_stat`, `collage`, `statement`, `media_statement`, `outro`,
+> registry (`cold_open`, `hook`, `counter_stat`, `collage`, `statement`, `media_statement`,
+> `outro`,
 > `pie_chart`, `line_chart`, `bar_chart`, `node_diagram`, `comparison_table`). It is **data
 > only** — image/video fields are stock-search *keywords* (never URLs), and the final aspect
 > ratio is derived server-side from `platform`. To
